@@ -36,7 +36,7 @@
 ### 1. 安装依赖
 
 ```bash
-cd /Users/chenyifeng/AstrBot/data/plugins/astrbot_plugin_paperrag
+cd ~/AstrBot/data/plugins/astrbot_plugin_paperrag
 pip install -r requirements.txt
 ```
 
