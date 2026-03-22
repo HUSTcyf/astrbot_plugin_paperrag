@@ -1,234 +1,153 @@
-# 📚 Paper RAG Plugin
+# 📚 Paper RAG Plugin - 用户指南
 
-本地论文库RAG检索插件，支持多模态PDF向量化（文本、图片、表格、公式）和智能问答。
+本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力。
 
-## 🆕 最新更新 (2026-03-23)
+## ✨ 核心功能
 
-### v2.1 更新内容
-
-#### 性能优化
-- ✅ **批量 Embedding**：每篇PDF仅1次API调用，节省80-90% RPD配额
-  - 从 `N chunks = N次调用` 优化为 `N chunks = 1次批量调用`
-  - 处理能力提升约50倍（1000 RPD从约20篇PDF提升到约1000篇PDF）
-
-#### 代码质量提升
-- ✅ **日志精简**：删除冗余日志，减少70-80%日志输出
-  - 移除所有 `[STEP X]`、`[WRAPPER STEP X]`、`[EMBED STEP X]` 调试日志
-  - 移除属性访问、连接模式、索引类型等详细日志
-  - 保留关键错误和警告信息
-
-#### Bug修复
-- ✅ **类型安全**：修复Pylance类型检查警告
-  - 修复 `drop_collection()` 未await问题
-  - 修复 `None` 类型参数问题
-  - 修复视觉编码器类型访问问题
-
-#### 文件过滤
-- ✅ **Meta文件过滤**：自动跳过macOS `._` 开头的元数据文件
-  - 避免导入系统生成的隐藏文件
-  - 提升导入准确性
+- 🔍 **智能检索**：基于语义相似度快速定位相关文档片段
+- 💡 **AI问答**：结合检索内容生成准确、有引用的答案
+- 📄 **多格式支持**：PDF、Word、TXT、Markdown、HTML
+- 🖼️ **多模态提取**：自动识别PDF中的图片、表格、公式
+- 💾 **本地存储**：所有数据存储在本地，保护隐私
+- ⚡ **缓存加速**：常用查询结果缓存，响应更快
 
 ---
 
-## 🎯 核心特性
+## 🚀 快速开始（5分钟）
 
-- ✅ **本地向量存储**: Milvus Lite进行本地向量存储，保护论文隐私
-- ✅ **高质量嵌入**: 集成AstrBot Embedding Provider，灵活配置嵌入模型
-- ✅ **智能问答**: 基于检索增强生成(RAG)技术，提供准确的论文相关回答
-- ✅ **多种检索模式**: 支持纯检索模式和RAG生成模式
-- ✅ **缓存优化**: 内置LRU缓存，提升重复查询性能
-- ✅ **引用标注**: 自动标注引用来源，方便追溯原文
-
-### 多模态PDF处理（v2.0）
-
-- ✅ **图片提取**：自动识别并保留PDF中的图片
-  - 🆕 **NMS去重**：基于 Bbox 的 Non-Maximum Suppression 过滤重复图片
-  - 🆕 **智能优选**：小图与大图重叠时，优先保留大图
-- ✅ **表格提取**：使用pdfplumber提取表格，支持Markdown格式
-- ✅ **公式识别**：识别LaTeX公式（`$$...$$`, `\(...\)`, `\begin{equation}`）
-- ✅ **智能分块**：图片/表格/公式完整保留，不分块
-- ✅ **优雅降级**：依赖不可用时自动回退到文本模式
-- ✅ **语义分块**：基于标题和段落的智能分块策略
-
----
-
-## 🚀 快速开始
-
-### 1. 安装依赖
+### 第一步：安装插件
 
 ```bash
 cd ~/AstrBot/data/plugins/astrbot_plugin_paperrag
 pip install -r requirements.txt
 ```
 
-**基础依赖**（必需）：
-- pymilvus[milvus_lite] - 向量数据库
-- PyMuPDF - PDF解析
-- pdfplumber - 表格提取
-- python-docx - Word文档
-- pillow - 图像处理
+### 第二步：配置Embedding Provider
 
-**可选依赖**（用于图片向量化）：
-- transformers - HuggingFace模型
-- torch - PyTorch
+在 **AstrBot WebUI → 设置 → 模型提供商** 中添加：
 
-> 💡 如果未安装transformers，系统会自动降级到文本模式，不会影响核心功能。
+| 配置项 | 值 |
+|-------|-----|
+| 类型 | Gemini |
+| ID | `gemini_embedding` |
+| API Key | [获取密钥](https://makersuite.google.com/app/apikey) |
+| 模型 | `gemini-embedding-2-preview` |
 
-### 2. 配置 Embedding Provider
+### 第三步：配置插件
 
-在 **AstrBot WebUI → 设置 → 模型提供商** 中添加 Embedding Provider：
+在 **AstrBot WebUI → 插件 → paper_rag → 插件配置** 中：
 
-**示例配置（Gemini）**:
-- 类型: `Gemini`
-- ID: `gemini_embedding`
-- API Key: 你的 Gemini API Key
-- 模型: `gemini-embedding-2-preview`
+| 配置项 | 值 |
+|-------|-----|
+| Embedding 服务提供商 | `gemini_embedding` |
+| LLM Provider ID | `glm-4.7-flash`（可选） |
+| 论文文件存放目录 | `./papers` |
+| 启用插件 | ✅ |
 
-获取 API Key: [Google AI Studio](https://makersuite.google.com/app/apikey)
-
-### 3. 配置 LLM Provider（可选）
-
-如需使用RAG生成功能，在 **AstrBot WebUI → 设置 → 模型提供商** 中添加 LLM Provider：
-
-**示例配置（智谱GLM）**:
-- 类型: `zhipu`
-- ID: `glm-4.7-flash`
-- API Key: 你的智谱 API Key
-- 模型: `glm-4.7-flash`
-
----
-
-## ⚙️ 配置选项
-
-在插件配置中添加：
-
-```json
-{
-    "enabled": true,
-    "embedding_provider_id": "gemini_embedding",
-    "llm_provider_id": "glm-4.7-flash",
-    "milvus_lite_path": "./data/milvus_papers.db",
-
-    "use_semantic_chunking": true,
-    "chunk_size": 512,
-    "chunk_overlap": 0,
-    "min_chunk_size": 100,
-
-    "enable_multimodal": true,
-    "multimodal": {
-        "enabled": true,
-        "extract_images": true,
-        "extract_tables": true,
-        "extract_formulas": true
-    }
-}
-```
-
-### 配置说明
-
-| 参数 | 说明 | 默认值 |
-|-----|------|--------|
-| `chunk_size` | 目标块大小（字符数） | 512 |
-| `chunk_overlap` | 块间重叠大小 | 0（禁用以避免无限循环） |
-| `min_chunk_size` | 最小块大小 | 100 |
-| `use_semantic_chunking` | 启用语义分块 | true |
-| `enable_multimodal` | 启用多模态提取 | true |
-| `multimodal.extract_images` | 提取图片 | true |
-| `multimodal.extract_tables` | 提取表格 | true |
-| `multimodal.extract_formulas` | 提取公式 | true |
-
-#### 多模态高级配置（可选）
-
-```json
-{
-    "enable_multimodal": true,
-    "multimodal": {
-        "enabled": true,
-        "extract_images": true,
-        "extract_tables": true,
-        "extract_formulas": true,
-        "nms_iou_threshold": 0.5,
-        "enable_nms": true
-    }
-}
-```
-
-| 参数 | 说明 | 默认值 |
-|-----|------|--------|
-| `nms_iou_threshold` | NMS IoU阈值（0-1），越小过滤越严格 | 0.5 |
-| `enable_nms` | 是否启用NMS图片去重 | true |
-
----
-
-## 📖 使用方法
-
-### 命令
+### 第四步：使用插件
 
 ```bash
-/paper search <问题>              # 搜索文档并回答
-/paper search <问题> retrieve     # 仅检索，不生成答案
-/paper list                       # 列出所有文档
-/paper add [目录]                 # 添加文档到知识库
-/paper clear confirm              # 清空知识库
-```
+# 1. 创建论文目录并放入PDF文件
+mkdir papers
+cp ~/Downloads/*.pdf papers/
 
-### 示例
+# 2. 添加文档到知识库
+/paper add
 
-**1. 添加文档**：
-```
-/paper add ~/Documents/papers
-```
-
-输出：
-```
-📄 Found 10 document files
-⏳ Starting import...
-📖 [1/10] Parsing: example.pdf
-✅ [1/10] example.pdf - 85 chunks (including 3 tables, 2 formulas)
-```
-
-**2. 搜索文档**：
-```
-/paper search What is the attention mechanism?
-```
-
-输出：
-```
-💡 Answer
-
-The attention mechanism is a neural network architecture that...
-
-📚 References
-
-[1] attention.pdf (chunk #5)
-> The attention mechanism computes weighted sums of values...
-
-[2] transformer.pdf (chunk #12)
-> Table: Attention head comparison
+# 3. 搜索论文
+/paper search 这篇论文的主要创新点是什么？
 ```
 
 ---
 
-## 📊 性能优化建议
+## 📖 使用说明
 
-### 分块大小配置
+### 命令速查
 
-| 场景 | chunk_size | chunk_overlap | 说明 |
-|-----|-----------|---------------|------|
-| 学术论文 | 512-768 | 0（推荐） | 较大的块保留更多上下文，禁用重叠避免bug |
-| 技术文档 | 384-512 | 0（推荐） | 平衡精度和速度，禁用重叠避免bug |
-| 长文档 | 768-1024 | 0（推荐） | 减少分块数量，禁用重叠避免bug |
+| 命令 | 功能 | 示例 |
+|------|------|------|
+| `/paper search <问题>` | 搜索并生成回答 | `/paper search attention机制的原理` |
+| `/paper search <问题> retrieve` | 仅检索相关片段 | `/paper search CNN retrieve` |
+| `/paper list` | 查看已收录文档 | `/paper list` |
+| `/paper add [目录]` | 添加文档（需管理员） | `/paper add ~/Documents/papers` |
+| `/paper clear confirm` | 清空知识库（需管理员） | `/paper clear confirm` |
 
-> ⚠️ **重要提示**：由于已知无限循环bug，建议将 `chunk_overlap` 设置为 0。如需启用重叠，请确保 `chunk_overlap < chunk_size / 2`。
+### 使用示例
+
+**示例1：添加论文**
+
+```
+你: /paper add
+Bot: 🔍 扫描目录: ./papers
+Bot: 📄 发现 10 个文档文件
+Bot: ⏳ 开始导入...
+Bot: ✅ [1/10] deep_learning.pdf - 85 个片段
+Bot: ✅ [2/10] transformer.pdf - 92 个片段
+...
+Bot: ✅ 导入完成
+Bot: 📊 总计: 10 个文件, 850 个片段
+Bot: 💡 提示: 使用 /paper search [问题] 来检索文档
+```
+
+**示例2：搜索问答**
+
+```
+你: /paper search 什么是注意力机制？
+Bot: 🔍 正在检索文档库...
+Bot:
+Bot: 💡 **回答**
+Bot:
+Bot: 注意力机制（Attention Mechanism）是一种神经网络架构...
+Bot:
+Bot: 📚 **参考文献**
+Bot:
+Bot: [1] **attention_is_all_you_need.pdf** (片段 #12)
+Bot: > The attention mechanism allows the model to focus on...
+```
+
+---
+
+## ⚙️ 配置详解
+
+### 基础配置
+
+| 配置项 | 说明 | 默认值 | 推荐值 |
+|-------|------|--------|--------|
+| `enabled` | 启用插件 | `true` | ✅ |
+| `embedding_provider_id` | Embedding Provider ID | - | `gemini_embedding` |
+| `llm_provider_id` | LLM Provider ID（可选） | - | `glm-4.7-flash` |
+| `papers_dir` | 论文目录 | `./papers` | `./papers` |
+| `embed_dim` | 向量维度 | `768` | `768` (Gemini) / `1536` (OpenAI) |
+| `top_k` | 返回片段数 | `5` | `5` |
+| `similarity_cutoff` | 相似度阈值 | `0.3` | `0.3` |
+
+### 分块配置
+
+| 配置项 | 说明 | 默认值 | 推荐值 |
+|-------|------|--------|--------|
+| `chunk_size` | 分块大小（字符） | `512` | `512` (论文) / `384` (文档) |
+| `chunk_overlap` | 块间重叠 | `0` | `0`（避免bug） |
+| `min_chunk_size` | 最小块大小 | `100` | `100` |
+| `use_semantic_chunking` | 智能分块 | `true` | ✅ |
+
+> 💡 **提示**：`chunk_overlap` 建议设为 0，避免已知分块bug。
 
 ### 多模态配置
 
-**生产环境**（稳定，推荐）：
+| 配置项 | 说明 | 默认值 |
+|-------|------|--------|
+| `enable_multimodal` | 启用多模态 | `true` |
+| `multimodal.extract_images` | 提取图片 | `true` |
+| `multimodal.extract_tables` | 提取表格 | `true` |
+| `multimodal.extract_formulas` | 提取公式 | `true` |
+| `multimodal.nms_iou_threshold` | 图片去重阈值 | `0.5` |
+| `multimodal.enable_nms` | 启用NMS去重 | `true` |
+
+**生产环境推荐配置**：
 ```json
 {
     "enable_multimodal": true,
     "multimodal": {
-        "enabled": false,
         "extract_images": false,
         "extract_tables": true,
         "extract_formulas": true
@@ -236,314 +155,84 @@ The attention mechanism is a neural network architecture that...
 }
 ```
 
-**开发环境**（全功能）：
-```json
-{
-    "enable_multimodal": true,
-    "multimodal": {
-        "enabled": true,
-        "extract_images": true,
-        "extract_tables": true,
-        "extract_formulas": true
-    }
-}
-```
+---
+
+## 💡 使用技巧
+
+### 1. 选择合适的分块大小
+
+| 文档类型 | 推荐chunk_size | 说明 |
+|---------|---------------|------|
+| 学术论文 | `512-768` | 保留更多上下文 |
+| 技术文档 | `384-512` | 平衡精度和速度 |
+| 长篇报告 | `768-1024` | 减少分块数量 |
+
+### 2. 提高搜索准确度
+
+- **使用具体问题**：避免太宽泛的问题
+- **包含关键词**：提问时使用专业术语
+- **调整top_k**：增加返回片段数（默认5）
+- **调整相似度阈值**：提高 `similarity_cutoff` 过滤低质量结果
+
+### 3. 加速导入
+
+- **批量导入**：一次性添加多个PDF
+- **禁用图片提取**：设置 `extract_images: false`
+- **使用SSD**：将Milvus数据库放在SSD上
 
 ---
 
-## 🔧 技术架构
+## ❓ 常见问题
 
-### 多模态处理流程
+### Q1: 提示"RAG引擎未就绪"
 
-```
-PDF文件
-   ↓
-[多模态提取]
-   ├─ 文本 → PyMuPDF
-   ├─ 图片 → PyMuPDF (位置信息)
-   │   └─ 🆕 NMS去重 → 过滤重复/重叠图片
-   ├─ 表格 → pdfplumber (Markdown)
-   └─ 公式 → LaTeX正则
-   ↓
-[智能分块]
-   ├─ 文本 → 语义分块
-   ├─ 图片 → 完整保留
-   ├─ 表格 → 完整保留
-   └─ 公式 → 完整保留
-   ↓
-[批量向量化] 🆕
-   ├─ 文本 → Embedding Provider (1次API调用)
-   ├─ 表格/公式 → 文本嵌入 (批量)
-   └─ 图片 → SigLIP (可选)
-   ↓
-[Milvus存储]
-   ↓
-[检索 + RAG生成]
-```
-
-### 图片去重机制
-
-```
-图片提取 → 多级过滤 → 保留唯一图片
-   ↓
-【第一级】尺寸过滤
-   ├─ 宽度 < 10px → 移除
-   ├─ 高度 < 10px → 移除
-   └─ 使用 image.size（原始图片尺寸）
-   ↓
-【第二级】图注去重 🆕
-   ├─ 提取图注编号（如 "Figure 1"）
-   ├─ 相同图注的图片 → 判定为同图的不同版本
-   ├─ 只保留尺寸最大的图片
-   └─ 过滤缩略图、预览图、低分辨率版本
-   ↓
-【第三级】尺寸去重
-   ├─ 相同 (宽, 高) → 判定为重复
-   ├─ 保留第一次出现的图片
-   └─ 过滤图标、分隔线等重复元素
-   ↓
-【第四级】NMS位置去重
-   ├─ 计算所有图片的 Bbox 面积
-   ├─ 按面积降序排序
-   ├─ 逐对比较 Bbox 重叠
-   │   ├─ IoU > 0.5 → 判定为重叠
-   │   ├─ 面积大的图片 → 保留
-   │   └─ 面积小的图片 → 移除
-   └─ 返回过滤后的图片列表
-```
-
-**去重原理**：
-- **尺寸过滤**：在调整大小前检查原始尺寸，过滤过小图片
-- **图注去重**：学术论文中同一图注对应多分辨率版本（缩略图、预览图、完整图），只保留最高清版本
-- **尺寸去重**：相同尺寸的图片通常是重复元素（logo、图标），只保留一份
-- **NMS去重**：处理同一图片在PDF中多次嵌入的情况，过滤位置重叠的小图
-
-### 批量Embedding优化 🆕
-
-```python
-# 旧方式：逐条调用（N次API调用）
-for chunk in chunks:
-    embedding = await get_text_embedding(chunk)  # ❌ 浪费RPD
-
-# 新方式：批量调用（1次API调用）
-embeddings = await embed(chunks)  # ✅ 节省RPD
-```
-
-**RPD节省效果**：
-- 1篇PDF(50 chunks): 从50次调用 → 1次调用 (节省98%)
-- 100篇PDF: 从5000次调用 → 100次调用 (节省98%)
-- 1000 RPD配额: 处理能力从~20篇 → ~1000篇
-
----
-
-## 🐛 故障排除
-
-### 问题：添加文档后chunks=0
-
-**可能原因**：
-1. PDF是扫描版（无文本层）
-2. 依赖未安装
+**原因**：Embedding Provider未配置或配置错误
 
 **解决**：
-```bash
-# 测试PDF
-python test_pdf.py paper.pdf
+1. 检查 WebUI → 设置 → 模型提供商
+2. 确认已添加 Embedding Provider
+3. 检查插件配置中的 Provider ID 是否正确
 
-# 安装依赖
-pip install -r requirements.txt
-```
+### Q2: 导入后chunks=0
 
-### 问题：transformers导入错误
-
-**原因**：未安装多模态依赖（正常）
-
-**解决**：无需处理，系统会自动降级到文本模式
-
-### 问题：表格提取失败
-
-**原因**：pdfplumber未安装
+**原因**：PDF是扫描版（无文本层）或依赖未安装
 
 **解决**：
-```bash
-pip install pdfplumber
-```
+1. 确认PDF不是扫描版
+2. 安装依赖：`pip install -r requirements.txt`
+3. 运行测试：`python test_pdf.py paper.pdf`
 
-### 问题：分块过多警告
+### Q3: 搜索结果不准确
 
-**原因**：文档生成了超过50个chunk
+**原因**：分块大小不合适或相似度阈值过高
 
-**影响**：可能影响检索性能，但不影响功能
+**解决**：
+1. 调整 `chunk_size`（尝试增大）
+2. 降低 `similarity_cutoff`（如0.2）
+3. 增加 `top_k`（返回更多结果）
 
-**解决**：调整 `chunk_size` 参数，增大分块大小
+### Q4: 提示"RPD配额耗尽"
 
-### 问题：RPD配额耗尽
+**原因**：Gemini API每日1000次请求限制
 
-**原因**：Gemini Embedding API达到每日1000次请求限制
+**解决**：
+1. 已优化批量调用，通常足够使用
+2. 在 [AI Studio](https://aistudio.google.com/) 绑定账单，配额提升至150,000+
+3. 切换其他Embedding Provider（如OpenAI）
 
-**解决方案**：
-1. **已优化**：批量调用已启用，节省80-90% RPD
-2. **升级配额**：在 [AI Studio](https://aistudio.google.com/) 绑定账单，RPD从1000提升到150,000+
-3. **切换模型**：使用OpenAI等其他Embedding Provider
-4. **本地模型**：部署 BGE-M3 等本地嵌入模型
+### Q5: transformers导入错误
 
----
+**原因**：未安装图片向量化依赖（正常）
 
-## 📚 开发指南
-
-### 插件架构
-
-```
-main.py (插件入口)
-  ├── PaperRAGPlugin (Star)
-  │   ├── __init__() - 初始化
-  │   ├── _get_engine() - 获取RAG引擎（懒加载）
-  │   ├── 缓存管理
-  │   └── 命令处理器
-  │
-rag_engine.py (核心引擎)
-  ├── RAGConfig - 配置数据类
-  ├── EmbeddingProviderWrapper - Embedding Provider 包装
-  ├── MilvusLiteStore - 向量存储
-  ├── PaperRAGEngine - RAG引擎主类
-  └── 文档解析器
-```
-
-### 设计模式
-
-1. **单例模式**: RAG 引擎懒加载，全局唯一实例
-2. **包装器模式**: 统一 Embedding Provider 接口
-3. **策略模式**: 支持多种文档解析策略
-4. **缓存模式**: LRU 缓存提升性能
-
-### 核心组件
-
-#### 1. PaperRAGPlugin (main.py)
-
-```python
-@register(
-    "paper_rag",
-    "YourName",
-    "本地论文库RAG检索插件",
-    "1.0.0",
-    "https://github.com/your/repo"
-)
-class PaperRAGPlugin(Star):
-    def __init__(self, context: Context, config: dict = {}):
-        super().__init__(context)
-        self.config = config or {}
-        self.context = context
-
-        # 插件配置
-        self.enabled = self.config.get("enabled", True)
-
-        # 缓存配置
-        self.cache_enabled = self.config.get("cache_enabled", True)
-        self.cache_ttl = self.config.get("cache_ttl_seconds", 3600)
-        self.cache_max_size = self.config.get("cache_max_entries", 100)
-        self._response_cache = {}
-
-        # RAG引擎（懒加载）
-        self._engine = None
-        self._config_valid = False
-```
-
-#### 2. RAGConfig (rag_engine.py)
-
-```python
-@dataclass
-class RAGConfig:
-    """RAG配置类"""
-    # Provider配置
-    embedding_provider_id: str = ""
-    llm_provider_id: str = ""
-
-    # Milvus配置
-    milvus_lite_path: str = "./data/milvus_papers.db"
-    collection_name: str = "paper_embeddings"
-
-    # 检索配置
-    embed_dim: int = 768
-    top_k: int = 5
-    similarity_cutoff: float = 0.3
-
-    # 论文目录
-    papers_dir: str = "./papers"
-```
-
-### 开发工作流
-
-```bash
-# 进入插件目录
-cd /Users/chenyifeng/AstrBot/data/plugins/astrbot_plugin_paperrag
-
-# 安装依赖
-uv pip install -r requirements.txt
-
-# 修改代码
-vim main.py  # 或 rag_engine.py
-
-# 重启 AstrBot
-# 修改会自动热加载（如果启用）
-```
-
-### 类型注解
-
-```python
-from typing import List, Dict, Any, Optional, cast
-
-async def search(self, query: str, mode: str = "rag") -> Dict[str, Any]:
-    """明确的返回类型注解"""
-    pass
-
-def _get_engine(self) -> Optional[PaperRAGEngine]:
-    """可能返回 None 的类型"""
-    pass
-```
+**解决**：无需处理，系统会自动降级到文本模式，不影响使用
 
 ---
 
-## 🧪 测试指南
+## 📞 获取帮助
 
-### 一键测试
-
-```bash
-cd /Users/chenyifeng/AstrBot/data/plugins/astrbot_plugin_paperrag
-python test_pdf.py /path/to/your/paper.pdf
-```
-
-### 测试流程
-
-#### 步骤1: 安装依赖
-
-```bash
-pip install -r requirements.txt
-```
-
-#### 步骤2: 准备测试PDF
-
-将测试PDF文件放到可访问的位置。
-
-#### 步骤3: 运行测试
-
-```bash
-python test_pdf.py ~/Documents/test_paper.pdf
-```
-
-### 测试结果解读
-
-#### 完美通过
-
-```
-🎉 所有测试通过! (5/5)
-```
-→ 插件功能完整，可以正常使用
-
-#### 部分通过
-
-```
-⚠️  部分测试失败 (4/5)
-```
-→ 核心功能可用，部分功能降级
+- **开发文档**：查看 [DEVELOPMENT.md](DEVELOPMENT.md) 了解技术细节
+- **问题反馈**：通过 GitHub Issues 提交问题
+- **日志查看**：AstrBot 控制台输出
 
 ---
 
@@ -553,8 +242,6 @@ MIT License
 
 ## 🙏 致谢
 
-- [SigLIP](https://arxiv.org/abs/2303.15343) - 视觉编码器
+- [AstrBot](https://github.com/AstrBotDevs/AstrBot) - 聊天机器人框架
 - [Milvus](https://milvus.io/) - 向量数据库
 - [PyMuPDF](https://pymupdf.readthedocs.io/) - PDF解析
-- [pdfplumber](https://github.com/jsvine/pdfplumber) - 表格提取
-- [AstrBot](https://github.com/AstrBotDevs/AstrBot) - 聊天机器人框架
