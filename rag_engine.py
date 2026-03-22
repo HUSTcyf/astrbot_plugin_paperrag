@@ -9,6 +9,7 @@ import os
 import sys
 import time
 import warnings
+import inspect
 from pathlib import Path
 from typing import List, Dict, Any, Optional, cast
 from dataclasses import dataclass
@@ -128,16 +129,7 @@ class EmbeddingProviderWrapper:
         self.provider = provider
         logger.info(f"✅ [WRAPPER STEP 3] EmbeddingProviderWrapper 初始化完成")
 
-    def embed(self, texts: str | List[str]) -> List[List[float]]:
-        """
-        获取文本的嵌入向量（支持 OpenAI 和 Gemini）
-
-        Args:
-            texts: 输入文本（单条字符串或字符串列表）
-
-        Returns:
-            嵌入向量列表
-        """
+    async def embed(self, texts: str | List[str]) -> List[List[float]]:
         logger.info(f"🔍 [EMBED STEP 1] embed() 方法被调用，texts 类型: {type(texts)}")
 
         try:
@@ -145,35 +137,36 @@ class EmbeddingProviderWrapper:
                 texts = [texts]
             logger.info(f"🔍 [EMBED STEP 2] 文本数量: {len(texts)}")
 
-            # 参考 mnemosyne: 使用 embed_texts 或 get_embedding 方法（而非 embed）
-            # 优先使用 embed_texts（批量处理）
-            logger.info(f"🔍 [EMBED STEP 3] 检查 Provider 方法")
+            embeddings = None
+
+            # 辅助函数：智能调用（同步/异步自适应）
+            async def call_method(method, *args):
+                if inspect.iscoroutinefunction(method):
+                    return await method(*args)
+                else:
+                    return method(*args)
 
             if hasattr(self.provider, "embed_texts") and callable(self.provider.embed_texts):
                 logger.info(f"🔍 [EMBED STEP 4] 使用 embed_texts() 方法")
-                embeddings: List[List[float]] = self.provider.embed_texts(texts)  # type: ignore
+                embeddings = await call_method(self.provider.embed_texts, texts)
+                
             elif hasattr(self.provider, "get_embedding") and callable(self.provider.get_embedding):
                 logger.info(f"🔍 [EMBED STEP 4] 使用 get_embedding() 方法")
-                # fallback 到 get_embedding（单个文本处理）
-                embeddings = [self.provider.get_embedding(text) for text in texts]  # type: ignore
+                embeddings = [await call_method(self.provider.get_embedding, text) for text in texts]
+                
             elif hasattr(self.provider, "embed") and callable(self.provider.embed):
                 logger.info(f"🔍 [EMBED STEP 4] 使用 embed() 方法")
-                # 最后尝试 embed 方法（某些 Provider 可能使用）
-                embeddings: List[List[float]] = self.provider.embed(texts)  # type: ignore
+                embeddings = await call_method(self.provider.embed, texts)
             else:
-                # 检查可用的方法
                 available_methods = [
                     attr for attr in ['embed_texts', 'get_embedding', 'embed']
                     if hasattr(self.provider, attr) and callable(getattr(self.provider, attr))
                 ]
                 raise Exception(f"Provider 没有支持的 embedding 方法。可用方法: {available_methods}")
 
-            logger.info(f"🔍 [EMBED STEP 5] 获取到 embeddings，数量: {len(embeddings) if embeddings else 0}")
-
             if not embeddings:
                 raise Exception("Embedding provider 返回空结果")
 
-            logger.info(f"✅ [EMBED STEP 6] embed() 完成")
             return embeddings
 
         except Exception as e:
@@ -181,8 +174,7 @@ class EmbeddingProviderWrapper:
             raise Exception(f"获取 embedding 失败: {e}")
 
     async def get_text_embedding(self, text: str) -> List[float]:
-        """获取文本嵌入（文档）"""
-        result = self.embed([text])
+        result = await self.embed([text])
         return result[0] if result and len(result) > 0 else []
 
     async def get_query_embedding(self, query: str) -> List[float]:
@@ -346,38 +338,38 @@ class MilvusStore:
         try:
             from pymilvus import Collection
 
-            # 获取集合
+            # 1. 获取集合
             collection = Collection(self.collection_name, using=self._alias)
 
-            # 准备数据
+            # 2. 【关键】验证 embedding 数据类型（调试用）
+            for i, doc in enumerate(documents):
+                if asyncio.iscoroutine(doc["embedding"]):
+                    raise RuntimeError(f"❌ documents[{i}]['embedding'] 是 coroutine！上游代码忘记 await")
+                if not isinstance(doc["embedding"], (list, tuple)):
+                    raise TypeError(f"❌ documents[{i}]['embedding'] 类型错误：{type(doc['embedding'])}")
+
+            # 3. 准备数据
             data = [
                 {
-                    "vector": doc["embedding"],
+                    "vector": doc["embedding"],  # 此时应该是 List[float]
                     "text": doc["text"],
                     "metadata": doc.get("metadata", {})
                 }
                 for doc in documents
             ]
 
-            # 插入数据
+            # 4. 插入数据（同步方法）
             insert_result = collection.insert(data)
+            logger.info(f"✅ 插入成功：{insert_result.succ_count}/{len(data)}")
 
-            # insert() 可能返回协程或 MutationFuture
-            if asyncio.iscoroutine(insert_result):
-                insert_result = await insert_result
-            elif insert_result is not None and hasattr(insert_result, 'done'):
-                insert_result.result()  # type: ignore[arg-type]
-
-            # 刷新以确保数据可搜索
-            flush_result = collection.flush()
-
-            # flush() 可能返回 Future
-            if flush_result is not None and hasattr(flush_result, 'done'):
-                flush_result.result()  # type: ignore[arg-type]
+            # 5. 刷新（同步方法）
+            collection.flush()
 
             return len(documents)
+
         except Exception as e:
-            logger.error(f"❌ 添加文档失败: {e}")
+            logger.error(f"❌ 添加文档失败：{e}")
+            logger.error(f"🔍 调试信息：documents[0]['embedding'] 类型 = {type(documents[0]['embedding']) if documents else 'N/A'}")
             return 0
 
     async def search(self, query_vector: List[float], top_k: int = 5,
