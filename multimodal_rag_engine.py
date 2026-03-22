@@ -4,10 +4,12 @@
 """
 
 import asyncio
-from typing import List, Dict, Any, Optional, Literal
+from typing import List, Dict, Any, Optional, Literal, cast
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
+
+from astrbot.api import logger
 
 try:
     from pymilvus import connections, utility, Collection, CollectionSchema, FieldSchema
@@ -79,14 +81,9 @@ class MultiModalIngestionEngine:
         # 检查视觉编码器可用性
         self.vision_available = vision_encoder is not None and getattr(vision_encoder, 'is_available', False)
 
-        if self.vision_available:
-            logger.info("✅ 视觉编码器已启用")
-        else:
-            logger.info("📝 视觉编码器不可用，将使用文本向量化模式")
-
     async def process_pdf(self, pdf_path: str) -> List[MultiModalChunk]:
         """
-        处理PDF文件，提取并编码多模态内容
+        处理PDF文件，提取并编码多模态内容（批量embedding，节省RPD）
 
         Args:
             pdf_path: PDF文件路径
@@ -94,44 +91,35 @@ class MultiModalIngestionEngine:
         Returns:
             多模态块列表
         """
-        logger.info(f"🔍 开始多模态处理: {pdf_path}")
-
-        # 1. 提取多模态内容
         extracted = self.extractor.extract(pdf_path)
-
-        logger.info(f"✅ 提取完成:")
-        logger.info(f"   • 图片: {len(extracted.images)}")
-        logger.info(f"   • 表格: {len(extracted.tables)}")
-        logger.info(f"   • 公式: {len(extracted.formulas)}")
-
         chunks = []
         chunk_index = 0
 
-        # 2. 处理图片
+        # 批量处理图片
         if self.extract_images and extracted.images:
+            image_texts = []
+            image_data_list = []
+
             for img in extracted.images:
+                text_content = f"{img.caption or ''} {img.context_before or ''} {img.context_after or ''}".strip()
+                image_texts.append(text_content if text_content else f"Image on page {img.page_number}")
+                image_data_list.append(img)
+
+            text_embeddings = await self.text_embedding_fn(image_texts)
+
+            for img, text_content, text_emb in zip(image_data_list, image_texts, text_embeddings):
                 try:
-                    # 生成视觉嵌入（如果可用）
                     vision_emb = None
                     if self.vision_available and img.image_bytes:
-                        vision_emb = self.vision_encoder.encode_image(img.image_bytes)
-                        if vision_emb is None:
-                            logger.debug(f"视觉编码失败，使用纯文本: 页 {img.page_number}")
+                        encoder = cast(VisionEncoder, self.vision_encoder)
+                        vision_emb = encoder.encode_image(img.image_bytes)
 
-                    # 生成文本嵌入（图注+上下文）
-                    text_content = f"{img.caption or ''} {img.context_before or ''} {img.context_after or ''}".strip()
-                    text_emb = None
-                    if text_content:
-                        text_emb = await self.text_embedding_fn(text_content)
-
-                    # 至少要有一种嵌入
                     if text_emb is None and vision_emb is None:
-                        logger.debug(f"跳过图片（无内容）: 页 {img.page_number}")
                         continue
 
                     chunks.append(MultiModalChunk(
                         content_type="image",
-                        content=text_content or f"Image on page {img.page_number}",
+                        content=text_content,
                         file_name=extracted.file_name,
                         page_number=img.page_number,
                         chunk_index=chunk_index,
@@ -145,22 +133,25 @@ class MultiModalIngestionEngine:
                     chunk_index += 1
 
                 except Exception as e:
-                    logger.warning(f"⚠️ 处理图片失败 (页 {img.page_number}): {e}")
+                    logger.warning(f"处理图片失败 (页 {img.page_number}): {e}")
                     continue
 
-        # 3. 处理表格
+        # 批量处理表格
         if self.extract_tables and extracted.tables:
+            table_texts = []
+            table_data_list = []
+
             for table in extracted.tables:
+                table_text = table.markdown or table.csv or str(table.data)
+                text_content = f"{table.caption or ''} {table_text}".strip()
+                table_texts.append(text_content)
+                table_data_list.append((table, table_text))
+
+            text_embeddings = await self.text_embedding_fn(table_texts)
+
+            for (table, table_text), text_content, text_emb in zip(table_data_list, table_texts, text_embeddings):
                 try:
-                    # 表格转文本（Markdown格式）
-                    table_text = table.markdown or table.csv or str(table.data)
-                    text_content = f"{table.caption or ''} {table_text}".strip()
-
-                    # 生成文本嵌入
-                    text_emb = await self.text_embedding_fn(text_content)
-
                     if text_emb is None:
-                        logger.debug(f"跳过表格（无嵌入）: 页 {table.page_number}")
                         continue
 
                     chunks.append(MultiModalChunk(
@@ -178,21 +169,24 @@ class MultiModalIngestionEngine:
                     chunk_index += 1
 
                 except Exception as e:
-                    logger.warning(f"⚠️ 处理表格失败 (页 {table.page_number}): {e}")
+                    logger.warning(f"处理表格失败 (页 {table.page_number}): {e}")
                     continue
 
-        # 4. 处理公式
+        # 批量处理公式
         if self.extract_formulas and extracted.formulas:
+            formula_texts = []
+            formula_data_list = []
+
             for formula in extracted.formulas:
+                text_content = f"Formula: {formula.text}"
+                formula_texts.append(text_content)
+                formula_data_list.append(formula)
+
+            text_embeddings = await self.text_embedding_fn(formula_texts)
+
+            for formula, text_content, text_emb in zip(formula_data_list, formula_texts, text_embeddings):
                 try:
-                    # 公式文本
-                    text_content = f"Formula: {formula.text}"
-
-                    # 生成文本嵌入
-                    text_emb = await self.text_embedding_fn(text_content)
-
                     if text_emb is None:
-                        logger.debug(f"跳过公式（无嵌入）: 页 {formula.page_number}")
                         continue
 
                     chunks.append(MultiModalChunk(
@@ -210,10 +204,9 @@ class MultiModalIngestionEngine:
                     chunk_index += 1
 
                 except Exception as e:
-                    logger.warning(f"⚠️ 处理公式失败 (页 {formula.page_number}): {e}")
+                    logger.warning(f"处理公式失败 (页 {formula.page_number}): {e}")
                     continue
 
-        logger.info(f"✅ 多模态编码完成: {len(chunks)} 个块")
         return chunks
 
 
@@ -377,8 +370,8 @@ class MultiModalMilvusStore:
         return 0
 
     async def hybrid_search(self,
-                           query_text: str = None,
-                           query_image_bytes: bytes = None,
+                           query_text: Optional[str] = None,
+                           query_image_bytes: Optional[bytes] = None,
                            text_weight: float = 0.5,
                            vision_weight: float = 0.5,
                            top_k: int = 5) -> List[Dict[str, Any]]:

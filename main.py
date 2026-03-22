@@ -284,6 +284,9 @@ class PaperRAGPlugin(Star):
             for ext in supported_extensions:
                 doc_files.extend(Path(papers_dir).glob(f"*{ext.upper()}"))
 
+            # Filter out macOS metadata files (starting with "._")
+            doc_files = [f for f in doc_files if not f.name.startswith("._")]
+
             if not doc_files:
                 yield event.plain_result("📭 No supported document files found\nSupported formats: PDF, Word, TXT, Markdown, HTML")
                 return

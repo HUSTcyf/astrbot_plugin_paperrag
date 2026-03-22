@@ -122,22 +122,14 @@ class EmbeddingProviderWrapper:
     """AstrBot Embedding Provider 包装类 - 仅支持 OpenAI 和 Gemini"""
 
     def __init__(self, provider):
-        logger.info(f"🔍 [WRAPPER STEP 1] EmbeddingProviderWrapper.__init__() 开始")
         if not provider:
             raise ValueError("Embedding provider 不能为 None")
-        logger.info(f"🔍 [WRAPPER STEP 2] 保存 provider 引用")
         self.provider = provider
-        logger.info(f"✅ [WRAPPER STEP 3] EmbeddingProviderWrapper 初始化完成")
 
     async def embed(self, texts: str | List[str]) -> List[List[float]]:
-        logger.info(f"🔍 [EMBED STEP 1] embed() 方法被调用，texts 类型: {type(texts)}")
-
         try:
             if isinstance(texts, str):
                 texts = [texts]
-            logger.info(f"🔍 [EMBED STEP 2] 文本数量: {len(texts)}")
-
-            embeddings = None
 
             # 辅助函数：智能调用（同步/异步自适应）
             async def call_method(method, *args):
@@ -147,15 +139,12 @@ class EmbeddingProviderWrapper:
                     return method(*args)
 
             if hasattr(self.provider, "embed_texts") and callable(self.provider.embed_texts):
-                logger.info(f"🔍 [EMBED STEP 4] 使用 embed_texts() 方法")
                 embeddings = await call_method(self.provider.embed_texts, texts)
-                
+
             elif hasattr(self.provider, "get_embedding") and callable(self.provider.get_embedding):
-                logger.info(f"🔍 [EMBED STEP 4] 使用 get_embedding() 方法")
                 embeddings = [await call_method(self.provider.get_embedding, text) for text in texts]
-                
+
             elif hasattr(self.provider, "embed") and callable(self.provider.embed):
-                logger.info(f"🔍 [EMBED STEP 4] 使用 embed() 方法")
                 embeddings = await call_method(self.provider.embed, texts)
             else:
                 available_methods = [
@@ -170,7 +159,7 @@ class EmbeddingProviderWrapper:
             return embeddings
 
         except Exception as e:
-            logger.error(f"❌ 获取 embedding 失败: {e}")
+            logger.error(f"Embedding 调用失败: {e}")
             raise Exception(f"获取 embedding 失败: {e}")
 
     async def get_text_embedding(self, text: str) -> List[float]:
@@ -201,22 +190,15 @@ class MilvusStore:
             return
 
         try:
-            # 准备连接参数
             connect_params = {}
 
-            # Lite 模式：使用文件路径
             if self.uri.endswith(".db"):
                 import os
-                # 确保目录存在
                 os.makedirs(os.path.dirname(self.uri) or ".", exist_ok=True)
                 connect_params["uri"] = self.uri
-                logger.info(f"🔍 连接模式: Milvus Lite ({self.uri})")
             else:
-                # 远程模式
                 connect_params["uri"] = self.uri
-                logger.info(f"🔍 连接模式: 远程 Milvus ({self.uri})")
 
-            # 添加认证信息
             if self.authentication.get("token"):
                 connect_params["token"] = self.authentication["token"]
             elif self.authentication.get("user"):
@@ -224,21 +206,14 @@ class MilvusStore:
                 if self.authentication.get("password"):
                     connect_params["password"] = self.authentication["password"]
 
-            # 添加数据库名称
             if self.db_name and self.db_name != "default":
                 connect_params["db_name"] = self.db_name
 
-            # 建立连接（使用旧式 API）
-            logger.info(f"🔍 调用 connections.connect(alias={self._alias})...")
-            connections.connect(
-                alias=self._alias,
-                **connect_params
-            )
+            connections.connect(alias=self._alias, **connect_params)
             self._is_connected = True
-            logger.info(f"✅ Milvus 连接成功")
 
         except Exception as e:
-            logger.error(f"❌ Milvus 连接失败: {e}")
+            logger.error(f"Milvus 连接失败: {e}")
             raise
 
     async def _ensure_collection(self):
@@ -246,79 +221,45 @@ class MilvusStore:
         if self._collection_initialized:
             return
 
-        # 确保已连接（同步方法）
         self._ensure_connected()
 
         try:
-            # 检查集合是否存在
             from pymilvus import utility
             has_collection = utility.has_collection(self.collection_name, using=self._alias)
 
             if not has_collection:
-                logger.info(f"🔍 创建新集合: {self.collection_name}")
-
-                # 创建字段
                 fields = [
-                    FieldSchema(name="id", dtype=MilvusDataType.INT64, is_primary=True, auto_id=True, description="primary_id"),  # type: ignore[arg-type]
-                    FieldSchema(name="vector", dtype=MilvusDataType.FLOAT_VECTOR, dim=self.dim, description="vector"),  # type: ignore[arg-type]
-                    FieldSchema(name="text", dtype=MilvusDataType.VARCHAR, max_length=65535, description="text"),  # type: ignore[arg-type]
-                    FieldSchema(name="metadata", dtype=MilvusDataType.JSON, description="metadata")  # type: ignore[arg-type]
+                    FieldSchema(name="id", dtype=MilvusDataType.INT64, is_primary=True, auto_id=True),  # type: ignore[arg-type]
+                    FieldSchema(name="vector", dtype=MilvusDataType.FLOAT_VECTOR, dim=self.dim),  # type: ignore[arg-type]
+                    FieldSchema(name="text", dtype=MilvusDataType.VARCHAR, max_length=65535),  # type: ignore[arg-type]
+                    FieldSchema(name="metadata", dtype=MilvusDataType.JSON)  # type: ignore[arg-type]
                 ]
 
-                # 创建 schema
                 schema = CollectionSchema(fields=fields, description="paper embeddings collection")
+                collection = Collection(name=self.collection_name, schema=schema, using=self._alias)
 
-                # 创建集合
-                collection = Collection(
-                    name=self.collection_name,
-                    schema=schema,
-                    using=self._alias
-                )
-
-                # 创建索引（根据模式选择类型）
-                # Lite 模式只支持 FLAT、IVF_FLAT 或 AUTOINDEX
                 is_lite_mode = self.uri.endswith(".db")
 
                 if is_lite_mode:
-                    # Lite 模式：使用 AUTOINDEX（自动选择最佳索引）
-                    index_params = {
-                        "index_type": "AUTOINDEX",
-                        "metric_type": "COSINE"
-                    }
-                    logger.info(f"🔍 使用 AUTOINDEX 索引 (Lite 模式)")
+                    index_params = {"index_type": "AUTOINDEX", "metric_type": "COSINE"}
                 else:
-                    # 远程模式：可以使用 HNSW
-                    index_params = {
-                        "index_type": "HNSW",
-                        "metric_type": "COSINE",
-                        "params": {"M": 8, "efConstruction": 64}
-                    }
-                    logger.info(f"🔍 使用 HNSW 索引 (远程模式)")
+                    index_params = {"index_type": "HNSW", "metric_type": "COSINE", "params": {"M": 8, "efConstruction": 64}}
 
-                # create_index 可能返回协程或 Future
-                index_result = collection.create_index(
-                    field_name="vector",
-                    index_params=index_params
-                )
+                index_result = collection.create_index(field_name="vector", index_params=index_params)
 
-                # 处理不同类型的返回值
                 if asyncio.iscoroutine(index_result):
                     await index_result
                 elif index_result is not None and hasattr(index_result, 'done'):
                     index_result.result()  # type: ignore[arg-type]
 
                 load_result = collection.load()
-
-                # load() 可能返回 Future 对象，需要等待
                 if load_result is not None and hasattr(load_result, 'done'):
                     load_result.result()  # type: ignore[arg-type]
-
-                logger.info(f"✅ 集合创建完成: {self.collection_name}")
 
             self._collection_initialized = True
 
         except Exception as e:
-            logger.error(f"❌ 集合初始化失败: {e}")
+            logger.error(f"集合初始化失败: {e}")
             raise
 
     @property
@@ -332,44 +273,35 @@ class MilvusStore:
         if not documents:
             return 0
 
-        # 确保集合已初始化
         await self._ensure_collection()
 
         try:
             from pymilvus import Collection
 
-            # 1. 获取集合
             collection = Collection(self.collection_name, using=self._alias)
 
-            # 2. 【关键】验证 embedding 数据类型（调试用）
             for i, doc in enumerate(documents):
                 if asyncio.iscoroutine(doc["embedding"]):
-                    raise RuntimeError(f"❌ documents[{i}]['embedding'] 是 coroutine！上游代码忘记 await")
+                    raise RuntimeError(f"documents[{i}]['embedding'] 是 coroutine！上游代码忘记 await")
                 if not isinstance(doc["embedding"], (list, tuple)):
-                    raise TypeError(f"❌ documents[{i}]['embedding'] 类型错误：{type(doc['embedding'])}")
+                    raise TypeError(f"documents[{i}]['embedding'] 类型错误：{type(doc['embedding'])}")
 
-            # 3. 准备数据
             data = [
                 {
-                    "vector": doc["embedding"],  # 此时应该是 List[float]
+                    "vector": doc["embedding"],
                     "text": doc["text"],
                     "metadata": doc.get("metadata", {})
                 }
                 for doc in documents
             ]
 
-            # 4. 插入数据（同步方法）
             insert_result = collection.insert(data)
-            logger.info(f"✅ 插入成功：{insert_result.succ_count}/{len(data)}")
-
-            # 5. 刷新（同步方法）
             collection.flush()
 
             return len(documents)
 
         except Exception as e:
-            logger.error(f"❌ 添加文档失败：{e}")
-            logger.error(f"🔍 调试信息：documents[0]['embedding'] 类型 = {type(documents[0]['embedding']) if documents else 'N/A'}")
+            logger.error(f"添加文档失败：{e}")
             return 0
 
     async def search(self, query_vector: List[float], top_k: int = 5,
@@ -419,36 +351,19 @@ class MilvusStore:
 
     async def list_papers(self) -> List[Dict[str, Any]]:
         """列出所有论文"""
-        logger.info(f"🔍 [LIST PAPERS STEP 1] list_papers() 开始")
-
-        # 确保集合已初始化
         await self._ensure_collection()
-        logger.info(f"🔍 [LIST PAPERS STEP 2] 集合初始化完成")
 
         try:
             from pymilvus import Collection
 
-            # 获取集合
             collection = Collection(self.collection_name, using=self._alias)
+            results = collection.query(expr="", output_fields=["metadata"], limit=16384)
 
-            logger.info(f"🔍 [LIST PAPERS STEP 3] 执行查询")
-
-            # 查询所有文档（必须指定 limit，即使使用空表达式）
-            results = collection.query(
-                expr="",  # 无过滤条件
-                output_fields=["metadata"],
-                limit=16384  # 设置一个足够大的限制
-            )
-
-            # query() 可能返回协程或 QueryFuture
             if asyncio.iscoroutine(results):
                 results = await results
             elif results is not None and hasattr(results, 'done'):
                 results = results.result()  # type: ignore[arg-type]
 
-            logger.info(f"🔍 [LIST PAPERS STEP 4] 查询完成，结果数: {len(results)}")
-
-            # 按文件名聚合
             papers = {}
             for result in results:
                 metadata = result.entity.get("metadata", {})
@@ -462,12 +377,9 @@ class MilvusStore:
                     }
                 papers[filename]["chunk_count"] += 1
 
-            logger.info(f"🔍 [LIST PAPERS STEP 5] 处理完成，返回 {len(papers)} 个文档")
             return list(papers.values())
         except Exception as e:
-            logger.error(f"❌ 列出论文失败: {e}")
-            import traceback
-            logger.error(f"❌ 错误详情: {traceback.format_exc()}")
+            logger.error(f"列出论文失败: {e}")
             return []
 
     async def clear(self):
@@ -475,20 +387,14 @@ class MilvusStore:
         try:
             from pymilvus import utility
 
-            # 确保已连接
             self._ensure_connected()
 
-            # 检查集合是否存在
             if utility.has_collection(self.collection_name, using=self._alias):
-                # 删除集合（同步操作，不需要await）
-                _ = utility.drop_collection(self.collection_name, using=self._alias)
-                logger.info(f"✅ 已清空集合: {self.collection_name}")
-                self._collection_initialized = False  # 重置标志，下次使用时重新创建
-            else:
-                logger.warning(f"⚠️ 集合不存在: {self.collection_name}")
+                await utility.drop_collection(self.collection_name, using=self._alias)
+                self._collection_initialized = False
 
         except Exception as e:
-            logger.error(f"❌ 清空集合失败: {e}")
+            logger.error(f"清空集合失败: {e}")
             raise
 
 
@@ -519,10 +425,7 @@ class PaperRAGEngine:
             return
 
         try:
-            # 获取连接 URI
             uri = self.config.get_connection_uri()
-
-            # Lite 模式需要确保目录存在
             if uri.endswith(".db"):
                 Path(uri).parent.mkdir(parents=True, exist_ok=True)
 
@@ -534,9 +437,8 @@ class PaperRAGEngine:
                 authentication=self.config.authentication
             )
             self._store_initialized = True
-            logger.info(f"✅ Milvus 存储初始化成功 ({self.config.get_connection_mode()} 模式)")
         except Exception as e:
-            logger.error(f"❌ Milvus 存储初始化失败: {e}")
+            logger.error(f"Milvus 存储初始化失败: {e}")
             self._initialization_failed = True
             self._initialization_error = str(e)
             raise
@@ -546,39 +448,28 @@ class PaperRAGEngine:
         if self._embedding_initialized:
             return
 
-        logger.info(f"🔍 [STEP 1] 开始初始化 Embedding Provider: {self.config.embedding_provider_id}")
-
         if not self.config.embedding_provider_id:
             raise Exception("embedding_provider_id 未配置")
 
         try:
-            logger.info(f"🔍 [STEP 2] 获取 provider_manager")
             provider_manager = getattr(self.context, "provider_manager", None)
             if provider_manager is None:
                 raise Exception("无法访问 context.provider_manager")
 
-            logger.info(f"🔍 [STEP 3] 获取 inst_map")
             inst_map = getattr(provider_manager, "inst_map", None)
             if not isinstance(inst_map, dict):
                 raise Exception("inst_map 不是 dict")
 
-            logger.info(f"🔍 [STEP 4] 从 inst_map 获取 Provider")
             provider = inst_map.get(self.config.embedding_provider_id)
             if provider is None:
                 raise Exception(f"Provider '{self.config.embedding_provider_id}' 不存在")
 
-            logger.info(f"🔍 [STEP 5] 创建 EmbeddingProviderWrapper")
-            # 包装 Provider
             self._embedding_provider = provider
-
-            logger.info(f"🔍 [STEP 6] EmbeddingProviderWrapper.__init__() 调用")
             self._embedding_wrapper = EmbeddingProviderWrapper(provider)
             self._embedding_initialized = True
 
-            logger.info(f"✅ [STEP 7] Embedding Provider 初始化完成")
-
         except Exception as e:
-            logger.error(f"❌ Embedding Provider 初始化失败: {e}")
+            logger.error(f"Embedding Provider 初始化失败: {e}")
             self._initialization_failed = True
             self._initialization_error = str(e)
             raise
@@ -602,21 +493,15 @@ class PaperRAGEngine:
     @property
     def store(self) -> MilvusStore:
         """获取 Milvus 存储（延迟初始化）"""
-        logger.info(f"🔍 [PROPERTY] 访问 self.store property")
-        logger.info(f"🔍 [PROPERTY] 调用 _ensure_store_initialized()")
         self._ensure_store_initialized()
         assert self._store is not None
-        logger.info(f"✅ [PROPERTY] 返回 Milvus store")
         return self._store
 
     @property
     def embedding(self) -> EmbeddingProviderWrapper:
         """获取 Embedding Wrapper（延迟初始化）"""
-        logger.info(f"🔍 [PROPERTY] 访问 self.embedding property")
-        logger.info(f"🔍 [PROPERTY] 调用 _ensure_embedding_initialized()")
         self._ensure_embedding_initialized()
         assert self._embedding_wrapper is not None
-        logger.info(f"✅ [PROPERTY] 返回 embedding wrapper")
         return self._embedding_wrapper
 
     @property
@@ -651,13 +536,8 @@ class PaperRAGEngine:
 
         for idx, file_path in enumerate(file_paths, 1):
             try:
-                file_path_obj = Path(file_path)
-                filename = str(file_path_obj.name)
-                file_ext = str(file_path_obj.suffix.lower())
+                filename = str(Path(file_path).name)
 
-                logger.info(f"📄 [{idx}/{len(file_paths)}] 处理文件: {filename} ({file_ext})")
-
-                # 报告开始解析
                 yield {
                     "current": idx,
                     "total": len(file_paths),
@@ -665,13 +545,10 @@ class PaperRAGEngine:
                     "status": "parsing"
                 }
 
-                # 解析文档（自动检测格式）
                 chunks = await self._parse_document(file_path)
-                logger.info(f"📄 [{idx}/{len(file_paths)}] {filename}: 解析完成，得到 {len(chunks)} 个片段")
 
                 if not chunks:
                     skipped_count += 1
-                    logger.warning(f"⏭️  [{idx}/{len(file_paths)}] {filename}: 跳过（无文本内容）")
                     yield {
                         "current": idx,
                         "total": len(file_paths),
@@ -680,7 +557,6 @@ class PaperRAGEngine:
                     }
                     continue
 
-                # 报告开始向量化
                 yield {
                     "current": idx,
                     "total": len(file_paths),
@@ -688,13 +564,10 @@ class PaperRAGEngine:
                     "status": "embedding"
                 }
 
-                # 生成嵌入（带限流）
-                documents = []
-                for i, chunk in enumerate(chunks):
-                    if i % 5 == 0:  # 每5个chunk暂停一下
-                        await asyncio.sleep(0.5)
+                embeddings = await self.embedding.embed(chunks)
 
-                    embedding = await self.embedding.get_text_embedding(chunk)
+                documents = []
+                for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
                     documents.append({
                         "text": chunk,
                         "embedding": embedding,
@@ -706,7 +579,6 @@ class PaperRAGEngine:
                         }
                     })
 
-                # 报告开始存储
                 yield {
                     "current": idx,
                     "total": len(file_paths),
@@ -714,11 +586,9 @@ class PaperRAGEngine:
                     "status": "storing"
                 }
 
-                # 批量添加到向量库
                 count = await self.store.add_documents(documents)
                 total_chunks += count
 
-                # 报告完成
                 yield {
                     "current": idx,
                     "total": len(file_paths),
@@ -727,11 +597,9 @@ class PaperRAGEngine:
                     "chunks": count
                 }
 
-                logger.info(f"✅ 导入: {filename} ({count} 个片段)")
-
             except Exception as e:
                 error_count += 1
-                logger.error(f"❌ 导入失败 {file_path}: {e}")
+                logger.error(f"导入失败 {Path(file_path).name}: {e}")
                 yield {
                     "current": idx,
                     "total": len(file_paths),
@@ -742,8 +610,6 @@ class PaperRAGEngine:
 
         # 返回最终统计
         elapsed_time = time.time() - start_time
-
-        logger.info(f"📊 导入统计: 总文件 {len(file_paths)}, 成功处理 {len(file_paths) - skipped_count - error_count}, 跳过 {skipped_count}, 错误 {error_count}, 总片段 {total_chunks}")
 
         yield {
             "status": "complete",
@@ -774,11 +640,10 @@ class PaperRAGEngine:
     async def _parse_pdf(self, file_path: str) -> List[str]:
         """解析PDF文件（使用语义感知分块）"""
         try:
-            logger.info(f"🔍 [PDF PARSE] 开始解析: {str(Path(file_path).name)}")
+            filename = str(Path(file_path).name)
 
             # 优先使用语义分块器
             if SEMANTIC_CHUNKER_AVAILABLE and self.config.use_semantic_chunking:
-                logger.info(f"🔍 [PDF PARSE] 使用语义感知分块器")
                 parser = PDFParserAdvanced(  # type: ignore
                     enable_multimodal=self.config.enable_multimodal
                 )
@@ -786,64 +651,40 @@ class PaperRAGEngine:
                     chunk_size=self.config.chunk_size,
                     overlap=self.config.chunk_overlap,
                     min_chunk_size=self.config.min_chunk_size,
-                    max_chunk_size=self.config.chunk_size * 2  # 最大块为目标大小的2倍
+                    max_chunk_size=self.config.chunk_size * 2
                 )
 
-                # 使用高级解析和分块
                 chunks_dict = parser.parse_and_chunk(file_path, chunker)
-                logger.info(f"✅ [PDF PARSE] {str(Path(file_path).name)}: 语义分块生成 {len(chunks_dict)} 个片段")
-
-                # 提取纯文本列表（保持兼容性）
                 text_chunks = [c["text"] for c in chunks_dict]
 
-                # 警告：分块数量过多
                 if len(text_chunks) > 50:
-                    logger.warning(f"⚠️ [PDF PARSE] {str(Path(file_path).name)}: 生成了 {len(text_chunks)} 个分块（超过50个），可能会影响检索性能")
+                    logger.warning(f"⚠️ {filename}: 生成了 {len(text_chunks)} 个分块（超过50个），可能会影响检索性能")
 
                 return text_chunks
 
             else:
                 # 回退到基础 PyMuPDF 解析
-                reason = "语义分块已禁用" if not self.config.use_semantic_chunking else "语义分块不可用"
-                logger.warning(f"⚠️ [PDF PARSE] 使用基础 PyMuPDF 解析（{reason}）")
                 doc: fitz.Document = fitz.open(file_path)  # type: ignore
                 text_chunks: List[str] = []
 
-                total_pages = len(doc)
-                logger.info(f"🔍 [PDF PARSE] 总页数: {total_pages}")
-
-                pages_with_text = 0
-                total_text_length = 0
-
-                for page_num, page in enumerate(doc, 1):  # type: ignore[arg-type]
+                for page in doc:  # type: ignore[arg-type]
                     text: str = page.get_text()  # type: ignore
-                    text_length = len(text.strip())
-
-                    if text_length > 0:
-                        pages_with_text += 1
-                        total_text_length += text_length
-
-                        # 使用配置的分块大小
-                        for i in range(0, len(text), self.config.chunk_size):
-                            chunk: str = text[i:i+self.config.chunk_size]
-                            if len(chunk.strip()) > self.config.min_chunk_size:  # 过滤太短的片段
-                                text_chunks.append(chunk.strip())
+                    for i in range(0, len(text), self.config.chunk_size):
+                        chunk: str = text[i:i+self.config.chunk_size]
+                        if len(chunk.strip()) > self.config.min_chunk_size:
+                            text_chunks.append(chunk.strip())
 
                 doc.close()
 
-                logger.info(f"✅ [PDF PARSE] {str(Path(file_path).name)}: {pages_with_text}/{total_pages} 页有文本, 总字符 {total_text_length}, 生成 {len(text_chunks)} 个片段")
-
                 if len(text_chunks) == 0:
-                    logger.warning(f"⚠️ [PDF PARSE] {str(Path(file_path).name)}: 没有提取到任何文本（可能是扫描版PDF）")
+                    logger.warning(f"⚠️ {filename}: 没有提取到任何文本（可能是扫描版PDF）")
                 elif len(text_chunks) > 50:
-                    logger.warning(f"⚠️ [PDF PARSE] {str(Path(file_path).name)}: 生成了 {len(text_chunks)} 个分块（超过50个），可能会影响检索性能")
+                    logger.warning(f"⚠️ {filename}: 生成了 {len(text_chunks)} 个分块（超过50个），可能会影响检索性能")
 
                 return text_chunks
 
         except Exception as e:
-            logger.error(f"❌ PDF解析失败 {file_path}: {e}")
-            import traceback
-            logger.error(f"❌ 错误堆栈: {traceback.format_exc()}")
+            logger.error(f"PDF解析失败 {file_path}: {e}")
             return []
 
     async def _parse_docx(self, file_path: str) -> List[str]:
