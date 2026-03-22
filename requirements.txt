@@ -1,0 +1,21 @@
+# Paper RAG 插件依赖（优雅降级版本）
+
+# 核心依赖
+pymilvus[milvus_lite]>=2.5.4,<3.0.0  # Milvus Lite 向量数据库
+PyMuPDF>=1.23.0  # PDF解析 (fitz)
+
+# 文档解析（轻量级，无冲突）
+python-docx>=1.0.0  # Word文档支持
+pdfplumber>=0.11.0  # PDF表格解析
+pillow>=9.0.0  # 图像处理（基础版本）
+
+# 多模态AI（可选 - 视觉编码器）
+# 这些包较大，只在需要图片向量化时安装
+# 使用宽松的版本要求以避免与 AstrBot 冲突
+transformers>=4.30.0  # HuggingFace transformers
+torch>=2.0.0  # PyTorch（会自动选择CPU版本）
+accelerate>=0.20.0  # 模型加速（可选）
+
+# 工具库
+httpx>=0.25.0  # 异步HTTP客户端
+pydantic>=2.0.0  # 配置验证

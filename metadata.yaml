@@ -1,0 +1,14 @@
+name: "paper_rag"
+author: "YourName"
+description: "本地论文库RAG检索插件，支持基于Gemini Embedding + Milvus Lite的论文检索和问答"
+version: "1.0.0"
+repository: "https://github.com/your/repo"
+tags:
+  - research
+  - rag
+  - papers
+  - milvus
+  - gemini
+license: "MIT"
+homepage: "https://github.com/your/repo"
+AstrBot_version: "4.0.0"

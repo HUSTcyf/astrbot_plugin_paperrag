@@ -1,0 +1,219 @@
+{
+    "enabled": {
+        "description": "是否启用Paper RAG插件",
+        "type": "bool",
+        "default": true
+    },
+    "embedding_provider_id": {
+        "description": "Embedding 服务提供商",
+        "type": "string",
+        "hint": "选择用于向量嵌入的 Embedding Provider（推荐使用 Gemini）。留空则使用 AstrBot 中配置的第一个 Embedding Provider",
+        "_special": "select_embedding_provider",
+        "default": "gemini_embedding"
+    },
+    "llm_provider_id": {
+        "description": "LLM Provider ID（用于RAG生成）",
+        "type": "string",
+        "hint": "手动输入LLM Provider的ID，用于RAG回答生成。可在 AstrBot 设置→模型提供商中查看Provider ID。如仅需检索功能可留空",
+        "obvious_hint": true,
+        "default": "glm-4.7-flash"
+    },
+    "milvus_lite_path": {
+        "description": "Milvus Lite 数据库路径",
+        "type": "string",
+        "hint": "注意！！！只使用 milvus_lite_path 或 address 其中一个即可，milvus_lite_path 优先级较高。留空则使用默认路径 ./data/milvus_papers.db",
+        "obvious_hint": true,
+        "default": "./data/milvus_papers.db",
+        "minLength": 0
+    },
+    "address": {
+        "description": "Milvus 数据库地址",
+        "type": "string",
+        "hint": "支持格式如：http://localhost:19530、https://localhost:19530、localhost:19530。如需使用远程 Milvus 服务器，请填写此项并将 milvus_lite_path 留空",
+        "obvious_hint": true,
+        "default": "",
+        "pattern": "^(https?://)?[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*:[0-9]{1,5}$",
+        "minLength": 0
+    },
+    "db_name": {
+        "description": "Milvus 数据库名称",
+        "type": "string",
+        "hint": "Milvus 2.2+ 支持多数据库。默认使用 default，可按需配置为其他数据库名以隔离数据",
+        "obvious_hint": true,
+        "default": "default",
+        "pattern": "^[a-zA-Z][a-zA-Z0-9_\\-]{0,63}$",
+        "minLength": 1,
+        "maxLength": 64
+    },
+    "authentication": {
+        "description": "Milvus 数据库认证信息",
+        "type": "object",
+        "hint": "如果 Milvus 开启了服务器认证，请填写对应的信息",
+        "obvious_hint": true,
+        "items": {
+            "token": {
+                "description": "Milvus 数据库认证 token",
+                "type": "string",
+                "hint": "Token 优先于账户密码",
+                "obvious_hint": true,
+                "minLength": 0
+            },
+            "user": {
+                "description": "Milvus 数据库认证用户名",
+                "type": "string",
+                "minLength": 1
+            },
+            "password": {
+                "description": "Milvus 数据库认证密码",
+                "type": "string",
+                "minLength": 0
+            }
+        }
+    },
+    "collection_name": {
+        "description": "向量数据库集合名称",
+        "type": "string",
+        "hint": "Milvus 中存储文档向量的集合名称，建议使用英文名称",
+        "default": "paper_embeddings",
+        "pattern": "^[a-zA-Z][a-zA-Z0-9_]*$",
+        "minLength": 1,
+        "maxLength": 64
+    },
+    "embed_dim": {
+        "description": "向量嵌入维度",
+        "type": "int",
+        "hint": "嵌入向量的维度，需与选择的 Embedding Provider 模型匹配（如 gemini-embedding-2-preview 为 768）",
+        "default": 768,
+        "minimum": 128,
+        "maximum": 4096
+    },
+    "top_k": {
+        "description": "检索返回的文档片段数量",
+        "type": "int",
+        "hint": "每次检索返回的最相关文档片段数量",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 20
+    },
+    "similarity_cutoff": {
+        "description": "相似度阈值",
+        "type": "float",
+        "hint": "仅返回相似度高于此阈值的文档片段（0-1之间，值越高越严格）",
+        "default": 0.3,
+        "minimum": 0,
+        "maximum": 1
+    },
+    "papers_dir": {
+        "description": "论文文件存放目录",
+        "type": "string",
+        "hint": "存放PDF、Word、TXT等文档的目录路径",
+        "obvious_hint": true,
+        "default": "./papers"
+    },
+    "cache_enabled": {
+        "description": "是否启用查询结果缓存",
+        "type": "bool",
+        "default": true
+    },
+    "cache_ttl_seconds": {
+        "description": "缓存有效时间（秒）",
+        "type": "int",
+        "default": 3600,
+        "minimum": 60,
+        "maximum": 86400
+    },
+    "cache_max_entries": {
+        "description": "最多缓存多少条查询结果",
+        "type": "int",
+        "default": 100,
+        "minimum": 10,
+        "maximum": 1000
+    },
+    "chunk_size": {
+        "description": "文档分块目标大小（字符数）",
+        "type": "int",
+        "hint": "语义感知分块的目标块大小。较大的值会产生更少但更大的块",
+        "default": 512,
+        "minimum": 256,
+        "maximum": 2048
+    },
+    "chunk_overlap": {
+        "description": "分块重叠大小（字符数）",
+        "type": "int",
+        "hint": "相邻块之间的重叠字符数，用于保留上下文连贯性",
+        "default": 50,
+        "minimum": 0,
+        "maximum": 256
+    },
+    "min_chunk_size": {
+        "description": "最小分块大小（字符数）",
+        "type": "int",
+        "hint": "小于此大小的块会被合并到相邻块中",
+        "default": 100,
+        "minimum": 50,
+        "maximum": 512
+    },
+    "use_semantic_chunking": {
+        "description": "是否启用语义感知分块",
+        "type": "bool",
+        "hint": "启用后将使用基于标题和段落边界的智能分块策略，禁用则使用简单字符分块",
+        "default": true
+    },
+    "multimodal": {
+        "description": "多模态向量化配置",
+        "type": "object",
+        "hint": "配置图片、表格、公式的提取和向量化",
+        "obvious_hint": true,
+        "items": {
+            "enabled": {
+                "description": "是否启用多模态处理",
+                "type": "bool",
+                "default": false,
+                "hint": "启用后将提取PDF中的图片、表格、公式并进行向量化。需要安装额外依赖（transformers、torch）"
+            },
+            "extract_images": {
+                "description": "是否提取图片",
+                "type": "bool",
+                "default": true
+            },
+            "extract_tables": {
+                "description": "是否提取表格",
+                "type": "bool",
+                "default": true
+            },
+            "extract_formulas": {
+                "description": "是否提取公式",
+                "type": "bool",
+                "default": true
+            },
+            "vision_model": {
+                "description": "视觉编码器模型",
+                "type": "string",
+                "default": "siglip-so400m",
+                "hint": "可选: siglip-base, siglip-so400m (推荐), siglip-large",
+                "enum": ["siglip-base", "siglip-so400m", "siglip-large"]
+            },
+            "vision_device": {
+                "description": "视觉编码器运行设备",
+                "type": "string",
+                "default": "cpu",
+                "hint": "auto（自动检测）, cpu（CPU）, cuda（GPU，需要CUDA支持）",
+                "enum": ["auto", "cpu", "cuda"]
+            },
+            "text_weight": {
+                "description": "文本嵌入权重（混合检索）",
+                "type": "float",
+                "default": 0.6,
+                "minimum": 0.0,
+                "maximum": 1.0
+            },
+            "vision_weight": {
+                "description": "视觉嵌入权重（混合检索）",
+                "type": "float",
+                "default": 0.4,
+                "minimum": 0.0,
+                "maximum": 1.0
+            }
+        }
+    }
+}
