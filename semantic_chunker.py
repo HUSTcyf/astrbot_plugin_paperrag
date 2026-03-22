@@ -28,8 +28,14 @@ try:
     )
     MULTIMODAL_AVAILABLE = True
 except ImportError as e:
-    print(e)
+    # 定义类型占位符，避免类型检查错误
+    MultimodalPDFExtractor = None  # type: ignore
+    ExtractedImage = None  # type: ignore
+    ExtractedTable = None  # type: ignore
+    ExtractedFormula = None  # type: ignore
     MULTIMODAL_AVAILABLE = False
+    if e:  # 只在有实际错误时打印
+        logger.debug(f"多模态提取器不可用: {e}")
 
 
 @dataclass
@@ -58,10 +64,15 @@ class SemanticChunker:
 
         Args:
             chunk_size: 目标块大小（字符数）
-            overlap: 重叠大小（字符数）
+            overlap: 重叠大小（字符数），默认0（禁用重叠以避免无限循环）
             min_chunk_size: 最小块大小
             max_chunk_size: 最大块大小
         """
+        # 参数验证
+        if overlap >= chunk_size:
+            logger.warning(f"⚠️ overlap({overlap}) >= chunk_size({chunk_size})，将overlap设置为0")
+            overlap = 0
+
         self.chunk_size = chunk_size
         self.overlap = overlap
         self.min_chunk_size = min_chunk_size
@@ -169,8 +180,15 @@ class SemanticChunker:
 
         start = 0
         chunk_index = 0
+        max_iterations = len(text) // self.min_chunk_size + 100  # 安全计数器
+        iterations = 0
 
         while start < len(text):
+            iterations += 1
+            if iterations > max_iterations:
+                logger.error(f"❌ 分块出现无限循环，已强制退出。start={start}, len(text)={len(text)}")
+                break
+
             end = min(start + self.chunk_size, len(text))
 
             # 找到最近的段落边界（避免在单词中间切断）
@@ -191,10 +209,17 @@ class SemanticChunker:
                 chunk_index += 1
 
             # 移动窗口（带重叠）
-            start = end - self.overlap
-            if start < 0:
-                start = 0
-            elif start >= len(text):
+            new_start = end - self.overlap
+
+            # 关键修复：确保start总是前进，避免无限循环
+            if new_start <= start:
+                # 如果overlap导致start不前进，至少前进1个字符
+                new_start = start + 1
+
+            start = new_start
+
+            # 安全检查：防止start超出文本长度
+            if start >= len(text):
                 break
 
         return chunks
@@ -231,14 +256,11 @@ class SemanticChunker:
 class PDFParserAdvanced:
     """高级 PDF 解析器（使用 PyMuPDF，集成多模态提取）"""
 
-    def __init__(self,
-                 use_unstructured: bool = False,
-                 enable_multimodal: bool = True):
+    def __init__(self, enable_multimodal: bool = True):
         """
         初始化PDF解析器
 
         Args:
-            use_unstructured: 保留参数以兼容旧接口，但不再使用
             enable_multimodal: 是否启用多模态提取（图片、表格、公式）
         """
         if not fitz:
@@ -253,7 +275,8 @@ class PDFParserAdvanced:
         # 初始化多模态提取器
         if self.enable_multimodal:
             try:
-                self.multimodal_extractor = MultimodalPDFExtractor(
+                assert MultimodalPDFExtractor is not None
+                self.multimodal_extractor = MultimodalPDFExtractor(  # type: ignore
                     extract_images=True,
                     extract_tables=True,
                     extract_formulas=True,
@@ -274,7 +297,7 @@ class PDFParserAdvanced:
         Returns:
             (提取的文本, 元数据字典)
         """
-        filename = Path(pdf_path).name
+        filename = str(Path(pdf_path).name)
 
         if not self.available:
             raise ImportError("PyMuPDF 不可用，请安装: pip install PyMuPDF")
@@ -291,6 +314,8 @@ class PDFParserAdvanced:
 
     def _parse_with_multimodal(self, pdf_path: str) -> tuple[str, Dict[str, Any]]:
         """使用多模态提取器解析"""
+        assert MultimodalPDFExtractor is not None  # 确保多模态提取器可用
+        assert self.multimodal_extractor is not None
         extracted = self.multimodal_extractor.extract(pdf_path)
 
         # 构建文本（包含图片、表格、公式的占位符）
@@ -364,16 +389,17 @@ class PDFParserAdvanced:
 
     def _parse_with_pymupdf(self, pdf_path: str) -> tuple[str, Dict[str, Any]]:
         """使用 PyMuPDF 解析（结构化提取）"""
-        doc = fitz.open(pdf_path)
+        assert fitz is not None  # 确保fitz可用
+        doc: fitz.Document = fitz.open(pdf_path)  # type: ignore
         text_parts = []
         metadata = {
-            "file_name": Path(pdf_path).name,
+            "file_name": str(Path(pdf_path).name),
             "total_pages": len(doc),
             "parser": "PyMuPDF"
         }
 
         # 按页提取，保留页码信息
-        for page_num, page in enumerate(doc, 1):
+        for page_num, page in enumerate(doc, 1):  # type: ignore[arg-type]
             text = page.get_text()
             if text.strip():
                 # 添加页码标记

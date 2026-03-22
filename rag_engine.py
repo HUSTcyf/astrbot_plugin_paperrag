@@ -73,7 +73,7 @@ class RAGConfig:
 
     # 语义分块配置
     chunk_size: int = 512  # 目标块大小
-    chunk_overlap: int = 50  # 重叠大小
+    chunk_overlap: int = 0  # 重叠大小（默认0，避免无限循环bug）
     min_chunk_size: int = 100  # 最小块大小
     use_semantic_chunking: bool = True  # 是否使用语义分块
 
@@ -659,8 +659,9 @@ class PaperRAGEngine:
 
         for idx, file_path in enumerate(file_paths, 1):
             try:
-                filename = Path(file_path).name
-                file_ext = Path(file_path).suffix.lower()
+                file_path_obj = Path(file_path)
+                filename = str(file_path_obj.name)
+                file_ext = str(file_path_obj.suffix.lower())
 
                 logger.info(f"📄 [{idx}/{len(file_paths)}] 处理文件: {filename} ({file_ext})")
 
@@ -742,7 +743,7 @@ class PaperRAGEngine:
                 yield {
                     "current": idx,
                     "total": len(file_paths),
-                    "filename": Path(file_path).name,
+                    "filename": str(Path(file_path).name),
                     "status": "error",
                     "error": str(e)
                 }
@@ -781,7 +782,7 @@ class PaperRAGEngine:
     async def _parse_pdf(self, file_path: str) -> List[str]:
         """解析PDF文件（使用语义感知分块）"""
         try:
-            logger.info(f"🔍 [PDF PARSE] 开始解析: {Path(file_path).name}")
+            logger.info(f"🔍 [PDF PARSE] 开始解析: {str(Path(file_path).name)}")
 
             # 优先使用语义分块器
             if SEMANTIC_CHUNKER_AVAILABLE and self.config.use_semantic_chunking:
@@ -798,14 +799,14 @@ class PaperRAGEngine:
 
                 # 使用高级解析和分块
                 chunks_dict = parser.parse_and_chunk(file_path, chunker)
-                logger.info(f"✅ [PDF PARSE] {Path(file_path).name}: 语义分块生成 {len(chunks_dict)} 个片段")
+                logger.info(f"✅ [PDF PARSE] {str(Path(file_path).name)}: 语义分块生成 {len(chunks_dict)} 个片段")
 
                 # 提取纯文本列表（保持兼容性）
                 text_chunks = [c["text"] for c in chunks_dict]
 
                 # 警告：分块数量过多
                 if len(text_chunks) > 50:
-                    logger.warning(f"⚠️ [PDF PARSE] {Path(file_path).name}: 生成了 {len(text_chunks)} 个分块（超过50个），可能会影响检索性能")
+                    logger.warning(f"⚠️ [PDF PARSE] {str(Path(file_path).name)}: 生成了 {len(text_chunks)} 个分块（超过50个），可能会影响检索性能")
 
                 return text_chunks
 
@@ -838,12 +839,12 @@ class PaperRAGEngine:
 
                 doc.close()
 
-                logger.info(f"✅ [PDF PARSE] {Path(file_path).name}: {pages_with_text}/{total_pages} 页有文本, 总字符 {total_text_length}, 生成 {len(text_chunks)} 个片段")
+                logger.info(f"✅ [PDF PARSE] {str(Path(file_path).name)}: {pages_with_text}/{total_pages} 页有文本, 总字符 {total_text_length}, 生成 {len(text_chunks)} 个片段")
 
                 if len(text_chunks) == 0:
-                    logger.warning(f"⚠️ [PDF PARSE] {Path(file_path).name}: 没有提取到任何文本（可能是扫描版PDF）")
+                    logger.warning(f"⚠️ [PDF PARSE] {str(Path(file_path).name)}: 没有提取到任何文本（可能是扫描版PDF）")
                 elif len(text_chunks) > 50:
-                    logger.warning(f"⚠️ [PDF PARSE] {Path(file_path).name}: 生成了 {len(text_chunks)} 个分块（超过50个），可能会影响检索性能")
+                    logger.warning(f"⚠️ [PDF PARSE] {str(Path(file_path).name)}: 生成了 {len(text_chunks)} 个分块（超过50个），可能会影响检索性能")
 
                 return text_chunks
 
@@ -887,7 +888,7 @@ class PaperRAGEngine:
                     text_chunks.append(chunk.strip())
 
             if len(text_chunks) > 50:
-                logger.warning(f"⚠️ [DOCX PARSE] {Path(file_path).name}: 生成了 {len(text_chunks)} 个分块（超过50个），可能会影响检索性能")
+                logger.warning(f"⚠️ [DOCX PARSE] {str(Path(file_path).name)}: 生成了 {len(text_chunks)} 个分块（超过50个），可能会影响检索性能")
 
             return text_chunks
 
@@ -910,7 +911,7 @@ class PaperRAGEngine:
                     text_chunks.append(chunk.strip())
 
             if len(text_chunks) > 50:
-                logger.warning(f"⚠️ [TEXT PARSE] {Path(file_path).name}: 生成了 {len(text_chunks)} 个分块（超过50个），可能会影响检索性能")
+                logger.warning(f"⚠️ [TEXT PARSE] {str(Path(file_path).name)}: 生成了 {len(text_chunks)} 个分块（超过50个），可能会影响检索性能")
 
             return text_chunks
 
@@ -928,7 +929,7 @@ class PaperRAGEngine:
                         text_chunks.append(chunk.strip())
 
                 if len(text_chunks) > 50:
-                    logger.warning(f"⚠️ [TEXT PARSE] {Path(file_path).name}: 生成了 {len(text_chunks)} 个分块（超过50个），可能会影响检索性能")
+                    logger.warning(f"⚠️ [TEXT PARSE] {str(Path(file_path).name)}: 生成了 {len(text_chunks)} 个分块（超过50个），可能会影响检索性能")
 
                 return text_chunks
             except Exception as e:

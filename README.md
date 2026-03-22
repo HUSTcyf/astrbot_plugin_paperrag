@@ -7,6 +7,8 @@
 ### 多模态PDF处理（v2.0）
 
 - ✅ **图片提取**：自动识别并保留PDF中的图片
+  - 🆕 **NMS去重**：基于 Bbox 的 Non-Maximum Suppression 过滤重复图片
+  - 🆕 **智能优选**：小图与大图重叠时，优先保留大图
 - ✅ **表格提取**：使用pdfplumber提取表格，支持Markdown格式
 - ✅ **公式识别**：识别LaTeX公式（`$$...$$`, `\(...\)`, `\begin{equation}`）
 - ✅ **智能分块**：图片/表格/公式完整保留，不分块
@@ -88,7 +90,7 @@ pip install -r requirements.txt
 
     "use_semantic_chunking": true,
     "chunk_size": 512,
-    "chunk_overlap": 50,
+    "chunk_overlap": 0,
     "min_chunk_size": 100,
 
     "enable_multimodal": true,
@@ -106,13 +108,39 @@ pip install -r requirements.txt
 | 参数 | 说明 | 默认值 |
 |-----|------|--------|
 | `chunk_size` | 目标块大小（字符数） | 512 |
-| `chunk_overlap` | 块间重叠大小 | 50 |
+| `chunk_overlap` | 块间重叠大小 | 0（禁用以避免无限循环） |
 | `min_chunk_size` | 最小块大小 | 100 |
 | `use_semantic_chunking` | 启用语义分块 | true |
 | `enable_multimodal` | 启用多模态提取 | true |
 | `multimodal.extract_images` | 提取图片 | true |
-| `multimodal.extract_tables` | 提取表格 | true |
+| `multodalextract_tables` | 提取表格 | true |
 | `multimodal.extract_formulas` | 提取公式 | true |
+
+#### 多模态高级配置（可选）
+
+```json
+{
+    "enable_multimodal": true,
+    "multimodal": {
+        "enabled": true,
+        "extract_images": true,
+        "extract_tables": true,
+        "extract_formulas": true,
+        "nms_iou_threshold": 0.5,
+        "enable_nms": true
+    }
+}
+```
+
+| 参数 | 说明 | 默认值 |
+|-----|------|--------|
+| `nms_iou_threshold` | NMS IoU阈值（0-1），越小过滤越严格 | 0.5 |
+| `enable_nms` | 是否启用NMS图片去重 | true |
+
+**NMS 去重说明**：
+- 自动过滤重叠图片（IoU > 0.5）
+- 优先保留面积大的图片
+- 有效减少重复图片和图标干扰
 
 ## 📖 使用方法
 
@@ -167,9 +195,11 @@ The attention mechanism is a neural network architecture that...
 
 | 场景 | chunk_size | chunk_overlap | 说明 |
 |-----|-----------|---------------|------|
-| 学术论文 | 512-768 | 50-100 | 较大的块保留更多上下文 |
-| 技术文档 | 384-512 | 30-50 | 平衡精度和速度 |
-| 长文档 | 768-1024 | 100-150 | 减少分块数量 |
+| 学术论文 | 512-768 | 0（推荐） | 较大的块保留更多上下文，禁用重叠避免bug |
+| 技术文档 | 384-512 | 0（推荐） | 平衡精度和速度，禁用重叠避免bug |
+| 长文档 | 768-1024 | 0（推荐） | 减少分块数量，禁用重叠避免bug |
+
+> ⚠️ **重要提示**：由于已知无限循环bug，建议将 `chunk_overlap` 设置为 0。如需启用重叠，请确保 `chunk_overlap < chunk_size / 2`。
 
 ### 多模态配置
 
@@ -209,6 +239,7 @@ PDF文件
 [多模态提取]
    ├─ 文本 → PyMuPDF
    ├─ 图片 → PyMuPDF (位置信息)
+   │   └─ 🆕 NMS去重 → 过滤重复/重叠图片
    ├─ 表格 → pdfplumber (Markdown)
    └─ 公式 → LaTeX正则
    ↓
@@ -227,6 +258,43 @@ PDF文件
    ↓
 [检索 + RAG生成]
 ```
+
+### 图片去重机制
+
+```
+图片提取 → 多级过滤 → 保留唯一图片
+   ↓
+【第一级】尺寸过滤
+   ├─ 宽度 < 10px → 移除
+   ├─ 高度 < 10px → 移除
+   └─ 使用 image.size（原始图片尺寸）
+   ↓
+【第二级】图注去重 🆕
+   ├─ 提取图注编号（如 "Figure 1"）
+   ├─ 相同图注的图片 → 判定为同图的不同版本
+   ├─ 只保留尺寸最大的图片
+   └─ 过滤缩略图、预览图、低分辨率版本
+   ↓
+【第三级】尺寸去重
+   ├─ 相同 (宽, 高) → 判定为重复
+   ├─ 保留第一次出现的图片
+   └─ 过滤图标、分隔线等重复元素
+   ↓
+【第四级】NMS位置去重
+   ├─ 计算所有图片的 Bbox 面积
+   ├─ 按面积降序排序
+   ├─ 逐对比较 Bbox 重叠
+   │   ├─ IoU > 0.5 → 判定为重叠
+   │   ├─ 面积大的图片 → 保留
+   │   └─ 面积小的图片 → 移除
+   └─ 返回过滤后的图片列表
+```
+
+**去重原理**：
+- **尺寸过滤**：在调整大小前检查原始尺寸，过滤过小图片
+- **图注去重**：学术论文中同一图注对应多分辨率版本（缩略图、预览图、完整图），只保留最高清版本
+- **尺寸去重**：相同尺寸的图片通常是重复元素（logo、图标），只保留一份
+- **NMS去重**：处理同一图片在PDF中多次嵌入的情况，过滤位置重叠的小图
 
 ### 优雅降级机制
 

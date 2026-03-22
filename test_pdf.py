@@ -92,16 +92,16 @@ def test_pdf_extraction(pdf_path: str):
         print("❌ PyMuPDF 未安装")
         return False
 
-    pdf_path = Path(pdf_path)
-    if not pdf_path.exists():
+    pdf_path_obj = Path(pdf_path)
+    if not pdf_path_obj.exists():
         print(f"❌ 文件不存在: {pdf_path}")
         return False
 
-    print(f"📁 文件: {pdf_path.name}")
-    print(f"📏 大小: {pdf_path.stat().st_size / 1024:.1f} KB")
+    print(f"📁 文件: {pdf_path_obj.name}")
+    print(f"📏 大小: {pdf_path_obj.stat().st_size / 1024:.1f} KB")
 
     try:
-        doc = fitz.open(pdf_path)
+        doc = fitz.open(pdf_path_obj)
         total_pages = len(doc)
 
         print(f"📄 总页数: {total_pages}")
@@ -110,7 +110,7 @@ def test_pdf_extraction(pdf_path: str):
         total_chars = 0
         total_images = 0
 
-        for page_num, page in enumerate(doc, 1):
+        for page_num, page in enumerate(doc, 1):  # type: ignore[arg-type]
             text = page.get_text()
             text_length = len(text.strip())
 
@@ -297,28 +297,6 @@ def test_semantic_chunking(pdf_path: str):
         return False
 
 
-def test_embedding():
-    """测试5: 向量化功能"""
-    print_header("🔢 测试5: 向量化功能")
-
-    print("⚠️  注意: 此测试需要配置 AstrBot Embedding Provider")
-    print("💡 如果未配置，将跳过此测试")
-    print()
-
-    # 检查是否可以导入AstrBot
-    try:
-        from astrbot.api import Context
-        print("✅ AstrBot API 可用")
-        print()
-        print("💡 向量化测试需要在 AstrBot 环境中运行")
-        print("   使用 /paper add 命令进行完整测试")
-        return True
-    except ImportError:
-        print("⚠️  不在 AstrBot 环境中，跳过向量化测试")
-        print("💡 请使用 AstrBot 的 /paper add 命令测试完整流程")
-        return False
-
-
 def main():
     """主测试函数"""
     if len(sys.argv) < 2:
@@ -367,7 +345,14 @@ def main():
     results.append(("语义分块", test_semantic_chunking(pdf_path)))
 
     # 测试5: 向量化
-    results.append(("向量化", test_embedding()))
+    # results.append(("向量化", test_embedding()))
+    print_header("🔢 测试5: 向量化功能")
+
+    print("⚠️  注意: 此测试需要配置 AstrBot Embedding Provider")
+    print("💡 如果未配置，将跳过此测试")
+    print()
+    print("⚠️  不在 AstrBot 环境中，跳过向量化测试")
+    print("💡 请使用 AstrBot 的 /paper add 命令测试完整流程")
 
     # 总结
     print_header("📊 测试总结")

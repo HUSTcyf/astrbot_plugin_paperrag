@@ -140,8 +140,8 @@
     "chunk_overlap": {
         "description": "分块重叠大小（字符数）",
         "type": "int",
-        "hint": "相邻块之间的重叠字符数，用于保留上下文连贯性",
-        "default": 50,
+        "hint": "相邻块之间的重叠字符数，用于保留上下文连贯性。默认0（禁用重叠以避免无限循环bug）",
+        "default": 0,
         "minimum": 0,
         "maximum": 256
     },

@@ -16,9 +16,18 @@ logger = logging.getLogger(__name__)
 # 抑制 transformers 警告
 warnings.filterwarnings("ignore", category=UserWarning)
 
-from transformers import AutoProcessor, AutoModel
-import torch
-TRANSFORMERS_AVAILABLE = True
+# 尝试导入可选依赖
+try:
+    from transformers import AutoProcessor, AutoModel
+    import torch
+    TRANSFORMERS_AVAILABLE = True
+except ImportError as e:
+    TRANSFORMERS_AVAILABLE = False
+    # 定义类型占位符，避免类型检查错误
+    torch = None  # type: ignore
+    AutoProcessor = None  # type: ignore
+    AutoModel = None  # type: ignore
+    logger.warning(f"⚠️ transformers或torch未安装: {e}")
 
 
 class VisionEncoder:
@@ -51,11 +60,21 @@ class VisionEncoder:
         self.available = False
         self.device = "cpu"
 
+        # 检查依赖是否可用
+        if not TRANSFORMERS_AVAILABLE:
+            if fallback_to_text:
+                logger.warning("⚠️ transformers或torch未安装")
+                logger.info("💡 将回退到文本模式")
+                return
+            else:
+                raise RuntimeError("transformers或torch未安装，且fallback_to_text=False")
+
         # 检测设备
+        assert torch is not None  # type: ignore
         if device is None:
-            if torch.cuda.is_available():
-                self.device = "cuda"  
-            else: 
+            if torch.cuda.is_available():  # type: ignore
+                self.device = "cuda"
+            else:
                 self.device = "cpu"
         else:
             self.device = device
@@ -75,19 +94,21 @@ class VisionEncoder:
 
     def _load_model(self):
         """加载模型和分词器"""
+        assert AutoModel is not None  # type: ignore
+        assert AutoProcessor is not None  # type: ignore
+
         model_path = self.MODELS.get(self.model_name, self.model_name)
 
         logger.info(f"加载 SigLIP 模型: {model_path} (设备: {self.device})")
 
         # 加载模型和处理器
-        self.model = AutoModel.from_pretrained(
+        self.model = AutoModel.from_pretrained(  # type: ignore
             model_path,
             cache_dir=self.cache_dir
         ).to(self.device).eval()
 
         # SigLIP不需要tokenizer，直接使用图像处理器
-        from transformers import AutoProcessor
-        self.processor = AutoProcessor.from_pretrained(
+        self.processor = AutoProcessor.from_pretrained(  # type: ignore
             model_path,
             cache_dir=self.cache_dir
         )
@@ -123,6 +144,7 @@ class VisionEncoder:
         inputs = self.processor(images=image, return_tensors="pt").to(self.device)
 
         # 编码
+        assert torch is not None
         with torch.no_grad():
             vision_outputs = self.model.vision_model(**inputs)
             image_embeds = vision_outputs.pooler_output
@@ -175,6 +197,7 @@ class VisionEncoder:
                 # 批处理
                 inputs = self.processor(images=pil_images, return_tensors="pt").to(self.device)
 
+                assert torch is not None
                 with torch.no_grad():
                     vision_outputs = self.model.vision_model(**inputs)
                     image_embeds = vision_outputs.pooler_output
@@ -212,6 +235,7 @@ class VisionEncoder:
         try:
             inputs = self.processor(text=text, return_tensors="pt").to(self.device)
 
+            assert torch is not None
             with torch.no_grad():
                 text_outputs = self.model.text_model(**inputs)
                 text_embeds = text_outputs.pooler_output
@@ -279,6 +303,7 @@ class SigLIPMultiModalEncoder(VisionEncoder):
                 padding=True
             ).to(self.device)
 
+            assert torch is not None
             with torch.no_grad():
                 outputs = self.model(**inputs)
                 combined_embeds = outputs.image_embeds + outputs.text_embeds
