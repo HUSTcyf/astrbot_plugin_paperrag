@@ -4,10 +4,18 @@
         "type": "bool",
         "default": true
     },
-    "embedding_provider_id": {
-        "description": "Embedding 服务提供商",
+    "embedding_mode": {
+        "description": "Embedding模式",
         "type": "string",
-        "hint": "选择用于向量嵌入的 Embedding Provider（推荐使用 Gemini）。留空则使用 AstrBot 中配置的第一个 Embedding Provider",
+        "hint": "选择embedding服务模式。API模式使用Gemini/OpenAI等云端服务；Ollama模式使用本地Ollama服务运行bge-m3等模型，完全免费且无限制",
+        "obvious_hint": true,
+        "default": "api",
+        "enum": ["api", "ollama"]
+    },
+    "embedding_provider_id": {
+        "description": "Embedding 服务提供商（API模式）",
+        "type": "string",
+        "hint": "选择用于向量嵌入的 Embedding Provider（推荐使用 Gemini）。留空则使用 AstrBot 中配置的第一个 Embedding Provider。仅在API模式下生效",
         "_special": "select_embedding_provider",
         "default": "gemini_embedding"
     },
@@ -21,7 +29,7 @@
     "milvus_lite_path": {
         "description": "Milvus Lite 数据库路径",
         "type": "string",
-        "hint": "注意！！！只使用 milvus_lite_path 或 address 其中一个即可，milvus_lite_path 优先级较高。留空则使用默认路径 ./data/milvus_papers.db",
+        "hint": "数据库文件路径。留空则使用默认路径 ./data/milvus_papers.db",
         "obvious_hint": true,
         "default": "./data/milvus_papers.db",
         "minLength": 0
@@ -38,7 +46,7 @@
     "db_name": {
         "description": "Milvus 数据库名称",
         "type": "string",
-        "hint": "Milvus 2.2+ 支持多数据库。默认使用 default，可按需配置为其他数据库名以隔离数据",
+        "hint": "Milvus 2.2+ 支持多数据库。默认使用 default，可按需配置为其他数据库名称以隔离数据",
         "obvious_hint": true,
         "default": "default",
         "pattern": "^[a-zA-Z][a-zA-Z0-9_\\-]{0,63}$",
@@ -73,7 +81,7 @@
     "collection_name": {
         "description": "向量数据库集合名称",
         "type": "string",
-        "hint": "Milvus 中存储文档向量的集合名称，建议使用英文名称",
+        "hint": "Milvus 中存储文档向量的集合名称，建议使用英文名",
         "default": "paper_embeddings",
         "pattern": "^[a-zA-Z][a-zA-Z0-9_]*$",
         "minLength": 1,
@@ -82,7 +90,7 @@
     "embed_dim": {
         "description": "向量嵌入维度",
         "type": "int",
-        "hint": "嵌入向量的维度，需与选择的 Embedding Provider 模型匹配（如 gemini-embedding-2-preview 为 768）",
+        "hint": "嵌入向量的维度，需与选择的 Embedding Provider 模型匹配。Gemini为768，OpenAI为1536",
         "default": 768,
         "minimum": 128,
         "maximum": 4096
@@ -140,7 +148,7 @@
     "chunk_overlap": {
         "description": "分块重叠大小（字符数）",
         "type": "int",
-        "hint": "相邻块之间的重叠字符数，用于保留上下文连贯性。默认0（禁用重叠以避免无限循环bug）",
+        "hint": "相邻块之间的重叠字符数，用于保留上下文连贯性。默认0（禁用重叠）",
         "default": 0,
         "minimum": 0,
         "maximum": 256
@@ -156,7 +164,7 @@
     "use_semantic_chunking": {
         "description": "是否启用语义感知分块",
         "type": "bool",
-        "hint": "启用后将使用基于标题和段落边界的智能分块策略，禁用则使用简单字符分块",
+        "hint": "启用后将使用基于标题和段落边界的智能分块策略",
         "default": true
     },
     "multimodal": {
@@ -213,6 +221,99 @@
                 "default": 0.4,
                 "minimum": 0.0,
                 "maximum": 1.0
+            }
+        }
+    },
+    "enable_reranking": {
+        "description": "是否启用重排序功能",
+        "type": "bool",
+        "hint": "启用后将使用交叉注意力模型对检索结果进行精确重排序，提升15-25%的检索精度。需要安装 FlagEmbedding 依赖（pip install -U FlagEmbedding）。会增加200-500ms延迟",
+        "default": false
+    },
+    "reranking_model": {
+        "description": "重排序模型名称",
+        "type": "string",
+        "hint": "HuggingFace 模型名称或本地路径。推荐使用 BAAI/bge-reranker-v2-m3（多语言支持）",
+        "obvious_hint": true,
+        "default": "BAAI/bge-reranker-v2-m3",
+        "minLength": 1,
+        "enum": [
+            "BAAI/bge-reranker-v2-m3",
+            "BAAI/bge-reranker-large",
+            "BAAI/bge-reranker-base"
+        ]
+    },
+    "reranking_device": {
+        "description": "重排序模型运行设备",
+        "type": "string",
+        "hint": "auto: 自动检测MPS/CUDA/CPU（推荐）；mps: Apple Silicon GPU加速；cuda: NVIDIA GPU加速；cpu: CPU运行",
+        "obvious_hint": true,
+        "default": "auto",
+        "enum": ["auto", "mps", "cuda", "cpu"]
+    },
+    "reranking_adaptive": {
+        "description": "是否使用自适应重排序",
+        "type": "bool",
+        "hint": "启用后将根据结果数量和相似度分布智能决定是否重排序，避免不必要的时间消耗",
+        "default": true
+    },
+    "reranking_threshold": {
+        "description": "重排序分数阈值",
+        "type": "float",
+        "hint": "过滤掉低于此分数的重排序结果（0-1之间）。设置为0表示保留所有结果",
+        "default": 0.0,
+        "minimum": 0.0,
+        "maximum": 1.0
+    },
+    "reranking_batch_size": {
+        "description": "重排序批处理大小",
+        "type": "int",
+        "hint": "批量处理文档数量，影响推理速度和内存占用。较大的值速度更快但占用更多内存",
+        "default": 32,
+        "minimum": 1,
+        "maximum": 128
+    },
+    "ollama": {
+        "description": "Ollama本地Embedding配置",
+        "type": "object",
+        "hint": "配置Ollama服务进行本地embedding（需要先安装并启动Ollama）。仅在embedding_mode='ollama'时生效",
+        "obvious_hint": true,
+        "items": {
+            "base_url": {
+                "description": "Ollama服务地址",
+                "type": "string",
+                "default": "http://localhost:11434",
+                "hint": "Ollama服务的HTTP API地址。默认使用本地11434端口"
+            },
+            "model": {
+                "description": "Ollama模型名称",
+                "type": "string",
+                "default": "bge-m3",
+                "hint": "Ollama中已安装的模型名称。常用模型: bge-m3（推荐1024维）、nomic-embed-text（768维）、mxbai-embed-large（1024维）"
+            },
+            "timeout": {
+                "description": "请求超时时间（秒）",
+                "type": "float",
+                "default": 120.0,
+                "minimum": 10.0,
+                "maximum": 600.0,
+                "hint": "单个请求的超时时间。首次运行模型加载可能需要较长时间"
+            },
+            "batch_size": {
+                "description": "并发批处理大小",
+                "type": "int",
+                "default": 10,
+                "minimum": 1,
+                "maximum": 50,
+                "hint": "同时处理的文本数量。较大的值速度更快但占用更多内存"
+            },
+            "retry_attempts": {
+                "description": "失败重试次数",
+                "type": "int",
+                "default": 3,
+                "minimum": 0,
+                "maximum": 10,
+                "hint": "请求失败时的重试次数"
             }
         }
     }

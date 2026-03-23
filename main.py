@@ -67,22 +67,34 @@ class PaperRAGPlugin(Star):
                 rag_config = RAGConfig(
                     embedding_provider_id=self.config.get("embedding_provider_id", ""),
                     llm_provider_id=self.config.get("llm_provider_id", ""),
+                    # Embedding模式配置
+                    embedding_mode=self.config.get("embedding_mode", "api"),
+                    # Ollama配置
+                    ollama_config=self.config.get("ollama", {}),
+                    # Milvus配置
                     milvus_lite_path=self.config.get("milvus_lite_path", "./data/milvus_papers.db"),
                     address=self.config.get("address", ""),
                     db_name=self.config.get("db_name", "default"),
                     authentication=self.config.get("authentication", {}),
                     collection_name=self.config.get("collection_name", "paper_embeddings"),
-                    embed_dim=self.config.get("embed_dim", 768),
+                    embed_dim=self.config.get("embed_dim", 768),  # 默认768
                     top_k=self.config.get("top_k", 5),
                     similarity_cutoff=self.config.get("similarity_cutoff", 0.3),
                     papers_dir=self.config.get("papers_dir", "./papers"),
                     # 语义分块配置
                     chunk_size=self.config.get("chunk_size", 512),
-                    chunk_overlap=self.config.get("chunk_overlap", 50),
+                    chunk_overlap=self.config.get("chunk_overlap", 0),  # 默认0避免bug
                     min_chunk_size=self.config.get("min_chunk_size", 100),
                     use_semantic_chunking=self.config.get("use_semantic_chunking", True),
                     # 多模态配置
-                    enable_multimodal=self.config.get("multimodal", {}).get("enabled", True)
+                    enable_multimodal=self.config.get("multimodal", {}).get("enabled", True),
+                    # 重排序配置
+                    enable_reranking=self.config.get("enable_reranking", False),
+                    reranking_model=self.config.get("reranking_model", "BAAI/bge-reranker-v2-m3"),
+                    reranking_device=self.config.get("reranking_device", "auto"),
+                    reranking_adaptive=self.config.get("reranking_adaptive", True),
+                    reranking_threshold=self.config.get("reranking_threshold", 0.0),
+                    reranking_batch_size=self.config.get("reranking_batch_size", 32)
                 )
 
                 # 验证配置

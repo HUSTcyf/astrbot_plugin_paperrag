@@ -20,7 +20,7 @@ except ImportError:
 # 多模态提取（可选）
 MULTIMODAL_AVAILABLE = False
 try:
-    from multimodal_extractor import (
+    from .multimodal_extractor import (
         MultimodalPDFExtractor,
         ExtractedImage,
         ExtractedTable,

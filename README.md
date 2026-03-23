@@ -10,6 +10,7 @@
 - 🖼️ **多模态提取**：自动识别PDF中的图片、表格、公式
 - 💾 **本地存储**：所有数据存储在本地，保护隐私
 - ⚡ **缓存加速**：常用查询结果缓存，响应更快
+- 🦙 **Ollama支持**：使用本地Ollama服务进行免费无限制的向量化（推荐）
 
 ---
 
@@ -22,29 +23,46 @@ cd ~/AstrBot/data/plugins/astrbot_plugin_paperrag
 pip install -r requirements.txt
 ```
 
-### 第二步：配置Embedding Provider
+### 第二步：配置插件
 
-在 **AstrBot WebUI → 设置 → 模型提供商** 中添加：
-
-| 配置项 | 值 |
-|-------|-----|
-| 类型 | Gemini |
-| ID | `gemini_embedding` |
-| API Key | [获取密钥](https://makersuite.google.com/app/apikey) |
-| 模型 | `gemini-embedding-2-preview` |
-
-### 第三步：配置插件
+**方式A：使用Ollama本地Embedding（推荐，免费无限制）**
 
 在 **AstrBot WebUI → 插件 → paper_rag → 插件配置** 中：
 
-| 配置项 | 值 |
-|-------|-----|
-| Embedding 服务提供商 | `gemini_embedding` |
-| LLM Provider ID | `glm-4.7-flash`（可选） |
-| 论文文件存放目录 | `./papers` |
-| 启用插件 | ✅ |
+| 配置项 | 值 | 说明 |
+|-------|-----|------|
+| Embedding模式 | `Ollama本地模式` | 使用Ollama |
+| 向量嵌入维度 | `1024` | BGE-M3固定1024维 |
+| Ollama模型名称 | `bge-m3` | 模型名称 |
+| LLM Provider ID | `glm-4.7-flash`（可选） | 用于RAG回答生成 |
+| 论文文件存放目录 | `./papers` | PDF存放路径 |
+| 启用插件 | ✅ | - |
 
-### 第四步：使用插件
+> ⚠️ **使用Ollama前需要先安装和配置**：
+> ```bash
+> # 1. 安装Ollama
+> curl -fsSL https://ollama.com/install.sh | sh
+>
+> # 2. 下载BGE-M3模型
+> ollama pull bge-m3
+>
+> # 3. 启动服务
+> ollama serve
+> ```
+> 详细配置见：[OLLAMA_GUIDE.md](docs/OLLAMA_GUIDE.md)
+
+**方式B：使用Gemini API（快速，有配额限制）**
+
+| 配置项 | 值 | 说明 |
+|-------|-----|------|
+| Embedding模式 | `API模式` | 使用API |
+| Embedding 服务提供商 | `gemini_embedding` | Gemini Embedding API |
+| 向量嵌入维度 | `768` | Gemini固定768维 |
+| LLM Provider ID | `glm-4.7-flash`（可选） | 用于RAG回答生成 |
+| 论文文件存放目录 | `./papers` | PDF存放路径 |
+| 启用插件 | ✅ | - |
+
+### 第三步：使用插件
 
 ```bash
 # 1. 创建论文目录并放入PDF文件
@@ -114,12 +132,30 @@ Bot: > The attention mechanism allows the model to focus on...
 | 配置项 | 说明 | 默认值 | 推荐值 |
 |-------|------|--------|--------|
 | `enabled` | 启用插件 | `true` | ✅ |
-| `embedding_provider_id` | Embedding Provider ID | - | `gemini_embedding` |
+| `embedding_mode` | Embedding模式 | `api` | `ollama`（推荐免费）/ `api` |
+| `embedding_provider_id` | Embedding Provider ID（API模式） | `gemini_embedding` | Gemini / OpenAI |
 | `llm_provider_id` | LLM Provider ID（可选） | - | `glm-4.7-flash` |
 | `papers_dir` | 论文目录 | `./papers` | `./papers` |
-| `embed_dim` | 向量维度 | `768` | `768` (Gemini) / `1536` (OpenAI) |
+| `embed_dim` | 向量维度 | `768` | `1024` (BGE-M3) / `768` (Gemini) / `1536` (OpenAI) |
+
+> 💡 **Embedding模式对比**：
+> - **Ollama模式**：免费、无限制、隐私保护、需要安装Ollama
+> - **API模式**：快速、有配额限制、需要API密钥
+
+### Ollama本地Embedding配置
+
+| 配置项 | 说明 | 默认值 | 推荐值 |
+|-------|------|--------|--------|
+| `ollama.base_url` | Ollama服务地址 | `http://localhost:11434` | 默认 |
+| `ollama.model` | Ollama模型名称 | `bge-m3` | `bge-m3`（推荐）/ `nomic-embed-text` |
+| `ollama.batch_size` | 并发批处理大小 | `10` | `10-20`（根据硬件） |
+| `ollama.timeout` | 请求超时（秒） | `120.0` | 默认 |
+
+> 🦙 **Ollama详细配置指南**：[OLLAMA_GUIDE.md](docs/OLLAMA_GUIDE.md)
 | `top_k` | 返回片段数 | `5` | `5` |
 | `similarity_cutoff` | 相似度阈值 | `0.3` | `0.3` |
+
+> 💡 **Embedding Provider 说明**：插件使用 AstrBot 中配置的 Embedding Provider。推荐使用 Gemini（768维，支持批量处理）。
 
 ### 分块配置
 
@@ -155,6 +191,68 @@ Bot: > The attention mechanism allows the model to focus on...
 }
 ```
 
+### 重排序配置
+
+| 配置项 | 说明 | 默认值 | 推荐值 |
+|-------|------|--------|--------|
+| `enable_reranking` | 启用重排序 | `false` | ✅（提升精度） |
+| `reranking_model` | 重排序模型 | `BAAI/bge-reranker-v2-m3` | 默认 |
+| `reranking_device` | 运行设备 | `auto` | `auto`（自动检测） |
+| `reranking_adaptive` | 自适应模式 | `true` | ✅ |
+| `reranking_batch_size` | 批处理大小 | `32` | `32-64` |
+| `reranking_threshold` | 分数阈值 | `0.0` | `0.0` |
+
+> 💡 **重排序说明**：
+> - **性能提升**：检索精度提升15-25%
+> - **延迟增加**：200-500ms（MPS加速）
+> - **内存占用**：约2GB
+> - **依赖安装**：`pip install -U FlagEmbedding`
+
+**配置场景示例**：
+
+1. **新手/默认配置**（推荐）
+```json
+{
+  "enable_reranking": true
+}
+```
+
+2. **Apple Silicon Mac**（MPS加速）
+```json
+{
+  "enable_reranking": true,
+  "reranking_device": "mps",
+  "reranking_batch_size": 64
+}
+```
+
+3. **NVIDIA GPU**（CUDA加速）
+```json
+{
+  "enable_reranking": true,
+  "reranking_device": "cuda",
+  "reranking_batch_size": 128
+}
+```
+
+4. **低内存/CPU**
+```json
+{
+  "enable_reranking": true,
+  "reranking_device": "cpu",
+  "reranking_batch_size": 16
+}
+```
+
+5. **高精度模式**
+```json
+{
+  "enable_reranking": true,
+  "reranking_model": "BAAI/bge-reranker-large",
+  "reranking_threshold": 0.3
+}
+```
+
 ---
 
 ## 💡 使用技巧
@@ -176,8 +274,9 @@ Bot: > The attention mechanism allows the model to focus on...
 
 ### 3. 加速导入
 
+- **批量Embedding**：自动启用批量处理（节省99% API调用）
 - **批量导入**：一次性添加多个PDF
-- **禁用图片提取**：设置 `extract_images: false`
+- **禁用图片提取**：设置 `multimodal.extract_images: false`
 - **使用SSD**：将Milvus数据库放在SSD上
 
 ---
@@ -226,11 +325,46 @@ Bot: > The attention mechanism allows the model to focus on...
 
 **解决**：无需处理，系统会自动降级到文本模式，不影响使用
 
+### Q6: 重排序功能不可用
+
+**原因**：FlagEmbedding未安装
+
+**解决**：
+```bash
+pip install -U FlagEmbedding
+```
+
+**MPS加速不可用**：
+- 检查macOS版本 ≥ 12.3
+- 更新PyTorch: `pip install --upgrade torch`
+
+### Q7: 批量请求超过100个文本错误
+
+**症状**: `at most 100 requests can be in one batch`
+
+**原因**: Gemini API单次批量请求限制为100个文本
+
+**解决**: ✅ 插件已自动处理，会自动分批无需手动干预
+
+**技术细节**:
+- 插件自动检测文本数量
+- 超过100个时自动分批处理（每批100个）
+- 完全透明，不影响使用体验
+
+### Q7: 启用重排序后速度变慢
+
+**原因**：重排序增加200-500ms延迟
+
+**解决**：
+- 启用自适应模式：`reranking_adaptive: true`
+- 使用GPU加速：`reranking_device: mps/cuda`
+- 调整批处理大小：减小`reranking_batch_size`
+
 ---
 
 ## 📞 获取帮助
 
-- **开发文档**：查看 [DEVELOPMENT.md](DEVELOPMENT.md) 了解技术细节
+- **开发文档**：查看 [DEVELOPMENT.md](docs/DEVELOPMENT.md) 了解技术细节
 - **问题反馈**：通过 GitHub Issues 提交问题
 - **日志查看**：AstrBot 控制台输出
 
