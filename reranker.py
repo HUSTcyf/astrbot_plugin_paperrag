@@ -5,12 +5,13 @@ RAG重排序模块
 """
 
 import asyncio
+import os
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 from dataclasses import dataclass
 
 from astrbot.api import logger
 
-# FlagEmbedding导入（优雅降级）
+# FlagEmbedding导入
 if TYPE_CHECKING:
     from FlagEmbedding import FlagReranker as FlagRerankerType
 else:
@@ -18,11 +19,9 @@ else:
 
 try:
     from FlagEmbedding import FlagReranker
-    FLAGRERANKER_AVAILABLE: bool = True
 except ImportError:
-    # 类型占位符，避免Pylance报告未绑定变量
-    FlagReranker: Optional[type] = None  # type: ignore
-    FLAGRERANKER_AVAILABLE = False
+    # 类型占位符
+    FlagReranker = None  # type: ignore
     logger.warning("⚠️ FlagEmbedding未安装，重排序功能将被禁用。安装: pip install -U FlagEmbedding")
 
 
@@ -47,14 +46,14 @@ class ContentReranker:
         self.config = config
         self._model: Optional[FlagRerankerType] = None
         self._initialized = False
-        self._available: bool = FLAGRERANKER_AVAILABLE
+        self._available: bool = FlagReranker is not None
 
     def _ensure_initialized(self):
         """延迟初始化模型"""
-        if self._initialized or not FLAGRERANKER_AVAILABLE:
+        if self._initialized:
             return
 
-        # 运行时检查FlagReranker是否可用
+        # 检查FlagReranker是否可用
         if FlagReranker is None:  # type: ignore
             return
 

@@ -15,7 +15,15 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union, TYPE_CHECKING
+
+# 类型注解导入（仅在类型检查时导入，避免循环导入）
+if TYPE_CHECKING:
+    from .hybrid_rag import HybridRAGEngine
+
+# 抑制底层库的 gRPC/absl 警告（必须在导入深度学习库之前设置）
+os.environ['GRPC_VERBOSITY'] = 'ERROR'
+os.environ['GLOG_minloglevel'] = '2'
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -24,7 +32,7 @@ from astrbot.api.provider import LLMResponse
 from astrbot.api.star import Context, Star, register
 
 from .rag_engine import (
-    PaperRAGEngine,
+    create_rag_engine,
     RAGConfig
 )
 
@@ -59,7 +67,7 @@ class PaperRAGPlugin(Star):
 
         logger.info("📚 Document RAG Plugin initialized (支持PDF/Word/TXT/HTML)")
 
-    def _get_engine(self) -> Optional[PaperRAGEngine]:
+    def _get_engine(self) -> "Optional[HybridRAGEngine]":
         """获取RAG引擎（单例模式，带缓存）"""
         if self._engine is None and not self._config_valid:
             try:
@@ -67,17 +75,21 @@ class PaperRAGPlugin(Star):
                 rag_config = RAGConfig(
                     embedding_provider_id=self.config.get("embedding_provider_id", ""),
                     llm_provider_id=self.config.get("llm_provider_id", ""),
+                    # GLM配置（新增 - llama-index集成）
+                    glm_api_key=self.config.get("glm_api_key", ""),
+                    glm_model=self.config.get("glm_model", "glm-4.7-flash"),
+                    embedding_model=self.config.get("embedding_model", ""),
                     # Embedding模式配置
-                    embedding_mode=self.config.get("embedding_mode", "api"),
+                    embedding_mode=self.config.get("embedding_mode", "ollama"),
                     # Ollama配置
                     ollama_config=self.config.get("ollama", {}),
                     # Milvus配置
-                    milvus_lite_path=self.config.get("milvus_lite_path", "./data/milvus_papers.db"),
+                    milvus_lite_path=self.config.get("milvus_lite_path", ""),
                     address=self.config.get("address", ""),
                     db_name=self.config.get("db_name", "default"),
                     authentication=self.config.get("authentication", {}),
                     collection_name=self.config.get("collection_name", "paper_embeddings"),
-                    embed_dim=self.config.get("embed_dim", 768),  # 默认768
+                    embed_dim=self.config.get("embed_dim", 1024),
                     top_k=self.config.get("top_k", 5),
                     similarity_cutoff=self.config.get("similarity_cutoff", 0.3),
                     papers_dir=self.config.get("papers_dir", "./papers"),
@@ -98,22 +110,26 @@ class PaperRAGPlugin(Star):
                 )
 
                 # 验证配置
+                logger.debug("🐛 [DEBUG] _get_engine: 验证配置")
                 valid, error_msg = rag_config.validate()
                 if not valid:
                     logger.error(f"❌ RAG配置无效: {error_msg}")
                     self._config_valid = False
                     return None
+                logger.debug("🐛 [DEBUG] _get_engine: 配置验证通过")
 
-                # 初始化引擎（传递context以获取Provider）
-                self._engine = PaperRAGEngine(rag_config, self.context)
+                # 创建llama-index引擎（已移除旧版引擎支持）
+                logger.debug("🐛 [DEBUG] _get_engine: 准备创建引擎")
+                self._engine = create_rag_engine(rag_config, self.context)
                 self._config_valid = True
+                logger.debug("🐛 [DEBUG] _get_engine: 引擎创建完成")
 
             except Exception as e:
                 logger.error(f"❌ RAG引擎初始化失败: {e}")
                 self._config_valid = False
                 return None
 
-        return self._engine
+        return self._engine # type: ignore
 
     def _get_cache_key(self, query: str, mode: str, top_k: int) -> str:
         """生成缓存键"""
@@ -159,6 +175,7 @@ class PaperRAGPlugin(Star):
         list         - List indexed documents
         add          - Add documents to knowledge base (PDF/Word/TXT supported)
         clear        - Clear knowledge base
+        rebuild      - Clear and re-add all documents
         """
         pass
 
@@ -230,23 +247,31 @@ class PaperRAGPlugin(Star):
     @paper_commands.command("list")
     async def cmd_list(self, event: AstrMessageEvent):
         """List all documents in the library"""
+        logger.debug("🐛 [DEBUG] cmd_list: 开始执行")
+
         if not self.enabled:
             yield event.plain_result("❌ Plugin is disabled")
             return
 
+        logger.debug("🐛 [DEBUG] cmd_list: 插件已启用，准备获取引擎")
         engine = self._get_engine()
+        logger.debug(f"🐛 [DEBUG] cmd_list: 引擎获取完成, engine={engine is not None}")
+
         if not engine:
             yield event.plain_result("❌ RAG engine is not ready, please check configuration")
             return
 
         try:
+            logger.debug("🐛 [DEBUG] cmd_list: 准备调用 engine.list_papers()")
             papers = await engine.list_papers()
+            logger.debug(f"🐛 [DEBUG] cmd_list: list_papers() 返回, papers数量={len(papers) if papers else 0}")
 
             if not papers:
                 yield event.plain_result("📭 Document library is empty, please add documents first")
                 return
 
             # Format output
+            logger.debug("🐛 [DEBUG] cmd_list: 开始格式化输出")
             output = "📚 **Document Library**\n\n"
             for i, paper in enumerate(papers[:20], 1):  # Show max 20 papers
                 output += f"{i}. ✅ **{paper['file_name']}**\n"
@@ -257,6 +282,7 @@ class PaperRAGPlugin(Star):
                 output += f"...and {len(papers) - 20} more papers\n"
 
             output += f"\n📊 Total: {len(papers)} documents"
+            logger.debug("🐛 [DEBUG] cmd_list: 输出格式化完成")
 
             yield event.plain_result(output)
 
@@ -311,67 +337,61 @@ class PaperRAGPlugin(Star):
                 yield event.plain_result("❌ RAG engine is not ready")
                 return
 
-            # Import documents and stream progress
-            # Convert to list to ensure correct type
-            file_paths = [str(f) for f in doc_files]
-            async for progress in engine.ingest_papers(file_paths):
-                if progress["status"] == "parsing":
-                    yield event.plain_result(
-                        f"📖 [{progress['current']}/{progress['total']}] "
-                        f"Parsing: {progress['filename']}"
-                    )
-                elif progress["status"] == "embedding":
-                    yield event.plain_result(
-                        f"🔢 [{progress['current']}/{progress['total']}] "
-                        f"Vectorizing: {progress['filename']}"
-                    )
-                elif progress["status"] == "storing":
-                    yield event.plain_result(
-                        f"💾 [{progress['current']}/{progress['total']}] "
-                        f"Storing: {progress['filename']}"
-                    )
-                elif progress["status"] == "done":
-                    yield event.plain_result(
-                        f"✅ [{progress['current']}/{progress['total']}] "
-                        f"{progress['filename']} - {progress['chunks']} chunks"
-                    )
-                elif progress["status"] == "skipped":
-                    yield event.plain_result(
-                        f"⏭️  [{progress['current']}/{progress['total']}] "
-                        f"Skipped: {progress['filename']}"
-                    )
-                elif progress["status"] == "error":
-                    yield event.plain_result(
-                        f"❌ [{progress['current']}/{progress['total']}] "
-                        f"Failed: {progress['filename']} - {progress['error']}"
-                    )
-                elif progress["status"] == "complete":
-                    # Final summary
-                    files_count = progress['files_count']
-                    chunks_count = progress['chunks_count']
-                    skipped_count = progress.get('skipped_count', 0)
-                    error_count = progress.get('error_count', 0)
-                    elapsed_time = progress['elapsed_time']
+            # Import documents using new API
+            import time
+            start_time = time.time()
 
-                    output = f"""✅ **Import Complete**
+            total_files = len(doc_files)
+            successful = 0
+            failed = 0
+            total_chunks = 0
+
+            for idx, doc_file in enumerate(doc_files, 1):
+                try:
+                    file_path = str(doc_file)
+                    file_name = doc_file.name
+
+                    # Add single document
+                    result = await engine.add_paper(file_path)
+
+                    if result["status"] == "success":
+                        chunks_added = result.get("chunks_added", 0)
+                        total_chunks += chunks_added
+                        successful += 1
+                        yield event.plain_result(
+                            f"✅ [{idx}/{total_files}] {file_name} - {chunks_added} chunks"
+                        )
+                    else:
+                        failed += 1
+                        error_msg = result.get("message", "未知错误")
+                        yield event.plain_result(
+                            f"❌ [{idx}/{total_files}] {file_name} - {error_msg}"
+                        )
+
+                except Exception as e:
+                    failed += 1
+                    logger.error(f"Failed to import {doc_file.name}: {e}")
+                    yield event.plain_result(
+                        f"❌ [{idx}/{total_files}] {doc_file.name} - {str(e)}"
+                    )
+
+            # Final summary
+            elapsed_time = time.time() - start_time
+            output = f"""✅ **Import Complete**
 
 📊 Statistics:
-  • Total files: {files_count}
-  • Successfully processed: {files_count - skipped_count - error_count}
-  • Skipped (no text): {skipped_count}
-  • Errors: {error_count}
-  • Chunks created: {chunks_count}
+  • Total files: {total_files}
+  • Successfully processed: {successful}
+  • Failed: {failed}
+  • Chunks created: {total_chunks}
   • Time: {elapsed_time:.1f}s
 
 💡 Tip: Use /paper search [question] to search documents"""
 
-                    if skipped_count > 0:
-                        output += f"\n\n⚠️ {skipped_count} files had no extractable text (may be scanned PDFs)"
+            if failed > 0:
+                output += f"\n\n⚠️ {failed} files failed to process"
 
-                    if error_count > 0:
-                        output += f"\n\n❌ {error_count} files failed to process"
-
-                    yield event.plain_result(output.strip())
+            yield event.plain_result(output.strip())
 
             # Clear related cache
             self._response_cache.clear()
@@ -398,14 +418,120 @@ class PaperRAGPlugin(Star):
             return
 
         try:
-            await engine.store.clear()
+            result = await engine.clear()
             self._response_cache.clear()
 
-            yield event.plain_result("✅ Document library cleared")
+            if result.get("status") == "success":
+                yield event.plain_result(f"✅ {result.get('message', 'Document library cleared')}")
+            else:
+                yield event.plain_result(f"❌ {result.get('message', 'Failed to clear document library')}")
 
         except Exception as e:
             logger.error(f"Failed to clear document library: {e}")
             yield event.plain_result(f"❌ Failed to clear document library: {e}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @paper_commands.command("rebuild")
+    async def cmd_rebuild(self, event: AstrMessageEvent, directory: str = '', confirm: str = ''):
+        """Clear and rebuild document knowledge base (Admin)
+
+        Args:
+            directory: Document directory path (optional, use configured path by default)
+            confirm: Must be 'confirm' to proceed
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if confirm != "confirm":
+            yield event.plain_result("⚠️ This will delete all existing embeddings and recreate them!\nUse: /paper rebuild <directory> confirm")
+            return
+
+        engine = self._get_engine()
+        if not engine:
+            yield event.plain_result("❌ RAG engine is not ready")
+            return
+
+        # Use provided directory or fallback to configured path
+        papers_dir = directory or self.config.get("papers_dir", "./papers")
+
+        # Check directory
+        if not os.path.exists(papers_dir):
+            yield event.plain_result(f"❌ Directory does not exist: {papers_dir}")
+            return
+
+        yield event.plain_result("🔄 Step 1/3: Clearing knowledge base...")
+
+        try:
+            # Clear database
+            result = await engine.clear()
+            if result.get("status") != "success":
+                yield event.plain_result(f"❌ Failed to clear: {result.get('message', 'Unknown error')}")
+                return
+            yield event.plain_result("✅ Step 1/3: Knowledge base cleared")
+
+        except Exception as e:
+            logger.error(f"Failed to clear document library: {e}")
+            yield event.plain_result(f"❌ Failed to clear: {e}")
+            return
+
+        yield event.plain_result("🔄 Step 2/3: Scanning documents...")
+
+        # Scan documents
+        supported_extensions = ['.pdf', '.docx', '.doc', '.txt', '.md', '.html', '.htm']
+        doc_files = []
+        for ext in supported_extensions:
+            doc_files.extend(Path(papers_dir).glob(f"*{ext}"))
+        for ext in supported_extensions:
+            doc_files.extend(Path(papers_dir).glob(f"*{ext.upper()}"))
+
+        doc_files = [f for f in doc_files if not f.name.startswith("._")]
+
+        if not doc_files:
+            yield event.plain_result("📭 No supported documents found")
+            return
+
+        yield event.plain_result(f"📄 Step 2/3: Found {len(doc_files)} documents")
+
+        # Re-add documents
+        import time
+        start_time = time.time()
+        total_files = len(doc_files)
+        successful = 0
+        failed = 0
+        total_chunks = 0
+
+        yield event.plain_result("🔄 Step 3/3: Rebuilding embeddings... (this may take a while)")
+
+        for idx, doc_file in enumerate(doc_files, 1):
+            try:
+                result = await engine.add_paper(str(doc_file))
+                if result.get("status") == "success":
+                    successful += 1
+                    total_chunks += result.get("chunks_added", 0)
+                else:
+                    failed += 1
+                    logger.warning(f"Failed to add {doc_file.name}: {result.get('message', 'Unknown error')}")
+
+                # Progress update every 5 files or at the end
+                if idx % 5 == 0 or idx == total_files:
+                    elapsed = time.time() - start_time
+                    yield event.plain_result(f"⏳ Progress: {idx}/{total_files} ({(idx/total_files*100):.1f}%) - {successful} added, {failed} failed")
+
+            except Exception as e:
+                failed += 1
+                logger.error(f"Error adding {doc_file.name}: {e}")
+
+        elapsed = time.time() - start_time
+        yield event.plain_result(
+            f"✅ Rebuild complete!\n"
+            f"   📄 Documents: {successful}/{total_files} successful\n"
+            f"   📊 Total chunks: {total_chunks}\n"
+            f"   ⏱️ Time: {elapsed:.1f}s"
+        )
+
+        # Clear cache
+        self._response_cache.clear()
 
     def _format_retrieve_response(self, sources: list) -> str:
         """Format retrieval results"""

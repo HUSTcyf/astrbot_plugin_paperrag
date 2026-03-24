@@ -1,8 +1,15 @@
 # Paper RAG 插件依赖
-
+setuptools==81.0.0
 # 核心依赖
 pymilvus[milvus_lite]>=2.5.4,<3.0.0  # Milvus Lite 向量数据库
 PyMuPDF>=1.23.0  # PDF解析 (fitz)
+
+# llama-index依赖（新RAG引擎）
+llama-index-core>=0.10.0  # llama-index核心库
+llama-index-vector-stores-milvus>=0.2.0  # Milvus向量存储（需要更版本以支持新的导入路径）
+llama-index-llms-openai>=0.1.0  # OpenAI兼容接口（用于智谱GLM，避免pyjwt冲突）
+# llama-index-llms-zhipuai>=0.1.0  # 智谱GLM LLM（已弃用：pyjwt版本冲突）
+# llama-index-embeddings-zhipuai>=0.1.0  # 智谱Embedding（可选，暂不使用）
 
 # 文档解析（轻量级，无冲突）
 python-docx>=1.0.0  # Word文档支持
@@ -19,3 +26,5 @@ FlagEmbedding>=1.2.0  # 重排序模型（支持MPS加速）
 # 工具库
 httpx>=0.25.0  # 异步HTTP客户端
 pydantic>=2.0.0  # 配置验证
+openai>=1.0.0  # OpenAI SDK（用于智谱GLM，避免pyjwt版本冲突）
+# zhipuai>=2.0.0  # 智谱AI SDK（已弃用：pyjwt版本冲突）

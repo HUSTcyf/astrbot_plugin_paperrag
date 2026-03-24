@@ -9,7 +9,7 @@
         "type": "string",
         "hint": "选择embedding服务模式。API模式使用Gemini/OpenAI等云端服务；Ollama模式使用本地Ollama服务运行bge-m3等模型，完全免费且无限制",
         "obvious_hint": true,
-        "default": "api",
+        "default": "ollama",
         "enum": ["api", "ollama"]
     },
     "embedding_provider_id": {
@@ -20,18 +20,49 @@
         "default": "gemini_embedding"
     },
     "llm_provider_id": {
-        "description": "LLM Provider ID（用于RAG生成）",
+        "description": "LLM Provider ID（用于RAG生成，已弃用）",
         "type": "string",
-        "hint": "手动输入LLM Provider的ID，用于RAG回答生成。可在 AstrBot 设置→模型提供商中查看Provider ID。如仅需检索功能可留空",
+        "hint": "⚠️ 已弃用。请使用 glm_api_key 配置RAG回答生成",
         "obvious_hint": true,
-        "default": "glm-4.7-flash"
+        "default": "glm-4.6v-flash",
+        "deprecated": true
+    },
+    "glm_api_key": {
+        "description": "智谱AI API密钥（GLM-4-Flash）",
+        "type": "string",
+        "hint": "从 https://open.bigmodel.cn/ 获取API密钥，用于RAG回答生成。GLM-4-Flash速度快、价格低。如仅需检索功能可留空",
+        "obvious_hint": true,
+        "default": "",
+        "minLength": 0
+    },
+    "glm_model": {
+        "description": "GLM模型名称",
+        "type": "string",
+        "hint": "选择GLM模型版本。glm-4.7-flash: 快速响应（推荐）；glm-4: 标准性能；glm-4-plus: 高质量输出",
+        "default": "glm-4.7-flash",
+        "enum": ["glm-4.7-flash", "glm-4", "glm-4-plus"]
+    },
+    "embedding_model": {
+        "description": "API Embedding模型名称（已弃用）",
+        "type": "string",
+        "hint": "⚠️ 已弃用。请使用 embedding_provider_id 选择Provider",
+        "default": "",
+        "minLength": 0,
+        "deprecated": true
+    },
+    "use_llama_index": {
+        "description": "使用llama-index引擎（已弃用）",
+        "type": "bool",
+        "hint": "⚠️ 已弃用。现在强制使用混合引擎",
+        "default": true,
+        "deprecated": true
     },
     "milvus_lite_path": {
         "description": "Milvus Lite 数据库路径",
         "type": "string",
-        "hint": "数据库文件路径。留空则使用默认路径 ./data/milvus_papers.db",
+        "hint": "数据库文件路径。留空则使用插件目录下的 data/milvus_papers.db",
         "obvious_hint": true,
-        "default": "./data/milvus_papers.db",
+        "default": "",
         "minLength": 0
     },
     "address": {

@@ -8,6 +8,7 @@
 - 💡 **AI问答**：结合检索内容生成准确、有引用的答案
 - 📄 **多格式支持**：PDF、Word、TXT、Markdown、HTML
 - 🖼️ **多模态提取**：自动识别PDF中的图片、表格、公式
+- 🖼️ **多模态查询**：支持图片输入进行问答
 - 💾 **本地存储**：所有数据存储在本地，保护隐私
 - ⚡ **缓存加速**：常用查询结果缓存，响应更快
 - 🦙 **Ollama支持**：使用本地Ollama服务进行免费无限制的向量化（推荐）
@@ -21,6 +22,7 @@
 ```bash
 cd ~/AstrBot/data/plugins/astrbot_plugin_paperrag
 pip install -r requirements.txt
+pip install llama-index-core llama-index-vector-stores-milvus
 ```
 
 ### 第二步：配置插件
@@ -34,7 +36,7 @@ pip install -r requirements.txt
 | Embedding模式 | `Ollama本地模式` | 使用Ollama |
 | 向量嵌入维度 | `1024` | BGE-M3固定1024维 |
 | Ollama模型名称 | `bge-m3` | 模型名称 |
-| LLM Provider ID | `glm-4.7-flash`（可选） | 用于RAG回答生成 |
+| LLM Provider ID | `glm-4.6v-flash`（可选） | 用于RAG回答生成 |
 | 论文文件存放目录 | `./papers` | PDF存放路径 |
 | 启用插件 | ✅ | - |
 
@@ -58,7 +60,7 @@ pip install -r requirements.txt
 | Embedding模式 | `API模式` | 使用API |
 | Embedding 服务提供商 | `gemini_embedding` | Gemini Embedding API |
 | 向量嵌入维度 | `768` | Gemini固定768维 |
-| LLM Provider ID | `glm-4.7-flash`（可选） | 用于RAG回答生成 |
+| LLM Provider ID | `glm-4.6v-flash`（可选） | 用于RAG回答生成 |
 | 论文文件存放目录 | `./papers` | PDF存放路径 |
 | 启用插件 | ✅ | - |
 
@@ -88,6 +90,7 @@ cp ~/Downloads/*.pdf papers/
 | `/paper search <问题> retrieve` | 仅检索相关片段 | `/paper search CNN retrieve` |
 | `/paper list` | 查看已收录文档 | `/paper list` |
 | `/paper add [目录]` | 添加文档（需管理员） | `/paper add ~/Documents/papers` |
+| `/paper rebuild [目录] confirm` | 清空并重建知识库 | `/paper rebuild ./papers confirm` |
 | `/paper clear confirm` | 清空知识库（需管理员） | `/paper clear confirm` |
 
 ### 使用示例
@@ -132,9 +135,9 @@ Bot: > The attention mechanism allows the model to focus on...
 | 配置项 | 说明 | 默认值 | 推荐值 |
 |-------|------|--------|--------|
 | `enabled` | 启用插件 | `true` | ✅ |
-| `embedding_mode` | Embedding模式 | `api` | `ollama`（推荐免费）/ `api` |
+| `embedding_mode` | Embedding模式 | `ollama` | `ollama`（推荐免费）/ `api` |
 | `embedding_provider_id` | Embedding Provider ID（API模式） | `gemini_embedding` | Gemini / OpenAI |
-| `llm_provider_id` | LLM Provider ID（可选） | - | `glm-4.7-flash` |
+| `llm_provider_id` | LLM Provider ID（可选） | - | `glm-4.6v-flash` |
 | `papers_dir` | 论文目录 | `./papers` | `./papers` |
 | `embed_dim` | 向量维度 | `768` | `1024` (BGE-M3) / `768` (Gemini) / `1536` (OpenAI) |
 
@@ -152,21 +155,24 @@ Bot: > The attention mechanism allows the model to focus on...
 | `ollama.timeout` | 请求超时（秒） | `120.0` | 默认 |
 
 > 🦙 **Ollama详细配置指南**：[OLLAMA_GUIDE.md](docs/OLLAMA_GUIDE.md)
+
+### 检索配置
+
+| 配置项 | 说明 | 默认值 | 推荐值 |
+|-------|------|--------|--------|
 | `top_k` | 返回片段数 | `5` | `5` |
 | `similarity_cutoff` | 相似度阈值 | `0.3` | `0.3` |
 
-> 💡 **Embedding Provider 说明**：插件使用 AstrBot 中配置的 Embedding Provider。推荐使用 Gemini（768维，支持批量处理）。
+> 💡 **Embedding Provider 说明**：插件使用 AstrBot 中配置的 Embedding Provider。推荐使用 Ollama（免费无限制）。
 
 ### 分块配置
 
 | 配置项 | 说明 | 默认值 | 推荐值 |
 |-------|------|--------|--------|
 | `chunk_size` | 分块大小（字符） | `512` | `512` (论文) / `384` (文档) |
-| `chunk_overlap` | 块间重叠 | `0` | `0`（避免bug） |
+| `chunk_overlap` | 块间重叠 | `0` | `0` |
 | `min_chunk_size` | 最小块大小 | `100` | `100` |
 | `use_semantic_chunking` | 智能分块 | `true` | ✅ |
-
-> 💡 **提示**：`chunk_overlap` 建议设为 0，避免已知分块bug。
 
 ### 多模态配置
 
@@ -178,6 +184,7 @@ Bot: > The attention mechanism allows the model to focus on...
 | `multimodal.extract_formulas` | 提取公式 | `true` |
 | `multimodal.nms_iou_threshold` | 图片去重阈值 | `0.5` |
 | `multimodal.enable_nms` | 启用NMS去重 | `true` |
+| `glm_multimodal_model` | 多模态模型 | `glm-4.6v-flash` |
 
 **生产环境推荐配置**：
 ```json
@@ -271,10 +278,12 @@ Bot: > The attention mechanism allows the model to focus on...
 - **包含关键词**：提问时使用专业术语
 - **调整top_k**：增加返回片段数（默认5）
 - **调整相似度阈值**：提高 `similarity_cutoff` 过滤低质量结果
+- **使用图片查询**：支持图片输入进行多模态检索
 
 ### 3. 加速导入
 
-- **批量Embedding**：自动启用批量处理（节省99% API调用）
+- **使用Ollama**：本地批量向量化，无API限制（推荐）
+- **批量Embedding**：自动启用批量处理
 - **批量导入**：一次性添加多个PDF
 - **禁用图片提取**：设置 `multimodal.extract_images: false`
 - **使用SSD**：将Milvus数据库放在SSD上
@@ -298,7 +307,8 @@ Bot: > The attention mechanism allows the model to focus on...
 
 **解决**：
 1. 确认PDF不是扫描版
-2. 安装依赖：`pip install -r requirements.txt`
+2. 安装依赖：`pip install -r requirements.txt
+pip install llama-index-core llama-index-vector-stores-milvus`
 3. 运行测试：`python test_pdf.py paper.pdf`
 
 ### Q3: 搜索结果不准确
@@ -351,7 +361,7 @@ pip install -U FlagEmbedding
 - 超过100个时自动分批处理（每批100个）
 - 完全透明，不影响使用体验
 
-### Q7: 启用重排序后速度变慢
+### Q8: 启用重排序后速度变慢
 
 **原因**：重排序增加200-500ms延迟
 
@@ -362,9 +372,64 @@ pip install -U FlagEmbedding
 
 ---
 
+## 📚 详细文档导航
+
+本插件提供完整的文档体系，涵盖用户使用、开发配置和本地Embedding等方面。
+
+### 🎯 快速导航
+
+| 需求 | 推荐文档 | 说明 |
+|------|---------|------|
+| **快速上手** | 当前文档 | 用户指南，5分钟快速开始 |
+| **文档导航** | [docs/DOCUMENTATION_INDEX.md](docs/DOCUMENTATION_INDEX.md) | 完整文档索引 |
+| **开发调试** | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | 开发者文档 |
+| **配置Ollama** | [docs/OLLAMA_QUICKREF.md](docs/OLLAMA_QUICKREF.md) | 快速参考 |
+| **深入Ollama** | [docs/OLLAMA_GUIDE.md](docs/OLLAMA_GUIDE.md) | 完整指南 |
+
+### 📂 docs/ 目录
+
+**核心文档**：
+
+1. **[DOCUMENTATION_INDEX.md](docs/DOCUMENTATION_INDEX.md)** - 📚 文档导航
+   - 快速定位所需文档
+   - 文档阅读路径
+   - 常见问题索引
+
+2. **[DEVELOPMENT.md](docs/DEVELOPMENT.md)** - 🔧 开发指南
+   - 技术架构说明
+   - 核心组件介绍
+   - 开发工作流程
+   - 故障排除（10个常见问题）
+
+3. **[OLLAMA_GUIDE.md](docs/OLLAMA_GUIDE.md)** - 🦙 Ollama完整指南
+   - Ollama安装和配置
+   - 模型选择和下载
+   - 性能优化建议
+   - 故障排除
+
+4. **[OLLAMA_QUICKREF.md](docs/OLLAMA_QUICKREF.md)** - 🦙 Ollama快速参考
+   - 一分钟开始
+   - 配置对比
+   - 快速故障排除
+
+**修复文档**：
+
+5. **[FIX_LIST_EMPTY_ISSUE.md](docs/FIX_LIST_EMPTY_ISSUE.md)** - 数据库路径问题修复
+6. **[FIX_MILVUS_API_COMPAT.md](docs/FIX_MILVUS_API_COMPAT.md)** - API兼容性修复
+
+### 📌 文档定位
+
+- **用户入口**: README.md (本文档)
+- **文档索引**: docs/DOCUMENTATION_INDEX.md
+- **开发者文档**: docs/DEVELOPMENT.md
+- **Ollama配置**: docs/OLLAMA_GUIDE.md, docs/OLLAMA_QUICKREF.md
+
+---
+
 ## 📞 获取帮助
 
-- **开发文档**：查看 [DEVELOPMENT.md](docs/DEVELOPMENT.md) 了解技术细节
+- **完整文档**：查看 [docs/DOCUMENTATION_INDEX.md](docs/DOCUMENTATION_INDEX.md) 浏览所有文档
+- **开发文档**：查看 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) 了解技术细节
 - **问题反馈**：通过 GitHub Issues 提交问题
 - **日志查看**：AstrBot 控制台输出
 

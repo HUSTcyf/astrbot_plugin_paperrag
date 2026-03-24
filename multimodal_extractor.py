@@ -13,23 +13,18 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
-# 条件导入（优雅降级）
+# 必需依赖
 from PIL import Image
-PIL_AVAILABLE = True
+import fitz  # PyMuPDF
 
-try:
-    import fitz  # PyMuPDF
-except ImportError:
-    fitz = None
-    logger.error("❌ PyMuPDF 不可用，PDF提取功能将被禁用")
-
+# 可选依赖（pdfplumber）
 try:
     import pdfplumber
     PDFPLUMBER_AVAILABLE = True
 except ImportError as e:
     PDFPLUMBER_AVAILABLE = False
     PDFPLUMBER_IMPORT_ERROR = str(e)
-    logger.warning(f"⚠️ pdfplumber 不可用: {e}")
+    logger.warning(f"⚠️ pdfplumber 不可用，表格提取功能将被禁用: {e}")
 
 
 @dataclass
@@ -114,7 +109,7 @@ class MultimodalPDFExtractor:
             self.available = True
 
         # 根据依赖可用性调整功能
-        self.extract_images = extract_images and PIL_AVAILABLE
+        self.extract_images = extract_images
         self.extract_tables = extract_tables and PDFPLUMBER_AVAILABLE
         self.extract_formulas = extract_formulas
         self.image_max_size = image_max_size
@@ -124,8 +119,6 @@ class MultimodalPDFExtractor:
         self.enable_nms = enable_nms
 
         # 记录降级情况
-        if extract_images and not PIL_AVAILABLE:
-            logger.warning("⚠️ 图片提取被禁用: Pillow 不可用")
         if extract_tables and not PDFPLUMBER_AVAILABLE:
             logger.warning("⚠️ 表格提取被禁用: pdfplumber 不可用")
 
@@ -244,8 +237,6 @@ class MultimodalPDFExtractor:
             minwh: 最小图片宽高（像素），默认10
         """
         """从页面提取图片"""
-        if not PIL_AVAILABLE:
-            return []
 
         images = []
         image_list = page.get_images(full=True)

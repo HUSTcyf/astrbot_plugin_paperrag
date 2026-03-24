@@ -148,6 +148,10 @@ class OllamaEmbeddingProvider:
             texts = [texts]
         return await self.get_embeddings(texts)
 
+    async def get_text_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
+        """批量获取文本embeddings（兼容接口）"""
+        return await self.get_embeddings(texts)
+
     async def get_text_embedding(self, text: str) -> List[float]:
         """获取单个文本的embedding（兼容接口）"""
         result = await self.embed([text])
