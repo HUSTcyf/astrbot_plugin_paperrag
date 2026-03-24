@@ -12,6 +12,7 @@
 import os
 import base64
 from typing import List, Dict, Any, Optional, Union, cast
+from pathlib import Path
 
 # 抑制底层库的 gRPC/absl 警告
 os.environ['GRPC_VERBOSITY'] = 'ERROR'
@@ -32,6 +33,13 @@ from .embedding_providers import (
 
 # 导入配置
 from .rag_engine import RAGConfig
+
+# 导入重排序模块
+from .reranker import (
+    AdaptiveReranker,
+    RerankerConfig,
+    create_reranker
+)
 
 
 class QueryResult:
@@ -120,6 +128,7 @@ class HybridRAGEngine:
         self._embed_provider: Union[OllamaEmbeddingProvider, AstrBotEmbeddingProvider, None] = None
         self._llm_client: Any = cast(Any, None)
         self._retriever: VectorRetriever = cast(VectorRetriever, None)
+        self._reranker: Optional[Any] = None
 
         # 初始化标志
         self._parser_initialized = False
@@ -127,6 +136,7 @@ class HybridRAGEngine:
         self._embed_provider_initialized = False
         self._llm_initialized = False
         self._retriever_initialized = False
+        self._reranker_initialized = False
 
     def _ensure_parser_initialized(self) -> HybridPDFParser:
         """确保解析器已初始化"""
@@ -252,6 +262,41 @@ class HybridRAGEngine:
             self._llm_initialized = True
             raise
 
+    def _ensure_reranker_initialized(self) -> Optional[AdaptiveReranker]:
+        """确保重排序器已初始化"""
+        if self._reranker_initialized:
+            return self._reranker
+
+        if not self.config.enable_reranking:
+            logger.debug("🔍 重排序未启用")
+            return None
+
+        try:
+            reranker_config = RerankerConfig(
+                model_name=self.config.reranking_model,
+                device=self.config.reranking_device,
+                batch_size=self.config.reranking_batch_size,
+                score_threshold=self.config.reranking_threshold
+            )
+            self._reranker = create_reranker(
+                model_name=self.config.reranking_model,
+                device=self.config.reranking_device,
+                batch_size=self.config.reranking_batch_size,
+                adaptive=self.config.reranking_adaptive
+            )
+            self._reranker_initialized = True
+            if self._reranker.reranker.is_available():
+                logger.info(f"✅ 重排序器初始化完成: {self.config.reranking_model}")
+            else:
+                logger.warning("⚠️ 重排序器不可用")
+                self._reranker = None
+            return self._reranker
+        except Exception as e:
+            logger.warning(f"⚠️ 重排序器初始化失败: {e}")
+            self._reranker_initialized = True
+            self._reranker = None
+            return None
+
     async def add_paper(self, file_path: str) -> Dict[str, Any]:
         """
         添加论文到知识库
@@ -320,9 +365,44 @@ class HybridRAGEngine:
         await self._ensure_embed_provider_initialized()
         self._ensure_index_manager_initialized()
         retriever = self._ensure_retriever_initialized()
+        reranker = self._ensure_reranker_initialized()
 
         try:
-            return await retriever.retrieve(query, top_k)
+            # 执行向量检索
+            query_result = await retriever.retrieve(query, top_k)
+
+            # 如果启用了重排序且结果数量足够，进行重排序
+            if reranker and len(query_result.nodes) >= 3:
+                # 转换为字典格式
+                results_dict = []
+                for i, node in enumerate(query_result.nodes):
+                    results_dict.append({
+                        "text": node.text,
+                        "metadata": node.metadata,
+                        "score": query_result.scores[i] if i < len(query_result.scores) else 0.0
+                    })
+
+                # 执行重排序
+                reranked_results = await reranker.rerank(
+                    query=query,
+                    results=results_dict,
+                    top_k=top_k
+                )
+
+                # 转换回Node列表
+                nodes = []
+                scores = []
+                for item in reranked_results:
+                    nodes.append(Node(
+                        text=item["text"],
+                        metadata=item["metadata"]
+                    ))
+                    scores.append(item.get("rerank_score", item.get("score", 0.0)))
+
+                logger.info(f"✅ 重排序完成: {len(query_result.nodes)} → {len(nodes)} 个节点")
+                return QueryResult(nodes=nodes, scores=scores)
+
+            return query_result
         except Exception as e:
             logger.error(f"❌ 检索失败: {e}")
             return QueryResult(nodes=[], scores=[])
@@ -384,9 +464,15 @@ class HybridRAGEngine:
         """
         检索 + RAG生成（支持多模态）
 
+        方案B核心流程：
+        1. 检索相关文档
+        2. 路由判断：查询含视觉关键词 OR 检索结果有关联图片 → 使用VLM
+        3. VLM模式：从检索结果提取图片路径，传递给多模态模型
+        4. LLM模式：纯文本生成
+
         Args:
             query: 查询文本
-            images: 图片路径列表（可选）
+            images: 用户直接上传的图片路径列表（可选）
         """
         try:
             # 检查LLM是否可用
@@ -417,9 +503,31 @@ class HybridRAGEngine:
                     "score": query_result.scores[i] if i < len(query_result.scores) else 0.0
                 })
 
-            # 生成答案（支持多模态）
+            # 方案B：VLM路由判断
+            # 用户直接上传图片 → 直接使用VLM
+            # 否则根据查询和检索结果自动判断
+            if images:
+                # 用户上传了图片，直接使用VLM
+                final_images = images
+                logger.info(f"🖼️ 用户上传 {len(images)} 张图片，使用VLM模式")
+            else:
+                # 自动路由：根据查询和检索结果判断
+                if self._should_use_vlm(query, sources):
+                    # 从检索结果提取关联图片
+                    final_images = self._extract_image_paths_from_sources(sources)
+                    if final_images:
+                        logger.info(f"🖼️ 检索到 {len(final_images)} 张关联图片，使用VLM模式")
+                    else:
+                        # 有视觉关键词但没有关联图片，回退到LLM
+                        logger.info(f"📝 检测到视觉关键词但无关联图片，使用LLM模式")
+                        final_images = None
+                else:
+                    final_images = None
+                    logger.info(f"📝 纯文本查询，使用LLM模式")
+
+            # 生成答案
             answer = await self._generate_answer_with_llm(
-                llm_client, query, sources, images=images
+                llm_client, query, sources, images=final_images
             )
 
             return {
@@ -427,7 +535,7 @@ class HybridRAGEngine:
                 "query": query,
                 "answer": answer,
                 "sources": sources,
-                "images": images if images else None
+                "images": final_images
             }
 
         except Exception as e:
@@ -445,6 +553,57 @@ class HybridRAGEngine:
                 return encoded_data
         except Exception as e:
             logger.error(f"❌ 图片编码失败 {image_path}: {e}")
+            return None
+
+    # VLM 图片 transform 配置
+    VLM_MAX_IMAGE_SIZE = (1024, 1024)  # VLM 输入图片最大尺寸
+
+    def _transform_image_for_vlm(self, image_path: str) -> Optional[str]:
+        """
+        将图片 transform 后返回 base64（用于 VLM）
+
+        方案B：保存时存原图，查询时统一 transform
+        - 压缩到 VLM 合适的大小
+        - 转为 base64 供 VLM 使用
+
+        Args:
+            image_path: 图片路径
+
+        Returns:
+            base64 编码字符串，失败返回 None
+        """
+        try:
+            from PIL import Image
+            import io
+
+            # 打开原图
+            image = Image.open(image_path)
+            original_size = image.size
+
+            # 计算新的尺寸（保持宽高比）
+            max_w, max_h = self.VLM_MAX_IMAGE_SIZE
+            if image.size[0] > max_w or image.size[1] > max_h:
+                image.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
+
+            # 转换为 RGB（如果是 RGBA）
+            if image.mode == 'RGBA':
+                image = image.convert('RGB')
+
+            # 压缩为 JPEG 并返回 base64
+            buffered = io.BytesIO()
+            image.save(buffered, format="JPEG", quality=85, optimize=True)
+            encoded_data = base64.b64encode(buffered.getvalue()).decode('utf-8')
+
+            # 计算压缩率
+            new_size = len(buffered.getvalue()) / 1024  # KB
+            original_size_kb = Path(image_path).stat().st_size / 1024
+
+            logger.debug(f"🖼️ [VLM Transform] {Path(image_path).name}: {original_size[0]}x{original_size[1]} → {image.size[0]}x{image.size[1]}, {original_size_kb:.1f}KB → {new_size:.1f}KB")
+
+            return encoded_data
+
+        except Exception as e:
+            logger.error(f"❌ 图片 transform 失败 {image_path}: {e}")
             return None
 
     async def _generate_answer_with_llm(
@@ -494,9 +653,10 @@ class HybridRAGEngine:
                     "text": text_prompt
                 })
 
-                # 添加图片部分
-                for image_path in images:
-                    base64_image = self._encode_image_to_base64(image_path)
+                # 添加图片部分（限制最多3张，避免Token爆炸）
+                for image_path in images[:3]:
+                    # 方案B：查询时统一transform（原图保存，VLM推理时压缩）
+                    base64_image = self._transform_image_for_vlm(image_path)
                     if base64_image:
                         content.append({
                             "type": "image_url",
@@ -509,7 +669,7 @@ class HybridRAGEngine:
                     {"role": "user", "content": content}
                 ]
 
-                logger.info(f"🖼️ 使用多模态模式查询 (模型: {model}, 图片数: {len(images)})")
+                logger.info(f"🖼️ 使用VLM模式查询 (模型: {model}, 图片数: {min(len(images), 3)})")
             else:
                 # 使用文本模型
                 model = self.config.glm_model
@@ -533,6 +693,82 @@ class HybridRAGEngine:
         except Exception as e:
             logger.error(f"❌ LLM生成失败: {e}")
             return f"生成答案失败: {e}"
+
+    # ==================== 方案B：VLM路由逻辑 ====================
+
+    # 视觉关键词（用于检测是否需要VLM）
+    VISUAL_KEYWORDS = [
+        "图", "figure", "chart", "plot", "graph",
+        "表格", "table", "公式", "formula", "equation",
+        "架构", "architecture", "diagram", "示意图",
+        "图像", "picture", "photo", "image",
+        "多少", "数值", "数据", "哪个大", "哪个小",
+        "颜色", "曲线", "峰值", "趋势"
+    ]
+
+    def _should_use_vlm(self, query: str, sources: List[Dict[str, Any]]) -> bool:
+        """
+        判断是否应该使用VLM（多模态模型）
+
+        方案B核心路由逻辑：
+        1. 查询关键词检测（视觉相关词汇）
+        2. 检索结果检测（是否关联了原图）
+        3. 同时满足则使用VLM
+
+        Args:
+            query: 用户查询
+            sources: 检索到的源文档
+
+        Returns:
+            True: 使用VLM，False: 使用纯文本LLM
+        """
+        # 检查查询是否包含视觉关键词
+        query_has_visual = any(
+            keyword in query.lower()
+            for keyword in self.VISUAL_KEYWORDS
+        )
+
+        # 检查检索结果是否关联了图片
+        sources_have_images = any(
+            src.get("metadata", {}).get("image_path")
+            for src in sources
+        )
+
+        # VLM条件：查询涉及视觉 OR 检索结果有图片
+        use_vlm = query_has_visual or sources_have_images
+
+        logger.debug(f"🔍 [VLM路由] query_has_visual={query_has_visual}, sources_have_images={sources_have_images} → use_vlm={use_vlm}")
+
+        return use_vlm
+
+    def _extract_image_paths_from_sources(self, sources: List[Dict[str, Any]]) -> List[str]:
+        """
+        从检索结果中提取所有关联的图片路径
+
+        Args:
+            sources: 检索到的源文档
+
+        Returns:
+            图片路径列表（去重，最多返回3个）
+        """
+        image_paths = []
+        seen = set()
+
+        for src in sources:
+            image_path = src.get("metadata", {}).get("image_path")
+            if image_path and image_path not in seen:
+                seen.add(image_path)
+                image_paths.append(image_path)
+
+            # 也检查顶层 metadata
+            if isinstance(src.get("metadata"), dict):
+                image_path = src["metadata"].get("image_path")
+                if image_path and image_path not in seen:
+                    seen.add(image_path)
+                    image_paths.append(image_path)
+
+        # 限制最多3张图片
+        return image_paths[:3]
 
     async def list_documents(self) -> List[Dict[str, Any]]:
         """列出所有文档（按文件分组）"""

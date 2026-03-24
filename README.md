@@ -1,6 +1,6 @@
-# 📚 Paper RAG Plugin - 用户指南
+# 📚 Paper RAG Plugin v2.0 - 用户指南
 
-本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力。
+本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力（支持多模态VLM问答）。
 
 ## ✨ 核心功能
 
@@ -8,10 +8,11 @@
 - 💡 **AI问答**：结合检索内容生成准确、有引用的答案
 - 📄 **多格式支持**：PDF、Word、TXT、Markdown、HTML
 - 🖼️ **多模态提取**：自动识别PDF中的图片、表格、公式
-- 🖼️ **多模态查询**：支持图片输入进行问答
+- 🖼️ **多模态查询**：支持图片输入进行VLM问答（方案B：原图+VLM）
 - 💾 **本地存储**：所有数据存储在本地，保护隐私
 - ⚡ **缓存加速**：常用查询结果缓存，响应更快
 - 🦙 **Ollama支持**：使用本地Ollama服务进行免费无限制的向量化（推荐）
+- 🏎️ **重排序支持**：FlagEmbedding加速检索精度
 
 ---
 
@@ -22,7 +23,7 @@
 ```bash
 cd ~/AstrBot/data/plugins/astrbot_plugin_paperrag
 pip install -r requirements.txt
-pip install llama-index-core llama-index-vector-stores-milvus
+pip install llama-index-core llama-index-vector-stores-milvus FlagEmbedding
 ```
 
 ### 第二步：配置插件
@@ -36,7 +37,7 @@ pip install llama-index-core llama-index-vector-stores-milvus
 | Embedding模式 | `Ollama本地模式` | 使用Ollama |
 | 向量嵌入维度 | `1024` | BGE-M3固定1024维 |
 | Ollama模型名称 | `bge-m3` | 模型名称 |
-| LLM Provider ID | `glm-4.6v-flash`（可选） | 用于RAG回答生成 |
+| glm_api_key | `glm-4.7-flash`（可选） | 用于RAG回答生成 |
 | 论文文件存放目录 | `./papers` | PDF存放路径 |
 | 启用插件 | ✅ | - |
 
@@ -60,7 +61,7 @@ pip install llama-index-core llama-index-vector-stores-milvus
 | Embedding模式 | `API模式` | 使用API |
 | Embedding 服务提供商 | `gemini_embedding` | Gemini Embedding API |
 | 向量嵌入维度 | `768` | Gemini固定768维 |
-| LLM Provider ID | `glm-4.6v-flash`（可选） | 用于RAG回答生成 |
+| glm_api_key | `glm-4.7-flash`（可选） | 用于RAG回答生成 |
 | 论文文件存放目录 | `./papers` | PDF存放路径 |
 | 启用插件 | ✅ | - |
 
@@ -137,8 +138,11 @@ Bot: > The attention mechanism allows the model to focus on...
 | `enabled` | 启用插件 | `true` | ✅ |
 | `embedding_mode` | Embedding模式 | `ollama` | `ollama`（推荐免费）/ `api` |
 | `embedding_provider_id` | Embedding Provider ID（API模式） | `gemini_embedding` | Gemini / OpenAI |
-| `llm_provider_id` | LLM Provider ID（可选） | - | `glm-4.6v-flash` |
+| `glm_api_key` | 智谱AI API密钥 | - | 用于RAG回答生成 |
+| `glm_model` | GLM文本模型 | `glm-4.7-flash` | `glm-4.7-flash` / `glm-4` |
+| `glm_multimodal_model` | GLM多模态模型 | `glm-4.6v-flash` | `glm-4.6v-flash`（用于图片问答） |
 | `papers_dir` | 论文目录 | `./papers` | `./papers` |
+| `figures_dir` | 图片存储目录 | `data/figures` | 插件目录下的 data/figures |
 | `embed_dim` | 向量维度 | `768` | `1024` (BGE-M3) / `768` (Gemini) / `1536` (OpenAI) |
 
 > 💡 **Embedding模式对比**：
@@ -184,7 +188,8 @@ Bot: > The attention mechanism allows the model to focus on...
 | `multimodal.extract_formulas` | 提取公式 | `true` |
 | `multimodal.nms_iou_threshold` | 图片去重阈值 | `0.5` |
 | `multimodal.enable_nms` | 启用NMS去重 | `true` |
-| `glm_multimodal_model` | 多模态模型 | `glm-4.6v-flash` |
+
+> 💡 **VLM路由说明**：查询含视觉关键词（"图"、"表格"、"公式"等）或检索结果关联图片时，自动使用 `glm_multimodal_model` 进行多模态回答。
 
 **生产环境推荐配置**：
 ```json
@@ -360,15 +365,6 @@ pip install -U FlagEmbedding
 - 插件自动检测文本数量
 - 超过100个时自动分批处理（每批100个）
 - 完全透明，不影响使用体验
-
-### Q8: 启用重排序后速度变慢
-
-**原因**：重排序增加200-500ms延迟
-
-**解决**：
-- 启用自适应模式：`reranking_adaptive: true`
-- 使用GPU加速：`reranking_device: mps/cuda`
-- 调整批处理大小：减小`reranking_batch_size`
 
 ---
 

@@ -312,9 +312,9 @@ class MultimodalPDFExtractor:
         使用多级策略过滤重复图片
 
         策略：
-        1. 基于图注去重：相同图注编号的图片，只保留尺寸最大的
-        2. 基于图片尺寸去重：相同尺寸的图片认为是重复的
-        3. NMS位置去重：IoU > 阈值的重叠图片，保留面积大的
+        0. 基于图片尺寸去重：相同尺寸的图片认为是重复的
+        1. ⚠️ 跳过基于图注去重：让所有相同图注的图片保留，用于计算完整大图
+        2. NMS位置去重：IoU > 阈值的重叠图片，保留面积大的
 
         Args:
             images: 提取的图片列表
@@ -336,96 +336,12 @@ class MultimodalPDFExtractor:
         original_count = len(images)
         current_images = images
 
-        # 第零步：基于图片尺寸去重
-        size_seen = set()
-        size_unique_images = []
-        size_duplicates = 0
+        # ⚠️ 跳过基于图片尺寸去重：相同尺寸可能是不同的子图
+        # ⚠️ 跳过基于图注的去重：保留所有相同图注的图片，后续在 hybrid_parser 中合并为完整大图
 
-        for img in current_images:
-            if img.image:
-                img_size = img.image.size  # (width, height)
-                size_key = (img_size[0], img_size[1])
+        logger.warning(f"🔍 [DEBUG 页 {page_num}] 保留所有 {len(current_images)} 张图片（尺寸去重和图注去重已跳过，将在后续合并为完整大图）")
 
-                if size_key not in size_seen:
-                    size_seen.add(size_key)
-                    size_unique_images.append(img)
-                else:
-                    size_duplicates += 1
-                    logger.debug(f"🔍 [尺寸去重 页 {page_num}] 重复尺寸 {img_size[0]}x{img_size[1]}")
-
-        if size_duplicates > 0:
-            logger.info(f"🔍 [尺寸去重 页 {page_num}] 过滤前: {len(current_images)} 张，尺寸重复: {size_duplicates} 张，保留: {len(size_unique_images)} 张")
-
-        current_images = size_unique_images
-
-        # 第一步：基于图注去重（相同图注编号，保留尺寸最大的）
-        caption_groups = {}  # {caption_key: [(img, area), ...]}
-
-        for img in current_images:
-            # 提取图注编号（如 "Figure 1"）
-            caption_key = self._extract_figure_number(img.caption)
-            # logger.warning(f"🔍 [DEBUG 页 {page_num}] 提取图注: caption='{img.caption}' -> key='{caption_key}'")
-
-            # 🔧 关键修复：只有图片存在时才处理
-            if img.image:
-                img_area = img.image.size[0] * img.image.size[1]
-
-                # 🔧 关键修复：如果没有图注，使用特殊标记而不是跳过
-                if not caption_key:
-                    caption_key = f"no_caption_{len(caption_groups)}"
-
-                # logger.warning(f"🔍 [DEBUG 页 {page_num}]   添加到组 {caption_key}: area={img_area}")
-
-                if caption_key not in caption_groups:
-                    caption_groups[caption_key] = []
-                caption_groups[caption_key].append((img, img_area))
-            else:
-                logger.warning(f"🔍 [DEBUG 页 {page_num}]   跳过: no image")
-
-        logger.warning(f"🔍 [DEBUG 页 {page_num}] 图注分组完成: {len(caption_groups)} 个组")
-        for key, img_list in caption_groups.items():
-            logger.warning(f"🔍 [DEBUG 页 {page_num}]   组 '{key}': {len(img_list)} 张图片")
-
-        # 对每个图注组，只保留尺寸最大的图片
-        caption_dedup_images = []
-        caption_duplicates = 0
-
-        # 处理有图注的图片
-        used_images = []
-        for caption_key, img_list in caption_groups.items():
-            # 🔧 关键修复：如果没有图注，直接保留所有图片
-            if caption_key.startswith("no_caption_"):
-                logger.warning(f"🔍 [DEBUG 页 {page_num}] 无图注组 '{caption_key}': 保留全部 {len(img_list)} 张图片")
-                for img, _ in img_list:
-                    caption_dedup_images.append(img)
-                used_images.extend(img_list)
-                continue
-
-            # 有图注的图片：每组只保留最大的
-            if len(img_list) > 1:
-                # 按面积降序排序
-                img_list.sort(key=lambda x: x[1], reverse=True)
-                # 只保留最大的
-                kept_img = img_list[0][0]
-                caption_dedup_images.append(kept_img)
-                caption_duplicates += len(img_list) - 1
-                logger.warning(f"🔍 [DEBUG 页 {page_num}] 组 '{caption_key}': {len(img_list)} 张 → 保留最大尺寸 {kept_img.image.size}")
-            else:
-                kept_img = img_list[0][0]
-                caption_dedup_images.append(kept_img)
-                logger.warning(f"🔍 [DEBUG 页 {page_num}] 组 '{caption_key}': 只有1张，保留 {kept_img.image.size}")
-
-            used_images.extend(img_list)
-        
-        # 添加没有图注的图片
-        after_caption_dedup = caption_dedup_images
-        if keep_no_cap:
-            no_caption_images = [img for img in current_images if img not in used_images]
-            after_caption_dedup = caption_dedup_images + no_caption_images
-
-        current_images = after_caption_dedup
-
-        # 第三步：NMS位置去重（仅对有效bbox的图片）
+        # NMS位置去重（仅对有效bbox的图片）- 保留
         valid_bbox_images = [img for img in current_images if img.bbox != (0, 0, 0, 0)]
         no_bbox_images = [img for img in current_images if img.bbox == (0, 0, 0, 0)]
 

@@ -11,12 +11,14 @@
 import os
 import re
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 from dataclasses import dataclass
 
 # 抑制底层库的 gRPC/absl 警告
 os.environ['GRPC_VERBOSITY'] = 'ERROR'
 os.environ['GLOG_minloglevel'] = '2'
+
+import fitz  # PyMuPDF
 
 from astrbot.api import logger
 
@@ -39,6 +41,7 @@ class HybridPDFParser:
     - 自定义多模态提取（PDFParserAdvanced）
     - 语义分块（保持语句/段落完整）
     - 块重叠（保持语义连贯）
+    - 图片存储与关联（方案B：存储原图路径供VLM使用）
     """
 
     # 中断符号优先级（越靠前越优先作为断点）
@@ -61,7 +64,8 @@ class HybridPDFParser:
         enable_multimodal: bool = True,
         chunk_size: int = 512,
         chunk_overlap: int = 50,
-        min_chunk_size: int = 100
+        min_chunk_size: int = 100,
+        figures_dir: str = ""
     ):
         """
         初始化混合解析器
@@ -71,16 +75,21 @@ class HybridPDFParser:
             chunk_size: 分块大小（字符数）
             chunk_overlap: 分块重叠大小（字符数）
             min_chunk_size: 最小块大小（避免太小）
+            figures_dir: 图片存储目录（空则使用 papers/figures）
         """
         self.enable_multimodal = enable_multimodal
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.min_chunk_size = min_chunk_size
+        self.figures_dir = figures_dir
 
         # 初始化自定义PDF解析器
         self.pdf_parser = PDFParserAdvanced(
             enable_multimodal=enable_multimodal
         )
+
+        # 图片索引计数器（用于生成唯一文件名）
+        self._image_counter = 0
 
         logger.info(f"✅ HybridPDFParser初始化完成 (chunk_size={chunk_size}, overlap={chunk_overlap}, min_size={min_chunk_size})")
 
@@ -189,6 +198,13 @@ class HybridPDFParser:
                 logger.warning(f"⚠️ 无法解析PDF: {pdf_path}")
                 return []
 
+            # 方案B：提取并保存图片（获取图片路径映射）
+            image_paths = {}
+            image_pages = {}
+            if documents and self.enable_multimodal:
+                multimodal_data = documents[0].metadata.get("multimodal_data", {})
+                image_paths, image_pages = self._extract_and_save_images(pdf_path, multimodal_data)
+
             # 语义分块
             logger.debug(f"🔄 语义分块处理...")
             all_nodes = []
@@ -198,6 +214,10 @@ class HybridPDFParser:
                 nodes = self._semantic_chunk(doc.text, doc.metadata, chunk_index)
                 all_nodes.extend(nodes)
                 chunk_index += len(nodes)
+
+            # 方案B：将图片路径关联到最近的 chunk
+            if image_paths:
+                all_nodes = self._associate_images_with_chunks(all_nodes, image_paths, image_pages)
 
             logger.debug(f"✅ 语义分块完成: {len(all_nodes)} 个nodes")
             return all_nodes
@@ -538,3 +558,371 @@ class HybridPDFParser:
             Node列表
         """
         return self._semantic_chunk(text, base_metadata, start_chunk_index)
+
+    # ==================== 方案B：图片存储与关联（VLM支持） ====================
+
+    def _get_figures_dir(self, pdf_path: str) -> str:
+        """
+        获取图片存储目录
+
+        Args:
+            pdf_path: PDF文件路径
+
+        Returns:
+            图片存储目录路径
+        """
+        if self.figures_dir:
+            return self.figures_dir
+
+        # 默认使用插件目录下的 data/figures
+        plugin_dir = Path(__file__).parent
+        return str(plugin_dir / "data" / "figures")
+
+    def _save_image_to_disk(
+        self,
+        image: Any,
+        pdf_path: str,
+        page_num: int,
+        image_index: Any
+    ) -> Optional[str]:
+        """
+        保存图片到磁盘（方案B核心）
+
+        将提取的图片保存到磁盘，返回图片路径。
+        这个路径将存储在 Milvus 中，供 VLM 后续加载。
+
+        Args:
+            image: PIL.Image 对象
+            pdf_path: PDF文件路径
+            page_num: 页码
+            image_index: 图片索引
+
+        Returns:
+            图片文件路径，失败返回 None
+        """
+        try:
+            from PIL import Image
+            import io
+
+            figures_dir = self._get_figures_dir(pdf_path)
+
+            # 确保目录存在
+            figures_path = Path(figures_dir)
+            figures_path.mkdir(parents=True, exist_ok=True)
+
+            # 生成唯一文件名：{pdf_name}_p{page}_i{index}.png
+            pdf_name = Path(pdf_path).stem
+            filename = f"{pdf_name}_p{page_num}_i{image_index}.png"
+            image_path = figures_path / filename
+
+            # 保存为 PNG（原图保存，查询时再transform）
+            image.save(str(image_path), format="PNG", optimize=True)
+
+            # 获取文件大小
+            file_size = image_path.stat().st_size / 1024  # KB
+
+            logger.info(f"🖼️ 保存图片: {filename} (页{page_num}, {image.size[0]}x{image.size[1]}, {file_size:.1f}KB) → {image_path}")
+
+            return str(image_path)
+
+        except Exception as e:
+            logger.warning(f"⚠️ 保存图片失败: {e}")
+            return None
+
+    def _extract_and_save_images(self, pdf_path: str, multimodal_data: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, int]]:
+        """
+        提取并保存图片，返回图片路径映射
+
+        方案B核心：提取图片保存到磁盘，供 VLM 后续加载。
+
+        改进：基于图注和位置聚类，提取完整大图
+        - 将相同图注（Figure 1, Figure 2）的图片按位置聚类
+        - 计算覆盖所有子图的外接矩形
+        - 从 PDF 页面直接裁剪外接矩形区域，得到完整大图
+
+        Args:
+            pdf_path: PDF文件路径
+            multimodal_data: 多模态数据（包含 images 列表）
+
+        Returns:
+            Tuple[Dict[str, str], Dict[str, int]]: (图注->图片路径, 图注->页码) 的映射
+        """
+        image_paths: Dict[str, str] = {}
+        image_pages: Dict[str, int] = {}
+
+        images = multimodal_data.get("images", [])
+        if not images:
+            return image_paths, image_pages
+
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception as e:
+            logger.warning(f"⚠️ 无法打开PDF提取图片: {pdf_path}, {e}")
+            return image_paths, image_pages
+
+        try:
+            # 第一步：按图注分组图片
+            caption_groups = self._group_images_by_caption(images)
+
+            # 第二步：对每组图片，提取完整大图
+            for caption, img_list in caption_groups.items():
+                if not img_list:
+                    continue
+
+                try:
+                    page_num = img_list[0].get("page_number", 0)
+                    if page_num == 0:
+                        continue
+
+                    # 获取该页面的所有图片 bbox
+                    page = doc[page_num - 1]
+                    image_list = page.get_images(full=True)
+
+                    # 构建该组图片的 bbox 列表
+                    group_bboxes = []
+                    for img_info in img_list:
+                        img_idx = img_info.get("image_index", 0)
+                        if img_idx < len(image_list):
+                            # 获取图片在页面上的位置
+                            img_rects = page.get_image_rects(image_list[img_idx][0])
+                            if img_rects:
+                                group_bboxes.append(img_rects[0])
+
+                    if not group_bboxes:
+                        continue
+
+                    # 计算外接矩形
+                    merged_rect = self._merge_bboxes(group_bboxes)
+
+                    # 从 PDF 页面裁剪外接矩形区域
+                    clipped_image = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=merged_rect)
+                    pil_image = self._pixmap_to_pil_image(clipped_image)
+
+                    if pil_image:
+                        # 保存完整大图（使用图注作为索引）
+                        figure_idx = self._extract_figure_number(caption)
+                        image_path = self._save_image_to_disk(
+                            pil_image, pdf_path, page_num, figure_idx
+                        )
+                        if image_path:
+                            # 每个图注只保存一次
+                            if caption not in image_paths:
+                                image_paths[caption] = image_path
+                                image_pages[caption] = page_num
+
+                except Exception as e:
+                    logger.debug(f"⚠️ 处理图片组 {caption} 失败: {e}")
+                    continue
+
+        finally:
+            doc.close()
+
+        if image_paths:
+            figures_dir = self._get_figures_dir(pdf_path)
+            logger.info(f"✅ [方案B] 从 PDF 提取并保存 {len(image_paths)} 张完整大图至 {figures_dir}")
+            for caption, path in image_paths.items():
+                logger.info(f"   {caption} (页{image_pages[caption]}) → {Path(path).name}")
+
+        return image_paths, image_pages
+
+    def _group_images_by_caption(self, images: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        将图片按图注分组
+
+        规则：
+        1. 有 caption 的图片：相同 caption 为一组
+        2. 无 caption 的图片：分配到距离最近的 captioned 组
+
+        Args:
+            images: 图片信息列表
+
+        Returns:
+            Dict[str, List[Dict]]: 图注 -> 图片列表 的映射
+        """
+        groups = {}  # {caption: [img_info, ...]}
+        no_caption_images = []
+
+        # 第一步：将所有图片按 caption 分组
+        for img_info in images:
+            caption = img_info.get("caption")
+            if caption:
+                # 有 caption 的图片
+                if caption not in groups:
+                    groups[caption] = []
+                groups[caption].append(img_info)
+            else:
+                # 无 caption 的图片暂存
+                no_caption_images.append(img_info)
+
+        # 第二步：无 caption 的图片分配到最近的组
+        for img in no_caption_images:
+            img_page = img.get("page_number", 0)
+            if img_page == 0:
+                # 无法确定页码，加入第一个组或创建 no_caption 组
+                if groups:
+                    groups[list(groups.keys())[0]].append(img)
+                else:
+                    groups["no_caption"] = [img]
+                continue
+
+            # 找距离最近的组
+            best_caption = None
+            min_distance = float('inf')
+
+            for caption, img_list in groups.items():
+                if not img_list:
+                    continue
+                # 使用该组第一张图片的页码作为组页码
+                group_page = img_list[0].get("page_number", 0)
+                distance = abs(group_page - img_page)
+                if distance < min_distance:
+                    min_distance = distance
+                    best_caption = caption
+
+            # 加入最近的组
+            if best_caption:
+                groups[best_caption].append(img)
+            else:
+                # 没有 captioned 组，创建 no_caption 组
+                if "no_caption" not in groups:
+                    groups["no_caption"] = []
+                groups["no_caption"].append(img)
+
+        return groups
+
+    def _merge_bboxes(self, bboxes: List) -> "fitz.Rect":
+        """
+        计算多个 bbox 的外接矩形
+
+        Args:
+            bboxes: bbox 列表 [(x0, y0, x1, y1), ...]
+
+        Returns:
+            覆盖所有 bbox 的外接矩形
+        """
+        if not bboxes:
+            return fitz.Rect(0, 0, 0, 0)
+
+        x0 = min(b.x0 for b in bboxes)
+        y0 = min(b.y0 for b in bboxes)
+        x1 = max(b.x1 for b in bboxes)
+        y1 = max(b.y1 for b in bboxes)
+
+        return fitz.Rect(x0, y0, x1, y1)
+
+    def _pixmap_to_pil_image(self, pixmap) -> Optional[Any]:
+        """
+        将 PyMuPDF Pixmap 转换为 PIL Image
+
+        Args:
+            pixmap: PyMuPDF Pixmap 对象
+
+        Returns:
+            PIL Image 对象
+        """
+        try:
+            from PIL import Image
+            import io
+
+            # Pixmap 转换为 PNG bytes
+            png_data = pixmap.tobytes("png")
+            return Image.open(io.BytesIO(png_data))
+        except Exception as e:
+            logger.debug(f"⚠️ Pixmap 转 PIL Image 失败: {e}")
+            return None
+
+    def _extract_figure_number(self, caption: str) -> str:
+        """
+        从图注中提取编号
+
+        Args:
+            caption: 图注文本，如 "Figure 1: xxx"
+
+        Returns:
+            图注编号，如 "1"
+        """
+        import re
+        match = re.search(r'(?:Figure|Fig\.)\s*(\d+|[A-Z]\d?)', caption, re.IGNORECASE)
+        if match:
+            return match.group(1)
+        return caption.replace(" ", "_")
+
+    def _associate_images_with_chunks(
+        self,
+        nodes: List[Node],
+        image_paths: Dict[str, str],
+        image_pages: Dict[str, int] = {}
+    ) -> List[Node]:
+        """
+        将图片路径关联到最近的 chunk
+
+        方案B核心：基于页码 proximity 将图片分配给最近的文本块。
+        这样检索时可以根据 chunk 关联到对应的原图。
+
+        Args:
+            nodes: 分块后的节点列表
+            image_paths: 图注 -> 图片路径 的映射
+            image_pages: 图注 -> 页码 的映射
+
+        Returns:
+            添加了 image_path 信息的节点列表
+        """
+        if not image_paths:
+            return nodes
+
+        # 如果没有提供 image_pages，尝试从路径解析（旧格式兼容）
+        if image_pages is None:
+            image_pages = {}
+            for caption, path in image_paths.items():
+                # 从路径解析页码，格式: {pdf_name}_p{page}_i{index}.png
+                import re
+                match = re.search(r'_p(\d+)_i', Path(path).stem)
+                if match:
+                    image_pages[caption] = int(match.group(1))
+        if not image_paths:
+            return nodes
+
+        # 解析每个 chunk 所属的页码
+        associated_count = 0
+        for node in nodes:
+            node.metadata = dict(node.metadata)  # 复制避免修改原数据
+
+            # 尝试从文本中提取页码
+            page_num = self._extract_page_number_from_text(node.text)
+
+            # 查找最近页码的图片（图注）
+            closest_caption = None
+            min_distance = float('inf')
+
+            for caption, img_page in image_pages.items():
+                distance = abs(img_page - page_num) if page_num > 0 else abs(img_page - 1)
+                if distance < min_distance:
+                    min_distance = distance
+                    closest_caption = caption
+
+            # 只关联最近页的图片（距离不超过2页）
+            if closest_caption is not None and min_distance <= 2:
+                node.metadata["image_path"] = image_paths[closest_caption]
+                node.metadata["image_caption"] = closest_caption
+                node.metadata["has_image"] = True
+                associated_count += 1
+            else:
+                node.metadata["has_image"] = False
+
+        logger.info(f"✅ [方案B] 关联 {associated_count}/{len(nodes)} 个文本块到图片")
+        return nodes
+
+    def _extract_page_number_from_text(self, text: str) -> int:
+        """从文本中提取页码"""
+        import re
+        # 匹配 [Page X] 格式
+        match = re.search(r'\[Page\s+(\d+)\]', text)
+        if match:
+            return int(match.group(1))
+
+        # 匹配第X页
+        match = re.search(r'第\s*(\d+)\s*页', text)
+        if match:
+            return int(match.group(1))
+
+        return 0

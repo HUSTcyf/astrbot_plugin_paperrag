@@ -41,7 +41,7 @@ from .rag_engine import (
     "paper_rag",
     "YourName",
     "本地文档库RAG检索插件 (支持PDF/Word/TXT/HTML, Gemini + Milvus Lite)",
-    "1.0.0",
+    "2.0.0",
     "https://github.com/your/repo"
 )
 class PaperRAGPlugin(Star):
@@ -73,34 +73,27 @@ class PaperRAGPlugin(Star):
             try:
                 # 从插件配置创建RAG配置
                 rag_config = RAGConfig(
+                    embedding_mode=self.config.get("embedding_mode", "ollama"),
                     embedding_provider_id=self.config.get("embedding_provider_id", ""),
-                    llm_provider_id=self.config.get("llm_provider_id", ""),
-                    # GLM配置（新增 - llama-index集成）
                     glm_api_key=self.config.get("glm_api_key", ""),
                     glm_model=self.config.get("glm_model", "glm-4.7-flash"),
-                    embedding_model=self.config.get("embedding_model", ""),
-                    # Embedding模式配置
-                    embedding_mode=self.config.get("embedding_mode", "ollama"),
-                    # Ollama配置
+                    glm_multimodal_model=self.config.get("glm_multimodal_model", "glm-4.6v-flash"),
                     ollama_config=self.config.get("ollama", {}),
-                    # Milvus配置
                     milvus_lite_path=self.config.get("milvus_lite_path", ""),
                     address=self.config.get("address", ""),
                     db_name=self.config.get("db_name", "default"),
                     authentication=self.config.get("authentication", {}),
                     collection_name=self.config.get("collection_name", "paper_embeddings"),
-                    embed_dim=self.config.get("embed_dim", 1024),
+                    embed_dim=self.config.get("embed_dim", 768),
                     top_k=self.config.get("top_k", 5),
                     similarity_cutoff=self.config.get("similarity_cutoff", 0.3),
                     papers_dir=self.config.get("papers_dir", "./papers"),
-                    # 语义分块配置
                     chunk_size=self.config.get("chunk_size", 512),
-                    chunk_overlap=self.config.get("chunk_overlap", 0),  # 默认0避免bug
+                    chunk_overlap=self.config.get("chunk_overlap", 0),
                     min_chunk_size=self.config.get("min_chunk_size", 100),
                     use_semantic_chunking=self.config.get("use_semantic_chunking", True),
-                    # 多模态配置
                     enable_multimodal=self.config.get("multimodal", {}).get("enabled", True),
-                    # 重排序配置
+                    figures_dir=self.config.get("figures_dir", ""),
                     enable_reranking=self.config.get("enable_reranking", False),
                     reranking_model=self.config.get("reranking_model", "BAAI/bge-reranker-v2-m3"),
                     reranking_device=self.config.get("reranking_device", "auto"),
@@ -110,13 +103,11 @@ class PaperRAGPlugin(Star):
                 )
 
                 # 验证配置
-                logger.debug("🐛 [DEBUG] _get_engine: 验证配置")
                 valid, error_msg = rag_config.validate()
                 if not valid:
                     logger.error(f"❌ RAG配置无效: {error_msg}")
                     self._config_valid = False
                     return None
-                logger.debug("🐛 [DEBUG] _get_engine: 配置验证通过")
 
                 # 创建llama-index引擎（已移除旧版引擎支持）
                 logger.debug("🐛 [DEBUG] _get_engine: 准备创建引擎")
