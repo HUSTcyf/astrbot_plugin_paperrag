@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- (暂无)
+
+## [1.3.1] - 2026-03-26
+
+### Added
+
+- **删除指定论文功能**
+  - 新增 `/paper delete <filename>` 命令
+  - 支持根据文件名删除对应的向量数据
+  - 需要管理员权限
+
+### Fixed
+
+- **VLM模式修复**
+  - 修复多模态Provider不支持时的错误处理，现在会正确fallback到文本模式
+  - 修复图片传递方式，优先使用本地文件路径，失败后降级到base64
+  - 修复LLMResponse内容提取逻辑，正确解析AstrBot的响应格式
+
 ## [1.3.0] - 2026-03-25
 
 ### Added

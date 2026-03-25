@@ -631,6 +631,42 @@ class HybridRAGEngine:
             logger.error(f"❌ 图片 transform 失败 {image_path}: {e}")
             return None
 
+    def _extract_answer_from_response(self, response: Any) -> str:
+        """
+        从 LLM Response 中提取答案文本
+
+        Args:
+            response: LLM Provider 返回的响应对象
+
+        Returns:
+            答案文本字符串
+        """
+        # 方法1：检查是否有 choices 属性（OpenAI 格式）
+        if hasattr(response, 'choices') and response.choices:
+            return response.choices[0].message.content
+
+        # 方法2：检查是否是 LLMResponse 对象（AstrBot 格式）
+        # LLMResponse.result_chain 包含 MessageChain
+        if hasattr(response, 'result_chain'):
+            chain = getattr(response.result_chain, 'chain', None)
+            if chain and len(chain) > 0:
+                first = chain[0]
+                # 检查是否有 get_text 方法
+                if hasattr(first, 'get_text'):
+                    return first.get_text()
+                # 检查是否有 text 属性
+                if hasattr(first, 'text'):
+                    return first.text
+
+        # 方法3：尝试从 raw_completion 提取
+        if hasattr(response, 'raw_completion'):
+            raw = response.raw_completion
+            if hasattr(raw, 'choices') and raw.choices:
+                return raw.choices[0].message.content
+
+        # 方法4：返回字符串形式
+        return str(response)
+
     async def _generate_answer_with_llm(
         self,
         llm_provider: Any,
@@ -669,57 +705,69 @@ class HybridRAGEngine:
             # 判断使用哪个Provider
             # 多模态：优先使用配置的 multimodal_provider_id
             # 文本：使用 text_provider_id 或当前provider
-            if images:
-                provider_to_use = None
-                if self.config.multimodal_provider_id:
+            use_multimodal = images is not None
+            provider_to_use = llm_provider  # 默认使用文本provider
+
+            if use_multimodal and self.config.multimodal_provider_id:
+                try:
+                    provider_manager = getattr(self.context, "provider_manager", None)
+                    if provider_manager:
+                        inst_map = getattr(provider_manager, "inst_map", None)
+                        if isinstance(inst_map, dict):
+                            vlm_provider = inst_map.get(self.config.multimodal_provider_id)
+                            if vlm_provider:
+                                provider_to_use = vlm_provider
+                                logger.info(f"🖼️ 使用VLM模式，多模态Provider: {self.config.multimodal_provider_id}")
+                            else:
+                                logger.warning(f"⚠️ 未找到多模态Provider: {self.config.multimodal_provider_id}，回退到文本模式")
+                                use_multimodal = False
+                except Exception as e:
+                    logger.warning(f"⚠️ 获取多模态Provider失败: {e}，回退到文本模式")
+                    use_multimodal = False
+            elif use_multimodal:
+                logger.warning("⚠️ 未配置多模态Provider，回退到文本模式")
+                use_multimodal = False
+
+            # 使用多模态模式
+            if use_multimodal:
+                # 直接使用本地文件路径（限制最多3张）
+                image_urls = [str(Path(img_path).resolve()) for img_path in images[:3]]
+
+                logger.info(f"🖼️ 使用VLM模式查询 (图片数: {len(image_urls)})")
+
+                # 使用 text_chat 接口（AstrBot Provider 统一接口）
+                # image_urls 支持本地文件路径或 URL
+                if hasattr(provider_to_use, 'text_chat'):
                     try:
-                        provider_manager = getattr(self.context, "provider_manager", None)
-                        if provider_manager:
-                            inst_map = getattr(provider_manager, "inst_map", None)
-                            if isinstance(inst_map, dict):
-                                provider_to_use = inst_map.get(self.config.multimodal_provider_id)
-                    except Exception:
-                        pass
+                        response = await provider_to_use.text_chat(
+                            prompt=text_prompt,
+                            image_urls=image_urls if image_urls else None,
+                            contexts=[],
+                            temperature=0.7
+                        )
+                        answer = self._extract_answer_from_response(response)
+                        return answer
+                    except Exception as e:
+                        # 如果文件路径方式失败，尝试 base64 方式
+                        logger.warning(f"⚠️ 文件路径方式失败，尝试base64方式: {e}")
+                        image_urls_b64 = []
+                        for img_path in images[:3]:
+                            base64_image = self._transform_image_for_vlm(img_path)
+                            if base64_image:
+                                image_urls_b64.append(f"data:image/jpeg;base64,{base64_image}")
 
-                if provider_to_use is None:
-                    provider_to_use = llm_provider
-
-                # 使用多模态模式
-                content = []
-
-                # 添加文本部分
-                content.append({
-                    "type": "text",
-                    "text": text_prompt
-                })
-
-                # 添加图片部分（限制最多3张，避免Token爆炸）
-                for image_path in images[:3]:
-                    # 查询时统一transform（原图保存，VLM推理时压缩）
-                    base64_image = self._transform_image_for_vlm(image_path)
-                    if base64_image:
-                        content.append({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            }
-                        })
-
-                messages = [
-                    {"role": "user", "content": content}
-                ]
-
-                logger.info(f"🖼️ 使用VLM模式查询 (图片数: {min(len(images), 3)})")
-
-                # 调用多模态
-                if hasattr(provider_to_use, 'chat'):
-                    response = await provider_to_use.chat.completions.create(
-                        messages=messages,
-                        temperature=0.7,
-                        max_tokens=2000
-                    )
+                        if image_urls_b64:
+                            response = await provider_to_use.text_chat(
+                                prompt=text_prompt,
+                                image_urls=image_urls_b64,
+                                contexts=[],
+                                temperature=0.7
+                            )
+                            answer = self._extract_answer_from_response(response)
+                            return answer
+                        raise
                 else:
-                    raise ValueError("Provider不支持多模态聊天")
+                    raise ValueError(f"Provider不支持多模态聊天: 缺少text_chat方法 (provider: {type(provider_to_use).__name__})")
             else:
                 # 使用文本模式
                 logger.info(f"📝 使用文本模式查询")
@@ -732,10 +780,7 @@ class HybridRAGEngine:
                         temperature=0.7,
                         max_tokens=2000
                     )
-                    if hasattr(response, 'choices'):
-                        answer = response.choices[0].message.content
-                    else:
-                        answer = str(response)
+                    answer = self._extract_answer_from_response(response)
                     return answer
                 elif hasattr(llm_provider, 'chat'):
                     # 使用 chat.completions.create 接口
@@ -747,7 +792,7 @@ class HybridRAGEngine:
                         temperature=0.7,
                         max_tokens=2000
                     )
-                    answer = response.choices[0].message.content
+                    answer = self._extract_answer_from_response(response)
                     return answer
                 else:
                     raise ValueError("Provider不支持文本聊天")
@@ -896,3 +941,31 @@ class HybridRAGEngine:
     async def clear(self) -> Dict[str, Any]:
         """清空知识库（别名方法，向后兼容）"""
         return await self.clear_index()
+
+    async def delete_paper(self, file_name: str) -> Dict[str, Any]:
+        """
+        删除指定论文的向量数据
+
+        Args:
+            file_name: 要删除的文件名
+
+        Returns:
+            删除结果
+        """
+        try:
+            index_manager = self._ensure_index_manager_initialized()
+            result = await index_manager.delete_by_file_name(file_name)
+
+            if result.get("status") == "success":
+                # 重置检索器（因为底层数据已改变）
+                self._retriever_initialized = False
+                self._retriever = cast(VectorRetriever, None)
+
+            return result
+
+        except Exception as e:
+            logger.error(f"❌ 删除论文 '{file_name}' 失败: {e}")
+            return {
+                "status": "error",
+                "message": f"删除论文失败: {e}"
+            }

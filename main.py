@@ -353,6 +353,8 @@ class PaperRAGPlugin(Star):
         search       - Search documents and answer questions
         list         - List indexed documents
         add          - Add documents to knowledge base (PDF/Word/TXT supported)
+        addf         - Add a single document to knowledge base
+        delete       - Delete a specific paper from knowledge base
         clear        - Clear knowledge base
         rebuild      - Clear and re-add all documents
         """
@@ -657,6 +659,40 @@ class PaperRAGPlugin(Star):
         except Exception as e:
             logger.error(f"Failed to clear document library: {e}")
             yield event.plain_result(f"❌ Failed to clear document library: {e}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @paper_commands.command("delete")
+    async def cmd_delete(self, event: AstrMessageEvent, file_name: str = ''):
+        """Delete a specific paper from knowledge base (Admin)
+
+        Args:
+            file_name: File name to delete (partial match supported)
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if not file_name:
+            yield event.plain_result("❌ Please provide file name\nUsage: /paper delete <filename>\nExample: /paper delete transformer.pdf")
+            return
+
+        engine = self._get_engine()
+        if not engine:
+            yield event.plain_result("❌ RAG engine is not ready")
+            return
+
+        try:
+            result = await engine.delete_paper(file_name)
+
+            if result.get("status") == "success":
+                deleted_count = result.get("deleted_count", 0)
+                yield event.plain_result(f"✅ {result.get('message', 'Paper deleted')}\n   └─ Deleted {deleted_count} vectors")
+            else:
+                yield event.plain_result(f"❌ {result.get('message', 'Failed to delete paper')}")
+
+        except Exception as e:
+            logger.error(f"Failed to delete paper: {e}")
+            yield event.plain_result(f"❌ Failed to delete paper: {e}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @paper_commands.command("rebuild")

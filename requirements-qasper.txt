@@ -1,0 +1,18 @@
+# requirements-qasper.txt
+# QASP评估所需依赖（与主插件分离）
+#
+# 注意：marker-pdf 与 astrbot 的 openai>=2.0 依赖冲突，已排除
+# 如需使用 marker-pdf，请创建独立虚拟环境安装
+
+datasets>=2.14.0
+evaluate>=0.4.0
+ragas>=0.1.0
+llama-index>=0.10.0
+transformers>=4.35.0
+sentence-transformers>=2.2.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+tqdm>=4.65.0
+
+# marker-pdf 已排除（与 astrbot openai>=2.0 冲突）
+# 如需安装请单独处理：pip install marker-pdf

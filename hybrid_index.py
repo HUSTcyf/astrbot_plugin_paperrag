@@ -12,6 +12,7 @@
 """
 
 import os
+import json
 import asyncio
 from pathlib import Path
 from typing import List, Dict, Any, Optional, cast
@@ -86,10 +87,100 @@ class HybridIndexManager:
         self._connection_info = {}
         self._collection: Optional[Collection] = None
 
+        # 文档统计追踪（用于解决 Milvus Lite 大数据量查询限制）
+        self._doc_stats_file = None  # JSON 文件路径
+        self._doc_stats: Dict[str, Dict[str, Any]] = {}  # file_name -> {chunk_count, added_time}
+
         # 确定连接模式
         self._configure_connection_mode()
 
+        # 初始化文档统计文件路径
+        self._init_doc_stats()
+
         logger.info(f"✅ HybridIndexManager 初始化完成 (collection={collection_name}, dim={embed_dim}, alias={alias})")
+
+    def _init_doc_stats(self):
+        """初始化文档统计追踪文件"""
+        # 使用与 Milvus 数据库相同的目录
+        if self._lite_path:
+            db_dir = os.path.dirname(self._lite_path)
+        elif self._uri:
+            db_dir = os.path.dirname(self._uri) or "."
+        else:
+            plugin_dir = Path(__file__).parent
+            db_dir = str(plugin_dir / "data")
+
+        self._doc_stats_file = os.path.join(db_dir, "paper_doc_stats.json")
+        self._load_doc_stats()
+        logger.info(f"📊 文档统计文件: {self._doc_stats_file}")
+
+    def _load_doc_stats(self):
+        """从 JSON 文件加载文档统计"""
+        if not self._doc_stats_file or not os.path.exists(self._doc_stats_file):
+            self._doc_stats = {}
+            return
+
+        try:
+            with open(self._doc_stats_file, 'r', encoding='utf-8') as f:
+                self._doc_stats = json.load(f)
+            logger.info(f"📊 已加载文档统计: {len(self._doc_stats)} 个文件")
+        except Exception as e:
+            logger.warning(f"⚠️ 加载文档统计失败: {e}")
+            self._doc_stats = {}
+
+    def _save_doc_stats(self):
+        """保存文档统计到 JSON 文件"""
+        if not self._doc_stats_file:
+            return
+
+        try:
+            # 确保目录存在
+            db_dir = os.path.dirname(self._doc_stats_file)
+            if db_dir and not os.path.exists(db_dir):
+                os.makedirs(db_dir, exist_ok=True)
+
+            with open(self._doc_stats_file, 'w', encoding='utf-8') as f:
+                json.dump(self._doc_stats, f, ensure_ascii=False, indent=2)
+            logger.debug(f"📊 已保存文档统计: {len(self._doc_stats)} 个文件")
+        except Exception as e:
+            logger.error(f"❌ 保存文档统计失败: {e}")
+
+    def _update_doc_stats_on_insert(self, nodes: List[Any]):
+        """插入数据后更新文档统计"""
+        for node in nodes:
+            metadata = node.metadata if hasattr(node, 'metadata') else {}
+            if isinstance(metadata, dict):
+                file_name = metadata.get("file_name", "unknown")
+                added_time = metadata.get("added_time", "")
+
+                if file_name in self._doc_stats:
+                    self._doc_stats[file_name]["chunk_count"] += 1
+                else:
+                    self._doc_stats[file_name] = {
+                        "file_name": file_name,
+                        "chunk_count": 1,
+                        "added_time": added_time
+                    }
+
+        self._save_doc_stats()
+
+    def _update_doc_stats_on_delete(self, file_name: str) -> int:
+        """删除文件后更新文档统计，返回删除的 chunk 数量"""
+        deleted_count = 0
+
+        if file_name in self._doc_stats:
+            deleted_count = self._doc_stats[file_name]["chunk_count"]
+            del self._doc_stats[file_name]
+            self._save_doc_stats()
+            logger.info(f"📊 已从统计中删除文件: {file_name} ({deleted_count} chunks)")
+
+        return deleted_count
+
+    def _clear_doc_stats(self):
+        """清空文档统计"""
+        self._doc_stats = {}
+        self._save_doc_stats()
+        logger.info("📊 已清空文档统计")
 
     def _prepare_lite_path(self, path_input: str) -> str:
         """准备 Milvus Lite 路径"""
@@ -415,6 +506,10 @@ class HybridIndexManager:
             await loop.run_in_executor(None, lambda: collection.flush())  # type: ignore[misc]
 
             logger.info(f"✅ 插入 {len(data)} 个 nodes")
+
+            # 更新文档统计追踪
+            self._update_doc_stats_on_insert(nodes)
+
             return len(data)
 
         except Exception as e:
@@ -530,7 +625,37 @@ class HybridIndexManager:
             }
 
     async def list_unique_documents(self) -> List[Dict[str, Any]]:
-        """列出所有不同的文档（按文件分组）"""
+        """列出所有不同的文档（按文件分组）- 使用追踪的统计数据"""
+        # 直接返回追踪的文档统计，避免 Milvus Lite 大数据量查询限制
+        if self._doc_stats:
+            logger.info(f"📊 返回追踪的文档统计: {len(self._doc_stats)} 个文件")
+            return list(self._doc_stats.values())
+
+        # 如果追踪统计为空但数据库有数据，需要重建统计
+        logger.info("📊 追踪统计为空，正在检查数据库...")
+        try:
+            await self._ensure_collection()
+            collection = cast(Collection, self._collection)
+            total_entities = collection.num_entities
+
+            if total_entities > 0:
+                logger.warning("⚠️ 检测到数据库有数据但追踪统计为空")
+                logger.warning("   建议：使用 /paper rebuild 重建索引以恢复完整统计")
+        except Exception:
+            pass
+
+        return []
+
+    async def delete_by_file_name(self, file_name: str) -> Dict[str, Any]:
+        """
+        根据文件名删除向量数据
+
+        Args:
+            file_name: 要删除的文件名
+
+        Returns:
+            删除结果 {"status": "success/error", "deleted_count": int, "message": str}
+        """
         import json
 
         try:
@@ -538,50 +663,92 @@ class HybridIndexManager:
 
             collection = cast(Collection, self._collection)
 
-            # query 使用线程池避免阻塞事件循环
+            # 构建查询表达式：查找 metadata["file_name"] 中匹配的文件名
+            # Milvus JSON 字段使用 metadata["field_name"] 语法访问
+            expr = f'metadata["file_name"] like "%{file_name}%"'
+
+            # 提取所有匹配的实体 ID（分批处理，避免超过限制）
+            all_ids_to_delete = []
+            BATCH_SIZE = 5000  # 每批处理的 ID 数量
             loop = asyncio.get_event_loop()
-            # pymilvus 类型标注与运行时行为不符，使用 cast(Any, ...) 避免类型检查错误
-            raw_results = await loop.run_in_executor(  # type: ignore[misc]
-                None,
-                lambda: collection.query(
-                    expr="",
-                    output_fields=["metadata"],
-                    limit=16384
+
+            while True:
+                raw_results = await loop.run_in_executor(
+                    None,
+                    lambda: collection.query(
+                        expr=expr,
+                        output_fields=["id"],
+                        limit=BATCH_SIZE
+                    )
                 )
-            )
-            results: Any = cast(Any, raw_results)
+                results: Any = cast(Any, raw_results)
 
-            if results is None:
-                return []
+                if not results:
+                    break
 
-            # 按文件分组统计
-            file_stats: Dict[str, Any] = {}
-            results_list: Any = cast(Any, results)
-            for hit in results_list:
-                metadata = hit.get("metadata", {})
-                if isinstance(metadata, str):
-                    try:
-                        metadata = json.loads(metadata)
-                    except json.JSONDecodeError:
-                        try:
-                            metadata = json.loads(metadata.replace("'", '"'))
-                        except Exception:
-                            metadata = {}
+                # 提取实体 ID
+                for hit in results:
+                    entity_id = hit.get("id")
+                    if entity_id is not None:
+                        all_ids_to_delete.append(entity_id)
 
-                file_name = metadata.get("file_name", "unknown")
-                if file_name not in file_stats:
-                    file_stats[file_name] = {
-                        "file_name": file_name,
-                        "chunk_count": 0,
-                        "added_time": metadata.get("added_time", "unknown")
-                    }
-                file_stats[file_name]["chunk_count"] += 1
+                # 如果返回数量少于批次大小，说明已经查询完毕
+                if len(results) < BATCH_SIZE:
+                    break
 
-            return list(file_stats.values())
+                # 安全限制
+                if len(all_ids_to_delete) >= 100000:
+                    logger.warning(f"⚠️ 文件 '{file_name}' 向量数量过大 ({len(all_ids_to_delete)})，已达安全限制")
+                    break
+
+            if not all_ids_to_delete:
+                return {
+                    "status": "success",
+                    "deleted_count": 0,
+                    "message": f"未找到文件 '{file_name}' 对应的向量数据"
+                }
+
+            # 分批删除（Milvus 对表达式长度有限制）
+            DELETE_BATCH_SIZE = 1000  # 每批删除的 ID 数量
+            total_deleted = 0
+
+            for i in range(0, len(all_ids_to_delete), DELETE_BATCH_SIZE):
+                batch_ids = all_ids_to_delete[i:i + DELETE_BATCH_SIZE]
+
+                # 构建删除表达式
+                if len(batch_ids) == 1:
+                    delete_expr = f"id == {batch_ids[0]}"
+                else:
+                    ids_str = ", ".join(str(id_) for id_ in batch_ids)
+                    delete_expr = f"id in [{ids_str}]"
+
+                await loop.run_in_executor(
+                    None,
+                    lambda de=delete_expr: collection.delete(de)
+                )
+
+                total_deleted += len(batch_ids)
+
+            await loop.run_in_executor(None, lambda: collection.flush())
+
+            logger.info(f"✅ 删除文件 '{file_name}': {total_deleted} 个向量")
+
+            # 更新文档统计追踪
+            self._update_doc_stats_on_delete(file_name)
+
+            return {
+                "status": "success",
+                "deleted_count": total_deleted,
+                "message": f"已删除文件 '{file_name}' 的 {total_deleted} 个向量数据"
+            }
 
         except Exception as e:
-            logger.error(f"列出文档失败: {e}")
-            return []
+            logger.error(f"删除文件 '{file_name}' 失败: {e}")
+            return {
+                "status": "error",
+                "deleted_count": 0,
+                "message": f"删除失败: {e}"
+            }
 
     async def clear(self) -> bool:
         """清空索引"""
@@ -596,6 +763,10 @@ class HybridIndexManager:
 
             self._collection = None
             logger.info(f"✅ 集合 '{self._collection_name}' 已清空")
+
+            # 清空文档统计追踪
+            self._clear_doc_stats()
+
             return True
 
         except Exception as e:

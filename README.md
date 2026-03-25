@@ -1,8 +1,8 @@
-# 📚 Paper RAG Plugin v1.3.0 - 用户指南
+# 📚 Paper RAG Plugin v1.3.1 - 用户指南
 
 本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力（支持多模态VLM问答）。
 
-> **版本说明**：当前版本 v1.3.0，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
+> **版本说明**：当前版本 v1.3.1，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
 
 ## ✨ 核心功能
 
@@ -92,6 +92,8 @@ cp ~/Downloads/*.pdf papers/
 | `/paper search <问题> retrieve` | 仅检索相关片段 | `/paper search CNN retrieve` |
 | `/paper list` | 查看已收录文档 | `/paper list` |
 | `/paper add [目录]` | 添加文档（需管理员） | `/paper add ~/Documents/papers` |
+| `/paper addf <文件路径>` | 添加单个文件（需管理员） | `/paper addf ./papers/attention.pdf` |
+| `/paper delete <文件名>` | 删除指定论文（需管理员） | `/paper delete attention.pdf` |
 | `/paper rebuild [目录] confirm` | 清空并重建知识库 | `/paper rebuild ./papers confirm` |
 | `/paper clear confirm` | 清空知识库（需管理员） | `/paper clear confirm` |
 
