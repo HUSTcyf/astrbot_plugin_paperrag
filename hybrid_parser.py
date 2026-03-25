@@ -6,6 +6,8 @@
 2. 语义分块（保持语句/段落完整）
 3. 支持块重叠（保持语义连贯）
 4. 保留学术论文的元数据（页码/章节/引用）
+5. 识别并关联参考文献（使用 Grobid 解析）
+6. 图片存储与关联（通过图片引用关联到文本块）
 """
 
 import os
@@ -22,8 +24,17 @@ import fitz  # PyMuPDF
 
 from astrbot.api import logger
 
-# 导入自定义PDF解析器
-from .semantic_chunker import PDFParserAdvanced
+# 导入自定义PDF解析器（从合并后的 multimodal_extractor）
+from .multimodal_extractor import PDFParserAdvanced
+
+# 导入引用处理器
+from .reference_processor import (
+    ReferenceExtractor,
+    CitationLinker,
+    process_references_and_citations,
+    process_references_and_citations_grobid,
+    Reference
+)
 
 
 @dataclass
@@ -41,7 +52,7 @@ class HybridPDFParser:
     - 自定义多模态提取（PDFParserAdvanced）
     - 语义分块（保持语句/段落完整）
     - 块重叠（保持语义连贯）
-    - 图片存储与关联（方案B：存储原图路径供VLM使用）
+    - 图片存储与关联（通过图片引用将图片关联到文本块，供VLM使用）
     """
 
     # 中断符号优先级（越靠前越优先作为断点）
@@ -198,7 +209,7 @@ class HybridPDFParser:
                 logger.warning(f"⚠️ 无法解析PDF: {pdf_path}")
                 return []
 
-            # 方案B：提取并保存图片（获取图片路径映射）
+            # 提取并保存图片（获取图片路径映射）
             image_paths = {}
             image_pages = {}
             if documents and self.enable_multimodal:
@@ -210,14 +221,29 @@ class HybridPDFParser:
             all_nodes = []
             chunk_index = 0
 
+            # 保存原始文本用于引用提取
+            raw_text = documents[0].text
+
             for doc in documents:
                 nodes = self._semantic_chunk(doc.text, doc.metadata, chunk_index)
                 all_nodes.extend(nodes)
                 chunk_index += len(nodes)
 
-            # 方案B：将图片路径关联到最近的 chunk
+            # 通过图片引用将图片关联到文本块
             if image_paths:
                 all_nodes = self._associate_images_with_chunks(all_nodes, image_paths, image_pages)
+
+            # 引用处理：根据配置决定是否使用 Grobid
+            logger.debug(f"🔄 引用处理...")
+            use_grobid = self.config.get("enable_grobid", False) if hasattr(self, 'config') else False
+            references, all_nodes = process_references_and_citations_grobid(
+                pdf_path, all_nodes, raw_text, use_grobid=use_grobid
+            )
+
+            if references:
+                # 将参考文献信息添加到文档元数据
+                doc.metadata['references'] = [ref.to_dict() for ref in references]
+                logger.info(f"📚 识别到 {len(references)} 条参考文献")
 
             logger.debug(f"✅ 语义分块完成: {len(all_nodes)} 个nodes")
             return all_nodes
@@ -559,7 +585,7 @@ class HybridPDFParser:
         """
         return self._semantic_chunk(text, base_metadata, start_chunk_index)
 
-    # ==================== 方案B：图片存储与关联（VLM支持） ====================
+    # ==================== 图片存储与关联（VLM支持） ====================
 
     def _get_figures_dir(self, pdf_path: str) -> str:
         """
@@ -586,7 +612,7 @@ class HybridPDFParser:
         image_index: Any
     ) -> Optional[str]:
         """
-        保存图片到磁盘（方案B核心）
+        保存图片到磁盘
 
         将提取的图片保存到磁盘，返回图片路径。
         这个路径将存储在 Milvus 中，供 VLM 后续加载。
@@ -633,7 +659,7 @@ class HybridPDFParser:
         """
         提取并保存图片，返回图片路径映射
 
-        方案B核心：提取图片保存到磁盘，供 VLM 后续加载。
+        核心：提取图片保存到磁盘，供 VLM 后续加载。
 
         改进：基于图注和位置聚类，提取完整大图
         - 将相同图注（Figure 1, Figure 2）的图片按位置聚类
@@ -719,9 +745,9 @@ class HybridPDFParser:
 
         if image_paths:
             figures_dir = self._get_figures_dir(pdf_path)
-            logger.info(f"✅ [方案B] 从 PDF 提取并保存 {len(image_paths)} 张完整大图至 {figures_dir}")
+            logger.info(f"🖼️ 提取并保存 {len(image_paths)} 张图片至 {figures_dir}")
             for caption, path in image_paths.items():
-                logger.info(f"   {caption} (页{image_pages[caption]}) → {Path(path).name}")
+                logger.debug(f"   {caption} (页{image_pages[caption]}) → {Path(path).name}")
 
         return image_paths, image_pages
 
@@ -854,10 +880,10 @@ class HybridPDFParser:
         image_pages: Dict[str, int] = {}
     ) -> List[Node]:
         """
-        将图片路径关联到最近的 chunk
+        将图片路径关联到包含对应引用的 chunk
 
-        方案B核心：基于页码 proximity 将图片分配给最近的文本块。
-        这样检索时可以根据 chunk 关联到对应的原图。
+        关联逻辑：通过识别正文中的图片引用（Figure 1, Fig. 2, 图1等）
+        将图片关联到包含对应引用的文本块。
 
         Args:
             nodes: 分块后的节点列表
@@ -870,47 +896,81 @@ class HybridPDFParser:
         if not image_paths:
             return nodes
 
-        # 如果没有提供 image_pages，尝试从路径解析（旧格式兼容）
-        if image_pages is None:
-            image_pages = {}
-            for caption, path in image_paths.items():
-                # 从路径解析页码，格式: {pdf_name}_p{page}_i{index}.png
-                import re
-                match = re.search(r'_p(\d+)_i', Path(path).stem)
-                if match:
-                    image_pages[caption] = int(match.group(1))
-        if not image_paths:
+        # 构建图片引用映射：figure编号 -> (图片路径, 图注)
+        figure_refs: Dict[str, Tuple[str, str]] = {}
+        for caption, path in image_paths.items():
+            figure_num = self._extract_figure_number(caption)
+            if figure_num:
+                figure_refs[figure_num] = (path, caption)
+
+        if not figure_refs:
+            logger.debug("⚠️ 未找到图片引用编号")
             return nodes
 
-        # 解析每个 chunk 所属的页码
+        # 预编译图片引用正则表达式
+        import re
+        figure_patterns = [
+            re.compile(r'(?:Figure|Fig\.?|图)\s*(\d+[a-zA-Z]?)', re.IGNORECASE),
+            re.compile(r'(?:Figure|Fig\.?|图)\s*(\d+[a-zA-Z]?)\s*[:.\)]', re.IGNORECASE),
+        ]
+
+        # 关联图片到 chunk
         associated_count = 0
         for node in nodes:
             node.metadata = dict(node.metadata)  # 复制避免修改原数据
 
-            # 尝试从文本中提取页码
-            page_num = self._extract_page_number_from_text(node.text)
+            found_images = []  # 可能一个 chunk 引用多张图片
 
-            # 查找最近页码的图片（图注）
-            closest_caption = None
-            min_distance = float('inf')
+            for pattern in figure_patterns:
+                for match in pattern.finditer(node.text):
+                    fig_num = match.group(1)
+                    if fig_num in figure_refs:
+                        path, caption = figure_refs[fig_num]
+                        # 去重
+                        if path not in [img[0] for img in found_images]:
+                            found_images.append((path, caption, fig_num))
 
-            for caption, img_page in image_pages.items():
-                distance = abs(img_page - page_num) if page_num > 0 else abs(img_page - 1)
-                if distance < min_distance:
-                    min_distance = distance
-                    closest_caption = caption
-
-            # 只关联最近页的图片（距离不超过2页）
-            if closest_caption is not None and min_distance <= 2:
-                node.metadata["image_path"] = image_paths[closest_caption]
-                node.metadata["image_caption"] = closest_caption
+            if found_images:
+                # 关联第一张图片（主要图片）
+                node.metadata["image_path"] = found_images[0][0]
+                node.metadata["image_caption"] = found_images[0][1]
+                node.metadata["image_figure_num"] = found_images[0][2]
                 node.metadata["has_image"] = True
+
+                # 如果有多张图片，保存所有图片
+                if len(found_images) > 1:
+                    node.metadata["all_images"] = [
+                        {"path": img[0], "caption": img[1], "figure_num": img[2]}
+                        for img in found_images
+                    ]
                 associated_count += 1
             else:
                 node.metadata["has_image"] = False
 
-        logger.info(f"✅ [方案B] 关联 {associated_count}/{len(nodes)} 个文本块到图片")
+        logger.info(f"🔗 通过图片引用关联 {associated_count}/{len(nodes)} 个文本块到图片")
         return nodes
+
+    def _extract_figure_number(self, caption: str) -> Optional[str]:
+        """
+        从图注中提取图片编号
+
+        Args:
+            caption: 图注文本，如 "Figure 1: Quantitative Results..."
+
+        Returns:
+            图片编号，如 "1" 或 "1a"，None 表示未找到
+        """
+        import re
+        # 匹配 Figure 1, Fig. 1, 图 1 等格式
+        patterns = [
+            r'(?:Figure|Fig\.?)\s*(\d+[a-zA-Z]?)',
+            r'(?:图)\s*(\d+[a-zA-Z]?)',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, caption, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return None
 
     def _extract_page_number_from_text(self, text: str) -> int:
         """从文本中提取页码"""

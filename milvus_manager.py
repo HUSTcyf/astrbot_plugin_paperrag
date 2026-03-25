@@ -80,7 +80,6 @@ class PaperMilvusManager:
         # 确定连接模式
         self._configure_connection_mode()
 
-        logger.debug(f"🐛 [DEBUG] PaperMilvusManager 初始化: alias={alias}, is_lite={self._is_lite}, db_name={self.db_name}")
 
     def _prepare_lite_path(self, path_input: str) -> str:
         """准备 Milvus Lite 路径"""

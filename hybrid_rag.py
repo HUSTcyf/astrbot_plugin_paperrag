@@ -187,7 +187,6 @@ class HybridRAGEngine:
         try:
             # 确定连接模式
             mode = self.config.get_connection_mode()
-            logger.debug(f"🔍 [DEBUG] _ensure_index_manager_initialized: mode='{mode}', milvus_lite_path='{self.config.milvus_lite_path}', address='{self.config.address}'")
 
             if mode == 'lite':
                 lite_path = self.config.milvus_lite_path
@@ -285,11 +284,8 @@ class HybridRAGEngine:
                 adaptive=self.config.reranking_adaptive
             )
             self._reranker_initialized = True
-            if self._reranker.reranker.is_available():
-                logger.info(f"✅ 重排序器初始化完成: {self.config.reranking_model}")
-            else:
-                logger.warning("⚠️ 重排序器不可用")
-                self._reranker = None
+            # 注意：reranker 使用延迟加载，模型在实际使用时才加载
+            # 这避免了在初始化时阻塞或占用资源
             return self._reranker
         except Exception as e:
             logger.warning(f"⚠️ 重排序器初始化失败: {e}")
@@ -442,7 +438,7 @@ class HybridRAGEngine:
                 return {
                     "type": "retrieve",
                     "query": query,
-                    "results": results,
+                    "sources": results,
                     "count": len(results)
                 }
             else:
@@ -464,7 +460,7 @@ class HybridRAGEngine:
         """
         检索 + RAG生成（支持多模态）
 
-        方案B核心流程：
+        多模态核心流程：
         1. 检索相关文档
         2. 路由判断：查询含视觉关键词 OR 检索结果有关联图片 → 使用VLM
         3. VLM模式：从检索结果提取图片路径，传递给多模态模型
@@ -479,7 +475,8 @@ class HybridRAGEngine:
             if not self.config.glm_api_key:
                 return {
                     "type": "error",
-                    "message": "GLM API Key未配置，无法生成回答。请配置glm_api_key或使用retrieve模式。"
+                    "message": "GLM API Key未配置，无法生成回答。请配置glm_api_key或使用retrieve模式。",
+                    "sources": []  # 提前返回时使用空列表
                 }
 
             # 确保LLM已初始化
@@ -491,7 +488,8 @@ class HybridRAGEngine:
             if len(query_result) == 0 and not images:
                 return {
                     "type": "error",
-                    "message": "未找到相关文档"
+                    "message": "未找到相关文档",
+                    "sources": []
                 }
 
             # 转换为源文档格式
@@ -503,7 +501,7 @@ class HybridRAGEngine:
                     "score": query_result.scores[i] if i < len(query_result.scores) else 0.0
                 })
 
-            # 方案B：VLM路由判断
+            # VLM路由判断
             # 用户直接上传图片 → 直接使用VLM
             # 否则根据查询和检索结果自动判断
             if images:
@@ -542,7 +540,8 @@ class HybridRAGEngine:
             logger.error(f"❌ RAG生成失败: {e}")
             return {
                 "type": "error",
-                "message": f"RAG生成失败: {e}"
+                "message": f"RAG生成失败: {e}",
+                "sources": []  # 确保错误响应也包含 sources 键
             }
 
     def _encode_image_to_base64(self, image_path: str) -> Optional[str]:
@@ -562,7 +561,7 @@ class HybridRAGEngine:
         """
         将图片 transform 后返回 base64（用于 VLM）
 
-        方案B：保存时存原图，查询时统一 transform
+        多模态：保存时存原图，查询时统一 transform
         - 压缩到 VLM 合适的大小
         - 转为 base64 供 VLM 使用
 
@@ -655,7 +654,7 @@ class HybridRAGEngine:
 
                 # 添加图片部分（限制最多3张，避免Token爆炸）
                 for image_path in images[:3]:
-                    # 方案B：查询时统一transform（原图保存，VLM推理时压缩）
+                    # 查询时统一transform（原图保存，VLM推理时压缩）
                     base64_image = self._transform_image_for_vlm(image_path)
                     if base64_image:
                         content.append({
@@ -694,7 +693,7 @@ class HybridRAGEngine:
             logger.error(f"❌ LLM生成失败: {e}")
             return f"生成答案失败: {e}"
 
-    # ==================== 方案B：VLM路由逻辑 ====================
+    # ==================== VLM路由逻辑 ====================
 
     # 视觉关键词（用于检测是否需要VLM）
     VISUAL_KEYWORDS = [
@@ -710,7 +709,7 @@ class HybridRAGEngine:
         """
         判断是否应该使用VLM（多模态模型）
 
-        方案B核心路由逻辑：
+        核心路由逻辑：
         1. 查询关键词检测（视觉相关词汇）
         2. 检索结果检测（是否关联了原图）
         3. 同时满足则使用VLM

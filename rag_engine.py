@@ -79,7 +79,6 @@ class RAGConfig:
 
     def validate(self) -> tuple[bool, str]:
         """验证配置"""
-        logger.debug(f"🔍 [DEBUG] validate: milvus_lite_path='{self.milvus_lite_path}', address='{self.address}'")
         if self.embed_dim % 64 != 0:
             return False, "嵌入维度必须是64的倍数"
 
@@ -87,13 +86,11 @@ class RAGConfig:
         # if not self.milvus_lite_path and not self.address:
         #     self.milvus_lite_path = ""  # 留空让管理器使用默认
 
-        logger.debug(f"🔍 [DEBUG] validate after: milvus_lite_path='{self.milvus_lite_path}'")
         return True, ""
 
     def get_connection_mode(self) -> str:
         """获取连接模式：'lite' 或 'remote'"""
         # milvus_lite_path 优先级更高
-        logger.debug(f"🔍 [DEBUG] get_connection_mode: milvus_lite_path='{self.milvus_lite_path}', address='{self.address}'")
         if self.milvus_lite_path and self.milvus_lite_path.strip():
             return 'lite'
         elif self.address and self.address.strip():

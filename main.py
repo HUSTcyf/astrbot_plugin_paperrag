@@ -14,6 +14,8 @@ AstrBot Paper RAG Plugin
 import asyncio
 import json
 import os
+import subprocess
+import requests
 from pathlib import Path
 from typing import Optional, Union, TYPE_CHECKING
 
@@ -65,7 +67,17 @@ class PaperRAGPlugin(Star):
         self._engine = None
         self._config_valid = False
 
-        logger.info("📚 Document RAG Plugin initialized (支持PDF/Word/TXT/HTML)")
+        # 根据配置决定是否启动 Grobid 服务
+        enable_grobid = self.config.get("enable_grobid", False)
+        if enable_grobid:
+            # 异步启动 Grobid 服务（用于参考文献解析）
+            # 不阻塞插件初始化，服务在后台启动
+            import threading
+            grobid_thread = threading.Thread(target=self._ensure_grobid_running, daemon=True)
+            grobid_thread.start()
+            logger.info("📚 Document RAG Plugin initialized (支持PDF/Word/TXT/HTML, Grobid已启用)")
+        else:
+            logger.info("📚 Document RAG Plugin initialized (支持PDF/Word/TXT/HTML, Grobid未启用)")
 
     def _get_engine(self) -> "Optional[HybridRAGEngine]":
         """获取RAG引擎（单例模式，带缓存）"""
@@ -110,10 +122,8 @@ class PaperRAGPlugin(Star):
                     return None
 
                 # 创建llama-index引擎（已移除旧版引擎支持）
-                logger.debug("🐛 [DEBUG] _get_engine: 准备创建引擎")
                 self._engine = create_rag_engine(rag_config, self.context)
                 self._config_valid = True
-                logger.debug("🐛 [DEBUG] _get_engine: 引擎创建完成")
 
             except Exception as e:
                 logger.error(f"❌ RAG引擎初始化失败: {e}")
@@ -156,6 +166,184 @@ class PaperRAGPlugin(Star):
             del self._response_cache[oldest_key]
 
         self._response_cache[cache_key] = (response, time.time())
+
+    def _ensure_grobid_running(self):
+        """
+        确保 Grobid 服务正在运行
+        首次使用需手动下载镜像，后续自动启动
+        """
+        import time
+
+        grobid_url = os.environ.get("GROBID_URL", "http://localhost:8070")
+        logger.info(f"🔍 检查 Grobid 服务状态 (URL: {grobid_url})...")
+
+        # 步骤1：检查 Grobid 是否已可用
+        logger.debug("📡 步骤1: 检查 Grobid 健康状态...")
+        try:
+            response = requests.get(f"{grobid_url}/api/health", timeout=3)
+            if response.status_code == 200:
+                logger.info("✅ Grobid 服务已就绪 (HTTP 200)")
+                return
+            else:
+                logger.debug(f"⚠️ Grobid 返回状态码: {response.status_code}")
+        except Exception as e:
+            logger.debug(f"⚠️ Grobid 健康检查失败: {e}")
+
+        # 步骤2：检查 Docker 是否可用
+        logger.debug("🐳 步骤2: 检查 Docker 可用性...")
+        try:
+            result = subprocess.run(
+                ["docker", "info"],
+                capture_output=True,
+                timeout=5,
+                check=False
+            )
+            if result.returncode != 0:
+                raise Exception("Docker 返回非零状态码")
+            logger.debug("✅ Docker 可用")
+        except (subprocess.SubprocessError, FileNotFoundError) as e:
+            logger.error("❌ Docker 不可用")
+            logger.warning(f"   原因: {e}")
+            logger.info("💡 请手动启动 Grobid:")
+            logger.info("   docker run --rm -p 8070:8070 grobid/grobid:0.8.2-full")
+            return
+
+        # 步骤3：检查 Docker 镜像是否已存在
+        logger.debug("🔍 步骤3: 检查 Grobid 镜像是否存在...")
+        try:
+            result = subprocess.run(
+                ["docker", "images", "-q", "grobid/grobid:0.8.2-full"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            image_exists = bool(result.stdout.strip())
+            logger.debug(f"   镜像存在: {image_exists}")
+        except Exception as e:
+            logger.debug(f"⚠️ 检查镜像失败: {e}")
+            image_exists = False
+
+        # 步骤4：处理镜像状态
+        if not image_exists:
+            logger.warning("⚠️ Docker 镜像 'grobid/grobid:0.8.2-full' 不存在")
+            logger.info("=" * 50)
+            logger.info("📦 首次使用需要下载 Grobid 镜像 (约 2-3GB)")
+            logger.info("   推荐手动下载以避免网络问题:")
+            logger.info("   1. 打开终端执行:")
+            logger.info("      docker pull grobid/grobid:0.8.2-full")
+            logger.info("   2. 等待下载完成后，重启插件或重新加载 Paper RAG")
+            logger.info("=" * 50)
+            logger.info("💡 或者手动启动 Grobid:")
+            logger.info("   docker run --rm -p 8070:8070 grobid/grobid:0.8.2-full")
+            return
+
+        # 步骤5：检查是否已有 Grobid 容器在运行
+        logger.debug("🔍 步骤5: 检查运行中的 Grobid 容器...")
+        try:
+            result = subprocess.run(
+                ["docker", "ps", "--filter", "ancestor=grobid/grobid:0.8.2-full", "--format", "{{.ID}}"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if result.stdout.strip():
+                container_id = result.stdout.strip()
+                logger.info(f"✅ 发现运行中的 Grobid 容器: {container_id}")
+
+                # 验证容器是否真正响应
+                logger.debug("📡 验证容器健康状态...")
+                for i in range(5):
+                    try:
+                        response = requests.get(f"{grobid_url}/api/health", timeout=3)
+                        if response.status_code == 200:
+                            logger.info("✅ Grobid 服务已就绪")
+                            return
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                logger.warning("⚠️ 容器存在但服务未响应，继续等待...")
+
+        except subprocess.TimeoutExpired:
+            logger.warning("⚠️ 检查容器超时")
+        except Exception as e:
+            logger.debug(f"⚠️ 检查容器失败: {e}")
+
+        # 步骤6：启动新 Grobid 容器
+        logger.info("🚀 步骤6: 启动 Grobid 容器...")
+
+        try:
+            # 停止并删除旧容器（如果存在）
+            subprocess.run(
+                ["docker", "stop", "grobid_paperrag"],
+                capture_output=True,
+                timeout=30
+            )
+            subprocess.run(
+                ["docker", "rm", "grobid_paperrag"],
+                capture_output=True,
+                timeout=30
+            )
+        except Exception:
+            pass  # 容器可能不存在，忽略错误
+
+        try:
+            # 启动新容器
+            proc = subprocess.Popen(
+                [
+                    "docker", "run",
+                    "--rm",
+                    "-d",
+                    "--name", "grobid_paperrag",
+                    "-p", "8070:8070",
+                    "-m", "4g",
+                    "grobid/grobid:0.8.2-full"
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            # 等待容器启动
+            stdout, stderr = proc.communicate(timeout=30)
+            stdout_str = stdout.decode('utf-8', errors='replace').strip()
+            stderr_str = stderr.decode('utf-8', errors='replace').strip()
+
+            if proc.returncode == 0 and stdout_str:
+                container_id = stdout_str.strip()
+                logger.info(f"✅ 容器启动成功 (ID: {container_id[:12]}...)")
+            else:
+                if stderr_str:
+                    logger.debug(f"   stderr: {stderr_str[:200]}")
+                logger.info("✅ 容器已在后台启动")
+
+            # 步骤7：等待服务就绪
+            logger.info("⏳ 步骤7: 等待 Grobid 服务就绪...")
+            for i in range(30):  # 最多等待60秒
+                elapsed = (i + 1) * 2
+                try:
+                    response = requests.get(f"{grobid_url}/api/health", timeout=3)
+                    if response.status_code == 200:
+                        logger.info(f"✅ Grobid 服务就绪! (耗时: {elapsed}s)")
+                        return
+                except Exception:
+                    pass
+
+                # 每10秒输出一次进度
+                if i % 5 == 0:
+                    logger.debug(f"   等待中... ({elapsed}s)")
+
+            # 超时但服务可能在继续初始化
+            logger.warning("⚠️ Grobid 启动超时 (60s)，服务可能在后台继续初始化")
+            logger.info("   验证命令: curl http://localhost:8070/api/health")
+
+        except subprocess.TimeoutExpired:
+            logger.error("❌ 容器启动命令超时 (30s)")
+            logger.info("💡 请手动启动 Grobid:")
+            logger.info("   docker run --rm -p 8070:8070 grobid/grobid:0.8.2-full")
+        except Exception as e:
+            logger.error(f"❌ 启动 Grobid 失败: {e}")
+            logger.info("💡 请手动启动 Grobid:")
+            logger.info("   docker run --rm -p 8070:8070 grobid/grobid:0.8.2-full")
 
     # ==================== 命令系统 ====================
 
@@ -210,20 +398,23 @@ class PaperRAGPlugin(Star):
             # Execute search
             response = await engine.search(query, mode=mode)
 
+            # 安全获取响应类型，避免 KeyError
+            response_type = response.get("type", "unknown")
+
             # Format output
-            if response["type"] == "retrieve":
+            if response_type == "retrieve":
                 # Retrieve mode only
-                output = self._format_retrieve_response(response["sources"])
-            elif response["type"] == "rag":
+                output = self._format_retrieve_response(response.get("sources", []))
+            elif response_type == "rag":
                 # RAG mode
                 output = self._format_rag_response(
-                    response["answer"],
-                    response["sources"]
+                    response.get("answer", ""),
+                    response.get("sources", [])
                 )
-            elif response["type"] == "error":
-                output = f"❌ {response['message']}"
+            elif response_type == "error":
+                output = f"❌ {response.get('message', 'Unknown error')}"
             else:
-                output = "❌ Unknown response type"
+                output = f"❌ Unknown response type: {response_type}"
 
             # Cache response
             self._set_cached_response(cache_key, output)
@@ -238,31 +429,24 @@ class PaperRAGPlugin(Star):
     @paper_commands.command("list")
     async def cmd_list(self, event: AstrMessageEvent):
         """List all documents in the library"""
-        logger.debug("🐛 [DEBUG] cmd_list: 开始执行")
-
         if not self.enabled:
             yield event.plain_result("❌ Plugin is disabled")
             return
 
-        logger.debug("🐛 [DEBUG] cmd_list: 插件已启用，准备获取引擎")
         engine = self._get_engine()
-        logger.debug(f"🐛 [DEBUG] cmd_list: 引擎获取完成, engine={engine is not None}")
 
         if not engine:
             yield event.plain_result("❌ RAG engine is not ready, please check configuration")
             return
 
         try:
-            logger.debug("🐛 [DEBUG] cmd_list: 准备调用 engine.list_papers()")
             papers = await engine.list_papers()
-            logger.debug(f"🐛 [DEBUG] cmd_list: list_papers() 返回, papers数量={len(papers) if papers else 0}")
 
             if not papers:
                 yield event.plain_result("📭 Document library is empty, please add documents first")
                 return
 
             # Format output
-            logger.debug("🐛 [DEBUG] cmd_list: 开始格式化输出")
             output = "📚 **Document Library**\n\n"
             for i, paper in enumerate(papers[:20], 1):  # Show max 20 papers
                 output += f"{i}. ✅ **{paper['file_name']}**\n"
@@ -273,7 +457,6 @@ class PaperRAGPlugin(Star):
                 output += f"...and {len(papers) - 20} more papers\n"
 
             output += f"\n📊 Total: {len(papers)} documents"
-            logger.debug("🐛 [DEBUG] cmd_list: 输出格式化完成")
 
             yield event.plain_result(output)
 

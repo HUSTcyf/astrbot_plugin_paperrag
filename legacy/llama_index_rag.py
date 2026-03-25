@@ -19,7 +19,7 @@ os.environ['GLOG_minloglevel'] = '2'
 from astrbot.api import logger
 
 # 导入自定义PDF解析器
-from .semantic_chunker import PDFParserAdvanced
+from .multimodal_extractor import PDFParserAdvanced
 
 
 @dataclass

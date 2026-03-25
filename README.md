@@ -8,7 +8,7 @@
 - 💡 **AI问答**：结合检索内容生成准确、有引用的答案
 - 📄 **多格式支持**：PDF、Word、TXT、Markdown、HTML
 - 🖼️ **多模态提取**：自动识别PDF中的图片、表格、公式
-- 🖼️ **多模态查询**：支持图片输入进行VLM问答（方案B：原图+VLM）
+- 🖼️ **多模态查询**：支持图片输入进行VLM问答（原图+VLM）
 - 💾 **本地存储**：所有数据存储在本地，保护隐私
 - ⚡ **缓存加速**：常用查询结果缓存，响应更快
 - 🦙 **Ollama支持**：使用本地Ollama服务进行免费无限制的向量化（推荐）
@@ -23,7 +23,6 @@
 ```bash
 cd ~/AstrBot/data/plugins/astrbot_plugin_paperrag
 pip install -r requirements.txt
-pip install llama-index-core llama-index-vector-stores-milvus FlagEmbedding
 ```
 
 ### 第二步：配置插件
@@ -312,9 +311,8 @@ Bot: > The attention mechanism allows the model to focus on...
 
 **解决**：
 1. 确认PDF不是扫描版
-2. 安装依赖：`pip install -r requirements.txt
-pip install llama-index-core llama-index-vector-stores-milvus`
-3. 运行测试：`python test_pdf.py paper.pdf`
+2. 安装依赖：`pip install -r requirements.txt`
+3. 运行测试：`python test_semantic_chunker.py paper.pdf`
 
 ### Q3: 搜索结果不准确
 
@@ -368,64 +366,19 @@ pip install -U FlagEmbedding
 
 ---
 
-## 📚 详细文档导航
+## 📚 详细文档
 
-本插件提供完整的文档体系，涵盖用户使用、开发配置和本地Embedding等方面。
-
-### 🎯 快速导航
-
-| 需求 | 推荐文档 | 说明 |
-|------|---------|------|
-| **快速上手** | 当前文档 | 用户指南，5分钟快速开始 |
-| **文档导航** | [docs/DOCUMENTATION_INDEX.md](docs/DOCUMENTATION_INDEX.md) | 完整文档索引 |
-| **开发调试** | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | 开发者文档 |
-| **配置Ollama** | [docs/OLLAMA_QUICKREF.md](docs/OLLAMA_QUICKREF.md) | 快速参考 |
-| **深入Ollama** | [docs/OLLAMA_GUIDE.md](docs/OLLAMA_GUIDE.md) | 完整指南 |
-
-### 📂 docs/ 目录
-
-**核心文档**：
-
-1. **[DOCUMENTATION_INDEX.md](docs/DOCUMENTATION_INDEX.md)** - 📚 文档导航
-   - 快速定位所需文档
-   - 文档阅读路径
-   - 常见问题索引
-
-2. **[DEVELOPMENT.md](docs/DEVELOPMENT.md)** - 🔧 开发指南
-   - 技术架构说明
-   - 核心组件介绍
-   - 开发工作流程
-   - 故障排除（10个常见问题）
-
-3. **[OLLAMA_GUIDE.md](docs/OLLAMA_GUIDE.md)** - 🦙 Ollama完整指南
-   - Ollama安装和配置
-   - 模型选择和下载
-   - 性能优化建议
-   - 故障排除
-
-4. **[OLLAMA_QUICKREF.md](docs/OLLAMA_QUICKREF.md)** - 🦙 Ollama快速参考
-   - 一分钟开始
-   - 配置对比
-   - 快速故障排除
-
-**修复文档**：
-
-5. **[FIX_LIST_EMPTY_ISSUE.md](docs/FIX_LIST_EMPTY_ISSUE.md)** - 数据库路径问题修复
-6. **[FIX_MILVUS_API_COMPAT.md](docs/FIX_MILVUS_API_COMPAT.md)** - API兼容性修复
-
-### 📌 文档定位
-
-- **用户入口**: README.md (本文档)
-- **文档索引**: docs/DOCUMENTATION_INDEX.md
-- **开发者文档**: docs/DEVELOPMENT.md
-- **Ollama配置**: docs/OLLAMA_GUIDE.md, docs/OLLAMA_QUICKREF.md
+| 文档 | 说明 |
+|------|------|
+| [README.md](README.md) | 用户指南（本文档） |
+| [docs/INDEX.md](docs/INDEX.md) | 文档索引 |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 技术架构说明 |
+| [docs/CHANGELOG.md](docs/CHANGELOG.md) | 变更记录 |
 
 ---
 
 ## 📞 获取帮助
 
-- **完整文档**：查看 [docs/DOCUMENTATION_INDEX.md](docs/DOCUMENTATION_INDEX.md) 浏览所有文档
-- **开发文档**：查看 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) 了解技术细节
 - **问题反馈**：通过 GitHub Issues 提交问题
 - **日志查看**：AstrBot 控制台输出
 

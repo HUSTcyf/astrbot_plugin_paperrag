@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 from PIL import Image
 import fitz  # PyMuPDF
 
+# 多模态可用标志
+MULTIMODAL_AVAILABLE = True
+
 # 可选依赖（pdfplumber）
 try:
     import pdfplumber
@@ -137,6 +140,79 @@ class MultimodalPDFExtractor:
         else:
             logger.info("📝 多模态提取器回退到纯文本模式")
 
+    def _extract_text_without_line_numbers(self, page: fitz.Page) -> str:
+        """
+        从页面提取文本，同时过滤掉两侧的行号
+
+        行号特征：
+        1. 位置：在页面左侧（x0很小）或右侧（x1接近页面宽度）
+        2. 格式：纯数字、数字+点、数字+括号，如 "1", "2.", "1)"
+        3. 字体：通常比正文小
+
+        Args:
+            page: PyMuPDF页面对象
+
+        Returns:
+            过滤后的文本
+        """
+        # 获取页面尺寸
+        page_width = page.rect.width
+
+        # 行号过滤阈值：页宽的百分比
+        left_margin_threshold = page_width * 0.08   # 左侧8%以内认为是行号
+        right_margin_threshold = page_width * 0.92    # 右侧92%以外认为是行号
+
+        # 行号匹配模式
+        line_number_patterns = [
+            r'^\s*\d+\s*$',           # 纯数字: "1", "  2  "
+            r'^\s*\d+\.\s*$',          # 数字+点: "1.", "2."
+            r'^\s*\d+\)\s*$',          # 数字+括号: "1)", "2)"
+            r'^\s*\(\d+\)\s*$',        # 括号包裹: "(1)", "(2)"
+            r'^\s*\d+[a-zA-Z]?\s*$',  # 数字+字母: "1a", "2b"
+        ]
+        line_number_regex = [re.compile(p, re.IGNORECASE) for p in line_number_patterns]
+
+        # 使用 "dict" 模式获取带位置信息的文本块
+        page_dict = page.get_text("dict")
+
+        text_lines = []
+        for block in page_dict.get("blocks", []):
+            if block.get("type") != 0:  # type 0 = text block
+                continue
+
+            for line in block.get("lines", []):
+                bbox = line.get("bbox", [])
+                if not bbox:
+                    continue
+
+                x0, y0, x1, y1 = bbox
+
+                # 检查是否是边缘位置（可能是行号）
+                is_left_edge = x0 < left_margin_threshold
+                is_right_edge = x1 > right_margin_threshold
+
+                # 提取行文本
+                line_text = ""
+                for span in line.get("spans", []):
+                    line_text += span.get("text", "")
+
+                if not line_text.strip():
+                    continue
+
+                # 判断是否是行号
+                is_line_number = False
+                if (is_left_edge or is_right_edge):
+                    for pattern in line_number_regex:
+                        if pattern.match(line_text.strip()):
+                            is_line_number = True
+                            break
+
+                # 如果不是行号，添加到结果
+                if not is_line_number:
+                    text_lines.append(line_text)
+
+        return '\n'.join(text_lines)
+
     def extract(self, pdf_path: str) -> ExtractedContent:
         """
         提取PDF的多模态内容
@@ -181,8 +257,8 @@ class MultimodalPDFExtractor:
         try:
             for page_num, page in enumerate(doc, 1):  # type: ignore[arg-type]
                 try:
-                    # 提取文本
-                    text = page.get_text()
+                    # 提取文本（过滤行号）
+                    text = self._extract_text_without_line_numbers(page)
                     full_text_parts.append(text)
 
                     # 提取图片
@@ -323,13 +399,6 @@ class MultimodalPDFExtractor:
         Returns:
             过滤后的图片列表
         """
-        # 🔧 DEBUG: 显示输入图片信息
-        logger.warning(f"🔍 [DEBUG 页 {page_num}] _deduplicate_images 输入: {len(images)} 张图片")
-        for i, img in enumerate(images):
-            caption_key = self._extract_figure_number(img.caption)
-            size = f"{img.image.size[0]}x{img.image.size[1]}" if img.image else "N/A"
-            # logger.warning(f"🔍 [DEBUG 页 {page_num}]   图片[{i}]: caption='{img.caption}', key='{caption_key}', size={size}")
-
         if not images:
             return images
 
@@ -339,7 +408,6 @@ class MultimodalPDFExtractor:
         # ⚠️ 跳过基于图片尺寸去重：相同尺寸可能是不同的子图
         # ⚠️ 跳过基于图注的去重：保留所有相同图注的图片，后续在 hybrid_parser 中合并为完整大图
 
-        logger.warning(f"🔍 [DEBUG 页 {page_num}] 保留所有 {len(current_images)} 张图片（尺寸去重和图注去重已跳过，将在后续合并为完整大图）")
 
         # NMS位置去重（仅对有效bbox的图片）- 保留
         valid_bbox_images = [img for img in current_images if img.bbox != (0, 0, 0, 0)]
@@ -643,3 +711,224 @@ class MultimodalPDFExtractor:
             line = ",".join(str(cell or "") for cell in row)
             lines.append(line)
         return '\n'.join(lines)
+
+
+# ============================================================================
+# PDFParserAdvanced - 高级PDF解析器，集成多模态提取和分块
+# ============================================================================
+
+@dataclass
+class Chunk:
+    """文本块（已弃用，保留用于向后兼容）"""
+    content: str
+    metadata: Dict[str, Any]
+    chunk_type: str = ""  # 'title', 'paragraph', 'table', 'formula', 'code', 'image'
+
+    # 多模态内容（可选）
+    image_data: Optional[bytes] = None
+    table_data: Optional[str] = None
+    formula_latex: Optional[str] = None
+
+
+class PDFParserAdvanced:
+    """高级 PDF 解析器（使用 PyMuPDF，集成多模态提取）"""
+
+    def __init__(self, enable_multimodal: bool = True):
+        """
+        初始化PDF解析器
+
+        Args:
+            enable_multimodal: 是否启用多模态提取（图片、表格、公式）
+        """
+        if not fitz:
+            logger.warning("PyMuPDF 不可用，PDF解析功能将被禁用")
+            self.available = False
+            self.enable_multimodal = False
+            return
+
+        self.available = True
+        self.enable_multimodal = enable_multimodal and MULTIMODAL_AVAILABLE
+
+        # 初始化多模态提取器
+        if self.enable_multimodal:
+            try:
+                self.multimodal_extractor = MultimodalPDFExtractor(
+                    extract_images=True,
+                    extract_tables=True,
+                    extract_formulas=True,
+                    fallback_to_text=True
+                )
+                logger.info("✅ 多模态提取器已启用")
+            except Exception as e:
+                logger.warning(f"⚠️ 多模态提取器初始化失败: {e}")
+                self.enable_multimodal = False
+
+    def parse_pdf(self, pdf_path: str) -> tuple[str, Dict[str, Any]]:
+        """
+        解析PDF文件
+
+        Args:
+            pdf_path: PDF文件路径
+
+        Returns:
+            (提取的文本, 元数据字典)
+        """
+        filename = str(Path(pdf_path).name)
+
+        if not self.available:
+            raise ImportError("PyMuPDF 不可用，请安装: pip install PyMuPDF")
+
+        try:
+            if self.enable_multimodal:
+                return self._parse_with_multimodal(pdf_path)
+            else:
+                return self._parse_with_pymupdf(pdf_path)
+
+        except Exception as e:
+            raise Exception(f"PDF解析失败 {filename}: {e}")
+
+    def _parse_with_multimodal(self, pdf_path: str) -> tuple[str, Dict[str, Any]]:
+        """使用多模态提取器解析"""
+        extracted = self.multimodal_extractor.extract(pdf_path)
+
+        text_parts = []
+
+        # 添加原始文本（已过滤行号）
+        if extracted.text:
+            text_parts.append(extracted.text)
+
+        # 添加图片占位符
+        if extracted.images:
+            for img in extracted.images:
+                caption = f" [{img.caption or f'Figure on page {img.page_number}'}]"
+
+        # 添加表格
+        if extracted.tables:
+            for table in extracted.tables:
+                if table.markdown:
+                    text_parts.append(f"\n{table.markdown}\n")
+
+        # 添加公式
+        if extracted.formulas:
+            for formula in extracted.formulas:
+                text_parts.append(f"\n$$ {formula.text} $$\n")
+
+        full_text = '\n'.join(text_parts)
+
+        metadata = {
+            "file_name": extracted.file_name,
+            "total_pages": extracted.text.count('[Page ') if extracted.text else 0,
+            "parser": "PyMuPDF-Multimodal",
+            "images_count": len(extracted.images),
+            "tables_count": len(extracted.tables),
+            "formulas_count": len(extracted.formulas),
+            "multimodal_data": {
+                "images": [
+                    {
+                        "page_number": img.page_number,
+                        "image_index": img.image_index,
+                        "caption": img.caption,
+                        "bbox": img.bbox,
+                        "has_image_bytes": img.image_bytes is not None
+                    }
+                    for img in extracted.images
+                ],
+                "tables": [
+                    {
+                        "page_number": table.page_number,
+                        "table_index": table.table_index,
+                        "caption": table.caption,
+                        "rows": len(table.data) if table.data else 0,
+                        "markdown": table.markdown
+                    }
+                    for table in extracted.tables
+                ],
+                "formulas": [
+                    {
+                        "page_number": formula.page_number,
+                        "formula_index": formula.formula_index,
+                        "text": formula.text[:100],
+                        "type": formula.type
+                    }
+                    for formula in extracted.formulas
+                ]
+            }
+        }
+
+        return full_text, metadata
+
+    def _parse_with_pymupdf(self, pdf_path: str) -> tuple[str, Dict[str, Any]]:
+        """使用 PyMuPDF 解析（结构化提取，过滤行号）"""
+        doc = fitz.open(pdf_path)
+        text_parts = []
+        metadata = {
+            "file_name": str(Path(pdf_path).name),
+            "total_pages": len(doc),
+            "parser": "PyMuPDF"
+        }
+
+        for page_num, page in enumerate(doc, 1):
+            page_text = self._extract_text_without_line_numbers(page)
+            if page_text.strip():
+                text_parts.append(f"\n[Page {page_num}]\n{page_text}")
+
+            image_list = page.get_images()
+            if image_list:
+                metadata["total_images"] = metadata.get("total_images", 0) + len(image_list)
+
+        doc.close()
+
+        full_text = '\n'.join(text_parts)
+        return full_text, metadata
+
+    def _extract_text_without_line_numbers(self, page: fitz.Page) -> str:
+        """
+        从页面提取文本，同时过滤掉两侧的行号
+        """
+        page_width = page.rect.width
+        left_margin_threshold = page_width * 0.08
+        right_margin_threshold = page_width * 0.92
+
+        line_number_patterns = [
+            r'^\s*\d+\s*$',
+            r'^\s*\d+\.\s*$',
+            r'^\s*\d+\)\s*$',
+            r'^\s*\(\d+\)\s*$',
+            r'^\s*\d+[a-zA-Z]?\s*$',
+        ]
+        line_number_regex = [re.compile(p, re.IGNORECASE) for p in line_number_patterns]
+
+        page_dict = page.get_text("dict")
+
+        text_lines = []
+        for block in page_dict.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+
+            for line in block.get("lines", []):
+                bbox = line.get("bbox", [])
+                if not bbox:
+                    continue
+
+                x0, y0, x1, y1 = bbox
+                is_left_edge = x0 < left_margin_threshold
+                is_right_edge = x1 > right_margin_threshold
+
+                line_text = ""
+                for span in line.get("spans", []):
+                    line_text += span.get("text", "")
+
+                if not line_text.strip():
+                    continue
+
+                is_line_number = False
+                if (is_left_edge or is_right_edge):
+                    for pattern in line_number_regex:
+                        if pattern.match(line_text.strip()):
+                            is_line_number = True
+                            break
+
+                if not is_line_number:
+                    text_lines.append(line_text)
+
+        return '\n'.join(text_lines)

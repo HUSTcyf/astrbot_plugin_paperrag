@@ -77,11 +77,9 @@ class HybridIndexManager:
         self.db_name = db_name or "default"
 
         # 连接配置
-        logger.debug(f"🔍 [DEBUG] HybridIndexManager init: milvus_uri='{milvus_uri}', lite_path='{lite_path}', uri='{uri}'")
         self._lite_path = self._prepare_lite_path(lite_path) if lite_path else None
         self._uri = uri
         self._is_lite = self._lite_path is not None
-        logger.debug(f"🔍 [DEBUG] HybridIndexManager init: _lite_path='{self._lite_path}', _is_lite={self._is_lite}")
 
         # 连接状态
         self._is_connected = False
@@ -107,7 +105,6 @@ class HybridIndexManager:
 
     def _configure_connection_mode(self):
         """配置连接模式"""
-        logger.debug(f"🔍 [DEBUG] _configure_connection_mode: _lite_path='{self._lite_path}', _uri='{self._uri}'")
         if self._lite_path:
             self._configure_lite()
         elif self._uri:
@@ -120,7 +117,6 @@ class HybridIndexManager:
         self._is_lite = True
         abs_path = os.path.abspath(self._lite_path) if self._lite_path else "None"
         logger.info(f"配置 Milvus Lite (别名: {self.alias}), 路径: '{abs_path}'")
-        logger.debug(f"🔍 [DEBUG] Milvus Lite 绝对路径: {abs_path}")
 
         # 确保目录存在
         if self._lite_path:
@@ -144,8 +140,6 @@ class HybridIndexManager:
         abs_path = str(default_path.resolve())
 
         logger.warning(f"使用默认 Milvus Lite 路径: '{abs_path}'")
-        logger.debug(f"🔍 [DEBUG] 插件目录: {plugin_dir}")
-        logger.debug(f"🔍 [DEBUG] Milvus Lite 绝对路径: {abs_path}")
 
         # 确保目录存在
         db_dir = default_path.parent
@@ -165,7 +159,6 @@ class HybridIndexManager:
         # 先尝试断开旧连接（如果存在）
         try:
             if connections.has_connection(self.alias):
-                logger.debug(f"🔍 [DEBUG] 断开旧连接: {self.alias}")
                 connections.disconnect(self.alias)
         except Exception:
             pass
@@ -280,7 +273,6 @@ class HybridIndexManager:
             else:
                 # 检查连接是否真的有效
                 if not connections.has_connection(self.alias):
-                    logger.debug(f"🔍 [DEBUG] 连接已断开，重新连接: {self.alias}")
                     self._is_connected = False
                     self.connect()
 
@@ -294,9 +286,9 @@ class HybridIndexManager:
                 self._collection = Collection(self._collection_name, using=self.alias)
                 collection = cast(Collection, self._collection)
 
-                # 等待 load 完成
-                load_result = collection.load()
-                await self._await_if_needed(load_result)
+                # load 是阻塞操作，使用线程池避免阻塞事件循环
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, collection.load)  # type: ignore[misc]
             else:
                 logger.debug(f"创建新集合 '{self._collection_name}'")
 
@@ -331,17 +323,14 @@ class HybridIndexManager:
                 if not is_lite:
                     index_params["params"] = {"M": 8, "efConstruction": 64}
 
-                # 等待索引创建完成
+                # 创建索引和加载是阻塞操作，使用线程池
                 collection = cast(Collection, self._collection)
-                index_result = collection.create_index(
-                    field_name="vector",
-                    index_params=index_params
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(  # type: ignore[misc]
+                    None,
+                    lambda c=collection, ip=index_params: c.create_index(field_name="vector", index_params=ip)
                 )
-                await self._await_if_needed(index_result)
-
-                # 等待 load 完成
-                load_result = collection.load()
-                await self._await_if_needed(load_result)
+                await loop.run_in_executor(None, collection.load)  # type: ignore[misc]
 
                 logger.info(f"✅ 集合 '{self._collection_name}' 创建成功 (索引: {index_type})")
 
@@ -419,14 +408,11 @@ class HybridIndexManager:
                     "metadata": metadata_str
                 })
 
-            # 插入数据
+            # 插入数据 - 使用线程池避免阻塞事件循环
             collection = cast(Collection, self._collection)
-            insert_result = collection.insert(data)
-            await self._await_if_needed(insert_result)
-
-            # 等待 flush 完成
-            flush_result = collection.flush()
-            await self._await_if_needed(flush_result)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: collection.insert(data))  # type: ignore[misc]
+            await loop.run_in_executor(None, lambda: collection.flush())  # type: ignore[misc]
 
             logger.info(f"✅ 插入 {len(data)} 个 nodes")
             return len(data)
@@ -469,26 +455,32 @@ class HybridIndexManager:
                     "params": {}
                 }
 
-            # 执行搜索
+            # 执行搜索 - 使用线程池避免阻塞事件循环
             collection = cast(Collection, self._collection)
-            search_result = collection.search(
-                data=[query_embedding],
-                anns_field="vector",
-                param=search_params,
-                limit=top_k,
-                output_fields=["text", "metadata"]
+            loop = asyncio.get_event_loop()
+            # pymilvus 类型标注与运行时行为不符，使用 cast(Any, ...) 避免类型检查错误
+            # type: ignore[misc] run_in_executor 类型标注与实际返回值不符
+            raw_results = await loop.run_in_executor(
+                None,
+                lambda: collection.search(
+                    data=[query_embedding],
+                    anns_field="vector",
+                    param=search_params,
+                    limit=top_k,
+                    output_fields=["text", "metadata"]
+                )
             )
-
-            # 等待搜索完成
-            results = await self._await_if_needed_with_result(search_result)
+            results: Any = cast(Any, raw_results)
 
             if results is None:
+                return []
                 return []
 
             # 转换结果
             import json
             documents = []
-            for hit in results[0]:
+            results_first: Any = cast(Any, results[0])
+            for hit in results_first:
                 metadata = hit.entity.get("metadata", {})
                 # 如果 metadata 是字符串，尝试反序列化
                 if isinstance(metadata, str):
@@ -546,21 +538,26 @@ class HybridIndexManager:
 
             collection = cast(Collection, self._collection)
 
-            # 查询所有不同的文件
-            query_result = collection.query(
-                expr="",
-                output_fields=["metadata"],
-                limit=16384
+            # query 使用线程池避免阻塞事件循环
+            loop = asyncio.get_event_loop()
+            # pymilvus 类型标注与运行时行为不符，使用 cast(Any, ...) 避免类型检查错误
+            raw_results = await loop.run_in_executor(  # type: ignore[misc]
+                None,
+                lambda: collection.query(
+                    expr="",
+                    output_fields=["metadata"],
+                    limit=16384
+                )
             )
-
-            results = await self._await_if_needed_with_result(query_result)
+            results: Any = cast(Any, raw_results)
 
             if results is None:
                 return []
 
             # 按文件分组统计
-            file_stats = {}
-            for hit in results:
+            file_stats: Dict[str, Any] = {}
+            results_list: Any = cast(Any, results)
+            for hit in results_list:
                 metadata = hit.get("metadata", {})
                 if isinstance(metadata, str):
                     try:
@@ -591,9 +588,11 @@ class HybridIndexManager:
         try:
             await self._ensure_collection()
 
-            # 删除集合
-            drop_result = utility.drop_collection(self._collection_name, using=self.alias)
-            await self._await_if_needed(drop_result)
+            # drop_collection 是阻塞操作，在线程池中执行
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: utility.drop_collection(  # type: ignore[misc]
+                self._collection_name, using=self.alias
+            ))
 
             self._collection = None
             logger.info(f"✅ 集合 '{self._collection_name}' 已清空")

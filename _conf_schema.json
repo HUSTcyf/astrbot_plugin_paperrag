@@ -136,7 +136,7 @@
     "figures_dir": {
         "description": "PDF图片存储目录",
         "type": "string",
-        "hint": "存放PDF解析出的图片的目录路径（方案B：存储原图路径供VLM使用）。空则使用插件目录下的 data/figures",
+        "hint": "存放PDF解析出的图片的目录路径（存储原图供VLM使用）。空则使用插件目录下的 data/figures",
         "obvious_hint": true,
         "default": "",
         "minLength": 0
@@ -159,6 +159,13 @@
         "default": 100,
         "minimum": 10,
         "maximum": 1000
+    },
+    "enable_grobid": {
+        "description": "启用 Grobid 参考文献解析（可选依赖）",
+        "type": "bool",
+        "hint": "Grobid 是专业的学术文献解析工具，可以更准确地提取参考文献信息（标题、作者、年份、DOI等）。启用后会自动启动 Grobid Docker 容器。首次使用需先下载镜像: docker pull grobid/grobid:0.8.2-full",
+        "obvious_hint": true,
+        "default": false
     },
     "chunk_size": {
         "description": "文档分块目标大小（字符数）",

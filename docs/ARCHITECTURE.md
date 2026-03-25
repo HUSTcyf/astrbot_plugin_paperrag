@@ -49,7 +49,7 @@ PDF → HybridPDFParser → Nodes → HybridIndexManager → HybridRAGEngine →
 RAGConfig(
     # 模型配置
     glm_api_key="",                    # GLM API密钥
-    glm_model="glm-4.6v-flash",        # 默认模型
+    glm_model="glm-4.7-flash",        # 文本模型
     glm_multimodal_model="glm-4.6v-flash",  # 多模态模型
 
     # Embedding配置
@@ -82,9 +82,13 @@ astrbot_plugin_paperrag/
 ├── hybrid_parser.py           # PDF解析+语义分块
 ├── hybrid_index.py            # Milvus索引管理
 ├── hybrid_rag.py              # RAG引擎
-├── semantic_chunker.py         # PDF解析器（多模态提取）
 ├── multimodal_extractor.py    # 多模态提取器
 ├── embedding_providers.py     # Embedding提供者
+├── reference_processor.py     # 参考文献解析
+├── milvus_manager.py          # Milvus管理器
+├── ollama_embedding.py        # Ollama Embedding
+├── llama_index_reranker.py    # 重排序
+├── reranker.py                # 重排序封装
 └── docs/
     ├── ARCHITECTURE.md        # 本文档
     ├── CHANGELOG.md          # 变更记录
