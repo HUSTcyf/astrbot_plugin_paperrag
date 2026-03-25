@@ -38,7 +38,7 @@ pip install -r requirements.txt
 | Embedding模式 | `Ollama本地模式` | 使用Ollama |
 | 向量嵌入维度 | `1024` | BGE-M3固定1024维 |
 | Ollama模型名称 | `bge-m3` | 模型名称 |
-| glm_api_key | `glm-4.7-flash`（可选） | 用于RAG回答生成 |
+| 文本问答Provider | （从AstrBot选取） | 用于RAG回答生成 |
 | 论文文件存放目录 | `./papers` | PDF存放路径 |
 | 启用插件 | ✅ | - |
 
@@ -62,7 +62,7 @@ pip install -r requirements.txt
 | Embedding模式 | `API模式` | 使用API |
 | Embedding 服务提供商 | `gemini_embedding` | Gemini Embedding API |
 | 向量嵌入维度 | `768` | Gemini固定768维 |
-| glm_api_key | `glm-4.7-flash`（可选） | 用于RAG回答生成 |
+| 文本问答Provider | （从AstrBot选取） | 用于RAG回答生成 |
 | 论文文件存放目录 | `./papers` | PDF存放路径 |
 | 启用插件 | ✅ | - |
 
@@ -139,9 +139,9 @@ Bot: > The attention mechanism allows the model to focus on...
 | `enabled` | 启用插件 | `true` | ✅ |
 | `embedding_mode` | Embedding模式 | `ollama` | `ollama`（推荐免费）/ `api` |
 | `embedding_provider_id` | Embedding Provider ID（API模式） | `gemini_embedding` | Gemini / OpenAI |
-| `glm_api_key` | 智谱AI API密钥 | - | 用于RAG回答生成 |
-| `glm_model` | GLM文本模型 | `glm-4.7-flash` | `glm-4.7-flash` / `glm-4` |
-| `glm_multimodal_model` | GLM多模态模型 | `glm-4.6v-flash` | `glm-4.6v-flash`（用于图片问答） |
+| `compress_provider_id` | 上下文压缩LLM | 空 | 从AstrBot提供商选取 |
+| `text_provider_id` | 文本问答LLM | 空 | 从AstrBot提供商选取 |
+| `multimodal_provider_id` | 多模态问答LLM | 空 | 从AstrBot提供商选取（用于图片问答） |
 | `papers_dir` | 论文目录 | `./papers` | `./papers` |
 | `figures_dir` | 图片存储目录 | `data/figures` | 插件目录下的 data/figures |
 | `embed_dim` | 向量维度 | `768` | `1024` (BGE-M3) / `768` (Gemini) / `1536` (OpenAI) |
@@ -190,7 +190,7 @@ Bot: > The attention mechanism allows the model to focus on...
 | `multimodal.nms_iou_threshold` | 图片去重阈值 | `0.5` |
 | `multimodal.enable_nms` | 启用NMS去重 | `true` |
 
-> 💡 **VLM路由说明**：查询含视觉关键词（"图"、"表格"、"公式"等）或检索结果关联图片时，自动使用 `glm_multimodal_model` 进行多模态回答。
+> 💡 **VLM路由说明**：查询含视觉关键词（"图"、"表格"、"公式"等）或检索结果关联图片时，自动使用 `multimodal_provider_id` 配置的多模态模型进行回答。
 
 **生产环境推荐配置**：
 ```json
