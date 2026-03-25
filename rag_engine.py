@@ -21,10 +21,10 @@ class RAGConfig:
     embedding_mode: str = "ollama"  # "api" 或 "ollama"
     embedding_provider_id: str = ""  # API模式下的Provider
 
-    # GLM配置
-    glm_api_key: str = ""  # 智谱AI API密钥
-    glm_model: str = "glm-4.7-flash"  # GLM文本模型
-    glm_multimodal_model: str = "glm-4.6v-flash"  # 多模态模型
+    # LLM Provider配置
+    compress_provider_id: str = ""  # LLM Provider ID（用于文本压缩）
+    text_provider_id: str = ""  # LLM Provider ID（用于文本问答）
+    multimodal_provider_id: str = ""  # LLM Provider ID（用于多模态问答）
 
     # Ollama配置
     ollama_config: dict = field(default_factory=dict)
@@ -134,6 +134,6 @@ def create_rag_engine(config: RAGConfig, context) -> "HybridRAGEngine":
     logger.info("   - 自定义PDF解析（多模态）")
     logger.info("   - 语义分块")
     logger.info("   - Milvus向量存储")
-    logger.info("   - GLM LLM生成")
+    logger.info("   - LLM生成（支持多模态）")
 
     return HybridRAGEngine(config, context)

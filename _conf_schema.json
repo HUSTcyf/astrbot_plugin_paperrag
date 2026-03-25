@@ -19,27 +19,26 @@
         "_special": "select_embedding_provider",
         "default": "gemini_embedding"
     },
-    "glm_api_key": {
-        "description": "智谱AI API密钥",
+    "compress_provider_id": {
+        "description": "上下文压缩使用的LLM服务商",
         "type": "string",
-        "hint": "从 https://open.bigmodel.cn/ 获取API密钥，用于RAG回答生成。如仅需检索功能可留空",
-        "obvious_hint": true,
-        "default": "",
-        "minLength": 0
+        "hint": "当文本超长时，选择用于压缩上下文的LLM Provider。留空则直接截断（不使用LLM压缩）",
+        "_special": "select_provider",
+        "default": ""
     },
-    "glm_model": {
-        "description": "GLM文本模型名称",
+    "text_provider_id": {
+        "description": "文本问答使用的LLM服务商",
         "type": "string",
-        "hint": "用于纯文本问答的GLM模型。glm-4.7-flash: 快速响应（推荐）；glm-4: 标准性能；glm-4-plus: 高质量输出",
-        "default": "glm-4.7-flash",
-        "enum": ["glm-4.7-flash", "glm-4", "glm-4-plus"]
+        "hint": "选择用于纯文本问答的LLM Provider。留空则使用当前会话的默认Provider",
+        "_special": "select_provider",
+        "default": ""
     },
-    "glm_multimodal_model": {
-        "description": "GLM多模态模型名称（用于图片问答）",
+    "multimodal_provider_id": {
+        "description": "多模态问答使用的LLM服务商（用于图片问答）",
         "type": "string",
-        "hint": "用于图片问答的GLM多模态模型。glm-4.6v-flash: 快速响应（推荐）；glm-4v: 标准性能",
-        "default": "glm-4.6v-flash",
-        "enum": ["glm-4.6v-flash", "glm-4v"]
+        "hint": "选择用于图片问答的多模态LLM Provider。留空则使用当前会话的默认Provider",
+        "_special": "select_provider",
+        "default": ""
     },
     "milvus_lite_path": {
         "description": "Milvus Lite 数据库路径",

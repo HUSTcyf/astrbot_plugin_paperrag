@@ -87,9 +87,9 @@ class PaperRAGPlugin(Star):
                 rag_config = RAGConfig(
                     embedding_mode=self.config.get("embedding_mode", "ollama"),
                     embedding_provider_id=self.config.get("embedding_provider_id", ""),
-                    glm_api_key=self.config.get("glm_api_key", ""),
-                    glm_model=self.config.get("glm_model", "glm-4.7-flash"),
-                    glm_multimodal_model=self.config.get("glm_multimodal_model", "glm-4.6v-flash"),
+                    compress_provider_id=self.config.get("compress_provider_id", ""),
+                    text_provider_id=self.config.get("text_provider_id", ""),
+                    multimodal_provider_id=self.config.get("multimodal_provider_id", ""),
                     ollama_config=self.config.get("ollama", {}),
                     milvus_lite_path=self.config.get("milvus_lite_path", ""),
                     address=self.config.get("address", ""),
@@ -567,12 +567,67 @@ class PaperRAGPlugin(Star):
 
             yield event.plain_result(output.strip())
 
-            # Clear related cache
-            self._response_cache.clear()
-
         except Exception as e:
             logger.error(f"Failed to add documents: {e}")
-            yield event.plain_result(f"❌ Failed to add documents: {e}")
+            yield event.plain_result(f"❌ Failed to add documents: {str(e)}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @paper_commands.command("addf")
+    async def cmd_add_file(self, event: AstrMessageEvent, file_path: str = ''):
+        """Add a single document to knowledge base (Admin)
+
+        Args:
+            file_path: Full path to the document file
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if not file_path:
+            yield event.plain_result("❌ Please provide file path\nUsage: /paper addf <file_path>")
+            return
+
+        file_path = file_path.strip()
+
+        # Check file exists
+        if not os.path.exists(file_path):
+            yield event.plain_result(f"❌ File not found: {file_path}")
+            return
+
+        # Check if it's a file (not directory)
+        if not os.path.isfile(file_path):
+            yield event.plain_result(f"❌ Not a file: {file_path}")
+            return
+
+        # Check supported format
+        supported_extensions = ['.pdf', '.docx', '.doc', '.txt', '.md', '.html', '.htm']
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext not in supported_extensions:
+            yield event.plain_result(f"❌ Unsupported format: {ext}\nSupported: {', '.join(supported_extensions)}")
+            return
+
+        # Get engine
+        engine = self._get_engine()
+        if not engine:
+            yield event.plain_result("❌ RAG engine is not ready")
+            return
+
+        file_name = os.path.basename(file_path)
+        yield event.plain_result(f"📄 Adding: {file_name}...")
+
+        try:
+            result = await engine.add_paper(file_path)
+
+            if result.get("status") == "success":
+                chunks_added = result.get("chunks_added", 0)
+                yield event.plain_result(f"✅ {file_name}\n   └─ {chunks_added} chunks added")
+            else:
+                error_msg = result.get("message", "Unknown error")
+                yield event.plain_result(f"❌ {file_name}\n   └─ {error_msg}")
+
+        except Exception as e:
+            logger.error(f"Failed to add {file_path}: {e}")
+            yield event.plain_result(f"❌ {file_name}\n   └─ {str(e)}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @paper_commands.command("clear")
@@ -594,7 +649,6 @@ class PaperRAGPlugin(Star):
         try:
             result = await engine.clear()
             self._response_cache.clear()
-
             if result.get("status") == "success":
                 yield event.plain_result(f"✅ {result.get('message', 'Document library cleared')}")
             else:
@@ -634,7 +688,7 @@ class PaperRAGPlugin(Star):
             yield event.plain_result(f"❌ Directory does not exist: {papers_dir}")
             return
 
-        yield event.plain_result("🔄 Step 1/3: Clearing knowledge base...")
+        yield event.plain_result("🔄 Step 1/4: Clearing knowledge base...")
 
         try:
             # Clear database
@@ -642,14 +696,35 @@ class PaperRAGPlugin(Star):
             if result.get("status") != "success":
                 yield event.plain_result(f"❌ Failed to clear: {result.get('message', 'Unknown error')}")
                 return
-            yield event.plain_result("✅ Step 1/3: Knowledge base cleared")
+            yield event.plain_result("✅ Step 1/4: Knowledge base cleared")
 
         except Exception as e:
             logger.error(f"Failed to clear document library: {e}")
             yield event.plain_result(f"❌ Failed to clear: {e}")
             return
 
-        yield event.plain_result("🔄 Step 2/3: Scanning documents...")
+        # Delete figures folder
+        yield event.plain_result("🔄 Step 2/4: Clearing figures...")
+        figures_dir = self.config.get("figures_dir", "")
+        if not figures_dir:
+            # Default figures directory
+            figures_dir = Path(__file__).parent / "data" / "figures"
+        else:
+            figures_dir = Path(figures_dir)
+
+        if figures_dir.exists() and figures_dir.is_dir():
+            try:
+                import shutil
+                shutil.rmtree(figures_dir)
+                logger.info(f"✅ Deleted figures folder: {figures_dir}")
+                yield event.plain_result(f"✅ Step 2/4: Figures folder cleared")
+            except Exception as e:
+                logger.warning(f"Failed to delete figures folder: {e}")
+                yield event.plain_result(f"⚠️ Failed to delete figures: {e}")
+        else:
+            yield event.plain_result("✅ Step 2/4: No figures folder found, skipping")
+
+        yield event.plain_result("🔄 Step 3/4: Scanning documents...")
 
         # Scan documents
         supported_extensions = ['.pdf', '.docx', '.doc', '.txt', '.md', '.html', '.htm']
@@ -665,7 +740,7 @@ class PaperRAGPlugin(Star):
             yield event.plain_result("📭 No supported documents found")
             return
 
-        yield event.plain_result(f"📄 Step 2/3: Found {len(doc_files)} documents")
+        yield event.plain_result(f"📄 Step 3/4: Found {len(doc_files)} documents")
 
         # Re-add documents
         import time
@@ -675,7 +750,7 @@ class PaperRAGPlugin(Star):
         failed = 0
         total_chunks = 0
 
-        yield event.plain_result("🔄 Step 3/3: Rebuilding embeddings... (this may take a while)")
+        yield event.plain_result("🔄 Step 4/4: Rebuilding embeddings... (this may take a while)")
 
         for idx, doc_file in enumerate(doc_files, 1):
             try:

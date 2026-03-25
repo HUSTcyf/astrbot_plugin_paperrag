@@ -163,11 +163,19 @@ class HybridRAGEngine:
             return self._embed_provider
 
         try:
+            # 构建 Ollama 配置
+            ollama_config = dict(self.config.ollama_config) if self.config.ollama_config else {}
+            # 配置 LLM 压缩
+            if self.config.compress_provider_id:
+                ollama_config["use_llm_compress"] = True
+                ollama_config["compress_max_chars"] = 8000
+
             self._embed_provider = create_embedding_provider(
                 mode=self.config.embedding_mode,
                 context=self.context,
                 provider_id=self.config.embedding_provider_id,
-                ollama_config=self.config.ollama_config,
+                ollama_config=ollama_config,
+                compress_provider_id=self.config.compress_provider_id,
                 embed_batch_size=10
             )
             self._embed_provider_initialized = True
@@ -238,26 +246,52 @@ class HybridRAGEngine:
         return self._retriever
 
     async def _ensure_llm_initialized(self) -> Any:
-        """确保GLM LLM已初始化"""
+        """确保LLM Provider已初始化"""
         if self._llm_initialized:
             assert self._llm_client is not None
             return self._llm_client
 
-        if not self.config.glm_api_key:
-            raise ValueError("GLM API Key未配置")
+        # 优先使用配置的 provider_id
+        provider_id = self.config.text_provider_id
+        if not provider_id:
+            # 回退到获取当前正在使用的 provider
+            try:
+                self._llm_client = self.context.get_using_provider()
+                if self._llm_client:
+                    logger.info("✅ 使用当前会话的 LLM Provider")
+                    self._llm_initialized = True
+                    return self._llm_client
+            except Exception as e:
+                logger.warning(f"⚠️ 获取当前Provider失败: {e}")
 
-        try:
-            from openai import AsyncOpenAI
-            self._llm_client = AsyncOpenAI(
-                api_key=self.config.glm_api_key,
-                base_url="https://open.bigmodel.cn/api/paas/v4/"
+            # 如果都获取不到，报错
+            raise ValueError(
+                "未配置 text_provider_id 且无法获取当前LLM Provider。"
+                "请在插件配置中设置 text_provider_id 或确保有可用的LLM Provider。"
             )
-            self._llm_initialized = True
-            logger.info(f"✅ GLM LLM初始化完成: {self.config.glm_model}")
-            assert self._llm_client is not None
-            return self._llm_client
+
+        # 从 context 获取指定的 provider
+        try:
+            provider_manager = getattr(self.context, "provider_manager", None)
+            if provider_manager:
+                inst_map = getattr(provider_manager, "inst_map", None)
+                if isinstance(inst_map, dict):
+                    self._llm_client = inst_map.get(provider_id)
+                    if self._llm_client:
+                        logger.info(f"✅ 使用 LLM Provider: {provider_id}")
+                        self._llm_initialized = True
+                        return self._llm_client
+
+            # 兼容旧版本
+            self._llm_client = self.context.get_provider_by_id(provider_id)
+            if self._llm_client:
+                logger.info(f"✅ 使用 LLM Provider: {provider_id}")
+                self._llm_initialized = True
+                return self._llm_client
+
+            raise ValueError(f"无法找到 Provider: {provider_id}")
         except Exception as e:
-            logger.error(f"❌ GLM LLM初始化失败: {e}")
+            logger.error(f"❌ LLM Provider初始化失败: {e}")
             self._llm_initialized = True
             raise
 
@@ -471,16 +505,8 @@ class HybridRAGEngine:
             images: 用户直接上传的图片路径列表（可选）
         """
         try:
-            # 检查LLM是否可用
-            if not self.config.glm_api_key:
-                return {
-                    "type": "error",
-                    "message": "GLM API Key未配置，无法生成回答。请配置glm_api_key或使用retrieve模式。",
-                    "sources": []  # 提前返回时使用空列表
-                }
-
             # 确保LLM已初始化
-            llm_client = await self._ensure_llm_initialized()
+            llm_provider = await self._ensure_llm_initialized()
 
             # 执行检索
             query_result = await self.retrieve(query, self.config.top_k)
@@ -525,7 +551,7 @@ class HybridRAGEngine:
 
             # 生成答案
             answer = await self._generate_answer_with_llm(
-                llm_client, query, sources, images=final_images
+                llm_provider, query, sources, images=final_images
             )
 
             return {
@@ -607,16 +633,16 @@ class HybridRAGEngine:
 
     async def _generate_answer_with_llm(
         self,
-        llm_client: Any,
+        llm_provider: Any,
         query: str,
         sources: List[Dict[str, Any]],
         images: Optional[List[str]] = None
     ) -> str:
         """
-        使用GLM LLM生成答案（支持多模态）
+        使用LLM Provider生成答案（支持多模态）
 
         Args:
-            llm_client: LLM客户端
+            llm_provider: LLM Provider
             query: 查询文本
             sources: 检索到的源文档
             images: 图片路径列表（可选）
@@ -640,10 +666,25 @@ class HybridRAGEngine:
 
 请提供详细的回答，并引用相关文献。"""
 
-            # 多模态处理：构建消息内容
+            # 判断使用哪个Provider
+            # 多模态：优先使用配置的 multimodal_provider_id
+            # 文本：使用 text_provider_id 或当前provider
             if images:
-                # 使用多模态模型 glm-4.6v-flash
-                model = self.config.glm_multimodal_model
+                provider_to_use = None
+                if self.config.multimodal_provider_id:
+                    try:
+                        provider_manager = getattr(self.context, "provider_manager", None)
+                        if provider_manager:
+                            inst_map = getattr(provider_manager, "inst_map", None)
+                            if isinstance(inst_map, dict):
+                                provider_to_use = inst_map.get(self.config.multimodal_provider_id)
+                    except Exception:
+                        pass
+
+                if provider_to_use is None:
+                    provider_to_use = llm_provider
+
+                # 使用多模态模式
                 content = []
 
                 # 添加文本部分
@@ -668,26 +709,48 @@ class HybridRAGEngine:
                     {"role": "user", "content": content}
                 ]
 
-                logger.info(f"🖼️ 使用VLM模式查询 (模型: {model}, 图片数: {min(len(images), 3)})")
+                logger.info(f"🖼️ 使用VLM模式查询 (图片数: {min(len(images), 3)})")
+
+                # 调用多模态
+                if hasattr(provider_to_use, 'chat'):
+                    response = await provider_to_use.chat.completions.create(
+                        messages=messages,
+                        temperature=0.7,
+                        max_tokens=2000
+                    )
+                else:
+                    raise ValueError("Provider不支持多模态聊天")
             else:
-                # 使用文本模型
-                model = self.config.glm_model
-                messages = [
-                    {"role": "user", "content": text_prompt}
-                ]
-                logger.info(f"📝 使用文本模式查询 (模型: {model})")
+                # 使用文本模式
+                logger.info(f"📝 使用文本模式查询")
 
-            # 调用GLM
-            response = await llm_client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0.7,
-                max_tokens=2000
-            )
-
-            # 提取回答
-            answer = response.choices[0].message.content
-            return answer
+                if hasattr(llm_provider, 'text_chat'):
+                    # 使用 text_chat 接口
+                    response = await llm_provider.text_chat(
+                        prompt=text_prompt,
+                        contexts=[],
+                        temperature=0.7,
+                        max_tokens=2000
+                    )
+                    if hasattr(response, 'choices'):
+                        answer = response.choices[0].message.content
+                    else:
+                        answer = str(response)
+                    return answer
+                elif hasattr(llm_provider, 'chat'):
+                    # 使用 chat.completions.create 接口
+                    messages = [
+                        {"role": "user", "content": text_prompt}
+                    ]
+                    response = await llm_provider.chat.completions.create(
+                        messages=messages,
+                        temperature=0.7,
+                        max_tokens=2000
+                    )
+                    answer = response.choices[0].message.content
+                    return answer
+                else:
+                    raise ValueError("Provider不支持文本聊天")
 
         except Exception as e:
             logger.error(f"❌ LLM生成失败: {e}")

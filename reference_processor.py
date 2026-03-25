@@ -176,9 +176,6 @@ class ReferenceExtractor:
                     expected_seq = actual_seq + 1
 
                 references.append(ref)
-                # 打印每条识别的参考文献
-                title_preview = ref.ref_title[:50] if ref.ref_title else "(无标题)"
-                logger.info(f"  [{len(references)}] {ref.ref_id}: {title_preview}... ({ref.ref_year})")
 
         logger.info(f"📚 共提取到 {len(references)} 条参考文献")
         return references
@@ -214,12 +211,17 @@ class ReferenceExtractor:
 
         for i, line in enumerate(lines):
             line_stripped = line.strip().lower()
-            # 检查是否是参考文献部分的标题
-            if any(kw in line_stripped for kw in self.REFERENCE_SECTION_KEYWORDS):
-                # 排除明显不是参考文献的行（如正文中的"as shown in reference [1]"）
-                if len(line_stripped) < 30 and not line_stripped.startswith('as '):
-                    ref_start = i + 1
-                    continue
+            # 检查是否是参考文献部分的标题（需要是独立的标题行，不是句子中的一部分）
+            is_reference_header = False
+            for kw in self.REFERENCE_SECTION_KEYWORDS:
+                # 精确匹配：整行就是关键词，或者只有关键词+空格
+                if line_stripped == kw or line_stripped.startswith(kw + ' '):
+                    is_reference_header = True
+                    break
+
+            if is_reference_header:
+                ref_start = i + 1
+                continue
 
             # 如果已经找到参考文献部分，检查是否到达其他部分
             if ref_start >= 0:
@@ -238,6 +240,7 @@ class ReferenceExtractor:
         lines = ref_text.split('\n')
         result = []
         current = []
+        MIN_REF_LENGTH = 100  # 最小引用长度阈值
 
         for line in lines:
             stripped = line.strip()
@@ -256,6 +259,23 @@ class ReferenceExtractor:
                 stripped.startswith('[') or
                 re.match(r'^\d+\.\s+[A-Z]', stripped)
             )
+
+            # 无序号引用的启发式判断
+            if not is_new_ref:
+                # 以 URL 开头的行通常是新的完整引用
+                if stripped.lower().startswith(('http://', 'https://', 'www.')):
+                    is_new_ref = True
+                # 如果当前累积文本已经很长（>=300字符），后续文本可能是新引用
+                elif current and len(' '.join(current)) >= 300:
+                    # 检查前一条引用是否看起来完整（以句号、doi或)结尾）
+                    prev_text = ' '.join(current)
+                    if prev_text.rstrip().endswith(('.', ')', 'doi:', 'org/', 'com/')):
+                        is_new_ref = True
+                # 如果一行以大写字母开头，且当前引用已完整，也可能新引用
+                elif current and re.match(r'^[A-Z][a-z]+', stripped):
+                    prev_text = ' '.join(current)
+                    if prev_text.rstrip().endswith('.') and len(prev_text) >= MIN_REF_LENGTH:
+                        is_new_ref = True
 
             if is_new_ref:
                 if current:

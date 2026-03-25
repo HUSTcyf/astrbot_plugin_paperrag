@@ -24,7 +24,11 @@ class OllamaEmbeddingConfig:
     timeout: float = 120.0
     batch_size: int = 10
     retry_attempts: int = 3
-    retry_delay: float = 1.0
+    retry_delay: float = 2.0
+    # LLM压缩配置（文本超限时使用）
+    use_llm_compress: bool = True
+    compress_provider: Any = None  # LLM Provider（用于文本压缩）
+    compress_max_chars: int = 8000
 
 
 class OllamaEmbeddingProvider:
@@ -34,6 +38,14 @@ class OllamaEmbeddingProvider:
         self.config = config
         self._client: Optional[httpx.AsyncClient] = None
         self._embed_dim: Optional[int] = None
+        self._llm_client: Optional[Any] = None
+
+    async def _get_llm_client(self) -> Any:
+        """获取LLM客户端（用于文本压缩）"""
+        if self._llm_client is None and self.config.use_llm_compress and self.config.compress_provider:
+            self._llm_client = self.config.compress_provider
+            logger.info("✅ 使用配置的LLM Provider进行文本压缩")
+        return self._llm_client
 
     async def _get_client(self) -> httpx.AsyncClient:
         """获取HTTP客户端（延迟初始化）"""
@@ -53,6 +65,9 @@ class OllamaEmbeddingProvider:
     async def _embed_single(self, text: str) -> List[float]:
         """获取单个文本的embedding"""
         client = await self._get_client()
+
+        # 处理文本：清理 -> 压缩（如需要）
+        text = await self._process_text(text)
 
         for attempt in range(self.config.retry_attempts):
             try:
@@ -86,10 +101,17 @@ class OllamaEmbeddingProvider:
                         f"请先运行: ollama pull {self.config.model}"
                     )
                 elif e.response.status_code == 500:
-                    raise Exception(
-                        f"Ollama服务错误 (500)。请确保Ollama服务正在运行: "
-                        f"ollama serve"
-                    )
+                    # 500 错误时增加重试间隔
+                    # 记录错误文本信息以便调试
+                    text_preview = text[:100] + "..." if len(text) > 100 else text
+                    logger.warning(f"Ollama 500 错误 (尝试 {attempt + 1}/{self.config.retry_attempts}): 文本长度={len(text)}, 内容: {text_preview}")
+                    if attempt < self.config.retry_attempts - 1:
+                        await asyncio.sleep(self.config.retry_delay * (attempt + 1))
+                    else:
+                        raise Exception(
+                            f"Ollama服务错误 (500)。文本长度={len(text)}。"
+                            f"可能是文本过长或包含特殊字符。可尝试: pkill -f 'ollama serve' && ollama serve"
+                        )
                 elif attempt < self.config.retry_attempts - 1:
                     await asyncio.sleep(self.config.retry_delay)
                 else:
@@ -111,6 +133,103 @@ class OllamaEmbeddingProvider:
                     await asyncio.sleep(self.config.retry_delay)
                 else:
                     raise
+
+    def _sanitize_text(self, text: str) -> str:
+        """清理文本，避免特殊字符导致 Ollama 处理失败"""
+        # 移除 null 字节
+        text = text.replace('\x00', '')
+        # 移除可能导致问题的控制字符
+        text = ''.join(char for char in text if ord(char) >= 32 or char in '\n\r\t')
+        # 压缩多余空白
+        import re
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+
+    async def _compress_text(self, text: str) -> str:
+        """
+        使用LLM压缩文本，保留核心语义信息
+
+        Args:
+            text: 原始文本
+
+        Returns:
+            压缩后的文本（纯字符串）
+        """
+        llm_provider = await self._get_llm_client()
+        if not llm_provider:
+            # 如果没有LLM客户端，直接截断
+            return text[:self.config.compress_max_chars]
+
+        try:
+            compress_prompt = f"""请将以下文本压缩到不超过8000字符，保留核心语义信息和关键细节。
+
+原文：
+{text}
+
+压缩后的文本（直接输出，不要解释）："""
+
+            # 优先使用 text_chat 接口（AstrBot 标准接口）
+            if hasattr(llm_provider, 'text_chat'):
+                response = await llm_provider.text_chat(
+                    prompt=compress_prompt,
+                    contexts=[],
+                    temperature=0.3,
+                    max_tokens=4000
+                )
+                # 安全提取纯文本内容
+                if hasattr(response, 'choices') and hasattr(response.choices[0], 'message'):
+                    content = response.choices[0].message.content
+                    # 确保返回纯字符串
+                    compressed = str(content).strip() if content else ""
+                else:
+                    compressed = str(response).strip()
+            # 回退到 chat.completions.create 接口
+            elif hasattr(llm_provider, 'chat'):
+                response = await llm_provider.chat.completions.create(
+                    messages=[{"role": "user", "content": compress_prompt}],
+                    max_tokens=4000,
+                    temperature=0.3
+                )
+                compressed = str(response.choices[0].message.content).strip()
+            else:
+                raise ValueError("Provider不支持 text_chat 或 chat 接口")
+
+            logger.debug(f"📝 文本压缩: {len(text)} -> {len(compressed)} 字符")
+            return compressed
+        except Exception as e:
+            logger.warning(f"⚠️ LLM压缩失败: {e}，使用直接截断")
+            return text[:self.config.compress_max_chars]
+
+    async def _process_text(self, text: str) -> str:
+        """
+        处理文本：清理 -> 压缩（如需要，支持多次压缩直到合适长度）
+
+        Args:
+            text: 原始文本
+
+        Returns:
+            处理后的文本
+        """
+        # 记录原始长度
+        original_len = len(text)
+
+        # 基础清理
+        text = self._sanitize_text(text)
+
+        # 如果超过限制且启用了LLM压缩，递归压缩直到合适长度
+        max_retries = 3
+        retry_count = 0
+        if len(text) > self.config.compress_max_chars and self.config.use_llm_compress:
+            while len(text) > self.config.compress_max_chars and retry_count < max_retries:
+                logger.debug(f"📝 文本超限({len(text)}>{self.config.compress_max_chars})，使用LLM压缩 (第{retry_count + 1}次)")
+                text = await self._compress_text(text)
+                retry_count += 1
+
+        # 记录处理后长度
+        if original_len > self.config.compress_max_chars:
+            logger.info(f"📊 文本压缩: {original_len} → {len(text)} 字符 (压缩了 {original_len - len(text)} 字符, 压缩次数: {retry_count})")
+
+        return text
 
     async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
         """批量获取文本embeddings（并发处理）"""
@@ -179,7 +298,10 @@ def create_ollama_provider(
     model: str = "bge-m3",
     timeout: float = 120.0,
     batch_size: int = 10,
-    retry_attempts: int = 3
+    retry_attempts: int = 3,
+    use_llm_compress: bool = True,
+    compress_provider: Any = None,
+    compress_max_chars: int = 8000
 ) -> OllamaEmbeddingProvider:
     """
     创建Ollama Embedding Provider
@@ -190,6 +312,9 @@ def create_ollama_provider(
         timeout: 请求超时时间（秒），默认120
         batch_size: 并发批处理大小，默认10
         retry_attempts: 重试次数，默认3
+        use_llm_compress: 文本超限时使用LLM压缩
+        compress_provider: LLM Provider实例（用于文本压缩）
+        compress_max_chars: 触发压缩的最大字符数
 
     Returns:
         OllamaEmbeddingProvider实例
@@ -199,7 +324,10 @@ def create_ollama_provider(
         model=model,
         timeout=timeout,
         batch_size=batch_size,
-        retry_attempts=retry_attempts
+        retry_attempts=retry_attempts,
+        use_llm_compress=use_llm_compress,
+        compress_provider=compress_provider,
+        compress_max_chars=compress_max_chars
     )
     return OllamaEmbeddingProvider(config)
 
@@ -374,6 +502,7 @@ def create_embedding_provider(
     context: Any = None,
     provider_id: str = None,
     ollama_config: dict = None,
+    compress_provider_id: str = None,
     **kwargs
 ) -> Union[OllamaEmbeddingProvider, AstrBotEmbeddingProvider]:
     """
@@ -384,6 +513,7 @@ def create_embedding_provider(
         context: AstrBot 上下文（astrbot 模式需要）
         provider_id: Provider ID（astrbot 模式需要）
         ollama_config: Ollama 配置（ollama 模式需要）
+        compress_provider_id: LLM Provider ID（用于文本压缩）
         **kwargs: 其他参数
 
     Returns:
@@ -396,12 +526,25 @@ def create_embedding_provider(
         if not ollama_config:
             raise ValueError("Ollama 模式需要 ollama_config")
 
+        # 获取压缩用的 LLM Provider
+        compress_provider = None
+        if compress_provider_id and context:
+            try:
+                compress_provider = context.get_provider_by_id(compress_provider_id)
+                if compress_provider:
+                    logger.info(f"✅ 使用 LLM Provider '{compress_provider_id}' 进行文本压缩")
+            except Exception as e:
+                logger.warning(f"⚠️ 无法获取压缩Provider '{compress_provider_id}': {e}")
+
         return create_ollama_provider(
             base_url=ollama_config.get("base_url", "http://localhost:11434"),
             model=ollama_config.get("model", "bge-m3"),
             timeout=ollama_config.get("timeout", 120.0),
             batch_size=ollama_config.get("batch_size", 10),
-            retry_attempts=ollama_config.get("retry_attempts", 3)
+            retry_attempts=ollama_config.get("retry_attempts", 3),
+            use_llm_compress=ollama_config.get("use_llm_compress", True),
+            compress_provider=compress_provider,
+            compress_max_chars=ollama_config.get("compress_max_chars", 8000)
         )
 
     elif mode == EmbeddingProviderType.ASTRBOT:
