@@ -233,16 +233,17 @@ class HybridPDFParser:
             if image_paths:
                 all_nodes = self._associate_images_with_chunks(all_nodes, image_paths, image_pages)
 
-            # 引用处理：根据配置决定是否使用 Grobid
+            # 引用处理（Grobid 通过外部调用，此处直接禁用）
             logger.debug(f"🔄 引用处理...")
-            use_grobid = self.config.get("enable_grobid", False) if hasattr(self, 'config') else False
+            use_grobid = False
             references, all_nodes = process_references_and_citations_grobid(
                 pdf_path, all_nodes, raw_text, use_grobid=use_grobid
             )
 
-            if references:
+            if references and documents:
                 # 将参考文献信息添加到文档元数据
-                doc.metadata['references'] = [ref.to_dict() for ref in references]
+                first_doc = documents[0]
+                first_doc.metadata['references'] = [ref.to_dict() for ref in references]
                 logger.info(f"📚 识别到 {len(references)} 条参考文献")
 
             logger.debug(f"✅ 语义分块完成: {len(all_nodes)} 个nodes")
@@ -348,7 +349,137 @@ class HybridPDFParser:
 
             i += 1
 
+        # 第三步：后处理 - 合并极短chunk，拆分极长chunk
+        nodes = self._post_process_chunks(nodes)
+
         return nodes
+
+    def _post_process_chunks(self, nodes: List[Node]) -> List[Node]:
+        """
+        后处理：合并极短chunk，拆分极长chunk
+
+        Args:
+            nodes: 分块后的节点列表
+
+        Returns:
+            处理后的节点列表
+        """
+        if not nodes:
+            return nodes
+
+        # 极短阈值: 小于 min_chunk_size 的一半就认为是异常短（需合并）
+        too_short_threshold = max(self.min_chunk_size // 2, 50)
+        # 极长阈值: 超过 chunk_size * 10 就认为需要拆分
+        too_long_threshold = self.chunk_size * 10
+
+        result = []
+
+        i = 0
+        while i < len(nodes):
+            node = nodes[i]
+            text_len = len(node.text)
+
+            # 极短chunk：合并到前一个chunk（如果存在），否则合并到下一个chunk
+            if text_len < too_short_threshold:
+                if result:
+                    # 合并到前一个chunk
+                    prev_node = result[-1]
+                    merged_text = prev_node.text + "\n\n" + node.text
+                    result[-1] = Node(
+                        text=merged_text,
+                        metadata={**prev_node.metadata}
+                    )
+                elif i + 1 < len(nodes):
+                    # 没有前一个chunk，合并到下一个chunk
+                    next_node = nodes[i + 1]
+                    merged_text = node.text + "\n\n" + next_node.text
+                    nodes[i + 1] = Node(
+                        text=merged_text,
+                        metadata={**next_node.metadata}
+                    )
+                    # 跳过下一个节点（已合并）
+                    i += 2
+                    continue
+                else:
+                    # 只有一个节点且太短，直接保留
+                    result.append(node)
+                i += 1
+                continue
+
+            # 极长chunk：拆分为固定大小的子块
+            if text_len > too_long_threshold:
+                sub_chunks = self._split_long_text(node.text)
+                for sub_text in sub_chunks:
+                    result.append(Node(
+                        text=sub_text,
+                        metadata={**node.metadata}
+                    ))
+                i += 1
+                continue
+
+            # 正常chunk
+            result.append(node)
+            i += 1
+
+        # 重建 chunk_index
+        for idx, node in enumerate(result):
+            node.metadata["chunk_index"] = idx
+
+        return result
+
+    def _split_long_text(self, text: str) -> List[str]:
+        """
+        将超长文本拆分为固定大小的块（不保留语义，简单分割）
+
+        用于处理PDF解析异常导致的超长段落
+
+        Args:
+            text: 超长文本
+
+        Returns:
+            文本块列表
+        """
+        chunks = []
+        start = 0
+        text_len = len(text)
+
+        while start < text_len:
+            end = start + self.chunk_size
+            if end >= text_len:
+                chunks.append(text[start:])
+                break
+
+            # 尝试在句子边界断开
+            chunk_text = text[start:end]
+            split_pos = -1
+
+            # 从后向前找句子边界
+            for delimiter in ['。', '！', '？', '. ', '! ', '? ']:
+                pos = chunk_text.rfind(delimiter)
+                if pos > self.chunk_size // 4:  # 确保不在太靠前的位置
+                    split_pos = pos + len(delimiter)
+                    break
+
+            # 如果找不到好的断点，尝试找逗号
+            if split_pos == -1:
+                for delimiter in ['，', ', ', '；', '; ']:
+                    pos = chunk_text.rfind(delimiter)
+                    if pos > self.chunk_size // 4:
+                        split_pos = pos + len(delimiter)
+                        break
+
+            # 如果还找不到，在空格处断开
+            if split_pos == -1:
+                space_pos = chunk_text.rfind(' ')
+                if space_pos > self.chunk_size // 4:
+                    split_pos = space_pos + 1
+                else:
+                    split_pos = end
+
+            chunks.append(chunk_text[:split_pos].strip())
+            start += split_pos
+
+        return [c for c in chunks if c]
 
     def _split_by_paragraphs(self, text: str) -> List[str]:
         """按段落分割文本"""
@@ -856,22 +987,6 @@ class HybridPDFParser:
         except Exception as e:
             logger.debug(f"⚠️ Pixmap 转 PIL Image 失败: {e}")
             return None
-
-    def _extract_figure_number(self, caption: str) -> str:
-        """
-        从图注中提取编号
-
-        Args:
-            caption: 图注文本，如 "Figure 1: xxx"
-
-        Returns:
-            图注编号，如 "1"
-        """
-        import re
-        match = re.search(r'(?:Figure|Fig\.)\s*(\d+|[A-Z]\d?)', caption, re.IGNORECASE)
-        if match:
-            return match.group(1)
-        return caption.replace(" ", "_")
 
     def _associate_images_with_chunks(
         self,

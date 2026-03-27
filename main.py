@@ -90,6 +90,12 @@ class PaperRAGPlugin(Star):
                     compress_provider_id=self.config.get("compress_provider_id", ""),
                     text_provider_id=self.config.get("text_provider_id", ""),
                     multimodal_provider_id=self.config.get("multimodal_provider_id", ""),
+                    llama_vlm_model_path=self.config.get("llama_vlm_model_path", "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf"),
+                    llama_vlm_mmproj_path=self.config.get("llama_vlm_mmproj_path", "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf"),
+                    llama_vlm_max_tokens=self.config.get("llama_vlm_max_tokens", 2560),
+                    llama_vlm_temperature=self.config.get("llama_vlm_temperature", 0.7),
+                    llama_vlm_n_ctx=self.config.get("llama_vlm_n_ctx", 4096),
+                    llama_vlm_n_gpu_layers=self.config.get("llama_vlm_n_gpu_layers", 99),
                     ollama_config=self.config.get("ollama", {}),
                     milvus_lite_path=self.config.get("milvus_lite_path", ""),
                     address=self.config.get("address", ""),
@@ -857,6 +863,19 @@ class PaperRAGPlugin(Star):
 
         # Clear resources
         self._response_cache.clear()
+
+        # 清理 Llama.cpp VLM Provider
+        try:
+            from .llama_cpp_vlm_provider import reset_llama_cpp_vlm_provider
+            reset_llama_cpp_vlm_provider()
+            logger.info("[Llama.cpp-VLM] Provider 已清理")
+
+            # 强制垃圾回收，尝试避免退出时的 Metal assert 错误
+            import gc
+            gc.collect()
+            logger.info("[Llama.cpp-VLM] 垃圾回收完成")
+        except Exception as e:
+            logger.warning(f"[Llama.cpp-VLM] 清理时出现警告: {e}")
 
         # Note: No need to explicitly close Milvus connection
         # MilvusClient manages connection automatically

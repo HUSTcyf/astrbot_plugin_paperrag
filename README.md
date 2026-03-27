@@ -1,12 +1,12 @@
-# 📚 Paper RAG Plugin v1.3.1 - 用户指南
+# 📚 Paper RAG Plugin v1.4.0 - 用户指南
 
 本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力（支持多模态VLM问答）。
 
-> **版本说明**：当前版本 v1.3.1，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
+> **版本说明**：当前版本 v1.4.0，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
 
 ## ✨ 核心功能
 
-- 🔍 **智能检索**：基于语义相似度快速定位相关文档片段
+- 🔍 **混合检索**：BM25 关键词 + 向量语义双路召回 + RRF 分数融合，兼顾精确术语匹配与语义理解
 - 💡 **AI问答**：结合检索内容生成准确、有引用的答案
 - 📄 **多格式支持**：PDF、Word、TXT、Markdown、HTML
 - 🖼️ **多模态提取**：自动识别PDF中的图片、表格、公式
@@ -169,6 +169,9 @@ Bot: > The attention mechanism allows the model to focus on...
 |-------|------|--------|--------|
 | `top_k` | 返回片段数 | `5` | `5` |
 | `similarity_cutoff` | 相似度阈值 | `0.3` | `0.3` |
+| `enable_bm25` | 启用 BM25 混合检索 | `false` | ✅ |
+| `bm25_top_k` | BM25 召回数量 | `20` | `20-50` |
+| `hybrid_alpha` | RRF 融合权重 | `0.5` | `0.5`（平等权重） |
 
 > 💡 **Embedding Provider 说明**：插件使用 AstrBot 中配置的 Embedding Provider。推荐使用 Ollama（免费无限制）。
 
@@ -204,6 +207,66 @@ Bot: > The attention mechanism allows the model to focus on...
         "extract_formulas": true
     }
 }
+```
+
+### Llama.cpp 本地 VLM 配置（当 multimodal_provider_id 为空时使用）
+
+当未配置 `multimodal_provider_id` 时，插件会自动使用本地 Llama.cpp VLM 进行图片问答。
+
+**自动降级**：插件会优先使用 9B 模型，9B 模型不存在或加载失败时自动降级到 4B 模型。
+
+| 配置项 | 说明 | 默认值 | 推荐值 |
+|-------|------|--------|--------|
+| `llama_vlm_model_path` | GGUF 模型路径 | `./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf` | 9B/4B 均可 |
+| `llama_vlm_mmproj_path` | mmproj 视觉编码器路径 | `./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf` | 与模型配套 |
+| `llama_vlm_n_ctx` | 上下文窗口大小 | `4096` | `4096` |
+| `llama_vlm_n_gpu_layers` | GPU 加速层数 | `99` | `99`（全部 GPU） |
+| `llama_vlm_max_tokens` | 最大生成 token 数 | `2560` | `512-4096` |
+| `llama_vlm_temperature` | 生成温度 | `0.7` | `0.7` |
+
+> 💡 **Llama.cpp VLM 优势**：
+> - 模型常驻内存，首次加载后推理快速（~1秒）
+> - 支持多图输入
+> - Apple Metal GPU 加速
+> - 完全本地运行，无需 API
+> - **自动降级**：9B 不可用时自动使用 4B
+
+**安装步骤**：
+
+1. 安装 llama-cpp-python（含多模态支持）：
+```bash
+# macOS Apple Silicon
+CMAKE_ARGS="-DGGML_METAL=on -DLLAMA_MTMD=on" pip install llama-cpp-python
+
+# NVIDIA GPU
+# CMAKE_ARGS="-DGGML_CUDA=on -DLLAMA_MTMD=on" pip install llama-cpp-python
+```
+
+2. 模型下载（插件首次初始化时会自动下载，也可手动执行）：
+```bash
+# 9B 模型（约 5.6GB Q4 量化）
+mkdir -p models
+hf download unsloth/Qwen3.5-9B-GGUF Qwen3.5-9B-UD-Q4_K_XL.gguf --local-dir ./models/Qwen3.5-9B-GGUF
+hf download unsloth/Qwen3.5-9B-GGUF mmproj-BF16.gguf --local-dir ./models/Qwen3.5-9B-GGUF
+
+# 4B 模型（约 2.7GB Q4 量化，备用）
+hf download unsloth/Qwen3.5-4B-GGUF Qwen3.5-4B-UD-Q4_K_XL.gguf --local-dir ./models/Qwen3.5-4B-GGUF
+hf download unsloth/Qwen3.5-4B-GGUF mmproj-BF16.gguf --local-dir ./models/Qwen3.5-4B-GGUF
+```
+
+3. 配置路径（基于插件目录）：
+```
+llama_vlm_model_path = ./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf
+llama_vlm_mmproj_path = ./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf
+```
+
+4. 验证安装：
+```bash
+python -c "
+from llama_cpp import Llama
+llama = Llama('./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf', mmproj='./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf')
+print('✅ Llama.cpp VLM 安装成功')
+"
 ```
 
 ### 重排序配置
@@ -267,6 +330,59 @@ Bot: > The attention mechanism allows the model to focus on...
   "reranking_threshold": 0.3
 }
 ```
+
+### 混合检索配置（BM25 + 向量）
+
+BM25 混合检索通过 **双路召回 + 分数融合** 兼顾关键词精确匹配与语义理解：
+
+| 配置项 | 说明 | 默认值 | 推荐值 |
+|-------|------|--------|--------|
+| `enable_bm25` | 是否启用混合检索 | `false` | ✅ |
+| `bm25_top_k` | BM25 召回数量 | `20` | `20-50` |
+| `hybrid_alpha` | RRF 向量权重（0=纯BM25，1=纯向量） | `0.5` | `0.5` |
+| `hybrid_rrf_k` | RRF 常数 k | `60` | 默认 |
+
+> **适用场景**：查询中包含明确关键词（论文标题、专业术语、作者名等）时，BM25 混合检索效果显著优于纯向量检索。
+
+**检索流程**：
+```
+Query
+  ├─ BM25 关键词搜索 ──→ 倒排索引命中 ──→ top_k 候选
+  └─ 向量语义搜索 ──→ Milvus COSINE ──→ top_k 候选
+                        ↓
+              RRF 分数融合 ──→ 排序取 top_k
+```
+
+**典型配置**：
+
+1. **默认（推荐）** — 关键词与语义兼顾
+```json
+{
+  "enable_bm25": true,
+  "bm25_top_k": 20,
+  "hybrid_alpha": 0.5
+}
+```
+
+2. **强关键词匹配** — 适合专有名词、技术术语查询
+```json
+{
+  "enable_bm25": true,
+  "bm25_top_k": 50,
+  "hybrid_alpha": 0.3
+}
+```
+
+3. **强语义理解** — 适合复杂问题、同义表述查询
+```json
+{
+  "enable_bm25": true,
+  "bm25_top_k": 20,
+  "hybrid_alpha": 0.7
+}
+```
+
+> ⚠️ **注意**：`bm25_top_k` 应大于最终 `top_k`，确保 RRF 融合时有足够候选；`enable_bm25` 与 `enable_reranking` 可同时开启，混合检索结果再经重排序二次优化。
 
 ---
 

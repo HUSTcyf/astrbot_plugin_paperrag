@@ -22,7 +22,7 @@ PDF → HybridPDFParser → Nodes → HybridIndexManager → HybridRAGEngine →
 ### 3. HybridRAGEngine (`hybrid_rag.py`)
 - 完整RAG流程：解析 → 分块 → 索引 → 检索 → 生成
 - 支持多模态查询（图片输入）
-- GLM LLM 生成
+- GLM LLM 生成 / Llama.cpp VLM 本地推理
 
 ## 关键特性
 
@@ -47,14 +47,21 @@ PDF → HybridPDFParser → Nodes → HybridIndexManager → HybridRAGEngine →
 
 ```python
 RAGConfig(
-    # 模型配置
-    glm_api_key="",                    # GLM API密钥
-    glm_model="glm-4.7-flash",        # 文本模型
-    glm_multimodal_model="glm-4.6v-flash",  # 多模态模型
-
     # Embedding配置
-    embedding_mode="api",               # "api" 或 "ollama"
-    embed_dim=768,                     # 向量维度
+    embedding_mode="ollama",           # "api" 或 "ollama"
+    embed_dim=1024,                    # 向量维度 (BGE-M3=1024)
+
+    # LLM Provider配置
+    text_provider_id="",               # 文本问答 Provider
+    multimodal_provider_id="",          # 多模态问答 Provider（可选）
+
+    # Llama.cpp VLM配置（当 multimodal_provider_id 为空时使用）
+    llama_vlm_model_path="./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf",
+    llama_vlm_mmproj_path="./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf",
+    llama_vlm_max_tokens=2560,
+    llama_vlm_temperature=0.7,
+    llama_vlm_n_ctx=4096,
+    llama_vlm_n_gpu_layers=99,
 
     # Milvus配置
     milvus_lite_path="./data/milvus_papers.db",
@@ -89,6 +96,7 @@ astrbot_plugin_paperrag/
 ├── ollama_embedding.py        # Ollama Embedding
 ├── llama_index_reranker.py    # 重排序
 ├── reranker.py                # 重排序封装
+├── llama_cpp_vlm_provider.py  # Llama.cpp VLM本地推理
 └── docs/
     ├── ARCHITECTURE.md        # 本文档
     ├── CHANGELOG.md          # 变更记录

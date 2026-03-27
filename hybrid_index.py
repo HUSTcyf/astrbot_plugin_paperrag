@@ -91,6 +91,11 @@ class HybridIndexManager:
         self._doc_stats_file = None  # JSON 文件路径
         self._doc_stats: Dict[str, Dict[str, Any]] = {}  # file_name -> {chunk_count, added_time}
 
+        # BM25 内存索引（延迟构建）
+        self._bm25: Any = None  # BM25Okapi 实例
+        self._bm25_corpus_texts: List[str] = []
+        self._bm25_corpus_metadata: List[Any] = []
+
         # 确定连接模式
         self._configure_connection_mode()
 
@@ -469,7 +474,9 @@ class HybridIndexManager:
         try:
             # 准备数据
             data = []
-            for node, embedding in zip(nodes, embeddings):
+            logger.info(f"🔍 [DEBUG] 准备插入: nodes={len(nodes)}, embeddings={len(embeddings)}")
+
+            for i, (node, embedding) in enumerate(zip(nodes, embeddings)):
                 metadata = node.metadata if hasattr(node, 'metadata') else {}
 
                 # 确保 metadata 是可 JSON 序列化的
@@ -498,6 +505,9 @@ class HybridIndexManager:
                     "text": node.text if hasattr(node, 'text') else str(node),
                     "metadata": metadata_str
                 })
+                logger.info(f"🔍 [DEBUG] 节点 {i}: text长度={len(node.text) if hasattr(node, 'text') else len(str(node))}, embedding长度={len(embedding) if embedding else 'None'}")
+
+            logger.info(f"🔍 [DEBUG] 最终准备插入: data条数={len(data)}")
 
             # 插入数据 - 使用线程池避免阻塞事件循环
             collection = cast(Collection, self._collection)
@@ -623,6 +633,86 @@ class HybridIndexManager:
                 "status": "error",
                 "error": str(e)
             }
+
+    async def get_all_chunks(self, batch_size: int = 1000) -> List[Dict[str, Any]]:
+        """
+        从 Milvus 提取全量文本 chunks（用于生成评测数据集）
+
+        Args:
+            batch_size: 每批提取的数量，避免大数据量内存问题
+
+        Returns:
+            [{"text": str, "metadata": dict, "id": int}, ...]
+        """
+        import json
+
+        try:
+            await self._ensure_collection()
+            collection = cast(Collection, self._collection)
+
+            all_chunks = []
+            loop = asyncio.get_event_loop()
+            offset = 0
+
+            logger.info(f"🔍 开始从 Milvus 提取全量 chunks (batch_size={batch_size})...")
+
+            while True:
+                raw_results: Any = await loop.run_in_executor(
+                    None,
+                    lambda: collection.query(
+                        expr="id >= 0",
+                        output_fields=["id", "text", "metadata"],
+                        limit=batch_size,
+                        offset=offset,
+                    )
+                )
+                raw_results = cast(List[Dict[str, Any]], raw_results)
+
+                if not raw_results:
+                    break
+
+                for row in raw_results:
+                    chunk = {
+                        "id": row.get("id"),
+                        "text": row.get("text", ""),
+                    }
+                    # 解析 metadata JSON 字符串
+                    meta = row.get("metadata", "{}")
+                    if isinstance(meta, str):
+                        try:
+                            meta = json.loads(meta)
+                        except Exception:
+                            meta = {"raw": meta}
+                    chunk["metadata"] = meta
+
+                    # 提取关键字段到顶层
+                    if isinstance(meta, dict):
+                        chunk["file_name"] = meta.get("file_name", "")
+                        chunk["paper_id"] = meta.get("paper_id", chunk["file_name"])
+
+                    all_chunks.append(chunk)
+
+                offset += len(raw_results)
+                logger.debug(f"  已提取 {offset} chunks...")
+
+                # 如果返回数量少于 batch_size，说明已经取完
+                if len(raw_results) < batch_size:
+                    break
+
+            logger.info(f"✅ 共提取 {len(all_chunks)} 个 chunks")
+
+            # 按 paper_id 分组统计
+            paper_counts: Dict[str, int] = {}
+            for c in all_chunks:
+                pid = c.get("paper_id", "unknown")
+                paper_counts[pid] = paper_counts.get(pid, 0) + 1
+            logger.info(f"📊 涉及 {len(paper_counts)} 篇论文")
+
+            return all_chunks
+
+        except Exception as e:
+            logger.error(f"提取 chunks 失败: {e}")
+            raise
 
     async def list_unique_documents(self) -> List[Dict[str, Any]]:
         """列出所有不同的文档（按文件分组）- 使用追踪的统计数据"""
@@ -772,6 +862,116 @@ class HybridIndexManager:
         except Exception as e:
             logger.error(f"清空索引失败: {e}")
             return False
+
+    # ============================================================================
+    # BM25 检索器
+    # ============================================================================
+
+    async def bm25_search(
+        self,
+        query: str,
+        top_k: int = 20
+    ) -> List[Dict[str, Any]]:
+        """
+        BM25 关键词检索（基于 rank_bm25）
+
+        Args:
+            query: 查询文本
+            top_k: 返回结果数量
+
+        Returns:
+            BM25 得分列表 [{"text", "metadata", "score"}, ...]
+        """
+        import json
+
+        # 延迟导入，避免未安装时阻塞
+        try:
+            from rank_bm25 import BM25Okapi
+        except ImportError:
+            logger.error("rank_bm25 未安装，请运行: pip install rank-bm25")
+            return []
+
+        # 构建或刷新内存索引
+        await self._ensure_bm25_index()
+
+        if self._bm25 is None:
+            return []
+
+        try:
+            # 分词并计算 BM25 分数
+            tokenized_query = query.split()
+            scores = self._bm25.get_scores(tokenized_query)
+
+            # 构建 (index, score) 对，排序取 top_k
+            scored = list(enumerate(scores))
+            scored.sort(key=lambda x: x[1], reverse=True)
+
+            results = []
+            seen_texts: set = set()
+            for idx, score in scored[:top_k]:
+                if idx >= len(self._bm25_corpus_texts):
+                    continue
+                text = self._bm25_corpus_texts[idx]
+                # 去重：相同文本只保留第一个
+                if text in seen_texts:
+                    continue
+                seen_texts.add(text)
+
+                metadata = self._bm25_corpus_metadata[idx]
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except json.JSONDecodeError:
+                        try:
+                            metadata = json.loads(metadata.replace("'", '"'))
+                        except Exception:
+                            metadata = {}
+                results.append({
+                    "text": text,
+                    "metadata": metadata or {},
+                    "score": float(score)
+                })
+
+            logger.debug(f"BM25 检索: query='{query}', 返回 {len(results)} 条结果")
+            return results
+
+        except Exception as e:
+            logger.error(f"BM25 检索失败: {e}")
+            return []
+
+    async def _ensure_bm25_index(self):
+        """延迟构建 BM25 内存索引"""
+        if self._bm25 is not None:
+            return
+
+        try:
+            # 从 Milvus 提取全量文本
+            chunks = await self.get_all_chunks(batch_size=1000)
+
+            if not chunks:
+                logger.warning("⚠️ BM25 索引构建失败：Milvus 中无数据")
+                return
+
+            self._bm25_corpus_texts = [c["text"] for c in chunks]
+            self._bm25_corpus_metadata = [c.get("metadata", {}) for c in chunks]
+
+            # 构建 BM25 索引
+            from rank_bm25 import BM25Okapi
+            tokenized_corpus = [text.split() for text in self._bm25_corpus_texts]
+            self._bm25 = BM25Okapi(tokenized_corpus)
+
+            logger.info(f"✅ BM25 索引构建完成: {len(self._bm25_corpus_texts)} 个 chunks")
+
+        except Exception as e:
+            logger.error(f"BM25 索引构建失败: {e}")
+            self._bm25 = None
+
+    def refresh_bm25_index(self):
+        """强制刷新 BM25 索引（如论文增删后）"""
+        self._bm25 = None
+        self._bm25_corpus_texts = []
+        self._bm25_corpus_metadata = []
+        logger.info("🔄 BM25 索引已重置，下次检索时将重新构建")
 
     def __del__(self):
         """析构函数，确保断开连接"""

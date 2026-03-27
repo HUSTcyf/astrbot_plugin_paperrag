@@ -5,11 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.4.0] - 2026-03-27
 
 ### Added
 
-- (暂无)
+- **Llama.cpp 本地 VLM Provider**
+  - 新增 `llama_cpp_vlm_provider.py` 模块
+  - 使用 llama-cpp-python 实现本地视觉语言模型推理
+  - Apple Metal GPU 加速支持
+  - 模型常驻内存，首次加载后推理快速（~1秒）
+
+- **自动模型下载**
+  - 初始化时自动检查模型文件是否存在
+  - 不存在时自动从 HuggingFace 下载
+  - 支持 9B 和 4B 双模型配置
+
+- **9B → 4B 自动降级**
+  - 优先使用 Qwen3.5-9B 模型
+  - 9B 模型不存在或加载失败时自动降级到 4B 模型
+  - 路径：`./models/Qwen3.5-9B-GGUF/` 和 `./models/Qwen3.5-4B-GGUF/`
+
+- **响应长度扩展**
+  - `llama_vlm_max_tokens` 从 512 扩展到 2560（5倍）
+  - 支持更长的多模态回答
+
+### Changed
+
+- **异步架构优化**
+  - 使用 `asyncio.run_in_executor` 避免阻塞事件循环
+  - 解决同步阻塞和冷启动问题
+
+- **配置默认值更新**
+  - `llama_vlm_model_path`: `./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf`
+  - `llama_vlm_mmproj_path`: `./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf`
+  - `llama_vlm_max_tokens`: `2560`
+
+### Removed
+
+- **删除 HF_MLX 相关逻辑**
+  - 移除 hf_mlx_provider.py 中的 HF_MLX 相关代码
+  - 不再依赖 hf_mlx 包
+
+- **删除图片数量限制**
+  - 移除所有图片数量限制逻辑
+  - 支持任意数量的图片输入
 
 ## [1.3.1] - 2026-03-26
 

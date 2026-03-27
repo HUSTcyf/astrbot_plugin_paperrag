@@ -36,9 +36,55 @@
     "multimodal_provider_id": {
         "description": "多模态问答使用的LLM服务商（用于图片问答）",
         "type": "string",
-        "hint": "选择用于图片问答的多模态LLM Provider。留空则使用当前会话的默认Provider",
+        "hint": "选择用于图片问答的多模态LLM Provider",
         "_special": "select_provider",
         "default": ""
+    },
+    "llama_vlm_model_path": {
+        "description": "Llama.cpp GGUF模型路径（当multimodal_provider_id为空时使用）",
+        "type": "string",
+        "hint": "配置 GGUF 模型路径。插件会自动检测 9B/4B 模型，9B 加载失败时会自动降级到 4B。",
+        "obvious_hint": true,
+        "default": "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf"
+    },
+    "llama_vlm_mmproj_path": {
+        "description": "Llama.cpp mmproj视觉编码器文件路径",
+        "type": "string",
+        "hint": "mmproj 文件路径，需与 GGUF 模型配套。插件会自动检测对应版本。",
+        "obvious_hint": true,
+        "default": "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf"
+    },
+    "llama_vlm_n_ctx": {
+        "description": "Llama.cpp VLM 上下文窗口大小",
+        "type": "int",
+        "hint": "上下文窗口大小。Qwen3.5 支持 262144，但较大的值会占用更多内存",
+        "default": 4096,
+        "minimum": 512,
+        "maximum": 262144
+    },
+    "llama_vlm_n_gpu_layers": {
+        "description": "Llama.cpp VLM GPU加速层数",
+        "type": "int",
+        "hint": "加载到GPU的层数。99表示全部加载到GPU（推荐Apple Silicon使用）",
+        "default": 99,
+        "minimum": 1,
+        "maximum": 999
+    },
+    "llama_vlm_max_tokens": {
+        "description": "Llama.cpp VLM 最大生成Token数",
+        "type": "int",
+        "hint": "VLM生成的最大token数量，5倍后为2560",
+        "default": 2560,
+        "minimum": 64,
+        "maximum": 4096
+    },
+    "llama_vlm_temperature": {
+        "description": "Llama.cpp VLM 生成温度",
+        "type": "float",
+        "hint": "控制生成随机性，较低值更确定性",
+        "default": 0.7,
+        "minimum": 0.0,
+        "maximum": 2.0
     },
     "milvus_lite_path": {
         "description": "Milvus Lite 数据库路径",
@@ -274,6 +320,28 @@
         "minimum": 1,
         "maximum": 128
     },
+    "enable_bm25": {
+        "description": "是否启用 BM25 混合检索",
+        "type": "bool",
+        "hint": "启用后将同时使用 BM25 关键词检索和向量语义检索，并通过 RRF 分数融合返回最优结果。适合查询中包含明确关键词（如论文标题、专业术语）的情况",
+        "default": false
+    },
+    "bm25_top_k": {
+        "description": "BM25 召回数量",
+        "type": "int",
+        "hint": "BM25 关键词检索返回的候选文档数量（应大于最终 top_k，以便 RRF 融合时保留更多候选）",
+        "default": 20,
+        "minimum": 5,
+        "maximum": 100
+    },
+    "hybrid_alpha": {
+        "description": "混合检索融合权重",
+        "type": "float",
+        "hint": "RRF 融合中向量检索的权重（0=纯BM25，1=纯向量）。设为 0.5 表示两者平等重要",
+        "default": 0.5,
+        "minimum": 0.0,
+        "maximum": 1.0
+    },
     "ollama": {
         "description": "Ollama本地Embedding配置",
         "type": "object",
@@ -295,10 +363,10 @@
             "timeout": {
                 "description": "请求超时时间（秒）",
                 "type": "float",
-                "default": 120.0,
+                "default": 300.0,
                 "minimum": 10.0,
                 "maximum": 600.0,
-                "hint": "单个请求的超时时间。首次运行模型加载可能需要较长时间"
+                "hint": "单个请求的超时时间。首次运行模型加载可能需要较长时间，建议设为300秒"
             },
             "batch_size": {
                 "description": "并发批处理大小",

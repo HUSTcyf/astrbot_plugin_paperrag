@@ -26,6 +26,14 @@ class RAGConfig:
     text_provider_id: str = ""  # LLM Provider ID（用于文本问答）
     multimodal_provider_id: str = ""  # LLM Provider ID（用于多模态问答）
 
+    # Llama.cpp VLM配置（当multimodal_provider_id为空时使用）
+    llama_vlm_model_path: str = "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf"
+    llama_vlm_mmproj_path: str = "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf"
+    llama_vlm_max_tokens: int = 2560
+    llama_vlm_temperature: float = 0.7
+    llama_vlm_n_ctx: int = 4096
+    llama_vlm_n_gpu_layers: int = 99
+
     # Ollama配置
     ollama_config: dict = field(default_factory=dict)
 
@@ -61,6 +69,12 @@ class RAGConfig:
     reranking_adaptive: bool = True
     reranking_threshold: float = 0.0
     reranking_batch_size: int = 32
+
+    # 混合检索配置（BM25 + 向量）
+    enable_bm25: bool = False
+    bm25_top_k: int = 20        # BM25 召回数量
+    hybrid_alpha: float = 0.5    # RRF 融合权重（0=纯BM25, 1=纯向量）
+    hybrid_rrf_k: int = 60      # RRF 常数 k
 
     def __post_init__(self):
         """初始化后处理"""

@@ -26,14 +26,15 @@
 {
   "embedding_mode": "ollama",
   "ollama_config": {"model": "bge-m3"},
-  "milvus_lite_path": "",
-  "collection_name": "paper_embeddings",
   "embed_dim": 1024,
   "chunk_size": 512,
   "chunk_overlap": 0,
-  "glm_api_key": "",
-  "glm_model": "glm-4.7-flash",
-  "glm_multimodal_model": "glm-4.6v-flash"
+  "text_provider_id": "",
+  "multimodal_provider_id": "",
+  "llama_vlm_model_path": "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf",
+  "llama_vlm_mmproj_path": "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf",
+  "llama_vlm_max_tokens": 2560,
+  "llama_vlm_temperature": 0.7
 }
 ```
 
@@ -49,6 +50,7 @@
 | `multimodal_extractor.py` | 多模态提取器 |
 | `embedding_providers.py` | Embedding提供者 |
 | `reference_processor.py` | 参考文献解析 |
+| `llama_cpp_vlm_provider.py` | Llama.cpp VLM本地推理 |
 
 ## 测试
 
@@ -59,4 +61,4 @@ python3 test_semantic_chunker.py   # PDF解析和分块测试
 
 ---
 
-**最后更新**: 2026-03-25
+**最后更新**: 2026-03-27

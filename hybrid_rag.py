@@ -10,15 +10,20 @@
 """
 
 import os
+import time
 import base64
 from typing import List, Dict, Any, Optional, Union, cast
 from pathlib import Path
+from itertools import zip_longest
 
 # 抑制底层库的 gRPC/absl 警告
 os.environ['GRPC_VERBOSITY'] = 'ERROR'
 os.environ['GLOG_minloglevel'] = '2'
 
 from astrbot.api import logger
+
+# 获取插件目录，用于解析相对路径
+_PLUGIN_DIR = Path(__file__).parent.resolve()
 
 # 导入混合架构组件
 from .hybrid_parser import HybridPDFParser, Node
@@ -40,6 +45,18 @@ from .reranker import (
     RerankerConfig,
     create_reranker
 )
+
+# 导入 Llama.cpp VLM Provider（用于图片问答）
+LLAMA_CPP_VLM_AVAILABLE = False
+LLAMA_CPP_VLM_IMPORT_ERROR = None
+try:
+    from .llama_cpp_vlm_provider import LlamaCppVLMProvider
+    LLAMA_CPP_VLM_AVAILABLE = True
+    logger.info("[Llama.cpp-VLM] Llama.cpp VLM Provider 已加载")
+except ImportError as e:
+    LLAMA_CPP_VLM_IMPORT_ERROR = e
+    logger.warning(f"[Llama.cpp-VLM] Llama.cpp VLM Provider 导入失败: {e}")
+    logger.warning("[Llama.cpp-VLM] 请确保已安装llama.cpp: brew install llama.cpp")
 
 
 class QueryResult:
@@ -100,6 +117,140 @@ class VectorRetriever(BaseRetriever):
         return QueryResult(nodes=nodes, scores=scores)
 
 
+class HybridRetriever(BaseRetriever):
+    """
+    混合检索器：BM25 关键词检索 + 向量语义检索 + RRF 分数融合
+
+    流程：
+    1. 并行执行 BM25 和向量搜索
+    2. 使用 Reciprocal Rank Fusion (RRF) 合并两路结果
+    3. 返回融合排序后的 top_k 结果
+    """
+
+    def __init__(
+        self,
+        index_manager: HybridIndexManager,
+        embed_provider: Any,
+        bm25_top_k: int = 20,
+        alpha: float = 0.5,
+        rrf_k: int = 60
+    ):
+        super().__init__(index_manager, embed_provider)
+        self._bm25_top_k = bm25_top_k
+        self._alpha = alpha
+        self._rrf_k = rrf_k
+
+    async def retrieve(self, query: str, top_k: int = 5) -> QueryResult:
+        """混合检索：BM25 + 向量 + RRF 融合"""
+        try:
+            # 1. 向量语义搜索
+            query_embedding = await self._embed_provider.get_text_embedding(query)
+            vector_results = await self._index_manager.search(
+                query_embedding=query_embedding,
+                top_k=top_k
+            )
+
+            # 2. BM25 关键词搜索
+            bm25_results = await self._index_manager.bm25_search(
+                query=query,
+                top_k=self._bm25_top_k
+            )
+
+            # 3. RRF 融合
+            fused = self._rrf_fusion(
+                vector_results=vector_results,
+                bm25_results=bm25_results,
+                top_k=top_k
+            )
+
+            nodes = []
+            scores = []
+            for item in fused:
+                nodes.append(Node(
+                    text=item["text"],
+                    metadata=item.get("metadata", {})
+                ))
+                scores.append(item.get("fused_score", 0.0))
+
+            logger.debug(
+                f"✅ 混合检索完成: query='{query}', "
+                f"向量={len(vector_results)}, BM25={len(bm25_results)}, "
+                f"融合后={len(fused)}"
+            )
+            return QueryResult(nodes=nodes, scores=scores)
+
+        except Exception as e:
+            logger.error(f"❌ 混合检索失败: {e}")
+            # 降级为纯向量检索
+            fallback = VectorRetriever(self._index_manager, self._embed_provider)
+            return await fallback.retrieve(query, top_k)
+
+    def _rrf_fusion(
+        self,
+        vector_results: List[Dict[str, Any]],
+        bm25_results: List[Dict[str, Any]],
+        top_k: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Reciprocal Rank Fusion (RRF) 分数融合
+
+        RRF score = alpha / (rank + k) + (1-alpha) / (rank + k)
+
+        Args:
+            vector_results: 向量检索结果 [{"text", "metadata", "score"}, ...]
+            bm25_results: BM25 检索结果 [{"text", "metadata", "score"}, ...]
+            top_k: 返回结果数量
+            alpha: 融合权重（0=纯BM25, 1=纯向量）
+
+        Returns:
+            融合排序后的结果列表
+        """
+        # 构建 text -> vector_rank 映射
+        vector_rank: Dict[str, int] = {}
+        for i, item in enumerate(vector_results):
+            vector_rank[item["text"]] = i + 1
+
+        # 构建 text -> bm25_rank 映射
+        bm25_rank: Dict[str, int] = {}
+        for i, item in enumerate(bm25_results):
+            bm25_rank[item["text"]] = i + 1
+
+        # 合并所有文本
+        all_texts = set(vector_rank.keys()) | set(bm25_rank.keys())
+
+        # 计算 RRF 分数
+        rrf_scores: Dict[str, float] = {}
+        for text in all_texts:
+            v_rank = vector_rank.get(text, len(vector_results) + 1)
+            b_rank = bm25_rank.get(text, len(bm25_results) + 1)
+
+            v_score = self._alpha / (v_rank + self._rrf_k)
+            b_score = (1 - self._alpha) / (b_rank + self._rrf_k)
+            rrf_scores[text] = v_score + b_score
+
+        # 按 RRF 分数降序排列
+        sorted_texts = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+
+        # 构建最终结果（保留完整 metadata）
+        text_to_metadata: Dict[str, Dict] = {}
+        for item in vector_results:
+            text_to_metadata[item["text"]] = item.get("metadata", {})
+        for item in bm25_results:
+            if item["text"] not in text_to_metadata:
+                text_to_metadata[item["text"]] = item.get("metadata", {})
+
+        fused = []
+        for text, fused_score in sorted_texts[:top_k]:
+            fused.append({
+                "text": text,
+                "metadata": text_to_metadata.get(text, {}),
+                "score": fused_score,
+                "fused_score": fused_score
+            })
+
+        return fused
+
+
 class HybridRAGEngine:
     """
     混合RAG引擎（多模态支持版）
@@ -107,7 +258,8 @@ class HybridRAGEngine:
     基于llama-index风格设计：
     - PDF解析（多模态）
     - Node结构存储
-    - VectorRetriever检索器
+    - 混合检索（BM25 + 向量 + RRF融合）或纯向量检索
+    - AdaptiveReranker 自适应重排序
     - LLM生成（支持多模态：图片查询）
     """
 
@@ -127,7 +279,7 @@ class HybridRAGEngine:
         self._index_manager: HybridIndexManager = cast(HybridIndexManager, None)
         self._embed_provider: Union[OllamaEmbeddingProvider, AstrBotEmbeddingProvider, None] = None
         self._llm_client: Any = cast(Any, None)
-        self._retriever: VectorRetriever = cast(VectorRetriever, None)
+        self._retriever: Union[VectorRetriever, "HybridRetriever"] = cast(Any, None)
         self._reranker: Optional[Any] = None
 
         # 初始化标志
@@ -168,7 +320,7 @@ class HybridRAGEngine:
             # 配置 LLM 压缩
             if self.config.compress_provider_id:
                 ollama_config["use_llm_compress"] = True
-                ollama_config["compress_max_chars"] = 8000
+                ollama_config["compress_max_chars"] = 6400
 
             self._embed_provider = create_embedding_provider(
                 mode=self.config.embedding_mode,
@@ -223,7 +375,7 @@ class HybridRAGEngine:
             logger.error(f"❌ HybridIndexManager初始化失败: {e}")
             raise
 
-    def _ensure_retriever_initialized(self) -> VectorRetriever:
+    def _ensure_retriever_initialized(self) -> Union[VectorRetriever, HybridRetriever]:
         """确保检索器已初始化"""
         if self._retriever_initialized:
             assert self._retriever is not None
@@ -236,12 +388,27 @@ class HybridRAGEngine:
         if embed_provider is None:
             raise RuntimeError("Embed provider not initialized")
 
-        self._retriever = VectorRetriever(
-            index_manager=index_manager,
-            embed_provider=embed_provider
-        )
-        self._retriever_initialized = True
-        logger.info("✅ VectorRetriever初始化完成")
+        if self.config.enable_bm25:
+            self._retriever = HybridRetriever(
+                index_manager=index_manager,
+                embed_provider=embed_provider,
+                bm25_top_k=self.config.bm25_top_k,
+                alpha=self.config.hybrid_alpha,
+                rrf_k=self.config.hybrid_rrf_k
+            )
+            self._retriever_initialized = True
+            logger.info(
+                f"✅ HybridRetriever初始化完成 "
+                f"(BM25 top_k={self.config.bm25_top_k}, alpha={self.config.hybrid_alpha})"
+            )
+        else:
+            self._retriever = VectorRetriever(
+                index_manager=index_manager,
+                embed_provider=embed_provider
+            )
+            self._retriever_initialized = True
+            logger.info("✅ VectorRetriever初始化完成")
+
         assert self._retriever is not None
         return self._retriever
 
@@ -266,8 +433,8 @@ class HybridRAGEngine:
 
             # 如果都获取不到，报错
             raise ValueError(
-                "未配置 text_provider_id 且无法获取当前LLM Provider。"
-                "请在插件配置中设置 text_provider_id 或确保有可用的LLM Provider。"
+                "未配置 text_provider_id、无法获取当前LLM Provider。"
+                "请在插件配置中设置 text_provider_id。"
             )
 
         # 从 context 获取指定的 provider
@@ -359,8 +526,35 @@ class HybridRAGEngine:
             texts = [node.text for node in nodes]
             embeddings = await embed_provider.get_text_embeddings_batch(texts)
 
+            logger.info(f"🔍 [DEBUG] 生成embeddings: texts数量={len(texts)}, embeddings数量={len(embeddings) if embeddings else 'None'}")
+
+            # 使用 zip_longest 配对，确保不漏掉任何 node（缺失的 embedding 填 None）
+            pairs = list(zip_longest(nodes, embeddings if embeddings else [None] * len(nodes), fillvalue=None))
+
+            # 过滤掉无效节点（文本为空或embedding为None/无效的节点）
+            valid_nodes = []
+            valid_embeddings = []
+            for i, (node, embedding) in enumerate(pairs):
+                # 跳过空文本
+                if not node or not node.text or not node.text.strip():
+                    if node:
+                        logger.warning(f"⚠️ 跳过空文本节点 {i}: text={node.text[:30] if node.text else 'N/A'}...")
+                    continue
+                # 跳过无效 embedding
+                if embedding is None or not isinstance(embedding, list) or len(embedding) == 0:
+                    logger.warning(f"⚠️ 跳过embedding无效的节点 {i}: text={node.text[:50]}..., embedding={embedding}")
+                    continue
+                valid_nodes.append(node)
+                valid_embeddings.append(embedding)
+
+            logger.info(f"🔍 配对后节点数: {len(pairs)}, 有效节点数: {len(valid_nodes)}, 有效embeddings数: {len(valid_embeddings)}")
+
             # 插入到索引
-            count = await index_manager.insert_nodes(nodes, embeddings)
+            count = await index_manager.insert_nodes(valid_nodes, valid_embeddings)
+
+            # 刷新 BM25 索引（下次检索时自动重建）
+            if self.config.enable_bm25:
+                index_manager.refresh_bm25_index()
 
             logger.info(f"✅ 论文添加成功: {count} 个chunks")
 
@@ -530,17 +724,32 @@ class HybridRAGEngine:
             # VLM路由判断
             # 用户直接上传图片 → 直接使用VLM
             # 否则根据查询和检索结果自动判断
+            logger.debug(f"[VLM Debug] 原始images参数: {images}")
+            logger.debug(f"[VLM Debug] 检索到的sources数量: {len(sources)}")
+            for i, src in enumerate(sources):
+                logger.debug(f"[VLM Debug] Source[{i}] metadata: {src.get('metadata', {})}")
+                img_path = src.get("metadata", {}).get("image_path")
+                if img_path:
+                    logger.debug(f"[VLM Debug] Source[{i}] 有image_path: {img_path}")
+
             if images:
                 # 用户上传了图片，直接使用VLM
                 final_images = images
                 logger.info(f"🖼️ 用户上传 {len(images)} 张图片，使用VLM模式")
+                for i, img in enumerate(images):
+                    logger.debug(f"[VLM Debug] 用户上传图片[{i}]: {img}")
             else:
                 # 自动路由：根据查询和检索结果判断
                 if self._should_use_vlm(query, sources):
                     # 从检索结果提取关联图片
                     final_images = self._extract_image_paths_from_sources(sources)
+                    logger.debug(f"[VLM Debug] _extract_image_paths_from_sources返回: {final_images}")
                     if final_images:
                         logger.info(f"🖼️ 检索到 {len(final_images)} 张关联图片，使用VLM模式")
+                        for i, img in enumerate(final_images):
+                            exists = os.path.exists(img) if img else False
+                            size = os.path.getsize(img) if exists else 0
+                            logger.debug(f"[VLM Debug] 检索图片[{i}]: {img} (exists={exists}, size={size})")
                     else:
                         # 有视觉关键词但没有关联图片，回退到LLM
                         logger.info(f"📝 检测到视觉关键词但无关联图片，使用LLM模式")
@@ -548,6 +757,8 @@ class HybridRAGEngine:
                 else:
                     final_images = None
                     logger.info(f"📝 纯文本查询，使用LLM模式")
+
+            logger.debug(f"[VLM Debug] 最终final_images: {final_images}")
 
             # 生成答案
             answer = await self._generate_answer_with_llm(
@@ -664,7 +875,11 @@ class HybridRAGEngine:
             if hasattr(raw, 'choices') and raw.choices:
                 return raw.choices[0].message.content
 
-        # 方法4：返回字符串形式
+        # 方法4：检查是否有 content 属性（我们的 LLMResponse 格式）
+        if hasattr(response, 'content'):
+            return response.content
+
+        # 方法5：返回字符串形式
         return str(response)
 
     async def _generate_answer_with_llm(
@@ -708,64 +923,147 @@ class HybridRAGEngine:
             use_multimodal = images is not None
             provider_to_use = llm_provider  # 默认使用文本provider
 
+            logger.debug(f"[VLM Debug] ===== _generate_answer_with_llm 开始 =====")
+            logger.debug(f"[VLM Debug] 输入images: {images}")
+            logger.debug(f"[VLM Debug] use_multimodal: {use_multimodal}")
+            logger.debug(f"[VLM Debug] multimodal_provider_id配置: {getattr(self.config, 'multimodal_provider_id', 'NOT_SET')}")
+
             if use_multimodal and self.config.multimodal_provider_id:
                 try:
                     provider_manager = getattr(self.context, "provider_manager", None)
+                    logger.debug(f"[VLM Debug] provider_manager: {provider_manager}")
                     if provider_manager:
                         inst_map = getattr(provider_manager, "inst_map", None)
+                        logger.debug(f"[VLM Debug] inst_map: {inst_map}")
+                        logger.debug(f"[VLM Debug] inst_map类型: {type(inst_map)}")
                         if isinstance(inst_map, dict):
                             vlm_provider = inst_map.get(self.config.multimodal_provider_id)
+                            logger.debug(f"[VLM Debug] 从inst_map获取的vlm_provider: {vlm_provider}")
+                            logger.debug(f"[VLM Debug] vlm_provider类型: {type(vlm_provider) if vlm_provider else None}")
                             if vlm_provider:
                                 provider_to_use = vlm_provider
-                                logger.info(f"🖼️ 使用VLM模式，多模态Provider: {self.config.multimodal_provider_id}")
+                                provider_name = getattr(vlm_provider, 'model_name', None) or getattr(vlm_provider, 'model', None) or 'unknown'
+                                logger.info(f"🖼️ 使用VLM模式，多模态Provider: {self.config.multimodal_provider_id} (实际provider: {provider_name})")
                             else:
                                 logger.warning(f"⚠️ 未找到多模态Provider: {self.config.multimodal_provider_id}，回退到文本模式")
+                                logger.warning(f"[VLM Debug] inst_map的keys: {list(inst_map.keys()) if inst_map else []}")
                                 use_multimodal = False
                 except Exception as e:
                     logger.warning(f"⚠️ 获取多模态Provider失败: {e}，回退到文本模式")
                     use_multimodal = False
             elif use_multimodal:
-                logger.warning("⚠️ 未配置多模态Provider，回退到文本模式")
-                use_multimodal = False
+                # multimodal_provider_id 未配置，使用 Llama.cpp VLM Provider
+                if LLAMA_CPP_VLM_AVAILABLE:
+                    try:
+                        # 解析路径（相对路径基于插件目录）
+                        llama_model_path_raw = getattr(self.config, 'llama_vlm_model_path', './models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf')
+                        llama_mmproj_path_raw = getattr(self.config, 'llama_vlm_mmproj_path', './models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf')
+
+                        llama_model_path = str((_PLUGIN_DIR / llama_model_path_raw).resolve())
+                        llama_mmproj_path = str((_PLUGIN_DIR / llama_mmproj_path_raw).resolve())
+
+                        llama_max_tokens = getattr(self.config, 'llama_vlm_max_tokens', 2560)
+                        llama_temperature = getattr(self.config, 'llama_vlm_temperature', 0.7)
+                        llama_n_ctx = getattr(self.config, 'llama_vlm_n_ctx', 4096)
+                        llama_n_gpu_layers = getattr(self.config, 'llama_vlm_n_gpu_layers', 99)
+                        from .llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
+                        provider_to_use = get_llama_cpp_vlm_provider(
+                            model_path=llama_model_path,
+                            mmproj_path=llama_mmproj_path,
+                            n_ctx=llama_n_ctx,
+                            n_gpu_layers=llama_n_gpu_layers,
+                            max_tokens=llama_max_tokens,
+                            temperature=llama_temperature
+                        )
+                        await provider_to_use.initialize()
+                        logger.info(f"🖼️ 使用Llama.cpp VLM Provider: {llama_model_path}")
+                    except Exception as e:
+                        logger.error(f"❌ Llama.cpp VLM Provider初始化失败: {e}，回退到文本模式")
+                        use_multimodal = False
+                else:
+                    logger.warning("⚠️ Llama.cpp VLM Provider不可用，回退到文本模式")
+                    use_multimodal = False
 
             # 使用多模态模式
             if use_multimodal:
-                # 直接使用本地文件路径（限制最多3张）
-                image_urls = [str(Path(img_path).resolve()) for img_path in images[:3]]
+                # 直接使用本地文件路径（不限制图片数量）
+                assert images is not None
+                image_urls = [str(Path(img_path).resolve()) for img_path in images]
 
                 logger.info(f"🖼️ 使用VLM模式查询 (图片数: {len(image_urls)})")
+                logger.debug(f"[VLM Debug] 解析后的image_urls: {image_urls}")
+
+                # 验证图片文件
+                for i, img_url in enumerate(image_urls):
+                    exists = os.path.exists(img_url)
+                    size = os.path.getsize(img_url) if exists else 0
+                    logger.debug(f"[VLM Debug] 图片[{i}] 路径: {img_url}")
+                    logger.debug(f"[VLM Debug] 图片[{i}] 存在: {exists}, 大小: {size} bytes")
+                    if not exists:
+                        logger.warning(f"[VLM Debug] 图片[{i}] 文件不存在: {img_url}")
+
+                # 检查prompt长度
+                prompt_len = len(text_prompt)
+                logger.debug(f"[VLM Debug] prompt长度: {prompt_len} 字符")
+                logger.debug(f"[VLM Debug] prompt前200字符: {text_prompt[:200]}...")
 
                 # 使用 text_chat 接口（AstrBot Provider 统一接口）
                 # image_urls 支持本地文件路径或 URL
+                start_time = time.time()
                 if hasattr(provider_to_use, 'text_chat'):
                     try:
+                        provider_class_name = type(provider_to_use).__name__
+                        logger.info(f"[VLM Debug] 开始调用 {provider_class_name}.text_chat()")
+                        logger.debug(f"[VLM Debug] provider类型: {provider_class_name}")
+                        logger.debug(f"[VLM Debug] text_chat参数: prompt_len={prompt_len}, image_urls={image_urls}, temperature=0.7")
+
                         response = await provider_to_use.text_chat(
                             prompt=text_prompt,
                             image_urls=image_urls if image_urls else None,
                             contexts=[],
                             temperature=0.7
                         )
+
+                        elapsed = time.time() - start_time
+                        logger.info(f"[VLM Debug] text_chat完成，耗时: {elapsed:.2f}秒")
+                        logger.debug(f"[VLM Debug] response类型: {type(response)}")
+                        logger.debug(f"[VLM Debug] response内容: {response}")
+
                         answer = self._extract_answer_from_response(response)
+                        logger.debug(f"[VLM Debug] 提取的answer: {answer[:200] if answer else 'None'}...")
+                        logger.debug(f"[VLM Debug] ===== _generate_answer_with_llm 成功完成 =====")
                         return answer
                     except Exception as e:
-                        # 如果文件路径方式失败，尝试 base64 方式
-                        logger.warning(f"⚠️ 文件路径方式失败，尝试base64方式: {e}")
-                        image_urls_b64 = []
-                        for img_path in images[:3]:
-                            base64_image = self._transform_image_for_vlm(img_path)
-                            if base64_image:
-                                image_urls_b64.append(f"data:image/jpeg;base64,{base64_image}")
-
-                        if image_urls_b64:
-                            response = await provider_to_use.text_chat(
+                        elapsed = time.time() - start_time
+                        logger.error(f"❌ VLM模式失败: {e}，耗时: {elapsed:.2f}秒")
+                        logger.warning("[VLM Debug] VLM处理失败，尝试回退到LLM文本模式...")
+                        import traceback
+                        logger.debug(f"[VLM Debug] VLM异常详情: {traceback.format_exc()}")
+                        # 回退到LLM文本模式
+                        use_multimodal = False
+                        llm_provider = await self._ensure_llm_initialized()
+                        if hasattr(llm_provider, 'text_chat'):
+                            response = await llm_provider.text_chat(
                                 prompt=text_prompt,
-                                image_urls=image_urls_b64,
                                 contexts=[],
-                                temperature=0.7
+                                temperature=0.7,
+                                max_tokens=2000
                             )
                             answer = self._extract_answer_from_response(response)
                             return answer
-                        raise
+                        elif hasattr(llm_provider, 'chat'):
+                            messages = [
+                                {"role": "user", "content": text_prompt}
+                            ]
+                            response = await llm_provider.chat.completions.create(
+                                messages=messages,
+                                temperature=0.7,
+                                max_tokens=2000
+                            )
+                            answer = self._extract_answer_from_response(response)
+                            return answer
+                        else:
+                            raise ValueError("Provider不支持文本聊天")
                 else:
                     raise ValueError(f"Provider不支持多模态聊天: 缺少text_chat方法 (provider: {type(provider_to_use).__name__})")
             else:
@@ -904,7 +1202,10 @@ class HybridRAGEngine:
 
             if success:
                 self._retriever_initialized = False
-                self._retriever = cast(VectorRetriever, None)
+                self._retriever = cast(Any, None)
+                # 刷新 BM25 索引
+                if self.config.enable_bm25:
+                    index_manager.refresh_bm25_index()
                 return {
                     "status": "success",
                     "message": "知识库已清空"
@@ -959,7 +1260,10 @@ class HybridRAGEngine:
             if result.get("status") == "success":
                 # 重置检索器（因为底层数据已改变）
                 self._retriever_initialized = False
-                self._retriever = cast(VectorRetriever, None)
+                self._retriever = cast(Any, None)
+                # 刷新 BM25 索引
+                if self.config.enable_bm25:
+                    index_manager.refresh_bm25_index()
 
             return result
 

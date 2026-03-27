@@ -116,6 +116,30 @@ class ReferenceExtractor:
             r'^\[(\d+)\]\s*([^\]]+?)\s*-\s*(.+?)\s*\((\d{4})\)',
             re.MULTILINE | re.IGNORECASE
         ),
+        # 格式5: Author, Initial. Year. Title. (无序号)
+        # 匹配 "Wu, J. 2020. Essentials of Pattern Recognition: An..."
+        re.compile(
+            r'^([A-Z][a-z]+,\s*[A-Z])\.\s*(\d{4})\.\s*(.+?)\.\s*$',
+            re.MULTILINE | re.IGNORECASE
+        ),
+        # 格式6: Author et al. Year. Title. (无序号，带et al)
+        # 匹配 "Zhang et al. 2021. Paper title..."
+        re.compile(
+            r'^([A-Z][a-z]+\s+et\s+al\.?)\s+(\d{4})\.\s*(.+?)\.\s*$',
+            re.MULTILINE | re.IGNORECASE
+        ),
+        # 格式7: Author, A. & Author, B. Year. Title. (无序号，多作者)
+        # 匹配 "Smith, A. & Jones, B. 2022. Paper title..."
+        re.compile(
+            r'^([A-Z][a-z]+,\s*[A-Z])\.\s*&\s*([A-Z][a-z]+,\s*[A-Z])\.\s*(\d{4})\.\s*(.+?)\.\s*$',
+            re.MULTILINE | re.IGNORECASE
+        ),
+        # 格式8: Author1; Author2. Year. Title. (无序号，分号分隔)
+        # 匹配 "Smith, A.; Jones, B. 2022. Paper title..."
+        re.compile(
+            r'^([A-Z][a-z]+,\s*[A-Z](?:\.\s*;\s*[A-Z][a-z]+,\s*[A-Z]\.)*)\s+(\d{4})\.\s*(.+?)\.\s*$',
+            re.MULTILINE | re.IGNORECASE
+        ),
     ]
 
     # DOI 正则表达式
@@ -178,6 +202,13 @@ class ReferenceExtractor:
                 references.append(ref)
 
         logger.info(f"📚 共提取到 {len(references)} 条参考文献")
+        # 打印参考文献详情
+        for i, ref in enumerate(references, 1):
+            title = ref.ref_title[:50] + "..." if len(ref.ref_title) > 50 else ref.ref_title
+            authors = ref.ref_authors[:40] + "..." if len(ref.ref_authors) > 40 else ref.ref_authors
+            logger.info(f"   [{i}] {title}")
+            logger.info(f"       作者: {authors}")
+            logger.info(f"       年份: {ref.ref_year or 'N/A'}, DOI: {ref.ref_doi or 'N/A'}")
         return references
 
     def extract_references_from_pdf(self, pdf_path: str) -> List[Reference]:
@@ -282,8 +313,14 @@ class ReferenceExtractor:
                     result.append(' '.join(current))
                 current = [stripped]
             elif current:
-                # 继续之前的引用
-                current.append(stripped)
+                # 继续之前的引用，合并时处理连字符断行
+                # 如 "Accessi-" + "ble" → "Accessible"
+                prev = current[-1]
+                merged_line = stripped
+                if prev.endswith('-'):
+                    current[-1] = prev[:-1] + merged_line
+                else:
+                    current.append(merged_line)
 
         if current:
             result.append(' '.join(current))
@@ -295,12 +332,22 @@ class ReferenceExtractor:
         # 清理空白
         line = ' '.join(line.split())
 
+        # 合并连字符断行（如 "Accessi- \n ble" → "Accessible"）
+        line = re.sub(r'(\w)-\s+(\w)', r'\1\2', line)
+
         # 尝试用各种模式匹配
         for pattern in self.REF_PATTERNS:
             match = pattern.match(line)
             if match:
                 groups = match.groups()
-                ref_num = groups[0]
+
+                # 判断是否有序号（原有格式）还是无序号（新格式）
+                # 有序号格式: groups[0] 是数字
+                # 无序号格式: groups[0] 是作者名（字母开头）
+                if groups[0].isdigit():
+                    ref_num = groups[0]
+                else:
+                    ref_num = str(index)  # 使用行号作为ref_num
 
                 # 提取年份 - 在groups中查找纯数字的4位数
                 year = None
@@ -347,9 +394,18 @@ class ReferenceExtractor:
 
     def _extract_title(self, groups: tuple) -> str:
         """从匹配组中提取标题"""
-        # groups结构: (ref_num, authors, title, venue/url, year) 或 (ref_num, authors, title, venue, year)
-        # title 始终在 index 2
-        if len(groups) >= 3:
+        # groups结构:
+        # - 有序号格式: (ref_num, authors, title, venue/url, year) 或 (ref_num, authors, title, venue, year)
+        # - 无序号格式5/6/8: (authors, year, title)
+        # - 无序号格式7: (author1, author2, year, title)
+        # title 通常在 index 2 或 3（取决于格式）
+        if len(groups) == 3:
+            # 格式5/6/8: (authors, year, title)
+            return groups[2].strip()
+        elif len(groups) == 4:
+            # 格式7: (author1, author2, year, title)
+            return groups[3].strip()
+        elif len(groups) >= 3:
             return groups[2].strip()
         elif len(groups) >= 2:
             return groups[-1].strip()
@@ -357,7 +413,13 @@ class ReferenceExtractor:
 
     def _extract_authors(self, groups: tuple) -> str:
         """从匹配组中提取作者"""
-        if len(groups) >= 2:
+        if len(groups) == 4:
+            # 格式7: (author1, author2, year, title) - 多作者用 & 合并
+            return groups[0].strip() + " & " + groups[1].strip()
+        elif len(groups) == 3:
+            # 格式5/6/8: (authors, year, title) - 作者在 groups[0]
+            return groups[0].strip()
+        elif len(groups) >= 2:
             return groups[1].strip()
         return ""
 
@@ -396,11 +458,19 @@ class CitationLinker:
     引用链接器
 
     识别正文中出现的引用标记，如 [1], [1,2], [1-3], [1, 2, 5]
+    以及 author-year 格式如 (Smith, 2020), Smith et al. (2020)
     并与提取的参考文献建立关联
     """
 
-    # 匹配引用标记的正则
+    # 匹配数字引用标记的正则
     CITATION_PATTERN = re.compile(r'\[(\d+(?:[,\-\s]+\d+)*)\]')
+
+    # 匹配 author-year 引用格式的正则
+    # 格式: (Smith, 2020), (Smith et al., 2020), Smith (2020), Smith et al. (2020)
+    AUTHOR_YEAR_PATTERN = re.compile(
+        r'([A-Z][a-z]+(?:\s+(?:et\s+al\.?|and\s+[A-Z][a-z]+))?)\s*,\s*(\d{4})|'
+        r'([A-Z][a-z]+(?:\s+(?:et\s+al\.?|and\s+[A-Z][a-z]+))?)\s+\((\d{4})\)'
+    )
 
     def find_citations_in_text(self, text: str) -> List[CitationInText]:
         """
@@ -460,6 +530,100 @@ class CitationLinker:
 
         return ref_ids
 
+    def _build_author_year_map(self, references: List[Reference]) -> Dict[str, str]:
+        """
+        从参考文献构建 author-year -> ref_id 映射
+
+        Args:
+            references: Reference列表
+
+        Returns:
+            映射字典，key为 "AuthorYear" 格式，value为 ref_id
+        """
+        author_year_map = {}
+        for ref in references:
+            authors = ref.ref_authors.strip()
+            year = ref.ref_year
+            if authors and year:
+                # 提取第一作者（处理 "Smith, A. & Jones, B." 格式）
+                first_author = re.split(r'\s*&\s*|,', authors)[0].strip()
+                # 移除末尾的点
+                first_author = first_author.rstrip('.')
+                key = f"{first_author}{year}"
+                author_year_map[key.lower()] = ref.ref_id
+                # 也存储 "Smith et al.YEAR" 格式以支持 "Smith et al." 变体
+                if 'et al' not in first_author.lower():
+                    key_et_al = f"{first_author} et al.{year}"
+                    author_year_map[key_et_al.lower()] = ref.ref_id
+        return author_year_map
+
+    def find_author_year_citations(self, text: str, author_year_map: Dict[str, str]) -> List[CitationInText]:
+        """
+        查找文本中的 author-year 引用并映射到 ref_id
+
+        Args:
+            text: 文本内容
+            author_year_map: author-year -> ref_id 的映射
+
+        Returns:
+            CitationInText列表
+        """
+        citations = []
+        seen_positions = set()  # 避免重复
+
+        for match in self.AUTHOR_YEAR_PATTERN.finditer(text):
+            # 获取作者和年份
+            if match.group(1) and match.group(2):
+                # 格式: Smith, 2020 或 Smith et al., 2020
+                author = match.group(1).strip()
+                year = match.group(2)
+            elif match.group(3) and match.group(4):
+                # 格式: Smith (2020) 或 Smith et al. (2020)
+                author = match.group(3).strip()
+                year = match.group(4)
+            else:
+                continue
+
+            # 避免同一位置重复匹配
+            if match.start() in seen_positions:
+                continue
+            seen_positions.add(match.start())
+
+            # 尝试多种作者名格式匹配
+            ref_id = None
+            author_lower = author.lower()
+
+            # 直接匹配
+            if author_lower in author_year_map:
+                ref_id = author_year_map[author_lower]
+            else:
+                # 尝试添加 " et al." 变体
+                author_et_al = author_lower + ' et al.'
+                if author_et_al in author_year_map:
+                    ref_id = author_year_map[author_et_al]
+                else:
+                    # 尝试只用姓氏匹配
+                    surname = author_lower.split()[0] if ' ' in author_lower else author_lower
+                    surname_et_al = surname + ' et al.'
+                    if surname in author_year_map:
+                        ref_id = author_year_map[surname]
+                    elif surname_et_al in author_year_map:
+                        ref_id = author_year_map[surname_et_al]
+
+            if ref_id:
+                start = max(0, match.start() - 50)
+                end = min(len(text), match.end() + 50)
+                context = text[start:end]
+
+                citations.append(CitationInText(
+                    ref_ids=[ref_id],
+                    position=match.start(),
+                    raw_text=match.group(),
+                    context=context
+                ))
+
+        return citations
+
     def link_citations_to_references(
         self,
         chunks: List[Any],
@@ -481,11 +645,19 @@ class CitationLinker:
         # 构建 ref_id -> Reference 的映射
         ref_map = {ref.ref_id: ref for ref in references}
 
+        # 构建 author-year -> ref_id 的映射（用于 author-year 格式引用）
+        author_year_map = self._build_author_year_map(references)
+
         for i, chunk in enumerate(chunks):
             # 获取chunk的索引（用于被引用记录）
             chunk_idx = chunk.metadata.get('chunk_index', i)
 
+            # 1. 查找数字引用 [1], [2,3]
             citations = self.find_citations_in_text(chunk.text)
+
+            # 2. 查找 author-year 引用 (Smith, 2020)
+            author_year_citations = self.find_author_year_citations(chunk.text, author_year_map)
+            citations.extend(author_year_citations)
 
             # 收集此chunk引用的所有ref_ids
             cited_refs = set()

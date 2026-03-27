@@ -28,7 +28,7 @@ class OllamaEmbeddingConfig:
     # LLM压缩配置（文本超限时使用）
     use_llm_compress: bool = True
     compress_provider: Any = None  # LLM Provider（用于文本压缩）
-    compress_max_chars: int = 8000
+    compress_max_chars: int = 6400
 
 
 class OllamaEmbeddingProvider:
@@ -62,7 +62,7 @@ class OllamaEmbeddingProvider:
             await self._client.aclose()
             self._client = None
 
-    async def _embed_single(self, text: str) -> List[float]:
+    async def _embed_single(self, text: str):
         """获取单个文本的embedding"""
         client = await self._get_client()
 
@@ -161,7 +161,7 @@ class OllamaEmbeddingProvider:
             return text[:self.config.compress_max_chars]
 
         try:
-            compress_prompt = f"""请将以下文本压缩到不超过8000字符，保留核心语义信息和关键细节。
+            compress_prompt = f"""请将以下文本压缩到不超过6400字符，保留核心语义信息和关键细节。
 
 原文：
 {text}
@@ -301,7 +301,7 @@ def create_ollama_provider(
     retry_attempts: int = 3,
     use_llm_compress: bool = True,
     compress_provider: Any = None,
-    compress_max_chars: int = 8000
+    compress_max_chars: int = 6400
 ) -> OllamaEmbeddingProvider:
     """
     创建Ollama Embedding Provider
@@ -500,9 +500,9 @@ class EmbeddingProviderType:
 def create_embedding_provider(
     mode: str,
     context: Any = None,
-    provider_id: str = None,
-    ollama_config: dict = None,
-    compress_provider_id: str = None,
+    provider_id: str = '',
+    ollama_config: dict = {},
+    compress_provider_id: str = '',
     **kwargs
 ) -> Union[OllamaEmbeddingProvider, AstrBotEmbeddingProvider]:
     """
@@ -544,7 +544,7 @@ def create_embedding_provider(
             retry_attempts=ollama_config.get("retry_attempts", 3),
             use_llm_compress=ollama_config.get("use_llm_compress", True),
             compress_provider=compress_provider,
-            compress_max_chars=ollama_config.get("compress_max_chars", 8000)
+            compress_max_chars=ollama_config.get("compress_max_chars", 6400)
         )
 
     elif mode == EmbeddingProviderType.ASTRBOT:
