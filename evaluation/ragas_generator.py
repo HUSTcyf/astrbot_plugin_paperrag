@@ -35,10 +35,7 @@ except Exception:
 
 RAGAS_AVAILABLE = True
 TestsetGenerator = None
-OpenAI = None
-OpenAIEmbedding = None
 Document = None
-SentenceSplitter = None
 BaseRagasLLM = None
 BaseRagasEmbeddings = None
 
@@ -49,9 +46,11 @@ try:
     from ragas.llms.base import BaseRagasLLM
     from ragas.embeddings.base import BaseRagasEmbeddings
     from llama_index.core import Document
-    from llama_index.core.node_parser import SentenceSplitter
-    from llama_index.llms.openai import OpenAI
-    from llama_index.embeddings.openai import OpenAIEmbedding
+
+    # 禁用 Ragas 遥测追踪（避免 SSL 证书过期错误）
+    import os
+    os.environ["RAGAS_DO_NOT_TRACK"] = "True"
+
 except ImportError as e:
     RAGAS_AVAILABLE = False
     logger.warning(f"Ragas 评估框架未安装，部分功能不可用: {e}")
@@ -71,6 +70,19 @@ try:
 except ImportError:
     LLMResult = None
     Generation = None
+
+
+class InvalidLLMResponseError(ValueError):
+    """
+    LLM 返回内容校验失败的专用异常。
+
+    继承自 ValueError，确保被 ragas 的异常处理链路正确识别和报告。
+    包含 .text 属性，适配 ragas 的 raise_first_exception 格式化逻辑。
+    """
+
+    def __init__(self, message: str, text: str = ""):
+        super().__init__(message)
+        self.text = text  # ragas raise_first_exception 会访问此属性
 
 
 class OpenAICompatibleLLM(BaseRagasLLM if BaseRagasLLM else object):
@@ -135,8 +147,16 @@ class OpenAICompatibleLLM(BaseRagasLLM if BaseRagasLLM else object):
         return False
 
     def _call_api(self, prompt_text: str, temperature: float, max_tokens: int, stop: Optional[list]):
-        """同步调用 API"""
+        """同步调用 API（受全局 Semaphore 限制并发）"""
         import requests
+        import threading
+
+        # 同步路径也必须限速：获取或创建信号量
+        # 注意：同步路径无法直接使用 asyncio.Semaphore，改用 threading.Semaphore
+        if not hasattr(OpenAICompatibleLLM, '_sync_semaphore'):
+            OpenAICompatibleLLM._sync_semaphore = threading.Semaphore(self._max_concurrent)
+        sync_sem = OpenAICompatibleLLM._sync_semaphore
+
         url = f"{self.api_base}/chat/completions"
         headers = {
             'Authorization': f'Bearer {self.api_key}',
@@ -147,14 +167,35 @@ class OpenAICompatibleLLM(BaseRagasLLM if BaseRagasLLM else object):
             'messages': [{'role': 'user', 'content': prompt_text}],
             'temperature': temperature,
             'max_tokens': max_tokens,
-            'response_format': {'type': 'json_object'},
         }
         if stop:
             data['stop'] = stop
-        response = requests.post(url, headers=headers, json=data, timeout=120)
-        response.raise_for_status()
-        result = response.json()
-        return result['choices'][0]['message']['content']
+
+        # 获取信号量后执行请求
+        sync_sem.acquire()
+        try:
+            response = requests.post(url, headers=headers, json=data, timeout=120)
+            response.raise_for_status()
+            result = response.json()
+            raw_text = result['choices'][0]['message']['content'] or ""
+
+            # 如果返回为空，返回一个有效的 StringIO JSON
+            if not raw_text.strip():
+                raw_text = '{"text": " "}'
+
+            # 确保返回的是有效 JSON
+            try:
+                parsed = json.loads(raw_text)
+                if isinstance(parsed, str):
+                    raw_text = json.dumps({"text": parsed})
+                elif isinstance(parsed, dict) and "text" not in parsed:
+                    raw_text = json.dumps({"text": json.dumps(parsed)})
+            except json.JSONDecodeError:
+                raw_text = json.dumps({"text": raw_text})
+
+            return raw_text
+        finally:
+            sync_sem.release()
 
     def generate_text(
         self,
@@ -197,7 +238,6 @@ class OpenAICompatibleLLM(BaseRagasLLM if BaseRagasLLM else object):
             'messages': [{'role': 'user', 'content': prompt_text}],
             'temperature': temperature if temperature is not None else self.temperature,
             'max_tokens': self.max_tokens,
-            'response_format': {'type': 'json_object'},
         }
         if stop:
             data['stop'] = stop
@@ -205,11 +245,25 @@ class OpenAICompatibleLLM(BaseRagasLLM if BaseRagasLLM else object):
         async with OpenAICompatibleLLM._semaphore:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, headers=headers, json=data, timeout=aiohttp.ClientTimeout(total=120)) as resp:
-                    resp.raise_for_status()
                     result = await resp.json()
 
-        text = result['choices'][0]['message']['content']
-        gen = Generation(text=text)
+        raw_text = result['choices'][0]['message']['content']
+
+        if not raw_text or not raw_text.strip():
+            # LLM 返回空，跳过此任务
+            raise ValueError("LLM returned empty content, skipping")
+
+        # 确保返回的是有效 JSON，StringIO 需要 {"text": "..."} 格式
+        try:
+            parsed = json.loads(raw_text)
+            if isinstance(parsed, str):
+                raw_text = json.dumps({"text": parsed})
+            elif isinstance(parsed, dict) and "text" not in parsed:
+                raw_text = json.dumps({"text": json.dumps(parsed)})
+        except json.JSONDecodeError:
+            raw_text = json.dumps({"text": raw_text})
+
+        gen = Generation(text=raw_text)
         return LLMResult(generations=[[gen]])
 
     def _get_prompt_text(self, prompt: Any) -> str:
@@ -220,6 +274,50 @@ class OpenAICompatibleLLM(BaseRagasLLM if BaseRagasLLM else object):
             return prompt.to_string()
         return str(prompt)
 
+    def _validate_json_response(self, text: str) -> str:
+        """
+        校验 LLM 返回内容是否为合法 JSON。
+
+        策略：
+        1. 直接解析
+        2. 失败则去除 markdown code block 包装后重试
+        3. 仍失败则记录日志并抛出 ValueError
+
+        Returns:
+            原始文本（校验通过后原样返回）
+
+        Raises:
+            InvalidLLMResponseError: 返回内容无法解析为 JSON（继承自 ValueError，携带 .text 属性供 ragas 异常处理使用）
+        """
+        if not text or not text.strip():
+            raise InvalidLLMResponseError("LLM 返回内容为空", text=text)
+
+        # 步骤 1：直接解析
+        try:
+            json.loads(text)
+            return text
+        except json.JSONDecodeError:
+            pass
+
+        # 步骤 2：去除 markdown code block 包装
+        import re
+        stripped = re.sub(r'^```(?:json)?\s*', '', text.strip(), flags=re.MULTILINE)
+        stripped = re.sub(r'\s*```$', '', stripped)
+        try:
+            json.loads(stripped)
+            logger.warning(f"LLM 返回了带 markdown 包装的 JSON，已自动去除: {stripped[:80]}...")
+            return stripped
+        except json.JSONDecodeError:
+            pass
+
+        # 步骤 3：解析失败，记录日志并抛出
+        preview = text.strip()[:200]
+        logger.error(f"LLM 返回内容无法解析为 JSON: {preview}...")
+        raise InvalidLLMResponseError(
+            f"LLM 返回内容不是合法 JSON: {preview}",
+            text=text.strip()
+        )
+
     def __repr__(self):
         return f"OpenAICompatibleLLM(model={self.model})"
 
@@ -228,13 +326,32 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings if BaseRagasEmbeddings else
     """
     适配 OpenAI 兼容接口的 Ragas Embeddings 包装器
     用于对接 Ollama 等 OpenAI 兼容的 Embedding API
+
+    特性：
+    - 全局并发限制（Semaphore）
+    - 同步/异步接口均受保护
+    - aiohttp ClientSession 实例级复用
     """
+
+    # 全局并发限制信号量（类变量，所有实例共享）
+    _semaphore: Optional[Any] = None
+    _max_concurrent: int = 3
+
+    @classmethod
+    def set_max_concurrent(cls, n: int):
+        """设置全局最大并发数"""
+        cls._max_concurrent = n
+        if cls._semaphore is not None:
+            cls._semaphore.release()
+            cls._semaphore = None
 
     def __init__(
         self,
         model: str,
         api_base: str,
         api_key: str = "ollama",
+        max_concurrent: int = 3,
+        batch_size: int = 50,
         **kwargs
     ):
         if BaseRagasEmbeddings:
@@ -242,9 +359,36 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings if BaseRagasEmbeddings else
         self.model = model
         self.api_base = api_base.rstrip('/')
         self.api_key = api_key
+        self._max_concurrent = max_concurrent
+        self._batch_size = batch_size
+        # 复用 aiohttp session（实例级）
+        self._session: Optional[Any] = None
+        self._run_config = None
+
+    @property
+    def run_config(self):
+        """Ragas 期望的 run_config 属性"""
+        if self._run_config is None:
+            from ragas.run_config import RunConfig
+            self._run_config = RunConfig()
+        return self._run_config
+
+    def set_run_config(self, run_config):
+        """设置 run_config（Ragas 接口）"""
+        self._run_config = run_config
+
+    def _get_sync_semaphore(self):
+        """获取同步信号量（threading.Semaphore，所有实例共享）"""
+        import threading
+        if not hasattr(OpenAICompatibleEmbeddings, '_sync_semaphore'):
+            OpenAICompatibleEmbeddings._sync_semaphore = threading.Semaphore(self._max_concurrent)
+        return OpenAICompatibleEmbeddings._sync_semaphore
 
     def _post_embedding(self, texts: Union[str, List[str]]) -> List[List[float]]:
-        """通用的 embedding API 调用"""
+        """通用的 embedding API 调用（受全局 Semaphore 限制并发）"""
+        import requests
+        import threading
+
         url = f"{self.api_base}/embeddings"
         headers = {
             'Authorization': f'Bearer {self.api_key}',
@@ -254,12 +398,18 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings if BaseRagasEmbeddings else
             'model': self.model,
             'input': texts,
         }
-        response = requests.post(url, headers=headers, json=data, timeout=60)
-        response.raise_for_status()
-        result = response.json()
+
+        sync_sem = self._get_sync_semaphore()
+        sync_sem.acquire()
+        try:
+            response = requests.post(url, headers=headers, json=data, timeout=60)
+            response.raise_for_status()
+            result = response.json()
+        finally:
+            sync_sem.release()
+
         # 按 input 顺序返回 embeddings
         embeddings = result['data']
-        # 按 index 排序确保顺序
         embeddings.sort(key=lambda x: x['index'])
         return [e['embedding'] for e in embeddings]
 
@@ -271,13 +421,52 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings if BaseRagasEmbeddings else
         """同步批量获取文本 embeddings"""
         return self._post_embedding(texts)
 
+    async def _get_session(self) -> Any:
+        """获取或创建 aiohttp ClientSession（实例级复用）"""
+        import aiohttp
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=120)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
+
     async def aembed_query(self, text: str) -> List[float]:
         """异步获取单条文本 embedding"""
-        return self.embed_query(text)
+        return (await self.aembed_documents([text]))[0]
 
     async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
-        """异步批量获取文本 embeddings"""
-        return self.embed_documents(texts)
+        """异步批量获取文本 embeddings（受全局 Semaphore 限制并发）"""
+        import aiohttp
+
+        # 获取或创建信号量
+        if OpenAICompatibleEmbeddings._semaphore is None:
+            OpenAICompatibleEmbeddings._semaphore = asyncio.Semaphore(self._max_concurrent)
+
+        url = f"{self.api_base}/embeddings"
+        headers = {
+            'Authorization': f'Bearer {self.api_key}',
+            'Content-Type': 'application/json'
+        }
+
+        async with OpenAICompatibleEmbeddings._semaphore:
+            session = await self._get_session()
+            data = {
+                'model': self.model,
+                'input': texts,
+            }
+            async with session.post(url, headers=headers, json=data) as resp:
+                resp.raise_for_status()
+                result = await resp.json()
+
+        # 按 index 排序确保顺序
+        embeddings = result['data']
+        embeddings.sort(key=lambda x: x['index'])
+        return [e['embedding'] for e in embeddings]
+
+    async def close(self):
+        """关闭 aiohttp session"""
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
     def __repr__(self):
         return f"OpenAICompatibleEmbeddings(model={self.model})"
@@ -325,6 +514,8 @@ class MilvusDocumentLoader:
         collection_name: str = "paper_embeddings",
         embed_dim: int = 1024,
         alias: str = "paperrag_eval",
+        milvus_query_batch_size: int = 50,
+        paper_doc_stats_path: str = "./data/paper_doc_stats.json",
     ):
         """
         Args:
@@ -332,6 +523,8 @@ class MilvusDocumentLoader:
             collection_name: 集合名称
             embed_dim: embedding 维度
             alias: 连接别名
+            milvus_query_batch_size: Milvus ID IN 查询批大小（默认50，影响查询次数和内存占用）
+            paper_doc_stats_path: 论文统计信息 JSON 文件路径
         """
         self.milvus_lite_path = milvus_lite_path
         self.collection_name = collection_name
@@ -341,6 +534,8 @@ class MilvusDocumentLoader:
         self._collection = None
         # 内存中存储所有论文的 chunks
         self._all_chunks: Dict[str, List[Dict]] = {}
+        self._milvus_query_batch_size = milvus_query_batch_size
+        self._paper_doc_stats_path = paper_doc_stats_path
 
     def _ensure_connection(self):
         """确保已建立数据库连接"""
@@ -367,34 +562,28 @@ class MilvusDocumentLoader:
             self._collection = None
 
     def _get_paper_names(self) -> List[str]:
-        """获取所有论文名称列表"""
-        self._ensure_connection()
+        """从 paper_doc_stats.json 读取论文名称列表"""
+        import os
 
-        # 使用 group by paper 名称查询，获取所有唯一论文
-        # Milvus Lite 不支持 group by，我们用 query + distinct
-        results = self._collection.query(
-            expr="id >= 0",
-            output_fields=["metadata"],
-            limit=10000,  # 假设论文数量不超过 10000
-        )
+        if not os.path.exists(self._paper_doc_stats_path):
+            raise FileNotFoundError(
+                f"论文统计文件不存在: {self._paper_doc_stats_path}\n"
+                "请确认插件目录下 data/paper_doc_stats.json 文件存在"
+            )
 
-        paper_names = set()
-        for r in results:
-            meta = r.get("metadata", "{}")
-            if isinstance(meta, str):
-                try:
-                    meta = json.loads(meta)
-                except Exception:
-                    meta = {}
-            fname = meta.get("file_name", "unknown")
-            if fname:
-                paper_names.add(fname)
+        with open(self._paper_doc_stats_path, "r", encoding="utf-8") as f:
+            stats = json.load(f)
 
-        return list(paper_names)
+        paper_names = list(stats.keys())
+        print(f"   从 paper_doc_stats.json 读取到 {len(paper_names)} 篇论文")
+        return paper_names
 
     def _load_paper_chunks(self, paper_name: str) -> List[Dict]:
         """
         加载指定论文的所有 chunks（含 text）
+
+        利用 Milvus 表达式过滤 metadata["file_name"] 直接定位该论文所有 chunks，
+        无需全表扫描。
 
         Args:
             paper_name: 论文文件名
@@ -404,75 +593,57 @@ class MilvusDocumentLoader:
         """
         self._ensure_connection()
 
-        # 通过 metadata 中的 file_name 查询该论文所有 chunks
-        # 由于 Milvus Lite 不支持复杂表达式，我们逐 ID 范围查询
-        # 先获取该论文的元数据（含 id 和 chunk_index）
-        chunks_meta = []
-        offset = 0
-        batch_size = 500
-
-        while True:
-            try:
-                results = self._collection.query(
-                    expr="id >= 0",
-                    output_fields=["id", "metadata"],
-                    limit=batch_size,
-                    offset=offset,
-                )
-                if not results:
-                    break
-
-                # 过滤出该论文的 chunks
-                for r in results:
-                    meta = r.get("metadata", "{}")
-                    if isinstance(meta, str):
-                        try:
-                            meta = json.loads(meta)
-                        except Exception:
-                            meta = {}
-                    if meta.get("file_name") == paper_name:
-                        chunks_meta.append({
-                            "id": r["id"],
-                            "chunk_idx": meta.get("chunk_index", 0),
-                            "metadata": meta,
-                        })
-
-                if len(results) < batch_size:
-                    break
-                offset += batch_size
-
-            except Exception as e:
-                print(f"  查询 {paper_name} 元数据失败: {str(e)[:60]}...")
-                break
-
-        if not chunks_meta:
+        # 步骤 1：通过表达式过滤直接获取该论文所有 chunk id（无扫描）
+        try:
+            results = self._collection.query(
+                expr=f'metadata["file_name"] == "{paper_name}"',
+                output_fields=["id", "metadata"],
+            )
+        except Exception as e:
+            print(f"  查询 {paper_name} 失败: {str(e)[:60]}...")
             return []
 
-        # 按 chunk_idx 排序
+        if not results:
+            return []
+
+        # 提取 id 和 chunk_idx，按 chunk_idx 排序
+        chunks_meta = []
+        for r in results:
+            meta = r.get("metadata", {})
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            chunks_meta.append({
+                "id": r["id"],
+                "chunk_idx": meta.get("chunk_index", 0),
+                "metadata": meta,
+            })
         chunks_meta.sort(key=lambda x: x["chunk_idx"])
 
-        # 批量查询完整文本（按 ID in [...] 方式）
+        # 步骤 2：批量查询完整文本（id in [...]）
         chunk_ids = [c["id"] for c in chunks_meta]
         all_chunks_with_text = []
 
-        for i in range(0, len(chunk_ids), 50):
-            batch_ids = chunk_ids[i:i + 50]
+        for i in range(0, len(chunk_ids), self._milvus_query_batch_size):
+            batch_ids = chunk_ids[i:i + self._milvus_query_batch_size]
             expr = f"id in {batch_ids}"
             try:
-                results = self._collection.query(
+                text_results = self._collection.query(
                     expr=expr,
                     output_fields=["id", "text", "metadata"],
                 )
-                for r in results:
-                    meta = r.get("metadata", "{}")
+                for tr in text_results:
+                    meta = tr.get("metadata", {})
                     if isinstance(meta, str):
                         try:
                             meta = json.loads(meta)
                         except Exception:
                             meta = {"raw": meta}
                     all_chunks_with_text.append({
-                        "id": r["id"],
-                        "text": r.get("text", ""),
+                        "id": tr["id"],
+                        "text": tr.get("text", ""),
                         "metadata": meta,
                     })
             except Exception as e:
@@ -480,7 +651,6 @@ class MilvusDocumentLoader:
 
         # 按 id 排序保持顺序
         all_chunks_with_text.sort(key=lambda x: x["id"])
-
         return all_chunks_with_text
 
     def load_all_papers(self) -> Dict[str, List[Dict]]:
@@ -624,6 +794,7 @@ class RagasTestsetGenerator:
         embed_dim: int = 1024,
         max_chunks: int = 200,
         max_concurrent: int = 3,
+        paper_doc_stats_path: Optional[str] = None,
     ):
         """
         初始化生成器
@@ -644,6 +815,7 @@ class RagasTestsetGenerator:
             embed_dim: Embedding 维度
             max_chunks: 从数据库加载的最大 chunk 数量
             max_concurrent: LLM 最大并发数（默认 3，建议不超过 5）
+            paper_doc_stats_path: 论文统计 JSON 文件路径（默认取插件 data/paper_doc_stats.json）
         """
         if not RAGAS_AVAILABLE:
             raise ImportError(
@@ -657,12 +829,17 @@ class RagasTestsetGenerator:
         self._max_chunks = max_chunks
         self._max_concurrent = max_concurrent
 
+        # 论文统计文件路径（默认为插件 data 目录）
+        if paper_doc_stats_path is None:
+            paper_doc_stats_path = str(Path(__file__).parent.parent / "data" / "paper_doc_stats.json")
+
         # Milvus 加载器
         self._milvus_loader = MilvusDocumentLoader(
             milvus_lite_path=milvus_lite_path,
             collection_name=collection_name,
             embed_dim=embed_dim,
             alias=f"paperrag_eval_{id(self)}",
+            paper_doc_stats_path=paper_doc_stats_path,
         )
 
         # 保存配置
@@ -726,6 +903,7 @@ class RagasTestsetGenerator:
                     model=self._embed_config["ollama_embed_model"],
                     api_base=embed_api_base,
                     api_key="ollama",  # Ollama 不需要真实 key
+                    max_concurrent=self._max_concurrent,
                 )
                 print(f"✅ Ollama embedding 初始化成功")
             elif self._embed_config["base_url"]:
@@ -734,6 +912,7 @@ class RagasTestsetGenerator:
                     model=self._embed_config["model"],
                     api_base=self._embed_config["base_url"],
                     api_key=self._embed_config["api_key"] or "sk-placeholder",
+                    max_concurrent=self._max_concurrent,
                 )
             else:
                 raise ValueError("embed_base_url or ollama mode is required for embedding")
@@ -796,7 +975,7 @@ class RagasTestsetGenerator:
 
         # 转换为标准格式
         samples = []
-        for sample in testset.test_data:
+        for sample in testset.samples:
             eval_sample_obj = sample.eval_sample
             # 兼容 SingleTurnSample 和 MultiTurnSample
             if hasattr(eval_sample_obj, 'user_input'):

@@ -89,7 +89,8 @@ class HybridIndexManager:
 
         # 文档统计追踪（用于解决 Milvus Lite 大数据量查询限制）
         self._doc_stats_file = None  # JSON 文件路径
-        self._doc_stats: Dict[str, Dict[str, Any]] = {}  # file_name -> {chunk_count, added_time}
+        # file_name -> {chunk_count, added_time, chunk_index_start, chunk_index_end, milvus_id_start, milvus_id_end}
+        self._doc_stats: Dict[str, Dict[str, Any]] = {}
 
         # BM25 内存索引（延迟构建）
         self._bm25: Any = None  # BM25Okapi 实例
@@ -631,6 +632,93 @@ class HybridIndexManager:
             logger.error(f"获取统计信息失败: {e}")
             return {
                 "status": "error",
+                "error": str(e)
+            }
+
+    async def get_all_references(self) -> Dict[str, Any]:
+        """
+        从数据库中提取所有参考文献，统计论文名称出现频次
+
+        Returns:
+            Dict containing:
+            - references: List of unique reference titles with frequency
+            - total_refs: Total number of references extracted
+            - total_chunks: Total chunks processed
+        """
+        try:
+            all_chunks = await self.get_all_chunks()
+            if not all_chunks:
+                return {
+                    "references": [],
+                    "total_refs": 0,
+                    "total_chunks": 0
+                }
+
+            # 统计论文标题出现频次
+            title_counter: Dict[str, Dict[str, Any]] = {}
+            total_refs = 0
+
+            for chunk in all_chunks:
+                metadata = chunk.get("metadata", {})
+                if not isinstance(metadata, dict):
+                    continue
+
+                references = metadata.get("references", [])
+                if not references:
+                    continue
+
+                for ref in references:
+                    if not isinstance(ref, dict):
+                        continue
+
+                    # 提取论文标题
+                    title = ref.get("ref_title", "").strip()
+                    if not title or len(title) < 5:  # 跳过太短的标题
+                        continue
+
+                    # 标准化标题用于比较（转小写，去除多余空格）
+                    title_normalized = " ".join(title.lower().split())
+
+                    if title_normalized in title_counter:
+                        title_counter[title_normalized]["count"] += 1
+                        title_counter[title_normalized]["raw_title"] = title  # 保留原始大小写
+                    else:
+                        title_counter[title_normalized] = {
+                            "count": 1,
+                            "raw_title": title,
+                            "ref_authors": ref.get("ref_authors", ""),
+                            "ref_year": ref.get("ref_year"),
+                            "ref_doi": ref.get("ref_doi", "")
+                        }
+                    total_refs += 1
+
+            # 转换为列表并按频次排序
+            refs_list = []
+            for title_norm, info in title_counter.items():
+                refs_list.append({
+                    "title": info["raw_title"],
+                    "count": info["count"],
+                    "authors": info["ref_authors"],
+                    "year": info["ref_year"],
+                    "doi": info["ref_doi"]
+                })
+
+            refs_list.sort(key=lambda x: x["count"], reverse=True)
+
+            logger.info(f"📚 提取参考文献统计: {len(refs_list)} 种不同论文, 共 {total_refs} 条引用")
+
+            return {
+                "references": refs_list,
+                "total_refs": total_refs,
+                "total_chunks": len(all_chunks)
+            }
+
+        except Exception as e:
+            logger.error(f"提取参考文献统计失败: {e}")
+            return {
+                "references": [],
+                "total_refs": 0,
+                "total_chunks": 0,
                 "error": str(e)
             }
 

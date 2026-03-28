@@ -1,8 +1,8 @@
-# 📚 Paper RAG Plugin v1.4.0 - 用户指南
+# 📚 Paper RAG Plugin v1.5.0 - 用户指南
 
 本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力（支持多模态VLM问答）。
 
-> **版本说明**：当前版本 v1.4.0，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
+> **版本说明**：当前版本 v1.5.0，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
 
 ## ✨ 核心功能
 
@@ -96,6 +96,11 @@ cp ~/Downloads/*.pdf papers/
 | `/paper delete <文件名>` | 删除指定论文（需管理员） | `/paper delete attention.pdf` |
 | `/paper rebuild [目录] confirm` | 清空并重建知识库 | `/paper rebuild ./papers confirm` |
 | `/paper clear confirm` | 清空知识库（需管理员） | `/paper clear confirm` |
+| `/paper refstats [top_k]` | 查看参考文献引用统计（需管理员） | `/paper refstats 20` |
+| `/paper arxiv_add <关键词> [数量]` | 从arXiv搜索下载论文并添加（需管理员） | `/paper arxiv_add attention is all you need 3` |
+| `/paper arxiv_refs [top_k] [每篇数量]` | 下载高频引用论文（需管理员） | `/paper arxiv_refs 10 3` |
+| `/paper arxiv_sync confirm` | 同步MCP已下载论文到数据库（需管理员） | `/paper arxiv_sync confirm` |
+| `/paper arxiv_cleanup confirm` | 清理arXiv论文旧版本（需管理员） | `/paper arxiv_cleanup confirm` |
 
 ### 使用示例
 
@@ -128,6 +133,111 @@ Bot: 📚 **参考文献**
 Bot:
 Bot: [1] **attention_is_all_you_need.pdf** (片段 #12)
 Bot: > The attention mechanism allows the model to focus on...
+```
+
+---
+
+## 🔬 arXiv 集成功能
+
+插件提供多种方式获取论文并添加到数据库。
+
+### arXiv MCP 同步
+
+已配置的 arXiv MCP 服务器（`/Volumes/ext/arxiv`）下载的论文可以同步到 paperrag 数据库：
+
+```
+/paper arxiv_sync        # 查看待处理数量
+/paper arxiv_sync confirm # 执行同步
+```
+
+### arXiv 论文清理
+
+清理 arXiv 下载目录中的旧版本论文，只保留最新版本：
+
+```
+/paper arxiv_cleanup        # 查看待清理数量
+/paper arxiv_cleanup confirm # 执行清理
+```
+
+**说明**：
+- 自动识别同一论文的多个版本（如 `2603.11298.pdf` 和 `2603.11298v2.pdf`）
+- 删除旧版本，保留最高版本号
+- 同时清理 macOS 元数据文件（`._*`）
+
+### 从 arXiv 搜索下载
+
+使用 arXiv MCP 搜索论文并下载：
+
+```
+/paper arxiv_add <搜索关键词> [最大数量]
+```
+
+**示例**：
+```
+你: /paper arxiv_add attention is all you need 3
+Bot: 🔍 在arXiv搜索: "attention is all you need"
+Bot: 📡 正在搜索arXiv...
+Bot: ✅ 找到 3 篇论文
+Bot: 📄 [1/3] Attention Is All You Need
+Bot:    📥 下载PDF: https://arxiv.org/pdf/1706.03762.pdf
+Bot:    ✅ 下载完成 (8.2 MB)
+Bot:    ✅ 已添加到数据库 (chunks: 45)
+...
+```
+
+### 自动下载高频引用论文
+
+根据已有文献的参考文献统计，自动下载被引用最多的论文：
+
+```
+/paper arxiv_refs [top_k] [每篇最大下载数]
+```
+
+**示例**：
+```
+你: /paper arxiv_refs 10 3
+Bot: 📊 正在获取高频引用论文统计...
+Bot: 📚 找到 156 种参考文献，取前 10 个高频引用
+Bot: [1/10] 📝 Attention Is All You Need
+Bot:    🔍 搜索: Attention Is All You Need Vaswani 2017
+Bot:    📥 下载: 1706.03762v5.pdf
+Bot:    ✅ 已添加到数据库
+...
+```
+
+**工作流程**：
+1. 调用 `/paper refstats` 获取高频引用论文列表
+2. 对每个高频引用，使用标题+作者+年份构建搜索查询
+3. 从 arXiv 下载相关论文
+4. 自动添加到数据库
+5. 跳过已存在的 PDF 文件
+
+### 参考文献统计
+
+查看数据库中论文的引用频次统计：
+
+```
+/paper refstats [top_k]
+```
+
+**示例输出**：
+```
+📚 **参考文献统计**
+
+📊 统计概览:
+   • 涉及论文种类: 156
+   • 引用总条次: 892
+   • 处理文档块: 234
+
+🔝 **Top 20 高频引用论文**
+
+ 1. [ 15次] **Attention Is All You Need**
+    └─ Vaswani, A. et al. (2017)
+ 2. [ 12次] **BERT: Pre-training of Deep Bidirectional**
+    └─ Devlin, J. et al. (2018)
+ 3. [  8次] **Language Models are Few-Shot Learners**
+    └─ Brown, T. et al. (2020)
+...
 ```
 
 ---

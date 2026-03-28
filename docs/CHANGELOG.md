@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-03-28
+
+### Added
+
+- **参考文献统计功能** (`refstats`)
+  - 新增 `get_all_references()` 方法从 Milvus 数据库提取参考文献
+  - 统计每篇论文标题的出现频次
+  - 按频次排序显示高频引用论文
+
+- **arXiv 论文下载功能** (`arxiv_add`)
+  - 使用配置的 arXiv MCP 搜索论文
+  - 从 arXiv 直接下载 PDF（`https://arxiv.org/pdf/{paper_id}.pdf`）
+  - 自动添加到数据库
+
+- **高频引用论文自动下载** (`arxiv_refs`)
+  - 根据 `refstats` 统计自动识别高频引用论文
+  - 使用标题+作者+年份构建搜索查询
+  - 自动从 arXiv 下载并添加到数据库
+
+- **MCP 论文同步功能** (`arxiv_sync`)
+  - 将 arXiv MCP 已下载的论文同步到 paperrag 数据库
+  - 扫描 MCP 存储路径（默认 `/Volumes/ext/arxiv`）
+  - 复制到 `papers_dir` 并添加到数据库
+
+- **arXiv 论文版本清理** (`arxiv_cleanup`)
+  - 自动识别同一论文的多个版本（如 `2603.11298.pdf` 和 `2603.11298v2.pdf`）
+  - 删除旧版本，只保留最高版本号
+  - 同时清理 macOS 元数据文件（`._*`）
+
 ## [1.4.0] - 2026-03-27
 
 ### Added

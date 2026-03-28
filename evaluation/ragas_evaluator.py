@@ -40,6 +40,11 @@ try:
         AnswerCorrectness,
     )
     from datasets import Dataset
+
+    # 禁用 Ragas 遥测追踪（避免 SSL 证书过期错误）
+    import os
+    os.environ["RAGAS_DO_NOT_TRACK"] = "True"
+
 except ImportError as e:
     RAGAS_AVAILABLE = False
     logger.warning(f"Ragas 评估框架未安装: {e}")
@@ -108,7 +113,7 @@ class RAGQueryWrapper:
 
         # 检测引擎类型
         self._is_hybrid = hasattr(query_engine, "search")
-        self._is_llama = hasattr(query_engine, "aqeury") or hasattr(query_engine, "_query")
+        self._is_llama = hasattr(query_engine, "aquery") or hasattr(query_engine, "_query")
 
         logger.info(f"RAG 引擎类型: {'HybridRAGEngine' if self._is_hybrid else 'llama-index QueryEngine'}")
 
@@ -233,6 +238,7 @@ class RagasEvaluator:
                         model=self._embed_config["ollama_embed_model"],
                         api_base=embed_api_base,
                         api_key="ollama",
+                        max_concurrent=self._max_concurrent,
                     )
                 else:
                     raise ImportError("OpenAICompatibleEmbeddings 未安装")
@@ -242,6 +248,7 @@ class RagasEvaluator:
                         model=self._embed_config["model"],
                         api_base=self._embed_config["base_url"],
                         api_key=self._embed_config["api_key"] or "sk-placeholder",
+                        max_concurrent=self._max_concurrent,
                     )
                 else:
                     raise ImportError("OpenAICompatibleEmbeddings 未安装")

@@ -12,6 +12,7 @@
 
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 from dataclasses import dataclass
@@ -135,7 +136,8 @@ class HybridPDFParser:
                     "images_count": metadata.get("images_count", 0),
                     "tables_count": metadata.get("tables_count", 0),
                     "formulas_count": metadata.get("formulas_count", 0),
-                    "multimodal_data": metadata.get("multimodal_data", {})
+                    "multimodal_data": metadata.get("multimodal_data", {}),
+                    "added_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
             )
 
