@@ -22,13 +22,21 @@ except ImportError:
     TextNode = None  # type: ignore
     QueryBundle = None  # type: ignore
 
-# 导入核心重排序器
-from .reranker import (
-    ContentReranker,
-    AdaptiveReranker as CoreAdaptiveReranker,
-    RerankerConfig,
-    create_reranker as create_core_reranker
-)
+# 导入核心重排序器（兼容直接运行和包运行）
+try:
+    from .reranker import (
+        ContentReranker,
+        AdaptiveReranker as CoreAdaptiveReranker,
+        RerankerConfig,
+        create_reranker as create_core_reranker
+    )
+except ImportError:
+    from reranker import (
+        ContentReranker,
+        AdaptiveReranker as CoreAdaptiveReranker,
+        RerankerConfig,
+        create_reranker as create_core_reranker
+    )
 
 
 @dataclass

@@ -75,7 +75,7 @@ async def test_pdf_parsing():
             print(f"   - 图片数: {doc.metadata.get('images_count', 0)}")
 
         # 解析为Nodes
-        nodes = parser.parse_and_split(str(test_pdf))
+        nodes = await parser.parse_and_split(str(test_pdf))
         print(f"✅ 分块成功: {len(nodes)} 个nodes")
 
         if nodes:

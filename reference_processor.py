@@ -174,10 +174,26 @@ class ReferenceExtractor:
         # 3. 解析每个引用
         references = []
         expected_seq = 1  # 期望的下一个序号
+        skipped_formulas = 0
+        skipped_tables = 0
+        skipped_empty = 0
+        parse_failed = 0
 
         for i, line in enumerate(ref_lines, 1):
             # 跳过公式引用（如 "[Formula on page 1] $ 36, 39, 57 $"）
             if '[Formula on page' in line:
+                skipped_formulas += 1
+                continue
+
+            # 跳过表格内容
+            if self._is_likely_table(line):
+                skipped_tables += 1
+                logger.debug(f"跳过表格内容: {line[:60]}...")
+                continue
+
+            # 跳过空行或太短的行
+            if not line or len(line.strip()) < 10:
+                skipped_empty += 1
                 continue
 
             ref = self._parse_reference_line(line, i)
@@ -200,12 +216,14 @@ class ReferenceExtractor:
                     expected_seq = actual_seq + 1
 
                 references.append(ref)
+            else:
+                parse_failed += 1
 
-        logger.info(f"📚 共提取到 {len(references)} 条参考文献")
+        logger.info(f"📚 共提取到 {len(references)} 条参考文献 (跳过公式: {skipped_formulas}, 跳过表格: {skipped_tables}, 跳过空行: {skipped_empty}, 解析失败: {parse_failed})")
         # 打印参考文献详情
         for i, ref in enumerate(references, 1):
-            title = ref.ref_title[:50] + "..." if len(ref.ref_title) > 50 else ref.ref_title
-            authors = ref.ref_authors[:40] + "..." if len(ref.ref_authors) > 40 else ref.ref_authors
+            title = ref.ref_title
+            authors = ref.ref_authors
             logger.info(f"   [{i}] {title}")
             logger.info(f"       作者: {authors}")
             logger.info(f"       年份: {ref.ref_year or 'N/A'}, DOI: {ref.ref_doi or 'N/A'}")
@@ -267,11 +285,15 @@ class ReferenceExtractor:
         return None
 
     def _split_reference_lines(self, ref_text: str) -> List[str]:
-        """将参考文献文本分割成单独的行"""
+        """
+        将参考文献文本分割成单独的行。
+
+        注意：此方法主要用于有明确编号格式的参考文献（如 [1]、1.）。
+        无序号格式的参考文献分割现在由 LLM（parse_reference_section）处理。
+        """
         lines = ref_text.split('\n')
         result = []
         current = []
-        MIN_REF_LENGTH = 100  # 最小引用长度阈值
 
         for line in lines:
             stripped = line.strip()
@@ -287,26 +309,12 @@ class ReferenceExtractor:
             is_new_ref = (
                 re.match(r'^\[\[\{]?\d+[\]]?', stripped) or
                 stripped.startswith(r'\bibitem{') or
-                stripped.startswith('[') or
                 re.match(r'^\d+\.\s+[A-Z]', stripped)
             )
 
-            # 无序号引用的启发式判断
-            if not is_new_ref:
-                # 以 URL 开头的行通常是新的完整引用
-                if stripped.lower().startswith(('http://', 'https://', 'www.')):
-                    is_new_ref = True
-                # 如果当前累积文本已经很长（>=300字符），后续文本可能是新引用
-                elif current and len(' '.join(current)) >= 300:
-                    # 检查前一条引用是否看起来完整（以句号、doi或)结尾）
-                    prev_text = ' '.join(current)
-                    if prev_text.rstrip().endswith(('.', ')', 'doi:', 'org/', 'com/')):
-                        is_new_ref = True
-                # 如果一行以大写字母开头，且当前引用已完整，也可能新引用
-                elif current and re.match(r'^[A-Z][a-z]+', stripped):
-                    prev_text = ' '.join(current)
-                    if prev_text.rstrip().endswith('.') and len(prev_text) >= MIN_REF_LENGTH:
-                        is_new_ref = True
+            # 无序号但以 URL 开头的行
+            if not is_new_ref and stripped.lower().startswith(('http://', 'https://', 'www.')):
+                is_new_ref = True
 
             if is_new_ref:
                 if current:
@@ -314,13 +322,11 @@ class ReferenceExtractor:
                 current = [stripped]
             elif current:
                 # 继续之前的引用，合并时处理连字符断行
-                # 如 "Accessi-" + "ble" → "Accessible"
                 prev = current[-1]
-                merged_line = stripped
                 if prev.endswith('-'):
-                    current[-1] = prev[:-1] + merged_line
+                    current[-1] = prev[:-1] + stripped
                 else:
-                    current.append(merged_line)
+                    current.append(stripped)
 
         if current:
             result.append(' '.join(current))
@@ -380,12 +386,22 @@ class ReferenceExtractor:
                 ref_venue=None
             )
 
-        # 无法解析，保存原始文本
-        logger.debug(f"无法解析引用格式: {line[:100]}...")
+        # 无法解析，检查是否看起来像有效标题
+        fallback_title = self._extract_fallback_title(line)
+        # 如果提取的"标题"实际上是作者名（如单个姓氏），则不使用
+        if self._is_likely_author_name(fallback_title):
+            fallback_title = ""  # 留空，这样在统计时会被过滤掉
+
+        # 如果看起来像表格内容，则不使用
+        if self._is_likely_table(line):
+            logger.debug(f"跳过表格内容: {line[:50]}...")
+            fallback_title = ""  # 留空，这样在统计时会被过滤掉
+
+        logger.debug(f"无法解析引用格式: {line}... -> fallback_title='{fallback_title if fallback_title else '(empty)'}...'")
         return Reference(
             ref_id=f"ref_{index}",
             raw_text=line,
-            ref_title=line[:100],
+            ref_title=fallback_title,
             ref_authors="",
             ref_year=None,
             ref_doi=None,
@@ -450,7 +466,110 @@ class ReferenceExtractor:
         title = re.sub(r'^\[\d+\]\s*', '', text)
         title = re.sub(r'10\.\d{4,}/[^\s]+', '', title)
         # 取前100字符作为标题
-        return title[:100].strip()
+        return title.strip()
+
+    def _is_likely_author_name(self, text: str) -> bool:
+        """
+        检测文本是否可能是作者名而不是论文标题
+
+        Args:
+            text: 待检测的文本
+
+        Returns:
+            True 如果文本看起来像作者名，False 如果看起来像标题
+        """
+        if not text or len(text) < 3:
+            return True
+
+        text = text.strip()
+
+        # 检查是否包含 "et al"（典型的作者引用格式）
+        if 'et al' in text.lower():
+            return True
+
+        # 检查是否匹配常见的作者名格式：单个姓氏、名字首字母缩写
+        # 例如: "Levine", "Smith, J.", "Wang, L."
+        author_patterns = [
+            r'^[A-Z][a-z]+$',  # 单个单词，首字母大写（可能是姓氏如 "Levine"）
+            r'^[A-Z][a-z]+,\s*[A-Z]\.$',  # "Smith, J." 格式
+            r'^[A-Z][a-z]+,\s*[A-Z]\.\s*[A-Z]\.$',  # "Smith, J. K." 格式
+            r'^[A-Z][a-z]+\s+et\s+al\.?$',  # "Smith et al." 格式
+        ]
+        for pattern in author_patterns:
+            if re.match(pattern, text, re.IGNORECASE):
+                return True
+
+        # 如果文本以方括号+数字开头（如 "[2] Angel Chang..."），这不是标题
+        if re.match(r'^\[\d+\]', text):
+            return True
+
+        # 如果文本很短（<=3个单词）且全是字母，可能是作者名
+        words = text.split()
+        if len(words) <= 3 and len(words) > 0:
+            # 检查是否全是简单的姓名格式
+            all_simple_names = True
+            for word in words:
+                # 移除非字母字符检查是否是简单的名字/姓氏
+                clean_word = re.sub(r'[^a-zA-Z]', '', word)
+                if not clean_word:
+                    continue
+                # 简单名字通常首字母大写，其余小写，长度2-15
+                if not (re.match(r'^[A-Z][a-z]{1,14}$', clean_word)):
+                    all_simple_names = False
+                    break
+            if all_simple_names and len(words) <= 2:
+                return True
+
+        return False
+
+    def _is_likely_table(self, text: str) -> bool:
+        """
+        检测文本是否可能是表格内容而不是论文标题
+
+        Args:
+            text: 待检测的文本
+
+        Returns:
+            True 如果文本看起来像表格内容
+        """
+        if not text:
+            return False
+
+        text = text.strip()
+
+        # 统计管道符数量（表格的典型特征）
+        pipe_count = text.count('|')
+
+        # 如果有多个管道符，且在同一行或相邻行，可能是表格
+        if pipe_count >= 3:
+            # 检查是否包含表格相关的箭头符号或数字组合
+            table_indicators = ['↑', '↓', '←', '→', ' LPIPS', ' SSIM', ' PSNR', 'RGB', ' FPS']
+            has_table_indicator = any(indicator in text for indicator in table_indicators)
+
+            # 检查是否包含大量数字（可能是表格的数值列）
+            numbers_found = re.findall(r'\d+\.?\d*', text)
+            has_many_numbers = len(numbers_found) >= 3
+
+            # 检查是否包含时间格式（如 4min28s, 10min3s 等）
+            time_patterns = [
+                r'\d+min\d+s',  # 如 4min28s
+                r'\d+min',      # 如 33min
+                r'\d+s',        # 如 98s
+            ]
+            has_time_format = any(re.search(p, text) for p in time_patterns)
+
+            if has_table_indicator or (has_many_numbers and has_time_format):
+                return True
+
+        # 检查是否主要是管道符分隔的数字和标题
+        if pipe_count >= 5:
+            return True
+
+        # 检查是否包含 "===" 这种 markdown 表格分隔符
+        if '===' in text:
+            return True
+
+        return False
 
 
 class CitationLinker:
@@ -673,7 +792,18 @@ class CitationLinker:
                 chunk.metadata = {}
 
             if cited_refs:
-                chunk.metadata['cited_references'] = list(cited_refs)
+                # 存储完整的引用信息（标题、作者、年份等），而不仅仅是 ref_id
+                chunk.metadata['cited_references'] = [
+                    {
+                        "ref_id": rid,
+                        "ref_title": ref_map[rid].ref_title,
+                        "ref_authors": ref_map[rid].ref_authors,
+                        "ref_year": ref_map[rid].ref_year,
+                        "ref_doi": ref_map[rid].ref_doi,
+                        "ref_venue": ref_map[rid].ref_venue,
+                    }
+                    for rid in cited_refs
+                ]
             else:
                 chunk.metadata['cited_references'] = []
 
@@ -829,7 +959,7 @@ class GrobidReferenceParser:
                 reference = Reference(
                     ref_id=f"ref_{i}",
                     raw_text=raw_text,
-                    ref_title=title or raw_text[:100] if raw_text else f"Reference {i}",
+                    ref_title=title or raw_text if raw_text else f"Reference {i}",
                     ref_authors=authors,
                     ref_year=year,
                     ref_doi=doi,
@@ -895,7 +1025,7 @@ class GrobidReferenceParser:
                 reference = Reference(
                     ref_id=f"ref_{i}",
                     raw_text=raw_text,
-                    ref_title=title or raw_text[:100] if raw_text else f"Reference {i}",
+                    ref_title=title or raw_text if raw_text else f"Reference {i}",
                     ref_authors=authors,
                     ref_year=year,
                     ref_doi=doi,
@@ -1242,7 +1372,10 @@ def process_references_and_citations_grobid(
             logger.error(f"❌ PDF 文本提取失败: {e}")
 
     regex_count = len(references)
-    logger.debug(f"📝 正则解析提取到 {regex_count} 条参考文献")
+    if references:
+        logger.info(f"📝 正则解析提取到 {regex_count} 条参考文献")
+    else:
+        logger.debug(f"📝 正则解析提取到 {regex_count} 条参考文献")
 
     # 2. 如果启用 Grobid，尝试 Grobid 解析作为补充
     if use_grobid:
@@ -1309,3 +1442,511 @@ def _merge_reference_lists(regex_refs: List[Reference], grobid_refs: List[Refere
             merged.append(ref)
 
     return merged
+
+
+class LLMReferenceParser:
+    """
+    基于大模型的参考文献解析器
+
+    使用 GPT-4o 解析参考文献的标题、作者、年份等信息，
+    并通过 arXiv MCP 查询论文详情进行补充。
+
+    特性：
+    1. LLM 直接解析参考文献文本
+    2. 使用 arXiv MCP 进行论文详情查询和补全
+    3. 自动识别参考文献中的标题、作者、年份、DOI 等信息
+    """
+
+    # 系统提示词
+    SYSTEM_PROMPT = """你是一个学术论文参考文献解析专家。你的任务是从论文的参考文献部分提取结构化信息。
+
+参考文献格式可能非常复杂，包括但不限于：
+- 序号. 作者: 标题. 期刊/会议, 年份.
+- [序号] 作者. 标题. 期刊, 年份.
+- 作者 (年份). 标题. 期刊.
+- 带DOI的格式: 作者. 标题. DOI: xx.xxxx/xxxxx
+
+你需要提取以下字段：
+- title: 论文标题（最重要的字段）
+- authors: 作者列表（多个作者用逗号分隔）
+- year: 年份（4位数字）
+- venue: 期刊/会议名称
+- doi: DOI（如果有）
+
+请仔细分析每条参考文献，准确提取上述信息。如果某些信息确实无法从文本中获得，请留空。"""
+
+    # 批量解析提示词
+    BATCH_PARSE_PROMPT = """你是一个学术论文参考文献解析专家。请批量解析以下参考文献。
+
+参考文献格式可能包括：
+- 序号. 作者: 标题. 期刊/会议, 年份.
+- [序号] 作者. 标题. 期刊, 年份.
+- 作者 (年份). 标题. 期刊.
+- 各种变体格式
+
+请为每条参考文献提取以下字段：
+- title: 论文标题
+- authors: 作者（多个作者用逗号分隔）
+- year: 年份（4位数字）
+- venue: 期刊/会议名称（如果有）
+- doi: DOI（如果有）
+
+请以JSON数组格式返回，不要包含任何其他内容：
+[
+    {{
+        "title": "论文标题",
+        "authors": "作者列表",
+        "year": "年份",
+        "venue": "期刊/会议",
+        "doi": "DOI"
+    }}
+]
+
+参考文献列表：
+{reference_list}
+
+只返回JSON数组，不要有其他内容："""
+
+    # 整段参考文献解析提示词（让LLM自己分割+解析）
+    SECTION_PARSE_PROMPT = """你是一个学术论文参考文献解析专家。下面是一篇论文的完整参考文献部分。
+
+你的任务是：
+1. 首先识别出参考文献部分中每一条单独的参考文献（参考文献可能跨多行）
+2. 然后解析每条参考文献的详细信息
+
+识别参考文献的技巧：
+- 参考文献通常以数字编号 [1]、1. 或直接以作者名开头
+- 每条参考文献通常以年份结尾（2021. 或 (2021)）
+- 新引用通常从新的一行开始（该行以作者名或编号开头）
+- 如果某行以大写字母开头且上一行以年份结尾，这是新引用的开始
+
+请为每条识别出的参考文献提取以下字段：
+- title: 论文标题
+- authors: 作者（多个作者用逗号分隔，只填作者姓名，不填"et al"等）
+- year: 年份（4位数字）
+- venue: 期刊/会议名称（如果有）
+- doi: DOI（如果有，只填DOI号）
+
+请以JSON数组格式返回，只返回一个数组，不要有任何其他内容：
+[
+    {{
+        "title": "论文标题",
+        "authors": "作者1, 作者2, 作者3",
+        "year": "2021",
+        "venue": "期刊或会议名称",
+        "doi": "10.xxxx/xxxxx"
+    }}
+]
+
+参考文献部分：
+{ref_section}
+
+只返回JSON数组，不要有任何其他内容："""
+
+    def __init__(
+        self,
+        llm_config: Dict[str, Any],
+        arxiv_client: Any = None
+    ):
+        """
+        初始化 LLM 参考文献解析器
+
+        Args:
+            llm_config: LLM 配置字典，包含：
+                - model: 模型名称（如 "gpt-4o"）
+                - api_base: API 基础 URL
+                - api_key: API Key
+            arxiv_client: arXiv MCP 客户端，用于查询论文详情
+        """
+        self.llm_config = llm_config
+        self.arxiv_client = arxiv_client
+        self._semaphore = None
+
+    async def _call_llm(self, prompt: str, max_retries: int = 3) -> Optional[str]:
+        """调用 LLM 生成文本（使用官方 OpenAI API），支持重试"""
+        import aiohttp
+        import asyncio
+        import time
+
+        # 获取或创建信号量（限制并发）
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(4)
+
+        url = f"{self.llm_config['api_base']}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.llm_config.get('api_key', 'sk-placeholder')}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": self.llm_config["model"],
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 8192,  # 增加token限制以支持大量参考文献
+        }
+
+        logger.info(f"📝 [LLM调用] 开始请求，prompt长度: {len(prompt)} 字符")
+
+        for attempt in range(max_retries):
+            logger.info(f"📝 [LLM调用] 尝试 {attempt + 1}/{max_retries}")
+            async with self._semaphore:
+                logger.info(f"📝 [LLM调用] 获得信号量，开始请求...")
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(url, headers=headers, json=data, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                            logger.info(f"📝 [LLM调用] 收到响应状态码: {resp.status}")
+                            if resp.status == 429:
+                                # 速率限制，等待后重试
+                                retry_after = int(resp.headers.get("Retry-After", 5))
+                                logger.warning(f"⚠️ LLM API 速率限制 (429)，{retry_after}秒后重试... (尝试 {attempt + 1}/{max_retries})")
+                                await asyncio.sleep(retry_after)
+                                continue
+                            if resp.status == 500:
+                                # 服务器错误，等待后重试
+                                logger.warning(f"⚠️ LLM API 服务器错误 (500)，5秒后重试... (尝试 {attempt + 1}/{max_retries})")
+                                await asyncio.sleep(5)
+                                continue
+                            if resp.status != 200:
+                                text = await resp.text()
+                                logger.warning(f"⚠️ LLM API 请求失败: HTTP {resp.status}, 响应: {text[:500]}")
+                                return None
+                            result = await resp.json()
+                            logger.info(f"📝 [LLM调用] 响应解析成功")
+                except asyncio.TimeoutError:
+                    logger.warning("⚠️ LLM API 请求超时")
+                    await asyncio.sleep(3)
+                    continue
+                except Exception as e:
+                    logger.warning(f"⚠️ LLM API 请求异常: {e}")
+                    await asyncio.sleep(3)
+                    continue
+
+            # 提取响应内容（在信号量外部执行）
+            logger.info(f"📝 [LLM调用] 解析响应内容...")
+            try:
+                choices = result.get("choices", [])
+                if not choices:
+                    logger.warning("⚠️ LLM 返回空 choices")
+                    return None
+                message = choices[0].get("message", {})
+                content = message.get("content", "")
+                logger.info(f"📝 [LLM调用] 提取到内容长度: {len(content) if content else 0}")
+                return content
+            except Exception as e:
+                logger.warning(f"⚠️ 解析 LLM 响应失败: {e}")
+                return None
+
+        logger.warning(f"⚠️ LLM API 重试 {max_retries} 次后仍失败")
+        return None
+
+    async def parse_reference_section(
+        self,
+        ref_section: str,
+        ref_id_prefix: str = "ref"
+    ) -> List[Reference]:
+        """
+        解析整段参考文献文本（让LLM自动分割+解析）
+
+        Args:
+            ref_section: 参考文献部分的完整文本（可能跨多行）
+            ref_id_prefix: ref_id 前缀
+
+        Returns:
+            Reference 对象列表
+        """
+        if not ref_section or not ref_section.strip():
+            return []
+
+        logger.info(f"📝 开始 LLM 参考文献解析（整段模式），文本长度: {len(ref_section)} 字符")
+
+        prompt = self.SECTION_PARSE_PROMPT.format(ref_section=ref_section)
+        logger.debug(f"📝 [LLM调试] Prompt长度: {len(prompt)} 字符")
+        logger.debug(f"📝 [LLM调试] Prompt预览: {prompt[:300]}...")
+
+        try:
+            response = await self._call_llm(prompt)
+            logger.debug(f"📝 [LLM调试] Raw响应长度: {len(response) if response else 0}")
+            logger.debug(f"📝 [LLM调试] Raw响应预览: {response[:500] if response else 'None'}")
+
+            if not response:
+                logger.warning("⚠️ LLM 未返回有效响应")
+                return []
+
+            # 提取 JSON
+            json_str = self._extract_json(response)
+            if not json_str:
+                logger.warning("⚠️ 无法从 LLM 响应中提取 JSON")
+                return []
+
+            parsed_list = json.loads(json_str)
+            if not isinstance(parsed_list, list):
+                logger.warning(f"⚠️ LLM 返回的不是数组: {type(parsed_list)}")
+                return []
+
+            results = []
+            for j, parsed in enumerate(parsed_list):
+                try:
+                    ref = Reference(
+                        ref_id=f"{ref_id_prefix}_{j + 1}",
+                        raw_text="",  # 整段模式不保留raw_text
+                        ref_title=parsed.get("title", ""),
+                        ref_authors=parsed.get("authors", ""),
+                        ref_year=int(parsed["year"]) if str(parsed.get("year", "")).isdigit() else None,
+                        ref_doi=parsed.get("doi") or None,
+                        ref_venue=parsed.get("venue") or None
+                    )
+                    results.append(ref)
+                except Exception as e:
+                    logger.debug(f"⚠️ 解析第 {j} 条失败: {e}, 数据: {parsed}")
+                    continue
+
+            logger.info(f"📚 LLM 解析参考文献: 成功 {len(results)} 条")
+            return results
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"⚠️ JSON 解析失败: {e}")
+            return []
+        except Exception as e:
+            logger.warning(f"⚠️ 参考文献解析失败: {e}")
+            return []
+
+    async def parse_references(
+        self,
+        references: List[str],
+        ref_id_prefix: str = "ref"
+    ) -> List[Reference]:
+        """
+        解析参考文献列表
+
+        Args:
+            references: 参考文献原始文本列表
+            ref_id_prefix: ref_id 前缀
+
+        Returns:
+            Reference 对象列表
+        """
+        if not references:
+            return []
+
+        total = len(references)
+        logger.info(f"📝 开始 LLM 参考文献解析，共 {total} 条...")
+
+        # 一次请求解析所有参考文献
+        results = await self._parse_batch(references, ref_id_prefix, 0)
+
+        # 过滤掉解析失败的
+        valid_results = [r for r in results if r is not None]
+
+        # MCP 参考文献补全默认禁用（如需启用，取消注释以下代码）
+        # if self.arxiv_client and valid_results:
+        #     await self._enrich_from_arxiv(valid_results)
+
+        logger.info(f"📚 LLM 解析参考文献: 成功 {len(valid_results)}/{total} 条")
+        return valid_results
+
+    async def _parse_batch(
+        self,
+        references: List[str],
+        ref_id_prefix: str,
+        start_index: int
+    ) -> List[Optional[Reference]]:
+        """批量解析一组参考文献"""
+        if not references:
+            return []
+
+        # 构建参考文献列表文本（不截断原始引用）
+        ref_list_text = "\n".join([
+            f"[{j}] {ref}"
+            for j, ref in enumerate(references)
+        ])
+
+        prompt = self.BATCH_PARSE_PROMPT.format(reference_list=ref_list_text)
+        logger.debug(f"📝 [LLM调试] Prompt长度: {len(prompt)} 字符")
+        logger.debug(f"📝 [LLM调试] Prompt前200字符: {prompt[:200]}")
+
+        try:
+            response = await self._call_llm(prompt)
+            logger.debug(f"📝 [LLM调试] Raw响应长度: {len(response) if response else 0}")
+            logger.debug(f"📝 [LLM调试] Raw响应前500字符: {response[:500] if response else 'None'}")
+
+            if not response:
+                logger.warning("⚠️ LLM 未返回有效响应")
+                return [None] * len(references)
+
+            # 提取 JSON
+            json_str = self._extract_json(response)
+            logger.debug(f"📝 [LLM调试] 提取的JSON长度: {len(json_str) if json_str else 0}")
+            logger.debug(f"📝 [LLM调试] 提取的JSON前300字符: {json_str[:300] if json_str else 'None'}")
+
+            if not json_str:
+                logger.warning("⚠️ 无法从 LLM 响应中提取 JSON")
+                return [None] * len(references)
+
+            parsed_list = json.loads(json_str)
+
+            results = []
+            for j, parsed in enumerate(parsed_list):
+                try:
+                    ref = Reference(
+                        ref_id=f"{ref_id_prefix}_{start_index + j + 1}",
+                        raw_text=references[j],
+                        ref_title=parsed.get("title", ""),
+                        ref_authors=parsed.get("authors", ""),
+                        ref_year=int(parsed["year"]) if str(parsed.get("year", "")).isdigit() else None,
+                        ref_doi=parsed.get("doi") or None,
+                        ref_venue=parsed.get("venue") or None
+                    )
+                    results.append(ref)
+                except Exception as e:
+                    logger.debug(f"⚠️ 解析第 {j} 条失败: {e}")
+                    results.append(None)
+
+            return results
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"⚠️ JSON 解析失败: {e}")
+            return [None] * len(references)
+        except Exception as e:
+            logger.warning(f"⚠️ 批量解析失败: {e}")
+            return [None] * len(references)
+
+    def _extract_json(self, text: str) -> Optional[str]:
+        """从文本中提取 JSON 字符串"""
+        try:
+            json.loads(text)
+            return text
+        except json.JSONDecodeError:
+            pass
+
+        # 尝试提取 markdown 代码块中的 JSON
+        import re
+        match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
+        if match:
+            json_str = match.group(1).strip()
+            try:
+                json.loads(json_str)
+                return json_str
+            except json.JSONDecodeError:
+                pass
+
+        # 尝试找到 JSON 数组或对象
+        for match in re.finditer(r'(\[[\s\S]*?\]|\{[\s\S]*?\})', text):
+            json_str = match.group(1)
+            try:
+                json.loads(json_str)
+                return json_str
+            except json.JSONDecodeError:
+                continue
+
+        return None
+
+    async def _enrich_from_arxiv(self, references: List[Reference]) -> None:
+        """
+        通过 arXiv MCP 补充论文信息
+
+        Args:
+            references: Reference 对象列表（会被直接修改）
+        """
+        if not self.arxiv_client:
+            return
+
+        for ref in references:
+            if not ref:
+                continue
+
+            # 优先使用 DOI 搜索
+            search_query = None
+            if ref.ref_doi:
+                search_query = ref.ref_doi
+            elif ref.ref_title and len(ref.ref_title) > 5:
+                search_query = ref.ref_title
+
+            if not search_query:
+                continue
+
+            try:
+                result = await self.arxiv_client.call_tool_with_reconnect(
+                    tool_name="search_arxiv",
+                    arguments={"query": search_query, "max_results": 3}
+                )
+
+                if not result or not result.get("results"):
+                    continue
+
+                # 找到最匹配的论文
+                for paper in result.get("results", []):
+                    paper_title = paper.get("title", "")
+                    ref_title = ref.ref_title if ref.ref_title else ""
+
+                    if not ref_title or not paper_title:
+                        continue
+
+                    # 标题必须完全相同（忽略大小写）
+                    if ref_title.lower() != paper_title.lower():
+                        continue
+
+                    # 完全匹配，更新 Reference 对象
+                    if paper.get("authors"):
+                        ref.ref_authors = ", ".join(paper["authors"])
+                    if paper.get("published_date"):
+                        year_match = re.search(r'(\d{4})', paper["published_date"])
+                        if year_match:
+                            ref.ref_year = int(year_match.group(1))
+                    if paper.get("doi"):
+                        ref.ref_doi = paper.get("doi")
+
+                    logger.debug(f"📝 arXiv 补充论文信息: {ref.ref_title}")
+                    break
+
+            except Exception as e:
+                logger.debug(f"⚠️ arXiv 查询失败: {e}")
+                continue
+
+
+async def process_references_with_llm(
+    pdf_path: str,
+    chunks: List[Any],
+    text: str,
+    llm_config: Dict[str, Any],
+    arxiv_client: Any = None
+) -> Tuple[List[Reference], List[Any]]:
+    """
+    使用 LLM 解析参考文献并建立引用关联
+
+    Args:
+        pdf_path: PDF 文件路径
+        chunks: 分块后的 Node 列表
+        text: PDF 原始文本
+        llm_config: LLM 配置字典，包含 model、api_base、api_key
+        arxiv_client: arXiv MCP 客户端（可选）
+
+    Returns:
+        (references列表, 更新后的chunks列表)
+    """
+    # 1. 使用正则表达式提取参考文献部分（作为后备）
+    extractor = ReferenceExtractor()
+    ref_section = extractor._find_reference_section(text)
+
+    if not ref_section:
+        logger.debug("📝 未找到参考文献部分")
+        return [], chunks
+
+    # 📝 调试：查看参考文献部分内容
+    logger.debug(f"📝 参考文献部分预览 (前500字符):\n{ref_section[:500]}")
+    logger.debug(f"📝 参考文献部分总长度: {len(ref_section)} 字符, {len(ref_section.split(chr(10)))} 行")
+
+    # 2. 直接将整段参考文献文本传给 LLM，让 LLM 自动分割+解析
+    llm_parser = LLMReferenceParser(llm_config, arxiv_client)
+    references = await llm_parser.parse_reference_section(ref_section)
+
+    if not references:
+        logger.warning("⚠️ LLM 解析参考文献失败，使用正则表达式作为后备")
+        references = extractor.extract_references(text)
+    else:
+        logger.info(f"📚 LLM 解析成功: {len(references)} 条参考文献")
+
+    # 4. 建立引用关联
+    if references:
+        linker = CitationLinker()
+        chunks = linker.link_citations_to_references(chunks, references)
+
+    return references, chunks

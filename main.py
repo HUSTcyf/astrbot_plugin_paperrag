@@ -14,6 +14,7 @@ AstrBot Paper RAG Plugin
 import asyncio
 import json
 import os
+import re
 import subprocess
 import requests
 from datetime import timedelta
@@ -79,6 +80,97 @@ class PaperRAGPlugin(Star):
             logger.info("📚 Document RAG Plugin initialized (支持PDF/Word/TXT/HTML, Grobid已启用)")
         else:
             logger.info("📚 Document RAG Plugin initialized (支持PDF/Word/TXT/HTML, Grobid未启用)")
+
+        # 注册 LLM 可调用的论文搜索工具
+        self._register_llm_tools()
+
+    def _register_llm_tools(self):
+        """注册 LLM 可调用的论文搜索工具"""
+        if not self.config.get("enable_llm_tools", True):
+            logger.info("📚 Paper RAG LLM工具已禁用")
+            return
+
+        async def search_papers_tool(event, query: str, top_k: int = 5) -> str:
+            """搜索本地论文库并返回结果（RAG模式）"""
+            engine = self._get_engine()
+            if not engine:
+                return "❌ RAG引擎未就绪，请检查配置文件"
+
+            try:
+                result = await engine.search(query, mode="rag")
+                if result.get("type") == "error":
+                    return f"❌ 搜索失败: {result.get('message', '未知错误')}"
+
+                answer = result.get("answer", "")
+                sources = result.get("sources", [])
+
+                # 格式化输出
+                output = f"💡 **搜索结果**\n\n{answer}\n\n" if answer else "📚 **检索结果**\n\n"
+
+                for i, src in enumerate(sources[:top_k], 1):
+                    metadata = src.get("metadata", {})
+                    filename = metadata.get("file_name", "unknown")
+                    text = src.get("text", "")[:200]
+                    output += f"[{i}] **{filename}**\n{text}...\n\n"
+
+                return output.strip() if output.strip() else "❌ 未找到相关文档"
+            except Exception as e:
+                logger.error(f"LLM工具搜索失败: {e}")
+                return f"❌ 搜索异常: {e}"
+
+        async def retrieve_papers_tool(event, query: str, top_k: int = 5) -> str:
+            """仅检索论文片段，不生成回答"""
+            engine = self._get_engine()
+            if not engine:
+                return "❌ RAG引擎未就绪，请检查配置文件"
+
+            try:
+                result = await engine.search(query, mode="retrieve")
+                if result.get("type") == "error":
+                    return f"❌ 检索失败: {result.get('message', '未知错误')}"
+
+                sources = result.get("sources", [])
+                if not sources:
+                    return "📭 未找到相关文档"
+
+                output = "📚 **检索结果**\n\n"
+                for i, src in enumerate(sources[:top_k], 1):
+                    metadata = src.get("metadata", {})
+                    filename = metadata.get("file_name", "unknown")
+                    score = src.get("score", 0.0)
+                    text = src.get("text", "")[:300]
+                    output += f"[{i}] **{filename}** (相似度: {score:.3f})\n{text}...\n\n"
+
+                return output.strip()
+            except Exception as e:
+                logger.error(f"LLM工具检索失败: {e}")
+                return f"❌ 检索异常: {e}"
+
+        # 注册工具
+        try:
+            self.context.register_llm_tool(
+                name="search_papers",
+                func_args=[
+                    {"type": "string", "name": "query", "description": "搜索查询关键词或问题"},
+                    {"type": "integer", "name": "top_k", "description": "返回结果数量，默认5"},
+                ],
+                desc="搜索本地论文库，使用RAG生成答案。适用于回答关于论文内容的问题。",
+                func_obj=search_papers_tool
+            )
+
+            self.context.register_llm_tool(
+                name="retrieve_papers",
+                func_args=[
+                    {"type": "string", "name": "query", "description": "搜索查询关键词"},
+                    {"type": "integer", "name": "top_k", "description": "返回结果数量，默认5"},
+                ],
+                desc="仅检索本地论文库中的相关片段，不生成回答。适用于需要直接查看原文的场景。",
+                func_obj=retrieve_papers_tool
+            )
+
+            logger.info("✅ Paper RAG LLM工具已注册: search_papers, retrieve_papers")
+        except Exception as e:
+            logger.error(f"注册LLM工具失败: {e}")
 
     def _get_engine(self) -> "Optional[HybridRAGEngine]":
         """获取RAG引擎（单例模式，带缓存）"""
@@ -839,16 +931,15 @@ class PaperRAGPlugin(Star):
             # Parse search results
             papers_info = []
             for content_block in search_result.content:
-                if hasattr(content_block, 'text'):
+                text = getattr(content_block, 'text', None)
+                if text:
                     try:
-                        paper_data = json.loads(content_block.text)
+                        paper_data = json.loads(text)
                         if isinstance(paper_data, dict):
                             papers_info.append(paper_data)
                         elif isinstance(paper_data, list):
                             papers_info.extend(paper_data)
                     except json.JSONDecodeError:
-                        # 如果不是JSON，尝试直接解析
-                        text = content_block.text
                         logger.debug(f"arXiv返回非JSON内容: {text[:200]}...")
                         continue
 
@@ -886,7 +977,6 @@ class PaperRAGPlugin(Star):
                     pdf_filename = f"{paper_id}.pdf"
                 else:
                     # 从URL提取arXiv ID
-                    import re
                     match = re.search(r'(\d+\.\d+)', arxiv_url)
                     if match:
                         paper_id = match.group(1)
@@ -1087,9 +1177,10 @@ class PaperRAGPlugin(Star):
                     # Parse results
                     papers_info = []
                     for content_block in search_result.content:
-                        if hasattr(content_block, 'text'):
+                        text = getattr(content_block, 'text', None)
+                        if text:
                             try:
-                                paper_data = json.loads(content_block.text)
+                                paper_data = json.loads(text)
                                 if isinstance(paper_data, dict):
                                     papers_info.append(paper_data)
                                 elif isinstance(paper_data, list):
@@ -1574,6 +1665,15 @@ class PaperRAGPlugin(Star):
     async def terminate(self):
         """Called when plugin is unloaded"""
         logger.info("📚 Document RAG Plugin is unloading...")
+
+        # 注销 LLM 工具
+        if self.config.get("enable_llm_tools", True):
+            try:
+                self.context.unregister_llm_tool("search_papers")
+                self.context.unregister_llm_tool("retrieve_papers")
+                logger.info("✅ Paper RAG LLM工具已注销")
+            except Exception as e:
+                logger.warning(f"注销LLM工具时出现警告: {e}")
 
         # Clear resources
         self._response_cache.clear()

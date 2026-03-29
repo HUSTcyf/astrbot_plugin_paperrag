@@ -475,7 +475,6 @@ class HybridIndexManager:
         try:
             # 准备数据
             data = []
-            logger.info(f"🔍 [DEBUG] 准备插入: nodes={len(nodes)}, embeddings={len(embeddings)}")
 
             for i, (node, embedding) in enumerate(zip(nodes, embeddings)):
                 metadata = node.metadata if hasattr(node, 'metadata') else {}
@@ -506,9 +505,6 @@ class HybridIndexManager:
                     "text": node.text if hasattr(node, 'text') else str(node),
                     "metadata": metadata_str
                 })
-                logger.info(f"🔍 [DEBUG] 节点 {i}: text长度={len(node.text) if hasattr(node, 'text') else len(str(node))}, embedding长度={len(embedding) if embedding else 'None'}")
-
-            logger.info(f"🔍 [DEBUG] 最终准备插入: data条数={len(data)}")
 
             # 插入数据 - 使用线程池避免阻塞事件循环
             collection = cast(Collection, self._collection)
@@ -663,7 +659,7 @@ class HybridIndexManager:
                 if not isinstance(metadata, dict):
                     continue
 
-                references = metadata.get("references", [])
+                references = metadata.get("cited_references", [])
                 if not references:
                     continue
 
@@ -726,8 +722,10 @@ class HybridIndexManager:
         """
         从 Milvus 提取全量文本 chunks（用于生成评测数据集）
 
+        使用按论文分组查询的方式，避免 Milvus Lite 全表扫描限制。
+
         Args:
-            batch_size: 每批提取的数量，避免大数据量内存问题
+            batch_size: 每批提取的数量（此参数已保留但不再用于全表分页）
 
         Returns:
             [{"text": str, "metadata": dict, "id": int}, ...]
@@ -740,52 +738,58 @@ class HybridIndexManager:
 
             all_chunks = []
             loop = asyncio.get_event_loop()
-            offset = 0
 
-            logger.info(f"🔍 开始从 Milvus 提取全量 chunks (batch_size={batch_size})...")
+            # 获取所有论文列表（使用追踪的统计数据，避免全表扫描）
+            papers = await self.list_unique_documents()
+            paper_names = [p.get("file_name", "") for p in papers if p.get("file_name")]
 
-            while True:
-                raw_results: Any = await loop.run_in_executor(
-                    None,
-                    lambda: collection.query(
-                        expr="id >= 0",
-                        output_fields=["id", "text", "metadata"],
-                        limit=batch_size,
-                        offset=offset,
+            logger.info(f"🔍 开始从 Milvus 提取全量 chunks ({len(paper_names)} 篇论文)...")
+
+            # 按论文逐个查询，避免全表扫描超出 Milvus Lite 限制
+            # 每隔20篇论文重新确保连接有效，避免连接超时
+            for i, paper_name in enumerate(paper_names):
+                if i % 20 == 0:
+                    await self._ensure_collection()
+                    collection = cast(Collection, self._collection)
+
+                try:
+                    raw_results: Any = await loop.run_in_executor(
+                        None,
+                        lambda pn=paper_name: collection.query(
+                            expr=f'metadata["file_name"] == "{pn}"',
+                            output_fields=["id", "text", "metadata"],
+                        )
                     )
-                )
-                raw_results = cast(List[Dict[str, Any]], raw_results)
+                    raw_results = cast(List[Dict[str, Any]], raw_results)
 
-                if not raw_results:
-                    break
+                    for row in raw_results:
+                        chunk = {
+                            "id": row.get("id"),
+                            "text": row.get("text", ""),
+                        }
+                        # 解析 metadata JSON 字符串
+                        meta = row.get("metadata", "{}")
+                        if isinstance(meta, str):
+                            try:
+                                meta = json.loads(meta)
+                            except Exception:
+                                meta = {"raw": meta}
+                        chunk["metadata"] = meta
 
-                for row in raw_results:
-                    chunk = {
-                        "id": row.get("id"),
-                        "text": row.get("text", ""),
-                    }
-                    # 解析 metadata JSON 字符串
-                    meta = row.get("metadata", "{}")
-                    if isinstance(meta, str):
-                        try:
-                            meta = json.loads(meta)
-                        except Exception:
-                            meta = {"raw": meta}
-                    chunk["metadata"] = meta
+                        # 提取关键字段到顶层
+                        if isinstance(meta, dict):
+                            chunk["file_name"] = meta.get("file_name", "")
+                            chunk["paper_id"] = meta.get("paper_id", chunk["file_name"])
 
-                    # 提取关键字段到顶层
-                    if isinstance(meta, dict):
-                        chunk["file_name"] = meta.get("file_name", "")
-                        chunk["paper_id"] = meta.get("paper_id", chunk["file_name"])
+                        all_chunks.append(chunk)
 
-                    all_chunks.append(chunk)
+                except Exception as e:
+                    logger.warning(f"  查询论文 {paper_name} 时出错: {e}")
+                    continue
 
-                offset += len(raw_results)
-                logger.debug(f"  已提取 {offset} chunks...")
-
-                # 如果返回数量少于 batch_size，说明已经取完
-                if len(raw_results) < batch_size:
-                    break
+                # 进度显示
+                if (i + 1) % 20 == 0:
+                    logger.debug(f"  已处理 {i + 1}/{len(paper_names)} 篇论文...")
 
             logger.info(f"✅ 共提取 {len(all_chunks)} 个 chunks")
 

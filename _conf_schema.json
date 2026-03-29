@@ -4,6 +4,12 @@
         "type": "bool",
         "default": true
     },
+    "enable_llm_tools": {
+        "description": "是否启用LLM可调用的论文搜索工具",
+        "type": "bool",
+        "hint": "启用后LLM可以自动调用论文搜索工具回答关于本地论文库的问题。禁用则只保留命令调用方式（/paper search）",
+        "default": true
+    },
     "embedding_mode": {
         "description": "Embedding模式",
         "type": "string",
@@ -341,6 +347,12 @@
         "default": 0.5,
         "minimum": 0.0,
         "maximum": 1.0
+    },
+    "enable_llm_reference_parsing": {
+        "description": "启用 LLM 参考文献解析（实验性）",
+        "type": "bool",
+        "hint": "启用后将使用 GPT-4o-mini 解析参考文献的标题、作者、年份等信息，比正则表达式更准确。需要配置 text_provider_id。arXiv MCP 可用于查询论文详情。",
+        "default": true
     },
     "ollama": {
         "description": "Ollama本地Embedding配置",

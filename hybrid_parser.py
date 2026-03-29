@@ -25,17 +25,31 @@ import fitz  # PyMuPDF
 
 from astrbot.api import logger
 
-# 导入自定义PDF解析器（从合并后的 multimodal_extractor）
-from .multimodal_extractor import PDFParserAdvanced
+# 导入自定义PDF解析器（兼容直接运行和包运行）
+try:
+    from .multimodal_extractor import PDFParserAdvanced
+except ImportError:
+    from multimodal_extractor import PDFParserAdvanced
 
-# 导入引用处理器
-from .reference_processor import (
-    ReferenceExtractor,
-    CitationLinker,
-    process_references_and_citations,
-    process_references_and_citations_grobid,
-    Reference
-)
+# 导入引用处理器（兼容直接运行和包运行）
+try:
+    from .reference_processor import (
+        ReferenceExtractor,
+        CitationLinker,
+        process_references_and_citations,
+        process_references_and_citations_grobid,
+        process_references_with_llm,
+        Reference
+    )
+except ImportError:
+    from reference_processor import (
+        ReferenceExtractor,
+        CitationLinker,
+        process_references_and_citations,
+        process_references_and_citations_grobid,
+        process_references_with_llm,
+        Reference
+    )
 
 
 @dataclass
@@ -77,7 +91,9 @@ class HybridPDFParser:
         chunk_size: int = 512,
         chunk_overlap: int = 50,
         min_chunk_size: int = 100,
-        figures_dir: str = ""
+        figures_dir: str = "",
+        llm_config: Dict[str, Any] = {},
+        arxiv_client: Any = None
     ):
         """
         初始化混合解析器
@@ -88,12 +104,16 @@ class HybridPDFParser:
             chunk_overlap: 分块重叠大小（字符数）
             min_chunk_size: 最小块大小（避免太小）
             figures_dir: 图片存储目录（空则使用 papers/figures）
+            llm_config: LLM 配置字典（可选），包含 model、api_base、api_key
+            arxiv_client: arXiv MCP 客户端（可选），用于查询论文详情
         """
         self.enable_multimodal = enable_multimodal
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.min_chunk_size = min_chunk_size
         self.figures_dir = figures_dir
+        self.llm_config = llm_config
+        self.arxiv_client = arxiv_client
 
         # 初始化自定义PDF解析器
         self.pdf_parser = PDFParserAdvanced(
@@ -193,12 +213,19 @@ class HybridPDFParser:
 
         return "\n".join(text_parts)
 
-    def parse_and_split(self, pdf_path: str) -> List[Node]:
+    async def parse_and_split(
+        self,
+        pdf_path: str,
+        llm_config: Dict[str, Any] = {},
+        arxiv_client: Any = None
+    ) -> List[Node]:
         """
         解析PDF并分块为Nodes
 
         Args:
             pdf_path: PDF文件路径
+            llm_config: LLM 配置字典（可选），包含 model、api_base、api_key
+            arxiv_client: arXiv MCP 客户端（可选，会覆盖初始化时设置的 client）
 
         Returns:
             Node列表
@@ -235,12 +262,32 @@ class HybridPDFParser:
             if image_paths:
                 all_nodes = self._associate_images_with_chunks(all_nodes, image_paths, image_pages)
 
-            # 引用处理（Grobid 通过外部调用，此处直接禁用）
-            logger.debug(f"🔄 引用处理...")
-            use_grobid = False
-            references, all_nodes = process_references_and_citations_grobid(
-                pdf_path, all_nodes, raw_text, use_grobid=use_grobid
-            )
+            # 引用处理
+            # 优先使用 LLM-based 解析（如果提供了 LLM config）
+            # 否则使用正则表达式解析
+            effective_llm_config = llm_config or self.llm_config
+            effective_arxiv_client = arxiv_client or self.arxiv_client
+
+            if effective_llm_config:
+                logger.debug(f"🔄 LLM引用处理...")
+                try:
+                    references, all_nodes = await process_references_with_llm(
+                        pdf_path, all_nodes, raw_text,
+                        llm_config=effective_llm_config,
+                        arxiv_client=effective_arxiv_client
+                    )
+                except Exception as e:
+                    logger.warning(f"⚠️ LLM引用处理失败，回退到正则解析: {e}")
+                    use_grobid = False
+                    references, all_nodes = process_references_and_citations_grobid(
+                        pdf_path, all_nodes, raw_text, use_grobid=use_grobid
+                    )
+            else:
+                logger.debug(f"🔄 正则引用处理...")
+                use_grobid = False
+                references, all_nodes = process_references_and_citations_grobid(
+                    pdf_path, all_nodes, raw_text, use_grobid=use_grobid
+                )
 
             if references and documents:
                 # 将参考文献信息添加到文档元数据

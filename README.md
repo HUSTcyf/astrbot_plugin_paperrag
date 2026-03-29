@@ -1,8 +1,8 @@
-# 📚 Paper RAG Plugin v1.5.0 - 用户指南
+# 📚 Paper RAG Plugin v1.6.0 - 用户指南
 
 本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力（支持多模态VLM问答）。
 
-> **版本说明**：当前版本 v1.5.0，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
+> **版本说明**：当前版本 v1.6.0，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
 
 ## ✨ 核心功能
 
@@ -238,6 +238,66 @@ Bot:    ✅ 已添加到数据库
  3. [  8次] **Language Models are Few-Shot Learners**
     └─ Brown, T. et al. (2020)
 ...
+```
+
+---
+
+## 📚 LLM 参考文献解析
+
+插件支持使用 LLM（GPT-4o-mini）自动解析参考文献的标题、作者、年份等信息。
+
+### 工作原理
+
+1. **整段文本解析**：将参考文献部分（可能跨多行）作为整体发送给 LLM
+2. **自动识别边界**：LLM 根据学术引用格式自动识别每条参考文献的边界
+3. **结构化提取**：解析出标题、作者、年份、期刊、DOI 等字段
+4. **双向关联建立**：将正文中的引用与参考文献关联
+
+### 配置
+
+LLM 参考文献解析使用 `evaluation/freeapi.json` 中的 API 配置：
+
+```json
+{
+    "API_URL": "https://free.v36.cm",
+    "API_KEY": "sk-..."
+}
+```
+
+如需修改 API，请编辑 `evaluation/freeapi.json` 文件。
+
+### 特性
+
+| 特性 | 说明 |
+|------|------|
+| **自动边界识别** | 无需正则表达式启发式规则，LLM 自动识别跨行引用 |
+| **并发控制** | 最多 4 个并发请求，避免 API 限流 |
+| **自动重试** | HTTP 429/500 错误自动重试 |
+| **表格过滤** | 自动检测并跳过表格，避免误解析 |
+| **后备方案** | LLM 解析失败时自动降级到正则表达式解析 |
+
+### 配置项
+
+| 配置项 | 说明 | 默认值 |
+|-------|------|--------|
+| `enable_llm_reference_parsing` | 启用 LLM 参考文献解析 | `true` |
+
+### API 配置说明
+
+API 配置从 `evaluation/freeapi.json` 读取，包含：
+- `API_URL`: API 基础地址
+- `API_KEY`: API 密钥
+
+> 💡 如需使用其他 API 服务，修改 `evaluation/freeapi.json` 中的配置即可。
+
+### MCP 参考文献补全（可选）
+
+默认禁用 MCP（arXiv）参考文献 enrichment。如需启用，在 `reference_processor.py` 中取消注释：
+
+```python
+# MCP 参考文献补全（如需启用，取消注释以下代码）
+# if self.arxiv_client and valid_results:
+#     await self._enrich_from_arxiv(valid_results)
 ```
 
 ---
@@ -604,6 +664,83 @@ pip install -U FlagEmbedding
 | [docs/INDEX.md](docs/INDEX.md) | 文档索引 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 技术架构说明 |
 | [docs/CHANGELOG.md](docs/CHANGELOG.md) | 变更记录 |
+
+---
+
+## 📈 Qasper 数据集评估
+
+插件支持使用 Qasper 数据集评估 RAG 系统的性能。
+
+### Qasper 数据集说明
+
+**Qasper 数据集不包含 PDF 文件**，只包含从论文提取的文本内容（full_text）。
+
+### 评估流程
+
+```
+1. 下载数据集 (qasper_downloader.py)
+       ↓
+2. 索引论文到 Milvus (index_qasper.py)
+       ↓
+3. 生成 predictions (run_evaluation.py --generate)
+       ↓
+4. 运行评估 (run_evaluation.py --evaluate 或 --all)
+```
+
+### 快速开始
+
+```bash
+# 1. 下载数据集
+cd datasets
+python qasper_downloader.py
+
+# 2. 索引论文到 Milvus
+cd evaluation
+python index_qasper.py --reinit
+
+# 3. 生成 Predictions
+python run_evaluation.py --generate
+
+# 4. 运行评估
+python run_evaluation.py --evaluate
+
+# 或一步完成
+python run_evaluation.py --all
+```
+
+### 命令行参数
+
+**index_qasper.py**：
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--split` | 数据集划分 | `all` |
+| `--reinit` | 重新初始化数据库 | False |
+
+**run_evaluation.py**：
+| 参数 | 说明 |
+|------|------|
+| `--generate` | 仅生成 predictions |
+| `--evaluate` | 仅运行评估 |
+| `--all` | 生成 + 评估 |
+
+### 评估指标
+
+- **Answer F1**: 答案 F1 分数
+- **Answer F1 by type**: 按答案类型 (extractive/abstractive/boolean/none) 的 F1
+- **Evidence F1**: 证据 F1 分数
+- **Missing predictions**: 缺失预测数量
+
+### 输出文件
+
+```
+evaluation_output/
+├── predictions.jsonl       # 预测结果
+└── evaluation_results.json # 评估指标
+```
+
+### 详细文档
+
+详见 [evaluation/README_qasper.md](evaluation/README_qasper.md)
 
 ---
 

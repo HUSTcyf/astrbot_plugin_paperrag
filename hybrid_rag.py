@@ -25,32 +25,44 @@ from astrbot.api import logger
 # 获取插件目录，用于解析相对路径
 _PLUGIN_DIR = Path(__file__).parent.resolve()
 
-# 导入混合架构组件
-from .hybrid_parser import HybridPDFParser, Node
-from .hybrid_index import HybridIndexManager
-
-# 导入Embedding Provider
-from .embedding_providers import (
-    create_embedding_provider,
-    OllamaEmbeddingProvider,
-    AstrBotEmbeddingProvider
-)
-
-# 导入配置
-from .rag_engine import RAGConfig
-
-# 导入重排序模块
-from .reranker import (
-    AdaptiveReranker,
-    RerankerConfig,
-    create_reranker
-)
+# 导入混合架构组件（兼容直接运行和包运行）
+try:
+    from .hybrid_parser import HybridPDFParser, Node
+    from .hybrid_index import HybridIndexManager
+    from .embedding_providers import (
+        create_embedding_provider,
+        OllamaEmbeddingProvider,
+        AstrBotEmbeddingProvider
+    )
+    from .rag_engine import RAGConfig
+    from .reranker import (
+        AdaptiveReranker,
+        RerankerConfig,
+        create_reranker
+    )
+except ImportError:
+    from hybrid_parser import HybridPDFParser, Node
+    from hybrid_index import HybridIndexManager
+    from embedding_providers import (
+        create_embedding_provider,
+        OllamaEmbeddingProvider,
+        AstrBotEmbeddingProvider
+    )
+    from rag_engine import RAGConfig
+    from reranker import (
+        AdaptiveReranker,
+        RerankerConfig,
+        create_reranker
+    )
 
 # 导入 Llama.cpp VLM Provider（用于图片问答）
 LLAMA_CPP_VLM_AVAILABLE = False
 LLAMA_CPP_VLM_IMPORT_ERROR = None
 try:
-    from .llama_cpp_vlm_provider import LlamaCppVLMProvider
+    try:
+        from .llama_cpp_vlm_provider import LlamaCppVLMProvider
+    except ImportError:
+        from llama_cpp_vlm_provider import LlamaCppVLMProvider
     LLAMA_CPP_VLM_AVAILABLE = True
     logger.info("[Llama.cpp-VLM] Llama.cpp VLM Provider 已加载")
 except ImportError as e:
@@ -423,18 +435,52 @@ class HybridRAGEngine:
         if not provider_id:
             # 回退到获取当前正在使用的 provider
             try:
-                self._llm_client = self.context.get_using_provider()
-                if self._llm_client:
-                    logger.info("✅ 使用当前会话的 LLM Provider")
-                    self._llm_initialized = True
-                    return self._llm_client
+                if self.context is not None:
+                    self._llm_client = self.context.get_using_provider()
+                    if self._llm_client:
+                        logger.info("✅ 使用当前会话的 LLM Provider")
+                        self._llm_initialized = True
+                        return self._llm_client
             except Exception as e:
                 logger.warning(f"⚠️ 获取当前Provider失败: {e}")
+
+            # 如果 context 为空或获取 provider 失败，尝试使用 LlamaCpp 作为文本生成备选
+            if LLAMA_CPP_VLM_AVAILABLE:
+                try:
+                    llama_model_path_raw = getattr(self.config, 'llama_vlm_model_path', './models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf')
+                    llama_mmproj_path_raw = getattr(self.config, 'llama_vlm_mmproj_path', './models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf')
+
+                    llama_model_path = str((_PLUGIN_DIR / llama_model_path_raw).resolve())
+                    llama_mmproj_path = str((_PLUGIN_DIR / llama_mmproj_path_raw).resolve())
+
+                    llama_max_tokens = getattr(self.config, 'llama_vlm_max_tokens', 2560)
+                    llama_temperature = getattr(self.config, 'llama_vlm_temperature', 0.7)
+                    llama_n_ctx = getattr(self.config, 'llama_vlm_n_ctx', 4096)
+                    llama_n_gpu_layers = getattr(self.config, 'llama_vlm_n_gpu_layers', 99)
+
+                    try:
+                        from .llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
+                    except ImportError:
+                        from llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
+
+                    self._llm_client = get_llama_cpp_vlm_provider(
+                        model_path=llama_model_path,
+                        mmproj_path=llama_mmproj_path,
+                        n_ctx=llama_n_ctx,
+                        n_gpu_layers=llama_n_gpu_layers,
+                        max_tokens=llama_max_tokens,
+                        temperature=llama_temperature
+                    )
+                    logger.info("✅ 使用 LlamaCpp 本地模型进行文本生成")
+                    self._llm_initialized = True
+                    return self._llm_client
+                except Exception as e:
+                    logger.warning(f"⚠️ LlamaCpp 模型加载失败: {e}")
 
             # 如果都获取不到，报错
             raise ValueError(
                 "未配置 text_provider_id、无法获取当前LLM Provider。"
-                "请在插件配置中设置 text_provider_id。"
+                "请在插件配置中设置 text_provider_id 或确保 LlamaCpp 模型可用。"
             )
 
         # 从 context 获取指定的 provider
@@ -494,12 +540,19 @@ class HybridRAGEngine:
             self._reranker = None
             return None
 
-    async def add_paper(self, file_path: str) -> Dict[str, Any]:
+    async def add_paper(
+        self,
+        file_path: str,
+        llm_config: Dict[str, Any] = {},
+        arxiv_client: Any = None
+    ) -> Dict[str, Any]:
         """
         添加论文到知识库
 
         Args:
             file_path: PDF文件路径
+            llm_config: LLM 配置字典（可选），包含 model、api_base、api_key
+            arxiv_client: arXiv MCP 客户端（可选）
 
         Returns:
             添加结果
@@ -510,9 +563,48 @@ class HybridRAGEngine:
             embed_provider = await self._ensure_embed_provider_initialized()
             index_manager = self._ensure_index_manager_initialized()
 
-            # 解析PDF并分块
+            # 如果启用了 LLM 参考文献解析且没有显式提供 LLM config，
+            # 则自动获取配置的 text_provider_id 并构建 config
+            effective_llm_config = llm_config
+            if not effective_llm_config and self.config.enable_llm_reference_parsing:
+                try:
+                    # 尝试从 freeapi.json 读取配置
+                    import json
+                    freeapi_path = _PLUGIN_DIR / "evaluation" / "freeapi.json"
+                    if freeapi_path.exists():
+                        with open(freeapi_path, "r", encoding="utf-8") as f:
+                            freeapi_config = json.load(f)
+                        api_url = freeapi_config.get("API_URL", "")
+                        api_key = freeapi_config.get("API_KEY", "")
+                        if api_url and api_key:
+                            effective_llm_config = {
+                                "model": "gpt-4o-mini",
+                                "api_base": f"{api_url}/v1",
+                                "api_key": api_key
+                            }
+                            logger.debug("📝 使用 freeapi.json 配置进行 LLM 参考文献解析")
+                    else:
+                        # 回退到从 provider 提取配置信息
+                        provider = await self._ensure_llm_initialized()
+                        if provider:
+                            model = getattr(provider, 'model', None) or getattr(provider, 'model_name', None)
+                            api_base = getattr(provider, 'api_base', None) or getattr(provider, 'base_url', None)
+                            api_key = getattr(provider, 'api_key', None) or getattr(provider, 'key', None)
+                            if model and api_base:
+                                effective_llm_config = {
+                                    "model": model,
+                                    "api_base": api_base,
+                                    "api_key": api_key or "sk-placeholder"
+                                }
+                                logger.debug("📝 使用 Provider 配置进行 LLM 参考文献解析")
+                            else:
+                                logger.warning(f"⚠️ 无法从 Provider 提取完整配置，LLM 参考文献解析被禁用")
+                except Exception as e:
+                    logger.warning(f"⚠️ 无法获取 LLM 配置，LLM 参考文献解析被禁用: {e}")
+
+            # 解析PDF并分块（传递 LLM config 和 arXiv client 以支持 LLM-based 引用解析）
             logger.info(f"📄 处理文件: {file_path}")
-            nodes = parser.parse_and_split(file_path)
+            nodes = await parser.parse_and_split(file_path, effective_llm_config, arxiv_client)
 
             if not nodes:
                 return {
@@ -966,7 +1058,10 @@ class HybridRAGEngine:
                         llama_temperature = getattr(self.config, 'llama_vlm_temperature', 0.7)
                         llama_n_ctx = getattr(self.config, 'llama_vlm_n_ctx', 4096)
                         llama_n_gpu_layers = getattr(self.config, 'llama_vlm_n_gpu_layers', 99)
-                        from .llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
+                        try:
+                            from .llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
+                        except ImportError:
+                            from llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
                         provider_to_use = get_llama_cpp_vlm_provider(
                             model_path=llama_model_path,
                             mmproj_path=llama_mmproj_path,

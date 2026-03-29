@@ -99,6 +99,7 @@ async def run_full_evaluation(
         milvus_lite_path=milvus_lite_path,
         collection_name=collection_name,
         embed_dim=embed_dim,
+        max_chunks=10,
         max_concurrent=max_concurrent,
     )
 
@@ -223,6 +224,7 @@ async def run_generate_only(
         milvus_lite_path=milvus_lite_path,
         collection_name=collection_name,
         embed_dim=embed_dim,
+        max_chunks=10,
         max_concurrent=max_concurrent,
     )
 
@@ -391,9 +393,18 @@ def main():
     llm_api_key = args.llm_api_key or os.getenv("ZHIPU_API_KEY", "") or os.getenv("DEEPSEEK_API_KEY", "")
     embed_api_key = args.embed_api_key or os.getenv("ZHIPU_API_KEY", "") or os.getenv("DEEPSEEK_API_KEY", "")
 
-    # 直接设置默认 LLM 配置
-    llm_api_key = "0d771acaa7d64e6ab82392672dd689b3.jMq18xPnQR2weqxK"
-    llm_model = "glm-4.5-air"
+    # 直接设置默认 LLM 配置（使用 freeapi.json）
+    freeapi_config_path = Path(__file__).parent / "freeapi.json"
+    if not freeapi_config_path.exists():
+        raise FileNotFoundError(f"freeapi.json 配置文件不存在: {freeapi_config_path}")
+    import json as json_lib
+    with open(freeapi_config_path, "r") as f:
+        freeapi_config = json_lib.load(f)
+    llm_api_key = freeapi_config.get("API_KEY", "")
+    # base_url 需要添加 /v1/ 后缀
+    llm_base_url = freeapi_config.get("API_URL", "") + "/v1/"
+    llm_model = "gpt-4o-mini"
+    print(f"✅ 已加载 freeapi.json 配置: {llm_base_url} ({llm_model})")
     embedding_model = "bge-m3"
     embedding_mode = args.embedding_mode
     ollama_base_url = args.ollama_base_url
@@ -419,7 +430,7 @@ def main():
     if args.step == "all":
         asyncio.run(run_full_evaluation(
             llm_model=llm_model,
-            llm_base_url=args.llm_base_url,
+            llm_base_url=llm_base_url,
             llm_api_key=llm_api_key,
             embedding_model=embedding_model,
             embed_base_url=args.embed_base_url,
@@ -441,7 +452,7 @@ def main():
         try:
             result = asyncio.run(run_generate_only(
                 llm_model=llm_model,
-                llm_base_url=args.llm_base_url,
+                llm_base_url=llm_base_url,
                 llm_api_key=llm_api_key,
                 embedding_model=embedding_model,
                 embed_base_url=args.embed_base_url,

@@ -208,3 +208,8 @@ __marimo__/
 
 data/
 models/
+cache/
+results/
+datasets/test_figures_and_tables
+evaluation/freeapi.json
+*.tgz

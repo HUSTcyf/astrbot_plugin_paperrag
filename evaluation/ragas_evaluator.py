@@ -7,58 +7,34 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from typing import List, Dict, Optional, Any, Union
+from typing import List, Dict, Optional, Any, Union, cast
 from dataclasses import dataclass, asdict
 
 import pandas as pd
+from ragas import evaluate, RunConfig, EvaluationDataset
+from ragas.llms.base import InstructorBaseRagasLLM
+from ragas.embeddings.base import BaseRagasEmbedding
+from ragas.metrics.collections import (
+    Faithfulness,
+    AnswerRelevancy,
+    ContextPrecision,
+    ContextRecall,
+    ContextRelevance,
+    AnswerCorrectness,
+)
+from datasets import Dataset
+
+# 禁用 Ragas 遥测追踪（避免 SSL 证书过期错误）
+import os
+os.environ["RAGAS_DO_NOT_TRACK"] = "True"
 
 from astrbot.api import logger
 
-# ============================================================================
-# 懒加载 ragas
-# ============================================================================
-
-RAGAS_AVAILABLE = True
-evaluate = None
-RunConfig = None
-Dataset = None
-faithfulness_metric = None
-answer_relevancy_metric = None
-context_precision_metric = None
-context_recall_metric = None
-context_relevancy_metric = None
-answer_correctness_metric = None
-
-try:
-    from ragas import evaluate, RunConfig
-    from ragas.metrics.collections import (
-        Faithfulness,
-        AnswerRelevancy,
-        ContextPrecision,
-        ContextRecall,
-        ContextRelevance,
-        AnswerCorrectness,
-    )
-    from datasets import Dataset
-
-    # 禁用 Ragas 遥测追踪（避免 SSL 证书过期错误）
-    import os
-    os.environ["RAGAS_DO_NOT_TRACK"] = "True"
-
-except ImportError as e:
-    RAGAS_AVAILABLE = False
-    logger.warning(f"Ragas 评估框架未安装: {e}")
-
 # 导入自定义 Ragas 兼容包装器（与 ragas_generator 共用）
-try:
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent))
-    from ragas_generator import OpenAICompatibleLLM, OpenAICompatibleEmbeddings
-except ImportError as e:
-    logger.warning(f"无法导入 ragas_generator 中的包装器: {e}")
-    OpenAICompatibleLLM = None
-    OpenAICompatibleEmbeddings = None
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+from ragas_generator import OpenAICompatibleLLM, OpenAICompatibleEmbeddings, EvalSample
 
 
 # ============================================================================
@@ -185,11 +161,6 @@ class RagasEvaluator:
             ollama_base_url: Ollama API 地址
             ollama_embed_model: Ollama Embedding 模型名称
         """
-        if not RAGAS_AVAILABLE:
-            raise ImportError(
-                "Ragas 评估框架未安装。请运行: pip install ragas datasets"
-            )
-
         self._llm = None
         self._embed_model = None
         self._max_concurrent = max_concurrent
@@ -212,16 +183,13 @@ class RagasEvaluator:
         """获取 LLM 实例（延迟初始化）- 使用自定义 Ragas 兼容包装器"""
         if self._llm is None:
             if self._llm_config["base_url"]:
-                if OpenAICompatibleLLM:
-                    self._llm = OpenAICompatibleLLM(
-                        model=self._llm_config["model"],
-                        api_base=self._llm_config["base_url"],
-                        api_key=self._llm_config["api_key"] or "sk-placeholder",
-                        temperature=0,
-                        max_concurrent=self._max_concurrent,
-                    )
-                else:
-                    raise ImportError("OpenAICompatibleLLM 未安装")
+                self._llm = OpenAICompatibleLLM(
+                    model=self._llm_config["model"],
+                    api_base=self._llm_config["base_url"],
+                    api_key=self._llm_config["api_key"] or "sk-placeholder",
+                    temperature=0,
+                    max_concurrent=self._max_concurrent,
+                )
             else:
                 raise ValueError("base_url is required for LLM")
         return self._llm
@@ -232,39 +200,35 @@ class RagasEvaluator:
             embed_mode = self._embed_config.get("mode", "api")
 
             if embed_mode == "ollama":
-                if OpenAICompatibleEmbeddings:
-                    embed_api_base = f"{self._embed_config['ollama_base_url']}/v1"
-                    self._embed_model = OpenAICompatibleEmbeddings(
-                        model=self._embed_config["ollama_embed_model"],
-                        api_base=embed_api_base,
-                        api_key="ollama",
-                        max_concurrent=self._max_concurrent,
-                    )
-                else:
-                    raise ImportError("OpenAICompatibleEmbeddings 未安装")
+                embed_api_base = f"{self._embed_config['ollama_base_url']}/v1"
+                self._embed_model = OpenAICompatibleEmbeddings(
+                    model=self._embed_config["ollama_embed_model"],
+                    api_base=embed_api_base,
+                    api_key="ollama",
+                    max_concurrent=self._max_concurrent,
+                )
             elif self._embed_config["base_url"]:
-                if OpenAICompatibleEmbeddings:
-                    self._embed_model = OpenAICompatibleEmbeddings(
-                        model=self._embed_config["model"],
-                        api_base=self._embed_config["base_url"],
-                        api_key=self._embed_config["api_key"] or "sk-placeholder",
-                        max_concurrent=self._max_concurrent,
-                    )
-                else:
-                    raise ImportError("OpenAICompatibleEmbeddings 未安装")
+                self._embed_model = OpenAICompatibleEmbeddings(
+                    model=self._embed_config["model"],
+                    api_base=self._embed_config["base_url"],
+                    api_key=self._embed_config["api_key"] or "sk-placeholder",
+                    max_concurrent=self._max_concurrent,
+                )
             else:
                 raise ValueError("embed_base_url or ollama mode is required for embedding")
         return self._embed_model
 
     def _get_ragas_metrics(self):
         """获取 Ragas 指标列表"""
+        llm = cast(InstructorBaseRagasLLM, self._get_llm())
+        embeddings = cast(BaseRagasEmbedding, self._get_embed_model())
         return [
-            Faithfulness(),
-            AnswerRelevancy(),
-            ContextPrecision(),
-            ContextRecall(),
-            ContextRelevance(),
-            AnswerCorrectness(),
+            Faithfulness(llm=llm),
+            AnswerRelevancy(llm=llm, embeddings=embeddings),
+            ContextPrecision(llm=llm),
+            ContextRecall(llm=llm),
+            ContextRelevance(llm=llm),
+            AnswerCorrectness(llm=llm),
         ]
 
     async def evaluate(
@@ -286,15 +250,12 @@ class RagasEvaluator:
         Returns:
             评估结果 DataFrame
         """
-        if not RAGAS_AVAILABLE:
-            raise ImportError("Ragas 未安装")
-
         print(f"\n{'='*60}")
         print("开始 Ragas 评估...")
         print(f"{'='*60}")
 
         # 加载测试集
-        from .ragas_generator import RagasTestsetGenerator, EvalSample
+        from .ragas_generator import RagasTestsetGenerator
         generator = RagasTestsetGenerator(
             llm_model=self._llm_config["model"],
             llm_base_url=self._llm_config["base_url"],
@@ -333,7 +294,7 @@ class RagasEvaluator:
             if isinstance(r, Exception):
                 logger.error(f"样本 {i} 处理失败: {r}")
                 continue
-            if r is None:
+            if r is None or not isinstance(r, dict):
                 continue
 
             questions.append(r["question"])
@@ -371,7 +332,7 @@ class RagasEvaluator:
         )
 
         # 转换为 DataFrame
-        scores_df = evaluation_result.to_pandas()
+        scores_df = cast(EvaluationDataset, evaluation_result).to_pandas()
 
         # 添加元数据列
         scores_df["latency_ms"] = latencies
@@ -389,7 +350,7 @@ class RagasEvaluator:
     async def _process_single_sample(
         self,
         rag_wrapper: RAGQueryWrapper,
-        sample: "EvalSample",
+        sample: EvalSample,
         idx: int,
     ) -> Optional[Dict[str, Any]]:
         """处理单个样本"""
@@ -467,14 +428,14 @@ async def main():
     """使用示例"""
     from llama_index.core import VectorStoreIndex, Document
 
-    # 初始化评估器（使用智谱 API）
+    # 初始化评估器（使用 freeapi）
     evaluator = RagasEvaluator(
-        llm_model="glm-4-flash",
-        llm_base_url="https://open.bigmodel.cn/api/paas/v4",
-        llm_api_key="你的智谱 API Key",
-        embedding_model="text-embedding-v3",
-        embed_base_url="https://open.bigmodel.cn/api/paas/v4",
-        embed_api_key="你的智谱 API Key",
+        llm_model="gpt-4o-mini",
+        llm_base_url="https://free.v36.cm/v1/",
+        llm_api_key="your-api-key",
+        embedding_model="text-embedding-3-small",
+        embed_base_url="https://free.v36.cm/v1/",
+        embed_api_key="your-api-key",
     )
 
     # 创建测试查询引擎

@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-03-29
+
+### Changed
+
+- **LLM参考文献解析架构重构**
+  - 改用整段参考文献文本传给LLM，让LLM自动识别和解析每条参考文献
+  - 舍弃复杂的正则表达式启发式规则（年份检测、长度阈值等）
+  - 避免因参考文献格式差异（跨行、无序号等）导致的分割错误
+
+### Added
+
+- **GPT-4o-mini参考文献解析**
+  - 使用官方OpenAI API直接调用GPT-4o-mini（不使用ragas依赖）
+  - 新增 `parse_reference_section()` 方法，支持整段文本解析
+  - API配置从 `evaluation/freeapi.json` 读取
+
+- **并发控制与重试机制**
+  - Semaphore-based并发控制（最多4个并发请求）
+  - HTTP 429（限流）自动重试，支持 Retry-After 解析
+  - HTTP 500（服务器错误）自动重试
+
+- **表格检测增强**
+  - 新增 `_is_likely_table()` 方法
+  - 通过管道符数量、时间格式、表格指示符等特征识别表格
+  - 避免将表格误判为参考文献
+
+- **调试日志增强**
+  - 新增 `📝 [LLM调用]`、`📝 [LLM调试]` 日志
+  - 记录Prompt长度、响应内容、JSON提取结果
+
+### Removed
+
+- **简化参考文献分割逻辑**
+  - `_split_reference_lines()` 移除冗余启发式规则
+  - 只保留明确的编号格式识别（`[1]`、`1.`、`\bibitem{}`）和URL检测
+  - 无序号参考文献的解析全部由LLM处理
+
+- **MCP参考文献 enrichment 默认禁用**
+  - 取消注释即可启用arXiv MCP补全
+
 ## [1.5.0] - 2026-03-28
 
 ### Added

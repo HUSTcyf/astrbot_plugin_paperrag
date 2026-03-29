@@ -7,9 +7,12 @@ from typing import Optional, TYPE_CHECKING
 from dataclasses import dataclass, field
 from astrbot.api import logger
 
-# 使用 TYPE_CHECKING 避免循环导入
+# 使用 TYPE_CHECKING 避免循环导入，兼容直接运行和包运行
 if TYPE_CHECKING:
-    from .hybrid_rag import HybridRAGEngine
+    try:
+        from .hybrid_rag import HybridRAGEngine
+    except ImportError:
+        from hybrid_rag import HybridRAGEngine
 
 HYBRID_RAG_AVAILABLE = True
 
@@ -76,6 +79,9 @@ class RAGConfig:
     hybrid_alpha: float = 0.5    # RRF 融合权重（0=纯BM25, 1=纯向量）
     hybrid_rrf_k: int = 60      # RRF 常数 k
 
+    # LLM 参考文献解析配置
+    enable_llm_reference_parsing: bool = True  # 是否启用 LLM-based 参考文献解析
+
     def __post_init__(self):
         """初始化后处理"""
         if self.authentication is None:
@@ -141,8 +147,11 @@ def create_rag_engine(config: RAGConfig, context) -> "HybridRAGEngine":
         >>> engine = create_rag_engine(config, context)
         >>> result = await engine.search("attention机制")
     """
-    # 延迟导入避免循环依赖
-    from .hybrid_rag import HybridRAGEngine
+    # 延迟导入避免循环依赖，兼容直接运行和包运行
+    try:
+        from .hybrid_rag import HybridRAGEngine
+    except ImportError:
+        from hybrid_rag import HybridRAGEngine
 
     logger.info("✅ 使用混合架构 RAG引擎（HybridRAGEngine）")
     logger.info("   - 自定义PDF解析（多模态）")

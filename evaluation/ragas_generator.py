@@ -25,9 +25,9 @@ except Exception:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(handler)
-    logger.info = lambda x: print(x)
-    logger.warning = lambda x: print(f"WARNING: {x}")
-    logger.error = lambda x: print(f"ERROR: {x}")
+    # logger.info = lambda x: print(x)
+    # logger.warning = lambda x: print(f"WARNING: {x}")
+    # logger.error = lambda x: print(f"ERROR: {x}")
 
 # ============================================================================
 # 懒加载 ragas（评估框架，可选安装）
@@ -36,24 +36,20 @@ except Exception:
 RAGAS_AVAILABLE = True
 TestsetGenerator = None
 Document = None
-BaseRagasLLM = None
-BaseRagasEmbeddings = None
 
-try:
-    from ragas.testset import TestsetGenerator
-    from ragas.testset.graph import KnowledgeGraph
-    from ragas.testset.synthesizers.generate import default_query_distribution
-    from ragas.llms.base import BaseRagasLLM
-    from ragas.embeddings.base import BaseRagasEmbeddings
-    from llama_index.core import Document
+from ragas.testset import TestsetGenerator
+from ragas.testset.graph import KnowledgeGraph
+from ragas.llms.base import BaseRagasLLM
+from ragas.embeddings.base import BaseRagasEmbeddings
+from llama_index.core import Document
 
-    # 禁用 Ragas 遥测追踪（避免 SSL 证书过期错误）
-    import os
-    os.environ["RAGAS_DO_NOT_TRACK"] = "True"
+# 禁用 Ragas 遥测追踪（避免 SSL 证书过期错误）
+import os
+os.environ["RAGAS_DO_NOT_TRACK"] = "True"
 
-except ImportError as e:
-    RAGAS_AVAILABLE = False
-    logger.warning(f"Ragas 评估框架未安装，部分功能不可用: {e}")
+# except ImportError as e:
+#     RAGAS_AVAILABLE = False
+#     logger.warning(f"Ragas 评估框架未安装，部分功能不可用: {e}")
 
 
 # ============================================================================
@@ -65,11 +61,9 @@ try:
 except ImportError:
     StringPromptValue = None
 
-try:
-    from ragas.llms.base import LLMResult, Generation
-except ImportError:
-    LLMResult = None
-    Generation = None
+from ragas.llms.base import BaseRagasLLM
+from langchain_core.outputs.llm_result import LLMResult
+from langchain_core.outputs.generation import Generation
 
 
 class InvalidLLMResponseError(ValueError):
@@ -85,7 +79,7 @@ class InvalidLLMResponseError(ValueError):
         self.text = text  # ragas raise_first_exception 会访问此属性
 
 
-class OpenAICompatibleLLM(BaseRagasLLM if BaseRagasLLM else object):
+class OpenAICompatibleLLM(BaseRagasLLM):
     """
     适配 OpenAI 兼容接口的 Ragas LLM 包装器
     用于对接 ZhipuAI 等 OpenAI 兼容的 API
@@ -99,7 +93,7 @@ class OpenAICompatibleLLM(BaseRagasLLM if BaseRagasLLM else object):
 
     # 全局并发限制信号量（类变量，所有实例共享）
     _semaphore: Optional[Any] = None
-    _max_concurrent: int = 3  # 全局最大并发数
+    _max_concurrent: int = 4  # 全局最大并发数（默认4，最大8）  # 全局最大并发数
 
     @classmethod
     def set_max_concurrent(cls, n: int):
@@ -116,21 +110,16 @@ class OpenAICompatibleLLM(BaseRagasLLM if BaseRagasLLM else object):
         api_key: str,
         temperature: float = 0.3,
         max_tokens: int = 2048,
-        max_concurrent: int = 3,
+        max_concurrent: int = 4,
         **kwargs
     ):
-        if BaseRagasLLM:
-            super().__init__()
+        super().__init__()
         self.model = model
         self.api_base = api_base.rstrip('/')
         self.api_key = api_key
         self.temperature = temperature
         self.max_tokens = max_tokens
-        self._run_config = None
-        self._max_concurrent = max_concurrent
-
-    def set_run_config(self, run_config):
-        self._run_config = run_config
+        self._max_concurrent = min(max_concurrent, 8)  # 最多8
 
     def get_temperature(self, n: Optional[int] = None) -> float:
         return self.temperature
@@ -177,23 +166,32 @@ class OpenAICompatibleLLM(BaseRagasLLM if BaseRagasLLM else object):
             response = requests.post(url, headers=headers, json=data, timeout=120)
             response.raise_for_status()
             result = response.json()
-            raw_text = result['choices'][0]['message']['content'] or ""
+            raw_text = result.get('choices', [{}])[0].get('message', {}).get('content') or ""
 
-            # 如果返回为空，返回一个有效的 StringIO JSON
-            if not raw_text.strip():
-                raw_text = '{"text": " "}'
+            # Step 1: 去除 markdown 代码块包裹
+            import re
+            stripped = raw_text.strip()
+            if stripped.startswith("```"):
+                stripped = re.sub(r'^```(?:json)?\s*', '', stripped, flags=re.MULTILINE)
+                stripped = re.sub(r'\s*```$', '', stripped)
+                stripped = stripped.strip()
 
-            # 确保返回的是有效 JSON
-            try:
-                parsed = json.loads(raw_text)
-                if isinstance(parsed, str):
-                    raw_text = json.dumps({"text": parsed})
-                elif isinstance(parsed, dict) and "text" not in parsed:
-                    raw_text = json.dumps({"text": json.dumps(parsed)})
-            except json.JSONDecodeError:
-                raw_text = json.dumps({"text": raw_text})
+            # Step 2: 处理空内容
+            if not stripped:
+                final_text = '{"text": "模型未返回有效响应"}'
+            else:
+                # Step 3: 验证 JSON 有效性
+                try:
+                    parsed = json.loads(stripped)
+                    if parsed == {}:
+                        final_text = '{"text": "模型未返回有效响应"}'
+                    else:
+                        # 有效 JSON，直接返回
+                        final_text = stripped
+                except json.JSONDecodeError:
+                    final_text = json.dumps({"text": stripped})
 
-            return raw_text
+            return final_text
         finally:
             sync_sem.release()
 
@@ -245,25 +243,59 @@ class OpenAICompatibleLLM(BaseRagasLLM if BaseRagasLLM else object):
         async with OpenAICompatibleLLM._semaphore:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, headers=headers, json=data, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                    # 检查 HTTP 状态码
+                    if resp.status != 200:
+                        text = await resp.text()
+                        raise RuntimeError(f"API 请求失败: HTTP {resp.status}, 响应: {text[:500]}")
                     result = await resp.json()
 
-        raw_text = result['choices'][0]['message']['content']
+        # 安全的 JSON 响应处理
+        import re
 
-        if not raw_text or not raw_text.strip():
-            # LLM 返回空，跳过此任务
-            raise ValueError("LLM returned empty content, skipping")
+        # 验证响应结构
+        if not isinstance(result, dict):
+            raise RuntimeError(f"API 响应不是字典类型: {type(result)}, 响应: {str(result)[:500]}")
 
-        # 确保返回的是有效 JSON，StringIO 需要 {"text": "..."} 格式
+        choices = result.get('choices')
+        if not choices or not isinstance(choices, list) or len(choices) == 0:
+            # API 返回错误信息
+            error_msg = result.get('error', {}).get('message', result.get('error', str(result)))
+            raise RuntimeError(f"API 返回空 choices，可能被限流或出错: {error_msg}")
+
+        first_choice = choices[0]
+        if not isinstance(first_choice, dict):
+            raise RuntimeError(f"API choice 格式错误: {type(first_choice)}")
+
+        message = first_choice.get('message')
+        if not isinstance(message, dict):
+            raise RuntimeError(f"API message 格式错误: {type(message)}")
+
+        raw_text = message.get('content') or ""
+
+        # Step 1: 去除 markdown 代码块包裹
+        stripped = raw_text.strip()
+        if stripped.startswith("```"):
+            stripped = re.sub(r'^```(?:json)?\s*', '', stripped, flags=re.MULTILINE)
+            stripped = re.sub(r'\s*```$', '', stripped)
+            stripped = stripped.strip()
+
+        # Step 2: 处理空内容
+        if not stripped:
+            raise RuntimeError("LLM 返回空内容，可能是模型服务暂时不可用或被限流")
+
+        # Step 3: 验证 JSON 有效性
         try:
-            parsed = json.loads(raw_text)
-            if isinstance(parsed, str):
-                raw_text = json.dumps({"text": parsed})
-            elif isinstance(parsed, dict) and "text" not in parsed:
-                raw_text = json.dumps({"text": json.dumps(parsed)})
+            parsed = json.loads(stripped)
+            if parsed == {}:
+                # 空字典，视为无效响应
+                raise RuntimeError("LLM 返回空 JSON 对象，可能是模型服务暂时不可用")
+            # 有效 JSON，直接返回（不再包装）
+            final_text = stripped
         except json.JSONDecodeError:
-            raw_text = json.dumps({"text": raw_text})
+            # 非 JSON，包装为标准格式
+            final_text = json.dumps({"text": stripped})
 
-        gen = Generation(text=raw_text)
+        gen = Generation(text=final_text)
         return LLMResult(generations=[[gen]])
 
     def _get_prompt_text(self, prompt: Any) -> str:
@@ -322,7 +354,7 @@ class OpenAICompatibleLLM(BaseRagasLLM if BaseRagasLLM else object):
         return f"OpenAICompatibleLLM(model={self.model})"
 
 
-class OpenAICompatibleEmbeddings(BaseRagasEmbeddings if BaseRagasEmbeddings else object):
+class OpenAICompatibleEmbeddings(BaseRagasEmbeddings):
     """
     适配 OpenAI 兼容接口的 Ragas Embeddings 包装器
     用于对接 Ollama 等 OpenAI 兼容的 Embedding API
@@ -335,7 +367,7 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings if BaseRagasEmbeddings else
 
     # 全局并发限制信号量（类变量，所有实例共享）
     _semaphore: Optional[Any] = None
-    _max_concurrent: int = 3
+    _max_concurrent: int = 4  # 全局最大并发数（默认4，最大8）
 
     @classmethod
     def set_max_concurrent(cls, n: int):
@@ -350,7 +382,7 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings if BaseRagasEmbeddings else
         model: str,
         api_base: str,
         api_key: str = "ollama",
-        max_concurrent: int = 3,
+        max_concurrent: int = 4,
         batch_size: int = 50,
         **kwargs
     ):
@@ -359,23 +391,17 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings if BaseRagasEmbeddings else
         self.model = model
         self.api_base = api_base.rstrip('/')
         self.api_key = api_key
-        self._max_concurrent = max_concurrent
+        self._max_concurrent = min(max_concurrent, 8)  # 最多8
         self._batch_size = batch_size
         # 复用 aiohttp session（实例级）
         self._session: Optional[Any] = None
-        self._run_config = None
-
-    @property
-    def run_config(self):
-        """Ragas 期望的 run_config 属性"""
-        if self._run_config is None:
-            from ragas.run_config import RunConfig
-            self._run_config = RunConfig()
-        return self._run_config
+        # 初始化 run_config（父类需要这个属性）
+        from ragas.run_config import RunConfig
+        self.run_config = RunConfig()
 
     def set_run_config(self, run_config):
         """设置 run_config（Ragas 接口）"""
-        self._run_config = run_config
+        self.run_config = run_config
 
     def _get_sync_semaphore(self):
         """获取同步信号量（threading.Semaphore，所有实例共享）"""
@@ -595,6 +621,7 @@ class MilvusDocumentLoader:
 
         # 步骤 1：通过表达式过滤直接获取该论文所有 chunk id（无扫描）
         try:
+            assert self._collection is not None
             results = self._collection.query(
                 expr=f'metadata["file_name"] == "{paper_name}"',
                 output_fields=["id", "metadata"],
@@ -608,7 +635,7 @@ class MilvusDocumentLoader:
 
         # 提取 id 和 chunk_idx，按 chunk_idx 排序
         chunks_meta = []
-        for r in results:
+        for r in results:  # type: ignore
             meta = r.get("metadata", {})
             if isinstance(meta, str):
                 try:
@@ -634,7 +661,7 @@ class MilvusDocumentLoader:
                     expr=expr,
                     output_fields=["id", "text", "metadata"],
                 )
-                for tr in text_results:
+                for tr in text_results:  # type: ignore
                     meta = tr.get("metadata", {})
                     if isinstance(meta, str):
                         try:
@@ -696,6 +723,47 @@ class MilvusDocumentLoader:
         finally:
             self._close()
 
+    def _filter_main_content_chunks(self, chunks: List[Dict]) -> List[Dict]:
+        """
+        过滤 chunks，只保留论文正文内容。
+
+        核心规则：
+        - 排除包含作者邮箱的 chunk（作者页的强信号）
+        - 排除参考文献相关
+        - 排除前几行有多个姓名行的 chunk
+        """
+        import re
+
+        # 最核心的过滤模式
+        exclude_patterns = [
+            r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',  # 邮箱
+            r'\b(Reference|References|Bibliography)\b',
+            r'^\[\d+\]',  # [1]
+            r'\[\s*[A-Z][a-z]+,?\s*\d{4}',  # [Zhang, 2023]
+            r'\(\s*[A-Z][a-z]+\s+et\s+al\.?,?\s*\d{4}',  # (Zhang et al., 2023)
+            r'\b(Acknowledgment|Appendix|Supplementary)\b',
+        ]
+
+        filtered = []
+        for chunk in chunks:
+            text = chunk.get("text", "")
+            if not text:
+                continue
+
+            # 1. 排除匹配模式的
+            if any(re.search(p, text, re.IGNORECASE) for p in exclude_patterns):
+                continue
+
+            # 2. 前几行有2+姓名行 → 排除（作者页）
+            lines = text.split('\n')[:10]
+            name_lines = sum(1 for l in lines if re.match(r"^[A-ZÀ-ÿ][a-zà-ÿ´'`-]+(\s+[A-ZÀ-ÿ][a-zà-ÿ´'`-]+)+$", l.strip()))
+            if name_lines >= 2:
+                continue
+
+            filtered.append(chunk)
+
+        return filtered
+
     def load_documents(
         self,
         max_chunks: int = 200,
@@ -721,36 +789,28 @@ class MilvusDocumentLoader:
             print("❌ 未从数据库中找到任何 chunks")
             return []
 
-        print(f"\n🎯 采样 {max_chunks} 个 chunks...")
+        print(f"\n🎯 遍历所有 chunks...")
 
-        # 采样
-        sampled_chunks = []
-        if sample_strategy == "uniform" and len(self._all_chunks) > 0:
-            chunks_per_paper = max(1, max_chunks // len(self._all_chunks))
-            for fname, chunks in self._all_chunks.items():
-                step = max(1, len(chunks) // chunks_per_paper)
-                for i in range(0, len(chunks), step):
-                    sampled_chunks.append(chunks[i])
-                    if len(sampled_chunks) >= max_chunks:
-                        break
-                if len(sampled_chunks) >= max_chunks:
-                    break
-        else:
-            # 直接从头取
-            for fname in sorted(self._all_chunks.keys()):
-                sampled_chunks.extend(self._all_chunks[fname])
-                if len(sampled_chunks) >= max_chunks:
-                    break
+        # 收集所有 chunks
+        all_chunks = []
+        for fname in sorted(self._all_chunks.keys()):
+            all_chunks.extend(self._all_chunks[fname])
 
-        sampled_chunks = sampled_chunks[:max_chunks]
-        print(f"   采样了 {len(sampled_chunks)} 个 chunks")
+        sampled_chunks = all_chunks
+        print(f"   共 {len(sampled_chunks)} 个 chunks")
+
+        # 过滤：只保留论文正文内容（过滤前置/后置部分）
+        print(f"\n🔍 过滤非正文 chunks（去除作者、摘要、参考文献）...")
+        filtered_chunks = self._filter_main_content_chunks(sampled_chunks)
+        print(f"   过滤后剩余 {len(filtered_chunks)} 个正文 chunks")
 
         # 转换为 Document 对象
         print(f"\n🔄 转换为 Document 对象...")
         documents = []
-        for chunk in sampled_chunks:
+        for chunk in filtered_chunks:
             meta = chunk.get("metadata", {})
 
+            assert Document is not None
             doc = Document(
                 text=chunk.get("text", ""),
                 metadata={
@@ -793,7 +853,7 @@ class RagasTestsetGenerator:
         collection_name: str = "paper_embeddings",
         embed_dim: int = 1024,
         max_chunks: int = 200,
-        max_concurrent: int = 3,
+        max_concurrent: int = 4,
         paper_doc_stats_path: Optional[str] = None,
     ):
         """
@@ -814,7 +874,7 @@ class RagasTestsetGenerator:
             collection_name: Milvus 集合名称
             embed_dim: Embedding 维度
             max_chunks: 从数据库加载的最大 chunk 数量
-            max_concurrent: LLM 最大并发数（默认 3，建议不超过 5）
+            max_concurrent: LLM 最大并发数（默认 4，最大 8）
             paper_doc_stats_path: 论文统计 JSON 文件路径（默认取插件 data/paper_doc_stats.json）
         """
         if not RAGAS_AVAILABLE:
@@ -918,6 +978,43 @@ class RagasTestsetGenerator:
                 raise ValueError("embed_base_url or ollama mode is required for embedding")
         return self._embed_model
 
+    def _filter_generated_questions(self, samples: List["EvalSample"]) -> List["EvalSample"]:
+        """
+        过滤低质量问题（作者、机构、发表信息等元数据问题）。
+        """
+        import re
+
+        # 核心：只过滤关于作者/机构/发表信息的问题
+        low_quality_patterns = [
+            r'\bwho\s+(is|are)\s+[A-Z]',  # who is/are [Name]
+            r'\b(about|by)\s+[A-Z][a-z]+\s+[A-Z][a-z]+',  # about John Doe
+            r'\b(first|last)\s+author\b',
+            r'\b(which|what)\s+(university|institute|lab|company)',
+            r'\bwhere\s+(was|is)\s+(this\s+paper|it)\s+published',
+            r'\bwhich\s+(conference|journal|venue)\b',
+            r'\b\d{4}\s+published\b',
+            r'\b(arxiv|doi|citation)\b',
+        ]
+
+        filtered = []
+        for sample in samples:
+            question = sample.question.lower()
+
+            # 检查是否匹配任何低质量模式
+            is_low_quality = False
+            for pattern in low_quality_patterns:
+                if re.search(pattern, question, re.IGNORECASE):
+                    is_low_quality = True
+                    break
+
+            if is_low_quality:
+                print(f"   [过滤] 低质量问题: {sample.question[:60]}...")
+                continue
+
+            filtered.append(sample)
+
+        return filtered
+
     async def generate_testset(
         self,
         documents: List[Any],
@@ -950,14 +1047,16 @@ class RagasTestsetGenerator:
         print(f"{'='*60}")
 
         # 初始化生成器
+        assert TestsetGenerator is not None
         generator = TestsetGenerator(
             llm=self._get_llm(),
             embedding_model=self._get_embed_model(),
-            knowledge_graph=self._knowledge_graph,
+            knowledge_graph=None,  # type: ignore[arg-type] # ragas 会在 generate_with_llamaindex_docs 中创建
         )
 
-        # 获取查询分布
-        if self._query_distribution is None:
+        # 获取查询分布（只在有 knowledge_graph 时才创建）
+        if self._query_distribution is None and self._knowledge_graph is not None:
+            from ragas.testset.synthesizers import default_query_distribution
             self._query_distribution = default_query_distribution(
                 llm=self._get_llm(),
                 kg=self._knowledge_graph,
@@ -974,14 +1073,16 @@ class RagasTestsetGenerator:
         )
 
         # 转换为标准格式
+        from ragas.testset.synthesizers.testset_schema import Testset
+        assert isinstance(testset, Testset), f"Expected Testset, got {type(testset)}"
         samples = []
         for sample in testset.samples:
             eval_sample_obj = sample.eval_sample
             # 兼容 SingleTurnSample 和 MultiTurnSample
             if hasattr(eval_sample_obj, 'user_input'):
-                question = eval_sample_obj.user_input or ""
-                answer = eval_sample_obj.reference or eval_sample_obj.response or ""
-                contexts = eval_sample_obj.reference_contexts or []
+                question = getattr(eval_sample_obj, 'user_input', "") or ""
+                answer = getattr(eval_sample_obj, 'reference', "") or getattr(eval_sample_obj, 'response', "") or ""
+                contexts = getattr(eval_sample_obj, 'reference_contexts', []) or []
             else:
                 question = ""
                 answer = ""
@@ -995,6 +1096,16 @@ class RagasTestsetGenerator:
                 episode_done=True,
             )
             samples.append(eval_sample)
+
+        # ========== 策略4：后处理过滤低质量问题 ==========
+        print(f"\n🔍 过滤低质量问题（作者、机构、发表信息等）...")
+        original_count = len(samples)
+        samples = self._filter_generated_questions(samples)
+        filtered_count = original_count - len(samples)
+        if filtered_count > 0:
+            print(f"   过滤掉 {filtered_count}/{original_count} 个低质量问题")
+        else:
+            print(f"   未发现低质量问题")
 
         # 保存结果
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)

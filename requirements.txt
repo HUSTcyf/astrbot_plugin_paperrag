@@ -40,3 +40,6 @@ httpx>=0.25.0  # 异步HTTP客户端
 pydantic>=2.0.0  # 配置验证
 openai>=1.0.0  # OpenAI SDK（用于智谱GLM，避免pyjwt版本冲突）
 # zhipuai>=2.0.0  # 智谱AI SDK（已弃用：pyjwt版本冲突）
+
+# 数据集处理
+datasets>=2.14.0  # HuggingFace 数据集加载
