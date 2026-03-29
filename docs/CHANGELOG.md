@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - 2026-03-30
+
+### Changed
+
+- **CORE API 替代 arXiv MCP**
+  - 新增 `CoreAPIClient` 类实现 CORE API v3 搜索功能
+  - `/paper arxiv_add` 和 `/paper arxiv_refs` 命令改用 CORE API
+  - 优先使用 arXiv PDF 链接下载，否则使用 `sourceFulltextUrls[0]`
+  - 无需配置 arXiv MCP 服务器
+
+- **参考文献提取修复**
+  - 修复 "Authors Suppressed Due to Excessive Length" 导致截断过早的问题
+  - 移除 `end_keywords` 中的 'author' 匹配，改用精确的 `section_headers` 列表
+  - 遇到 Markdown 表格分隔行 `| --- | --- |` 时直接截断
+  - 简化 `_find_reference_section()` 函数逻辑：找到最后一个编号行后截断
+
+### Added
+
+- **CORE API Key 配置项**
+  - 新增 `core_api_key` 配置项（从 https://core.ac.uk/services/api 获取）
+  - 存储在插件配置中
+
 ## [1.6.0] - 2026-03-29
 
 ### Changed

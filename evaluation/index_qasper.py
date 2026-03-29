@@ -77,6 +77,53 @@ def load_qasper_data(data_dir: Path, split: str = "all") -> dict:
     return result
 
 
+def prepare_figure_caption_nodes(paper: dict, paper_id: str) -> List[dict]:
+    """
+    从论文中提取图表 caption 作为独立节点
+
+    Args:
+        paper: 论文数据
+        paper_id: 论文 ID
+
+    Returns:
+        Node 列表，每个 caption 一个 Node
+    """
+    nodes = []
+    metadata = {
+        "paper_id": paper_id,
+        "file_name": paper_id,
+        "paper_title": paper.get("title", ""),
+    }
+
+    figures_and_tables = paper.get("figures_and_tables", [])
+    for fig_idx, fig in enumerate(figures_and_tables):
+        caption = fig.get("caption", "")
+        if not caption or len(caption.strip()) < 20:
+            continue
+
+        file_name = fig.get("file", "")
+        node_metadata = {
+            **metadata,
+            "section_name": "figures_and_tables",
+            "paragraph_index": fig_idx,
+            "node_type": "figure_caption",
+            "figure_file": file_name,
+        }
+
+        # 区分 Figure 和 Table
+        if file_name.lower().startswith(("fig", "figure")):
+            node_text = f"Figure: {caption}"
+        else:
+            node_text = f"Table: {caption}"
+
+        nodes.append({
+            "text": node_text,
+            "metadata": node_metadata
+        })
+
+    return nodes
+
+
 def prepare_nodes_from_paper(paper: dict, paper_id: str) -> tuple:
     """
     将论文转换为 Node 列表
@@ -194,6 +241,7 @@ async def index_papers(
     papers_data: dict,
     collection_name: str = "paper_embeddings",
     milvus_lite_path: Optional[str] = None,
+    include_figures: bool = False,
 ) -> tuple:
     """
     将论文索引到 Milvus
@@ -203,6 +251,7 @@ async def index_papers(
         papers_data: {paper_id: paper_data}
         collection_name: 集合名称
         milvus_lite_path: 可选的 Milvus Lite 路径覆盖
+        include_figures: 是否将图表 captions 加入索引
 
     Returns:
         (total_indexed, paper_stats) 元组
@@ -263,19 +312,30 @@ async def index_papers(
     print("\n准备节点...")
     all_nodes = []
     paper_stats: Dict[str, Dict] = {}
+    total_figure_captions = 0
+
     for paper_id, paper in papers_data.items():
         nodes, chunk_count = prepare_nodes_from_paper(paper, paper_id)
+
+        # 可选：添加图表 caption 节点
+        fig_caption_nodes = []
+        if include_figures:
+            fig_caption_nodes = prepare_figure_caption_nodes(paper, paper_id)
+            nodes.extend(fig_caption_nodes)
+            total_figure_captions += len(fig_caption_nodes)
+
         all_nodes.extend(nodes)
         # Qasper 使用 paper_id 作为 file_name
         paper_title = paper.get("title", paper_id)
         paper_stats[paper_id] = {
             "file_name": paper_id,  # 使用 paper_id 作为 file_name
             "chunk_count": chunk_count,
+            "figure_caption_count": len(fig_caption_nodes),
             "paper_title": paper_title,
             "source_split": paper.get("source_split", ""),
         }
 
-    print(f"共 {len(all_nodes)} 个段落")
+    print(f"共 {len(all_nodes)} 个节点 (含 {total_figure_captions} 个图表 captions)")
 
     # 分批索引
     batch_size = config.get("batch_size", 10)
@@ -346,8 +406,17 @@ async def main_async(args):
 
     collection_name = "paper_embeddings"
 
-    # 使用专用的 Qasper Milvus 数据库路径
-    default_qasper_path = str(SCRIPT_DIR / "data" / "milvus_qasper.db")
+    # 根据是否包含图表 captions 选择数据库路径
+    include_figures = args.include_figures_captions
+    if include_figures:
+        default_qasper_path = str(SCRIPT_DIR / "data" / "milvus_qasper_vision.db")
+        default_stats_path = str(SCRIPT_DIR / "data" / "qasper_doc_stats_vision.json")
+        print("\n[INFO] 将把图表 captions 加入索引 (vision 模式)")
+    else:
+        default_qasper_path = str(SCRIPT_DIR / "data" / "milvus_qasper_text.db")
+        default_stats_path = str(SCRIPT_DIR / "data" / "qasper_doc_stats_text.json")
+        print("\n[INFO] text-only 模式")
+
     milvus_qasper_path = args.milvus_qasper_path if args.milvus_qasper_path else default_qasper_path
     print(f"\n📦 Milvus Qasper 数据库路径: {milvus_qasper_path}")
 
@@ -372,11 +441,11 @@ async def main_async(args):
         plugin_config,
         papers_data,
         collection_name=collection_name,
-        milvus_lite_path=milvus_qasper_path
+        milvus_lite_path=milvus_qasper_path,
+        include_figures=include_figures
     )
 
     # 保存 qasper_doc_stats.json
-    default_stats_path = str(SCRIPT_DIR / "data" / "qasper_doc_stats.json")
     stats_path = args.qasper_doc_stats if args.qasper_doc_stats else default_stats_path
 
     # 转换为与 paper_doc_stats.json 兼容的格式
@@ -386,6 +455,7 @@ async def main_async(args):
         doc_stats[paper_id] = {
             "file_name": stats["file_name"],
             "chunk_count": stats["chunk_count"],
+            "figure_caption_count": stats.get("figure_caption_count", 0),
             "added_time": added_time,
             "paper_title": stats.get("paper_title", ""),
             "source_split": stats.get("source_split", ""),
@@ -397,11 +467,15 @@ async def main_async(args):
         json.dump(doc_stats, f, ensure_ascii=False, indent=2)
     print(f"\n✅ 论文统计已保存到: {stats_path}")
 
+    # 统计图表 caption 总数
+    total_fig_captions = sum(s.get("figure_caption_count", 0) for s in paper_stats.values())
+
     print("\n" + "=" * 60)
     print("索引完成!")
     print("=" * 60)
     print(f"  论文数: {total_papers}")
-    print(f"  段落数: {total_indexed}")
+    print(f"  段落数: {total_indexed - total_fig_captions}")
+    print(f"  图表 captions: {total_fig_captions}")
     print(f"  集合名: {collection_name}")
     print(f"  Milvus 数据库: {milvus_qasper_path}")
     print(f"  统计文件: {stats_path}")
@@ -416,7 +490,7 @@ def main():
   python index_qasper.py                                    # 索引所有论文到 data/milvus_qasper.db
   python index_qasper.py --split train                     # 仅索引训练集
   python index_qasper.py --reinit                          # 重新初始化数据库
-  python index_qasper.py --config /path/to/config.json     # 指定配置文件
+  python index_qasper.py --include-figures-captions        # 索引时包含图表 captions
   python index_qasper.py --milvus-qasper-path /path/to.db  # 指定 Milvus 数据库路径
   python index_qasper.py --qasper-doc-stats /path/to.json  # 指定统计文件路径
         """
@@ -433,6 +507,8 @@ def main():
                         help="Qasper 专用 Milvus 数据库路径 (默认: ./data/milvus_qasper.db)")
     parser.add_argument("--qasper-doc-stats", type=str, default=None,
                         help="Qasper 论文统计 JSON 文件路径 (默认: ./data/qasper_doc_stats.json)")
+    parser.add_argument("--include-figures-captions", action="store_true",
+                        help="将图表 captions 加入索引（用于对比实验）")
 
     args = parser.parse_args()
     asyncio.run(main_async(args))

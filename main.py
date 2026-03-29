@@ -41,11 +41,67 @@ from .rag_engine import (
 )
 
 
+# ============================================================================
+# CORE API 客户端（替代 arXiv MCP）
+# ============================================================================
+
+class CoreAPIClient:
+    """CORE API v3 客户端 - 用于搜索和下载开放获取论文"""
+
+    BASE_URL = "https://api.core.ac.uk/v3"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+    def search_by_title(self, title: str, year: Optional[int] = None, limit: int = 5) -> list:
+        """根据论文标题搜索论文
+
+        Args:
+            title: 论文标题
+            year: 可选的发表年份过滤
+            limit: 返回结果数量
+
+        Returns:
+            匹配的论文列表
+        """
+        query_parts = [f'title:"{title}"']
+        if year:
+            query_parts.append(f"publishedDate:{year}")
+        query = " AND ".join(query_parts)
+
+        try:
+            response = requests.post(
+                f"{self.BASE_URL}/search/works",
+                headers=self.headers,
+                json={"q": query, "limit": min(limit, 100)},
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json().get("results", [])
+        except Exception as e:
+            logger.error(f"CORE API搜索失败: {e}")
+            return []
+
+    def extract_arxiv_id(self, work: dict) -> Optional[str]:
+        """从 work 记录中提取 arXiv ID"""
+        urls = work.get("sourceFulltextUrls", []) or []
+        for url in urls:
+            if url and "arxiv.org" in url:
+                match = re.search(r'arxiv\.org/(?:abs|pdf)/(\d+\.\d+)', url)
+                if match:
+                    return match.group(1)
+        return None
+
+
 @register(
     "paper_rag",
     "YourName",
     "本地文档库RAG检索插件 (支持PDF/Word/TXT/HTML, Gemini + Milvus Lite)",
-    "1.5.0",
+    "1.6.1",
     "https://github.com/your/repo"
 )
 class PaperRAGPlugin(Star):
@@ -876,10 +932,10 @@ class PaperRAGPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @paper_commands.command("arxiv_add")
     async def cmd_arxiv_add(self, event: AstrMessageEvent, query: str = '', max_results: int = 5):
-        """Search arxiv and download papers, then add to database (Admin)
+        """Search CORE API and download papers, then add to database (Admin)
 
         Args:
-            query: Search query for arxiv (e.g., paper title, authors, keywords)
+            query: Search query for papers (e.g., paper title, authors, keywords)
             max_results: Maximum number of papers to download (default: 5)
         """
         if not self.enabled:
@@ -890,21 +946,12 @@ class PaperRAGPlugin(Star):
             yield event.plain_result("❌ Please provide search query\nUsage: /paper arxiv_add <query> [max_results]\nExample: /paper arxiv_add attention is all you need 3")
             return
 
-        # Get MCP tool manager
-        try:
-            mcp_manager = self.context.get_llm_tool_manager()
-            mcp_clients = mcp_manager.mcp_client_dict
-        except Exception as e:
-            logger.error(f"Failed to get MCP manager: {e}")
-            yield event.plain_result(f"❌ 无法获取MCP工具管理器: {e}")
+        # Check CORE API key
+        core_api_key = self.config.get("core_api_key", "")
+        if not core_api_key:
+            yield event.plain_result("❌ CORE API Key未配置\n请在插件配置中设置 core_api_key")
             return
 
-        # Check if arxiv MCP is available
-        if "arxiv" not in mcp_clients:
-            yield event.plain_result("❌ arxiv MCP服务器未连接\n请检查 mcp_server.json 配置")
-            return
-
-        arxiv_client = mcp_clients["arxiv"]
         papers_dir = self.config.get("papers_dir", "./papers")
 
         # Ensure papers directory exists
@@ -912,42 +959,19 @@ class PaperRAGPlugin(Star):
         if not papers_path.exists():
             papers_path.mkdir(parents=True, exist_ok=True)
 
-        yield event.plain_result(f"🔍 在arXiv搜索: \"{query}\"\n最大下载数量: {max_results}")
+        yield event.plain_result(f"🔍 在CORE搜索: \"{query}\"\n最大下载数量: {max_results}")
 
         try:
-            # Step 1: Search arxiv
-            yield event.plain_result("📡 正在搜索arXiv...")
+            # Step 1: Search CORE API
+            yield event.plain_result("📡 正在搜索CORE...")
+            core_client = CoreAPIClient(core_api_key)
+            works = core_client.search_by_title(query, limit=max_results)
 
-            search_result = await arxiv_client.call_tool_with_reconnect(
-                tool_name="search_arxiv",
-                arguments={"query": query, "max_results": max_results},
-                read_timeout_seconds=timedelta(seconds=60)
-            )
-
-            if not search_result or not hasattr(search_result, 'content'):
-                yield event.plain_result("❌ arXiv搜索失败: 无返回结果")
-                return
-
-            # Parse search results
-            papers_info = []
-            for content_block in search_result.content:
-                text = getattr(content_block, 'text', None)
-                if text:
-                    try:
-                        paper_data = json.loads(text)
-                        if isinstance(paper_data, dict):
-                            papers_info.append(paper_data)
-                        elif isinstance(paper_data, list):
-                            papers_info.extend(paper_data)
-                    except json.JSONDecodeError:
-                        logger.debug(f"arXiv返回非JSON内容: {text[:200]}...")
-                        continue
-
-            if not papers_info:
+            if not works:
                 yield event.plain_result("❌ 未找到相关论文")
                 return
 
-            yield event.plain_result(f"✅ 找到 {len(papers_info)} 篇论文")
+            yield event.plain_result(f"✅ 找到 {len(works)} 篇论文")
 
             # Step 2: Download each paper
             engine = self._get_engine()
@@ -959,32 +983,40 @@ class PaperRAGPlugin(Star):
             failed = 0
             skipped = 0
 
-            for i, paper in enumerate(papers_info, 1):
+            for i, work in enumerate(works, 1):
                 # 提取论文信息
-                paper_id = paper.get('id', paper.get('paper_id', ''))
-                title = paper.get('title', 'unknown')
-                arxiv_url = paper.get('url', paper.get('arxiv_url', ''))
+                work_id = work.get('id', '')
+                title = work.get('title', 'unknown')
+                source_urls = work.get('sourceFulltextUrls', []) or []
 
-                if not paper_id and not arxiv_url:
-                    logger.warning(f"⚠️ 论文信息缺少ID或URL: {paper}")
+                if not title:
+                    logger.warning(f"⚠️ 论文信息缺少标题: {work}")
                     failed += 1
                     continue
 
-                yield event.plain_result(f"\n📄 [{i}/{len(papers_info)}] {title[:60]}...")
+                yield event.plain_result(f"\n📄 [{i}/{len(works)}] {title[:60]}...")
+
+                # 提取下载URL（优先使用arXiv链接）
+                pdf_url = None
+                for url in source_urls:
+                    if 'arxiv.org/pdf' in url:
+                        pdf_url = url
+                        break
+                if not pdf_url and source_urls:
+                    pdf_url = source_urls[0]
+
+                if not pdf_url:
+                    yield event.plain_result(f"   ⚠️ 无可下载链接")
+                    failed += 1
+                    continue
 
                 # 确定文件名
-                if paper_id:
-                    pdf_filename = f"{paper_id}.pdf"
+                arxiv_id = core_client.extract_arxiv_id(work)
+                if arxiv_id:
+                    pdf_filename = f"{arxiv_id}.pdf"
                 else:
-                    # 从URL提取arXiv ID
-                    match = re.search(r'(\d+\.\d+)', arxiv_url)
-                    if match:
-                        paper_id = match.group(1)
-                        pdf_filename = f"{paper_id}.pdf"
-                    else:
-                        # 使用标题生成文件名
-                        safe_title = re.sub(r'[^\w\s-]', '', title)[:50]
-                        pdf_filename = f"{safe_title}.pdf"
+                    safe_title = re.sub(r'[^\w\s-]', '', title)[:50]
+                    pdf_filename = f"{work_id}_{safe_title}.pdf"
 
                 pdf_path = papers_path / pdf_filename
 
@@ -992,72 +1024,46 @@ class PaperRAGPlugin(Star):
                 if pdf_path.exists():
                     yield event.plain_result(f"   ⏭️ PDF已存在，跳过下载")
                     skipped += 1
-                    # 仍然添加到数据库
                     result = await engine.add_paper(str(pdf_path))
                     if result.get("status") == "success":
                         successful += 1
                         yield event.plain_result(f"   ✅ 已添加 (chunks: {result.get('chunks_added', 0)})")
-                    else:
-                        yield event.plain_result(f"   ⚠️ 添加失败: {result.get('message', 'unknown')}")
                     continue
 
                 # 下载PDF
                 try:
-                    # 使用arXiv API下载PDF
-                    if not paper_id:
-                        # 从URL提取ID
-                        match = re.search(r'(\d+\.\d+)', arxiv_url)
-                        if match:
-                            paper_id = match.group(1)
+                    yield event.plain_result(f"   📥 下载PDF: {pdf_url[:80]}...")
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+                    }
+                    pdf_response = requests.get(pdf_url, headers=headers, timeout=120, stream=True)
 
-                    if paper_id:
-                        # arXiv PDF下载URL格式
-                        pdf_url = f"https://arxiv.org/pdf/{paper_id}.pdf"
-                        yield event.plain_result(f"   📥 下载PDF: {pdf_url}")
+                    if pdf_response.status_code == 200:
+                        with open(pdf_path, 'wb') as f:
+                            for chunk in pdf_response.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                        file_size = pdf_path.stat().st_size / (1024 * 1024)
+                        yield event.plain_result(f"   ✅ 下载完成 ({file_size:.1f} MB)")
 
-                        # 下载文件
-                        headers = {
-                            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-                        }
-                        pdf_response = requests.get(pdf_url, headers=headers, timeout=120, stream=True)
-
-                        if pdf_response.status_code == 200:
-                            with open(pdf_path, 'wb') as f:
-                                for chunk in pdf_response.iter_content(chunk_size=8192):
-                                    f.write(chunk)
-                            file_size = pdf_path.stat().st_size / (1024 * 1024)
-                            yield event.plain_result(f"   ✅ 下载完成 ({file_size:.1f} MB)")
+                        # Add to database
+                        result = await engine.add_paper(str(pdf_path))
+                        if result.get("status") == "success":
+                            successful += 1
+                            yield event.plain_result(f"   ✅ 已添加 (chunks: {result.get('chunks_added', 0)})")
                         else:
-                            yield event.plain_result(f"   ❌ 下载失败: HTTP {pdf_response.status_code}")
-                            failed += 1
-                            continue
+                            yield event.plain_result(f"   ⚠️ 添加失败: {result.get('message', 'unknown')}")
                     else:
-                        yield event.plain_result(f"   ❌ 无法确定arXiv ID")
+                        yield event.plain_result(f"   ❌ 下载失败: HTTP {pdf_response.status_code}")
                         failed += 1
-                        continue
 
                 except Exception as e:
                     logger.error(f"下载论文失败: {e}")
                     yield event.plain_result(f"   ❌ 下载失败: {e}")
                     failed += 1
-                    continue
-
-                # Step 3: Add to database
-                try:
-                    result = await engine.add_paper(str(pdf_path))
-                    if result.get("status") == "success":
-                        successful += 1
-                        yield event.plain_result(f"   ✅ 已添加到数据库 (chunks: {result.get('chunks_added', 0)})")
-                    else:
-                        yield event.plain_result(f"   ⚠️ 添加失败: {result.get('message', 'unknown')}")
-                except Exception as e:
-                    logger.error(f"添加论文失败: {e}")
-                    yield event.plain_result(f"   ❌ 添加失败: {e}")
-                    failed += 1
 
             # Summary
             output = f"""
-📊 **arXiv论文下载完成**
+📊 **CORE论文下载完成**
 
 ✅ 成功: {successful}
 ⏭️ 跳过: {skipped} (已存在)
@@ -1077,7 +1083,7 @@ class PaperRAGPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @paper_commands.command("arxiv_refs")
     async def cmd_arxiv_refs(self, event: AstrMessageEvent, top_k: int = 10, max_per_paper: int = 3):
-        """Download highly-cited reference papers from arxiv and add to database (Admin)
+        """Download highly-cited reference papers via CORE API and add to database (Admin)
 
         Args:
             top_k: Number of top-cited references to process (default: 10)
@@ -1092,20 +1098,12 @@ class PaperRAGPlugin(Star):
             yield event.plain_result("❌ RAG engine is not ready")
             return
 
-        # Get MCP tool manager
-        try:
-            mcp_manager = self.context.get_llm_tool_manager()
-            mcp_clients = mcp_manager.mcp_client_dict
-        except Exception as e:
-            logger.error(f"Failed to get MCP manager: {e}")
-            yield event.plain_result(f"❌ 无法获取MCP工具管理器: {e}")
+        # Check CORE API key
+        core_api_key = self.config.get("core_api_key", "")
+        if not core_api_key:
+            yield event.plain_result("❌ CORE API Key未配置\n请在插件配置中设置 core_api_key")
             return
 
-        if "arxiv" not in mcp_clients:
-            yield event.plain_result("❌ arxiv MCP服务器未连接\n请检查 mcp_server.json 配置")
-            return
-
-        arxiv_client = mcp_clients["arxiv"]
         papers_dir = self.config.get("papers_dir", "./papers")
         papers_path = Path(papers_dir)
         if not papers_path.exists():
@@ -1131,17 +1129,16 @@ class PaperRAGPlugin(Star):
             top_refs = references[:top_k]
             yield event.plain_result(f"📚 找到 {len(references)} 种参考文献，取前 {len(top_refs)} 个高频引用")
 
-            # Step 2: Search and download each reference paper from arxiv
+            # Step 2: Search and download each reference paper via CORE API
             successful = 0
             failed = 0
             skipped = 0
             total_downloaded = 0
 
-            import re
+            core_client = CoreAPIClient(core_api_key)
 
             for i, ref in enumerate(top_refs, 1):
                 title = ref.get("title", "")
-                authors = ref.get("authors", "")
                 year = ref.get("year", "")
 
                 if not title:
@@ -1149,73 +1146,48 @@ class PaperRAGPlugin(Star):
 
                 yield event.plain_result(f"\n[{i}/{len(top_refs)}] 📝 {title[:60]}...")
 
-                # Build search query from title and authors
-                search_parts = [title]
-                if authors:
-                    # Extract first author surname
-                    first_author = authors.split(',')[0].strip()
-                    search_parts.append(first_author)
-                if year:
-                    search_parts.append(str(year))
-
-                search_query = " ".join(search_parts)
-                yield event.plain_result(f"   🔍 搜索: {search_query[:80]}...")
-
                 try:
-                    # Search arxiv
-                    search_result = await arxiv_client.call_tool_with_reconnect(
-                        tool_name="search_arxiv",
-                        arguments={"query": search_query, "max_results": max_per_paper},
-                        read_timeout_seconds=timedelta(seconds=60)
-                    )
+                    # Search CORE API
+                    yield event.plain_result(f"   🔍 搜索: {title[:60]}...")
+                    works = core_client.search_by_title(title, year=int(year) if year else None, limit=max_per_paper)
 
-                    if not search_result or not hasattr(search_result, 'content'):
-                        yield event.plain_result(f"   ⚠️ 搜索无结果")
-                        failed += 1
-                        continue
-
-                    # Parse results
-                    papers_info = []
-                    for content_block in search_result.content:
-                        text = getattr(content_block, 'text', None)
-                        if text:
-                            try:
-                                paper_data = json.loads(text)
-                                if isinstance(paper_data, dict):
-                                    papers_info.append(paper_data)
-                                elif isinstance(paper_data, list):
-                                    papers_info.extend(paper_data)
-                            except json.JSONDecodeError:
-                                continue
-
-                    if not papers_info:
+                    if not works:
                         yield event.plain_result(f"   ⚠️ 未找到相关论文")
                         failed += 1
                         continue
 
                     # Download first (most relevant) result
-                    paper = papers_info[0]
-                    paper_id = paper.get('id', paper.get('paper_id', ''))
+                    work = works[0]
+                    source_urls = work.get("sourceFulltextUrls", []) or []
 
-                    if not paper_id:
-                        # Try to extract from URL
-                        arxiv_url = paper.get('url', paper.get('arxiv_url', ''))
-                        match = re.search(r'(\d+\.\d+)', arxiv_url)
-                        if match:
-                            paper_id = match.group(1)
+                    # 提取下载URL（优先使用arXiv链接）
+                    pdf_url = None
+                    for url in source_urls:
+                        if 'arxiv.org/pdf' in url:
+                            pdf_url = url
+                            break
+                    if not pdf_url and source_urls:
+                        pdf_url = source_urls[0]
 
-                    if not paper_id:
-                        yield event.plain_result(f"   ⚠️ 无法确定arXiv ID")
+                    if not pdf_url:
+                        yield event.plain_result(f"   ⚠️ 无可下载链接")
                         failed += 1
                         continue
 
-                    pdf_filename = f"{paper_id}.pdf"
+                    # 确定文件名
+                    arxiv_id = core_client.extract_arxiv_id(work)
+                    if arxiv_id:
+                        pdf_filename = f"{arxiv_id}.pdf"
+                    else:
+                        work_id = work.get('id', 'unknown')
+                        safe_title = re.sub(r'[^\w\s-]', '', title)[:50]
+                        pdf_filename = f"{work_id}_{safe_title}.pdf"
+
                     pdf_path = papers_path / pdf_filename
 
                     if pdf_path.exists():
                         yield event.plain_result(f"   ⏭️ PDF已存在，跳过")
                         skipped += 1
-                        # Still add to database
                         result = await engine.add_paper(str(pdf_path))
                         if result.get("status") == "success":
                             successful += 1
@@ -1223,9 +1195,7 @@ class PaperRAGPlugin(Star):
                         continue
 
                     # Download PDF
-                    pdf_url = f"https://arxiv.org/pdf/{paper_id}.pdf"
                     yield event.plain_result(f"   📥 下载: {pdf_filename}")
-
                     headers = {
                         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
                     }
@@ -1257,7 +1227,7 @@ class PaperRAGPlugin(Star):
 
             # Summary
             output = f"""
-📊 **高频引用论文下载完成**
+📊 **CORE高频引用论文下载完成**
 
 ✅ 成功: {successful}
 ⏭️ 跳过: {skipped}
@@ -1270,7 +1240,7 @@ class PaperRAGPlugin(Star):
             yield event.plain_result(output.strip())
 
         except Exception as e:
-            logger.error(f"arXiv批量下载失败: {e}")
+            logger.error(f"CORE批量下载失败: {e}")
             import traceback
             logger.error(traceback.format_exc())
             yield event.plain_result(f"❌ 操作失败: {e}")

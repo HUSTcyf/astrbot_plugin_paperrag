@@ -354,6 +354,13 @@
         "hint": "启用后将使用 GPT-4o-mini 解析参考文献的标题、作者、年份等信息，比正则表达式更准确。需要配置 text_provider_id。arXiv MCP 可用于查询论文详情。",
         "default": true
     },
+    "core_api_key": {
+        "description": "CORE API Key（用于替代arXiv MCP搜索论文）",
+        "type": "string",
+        "hint": "从 https://core.ac.uk/services/api 获取API Key，用于搜索和下载开放获取论文",
+        "obvious_hint": true,
+        "default": ""
+    },
     "ollama": {
         "description": "Ollama本地Embedding配置",
         "type": "object",

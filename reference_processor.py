@@ -17,7 +17,7 @@ import os
 import requests
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from astrbot.api import logger
 
@@ -32,11 +32,7 @@ class Reference:
     ref_year: Optional[int]  # 年份
     ref_doi: Optional[str]  # DOI
     ref_venue: Optional[str]  # 期刊/会议
-    ref_cited_by: List[str] = None  # 正文中引用此文献的位置（chunk索引）
-
-    def __post_init__(self):
-        if self.ref_cited_by is None:
-            self.ref_cited_by = []
+    ref_cited_by: List[str] = field(default_factory=list)  # 正文中引用此文献的位置（chunk索引）
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -229,60 +225,46 @@ class ReferenceExtractor:
             logger.info(f"       年份: {ref.ref_year or 'N/A'}, DOI: {ref.ref_doi or 'N/A'}")
         return references
 
-    def extract_references_from_pdf(self, pdf_path: str) -> List[Reference]:
-        """
-        从 PDF 文件提取参考文献
-
-        Args:
-            pdf_path: PDF 文件路径
-
-        Returns:
-            Reference对象列表
-        """
-        try:
-            import fitz
-            doc = fitz.open(pdf_path)
-            text = ""
-            for page in doc:
-                text += page.get_text()
-            doc.close()
-            return self.extract_references(text)
-        except Exception as e:
-            logger.error(f"❌ PDF 文本提取失败: {e}")
-            return []
-        return references
-
     def _find_reference_section(self, text: str) -> Optional[str]:
-        """找到参考文献部分"""
+        """找到参考文献部分
+
+        策略：
+        1. 从 "References"（不区分大小写）标题之后开始
+        2. 找到最后一个有效的编号参考文献行
+        3. 遇到表格分隔行 | --- | --- | 时截断
+        """
         lines = text.split('\n')
         ref_start = -1
-        ref_end = len(lines)
 
+        # 找到 "References" 标题位置
         for i, line in enumerate(lines):
             line_stripped = line.strip().lower()
-            # 检查是否是参考文献部分的标题（需要是独立的标题行，不是句子中的一部分）
-            is_reference_header = False
             for kw in self.REFERENCE_SECTION_KEYWORDS:
-                # 精确匹配：整行就是关键词，或者只有关键词+空格
                 if line_stripped == kw or line_stripped.startswith(kw + ' '):
-                    is_reference_header = True
+                    ref_start = i + 1
                     break
 
-            if is_reference_header:
-                ref_start = i + 1
-                continue
+        if ref_start < 0:
+            return None
 
-            # 如果已经找到参考文献部分，检查是否到达其他部分
-            if ref_start >= 0:
-                # 常见的新章节标题（表示参考文献部分结束）
-                if re.match(r'^(appendix|acknowledg|author|bio|supplementary)', line_stripped):
-                    ref_end = i
-                    break
+        # 找到最后一个编号参考文献行，遇到表格分隔行直接截断
+        ref_end = len(lines)
+        for i, line in enumerate(lines[ref_start:], start=ref_start):
+            stripped = line.strip()
+            # 遇到 Markdown 表格分隔行 | --- | --- | 直接截断
+            if stripped.startswith('|') and stripped.count('|') >= 3:
+                ref_end = i
+                break
+            # 记录最后一个编号参考文献行
+            if re.match(r'^\d+\.\s+', stripped) or re.match(r'^\[\d+\]', stripped):
+                ref_end = i + 1
 
-        if ref_start >= 0 and ref_start < ref_end:
-            return '\n'.join(lines[ref_start:ref_end])
+        if ref_start >= ref_end:
+            return None
 
-        return None
+        result = '\n'.join(lines[ref_start:ref_end])
+        logger.info(f"📝 参考文献提取成功: {len(result)} 字符, {ref_end - ref_start} 行")
+        return result
 
     def _split_reference_lines(self, ref_text: str) -> List[str]:
         """
@@ -923,19 +905,6 @@ class GrobidReferenceParser:
 
         return []
 
-    def parse_references_text(self, pdf_path: str) -> List[Reference]:
-        """
-        从 PDF 的参考文献文本解析（备选方案，当 Grobid 解析失败时）
-
-        Args:
-            pdf_path: PDF 文件路径
-
-        Returns:
-            Reference 对象列表
-        """
-        extractor = ReferenceExtractor()
-        return extractor.extract_references_from_pdf(pdf_path)
-
     def _parse_grobid_response(self, data: dict) -> List[Reference]:
         """解析 Grobid JSON 响应"""
         references = []
@@ -1142,6 +1111,8 @@ class GrobidReferenceParser:
             idnos = bibl.findall('.//idno')
 
         for idno in idnos:
+            if not idno.text: 
+                idno.text = ''
             idno_type = idno.get('type', '')
             if 'doi' in idno_type.lower() or idno.text.startswith('10.'):
                 return idno.text or ''
@@ -1365,7 +1336,7 @@ def process_references_and_citations_grobid(
             doc = fitz.open(pdf_path)
             text = ""
             for page in doc:
-                text += page.get_text()
+                text += str(page.get_text())
             doc.close()
             references = extractor.extract_references(text)
         except Exception as e:
@@ -1659,13 +1630,9 @@ class LLMReferenceParser:
         logger.info(f"📝 开始 LLM 参考文献解析（整段模式），文本长度: {len(ref_section)} 字符")
 
         prompt = self.SECTION_PARSE_PROMPT.format(ref_section=ref_section)
-        logger.debug(f"📝 [LLM调试] Prompt长度: {len(prompt)} 字符")
-        logger.debug(f"📝 [LLM调试] Prompt预览: {prompt[:300]}...")
 
         try:
             response = await self._call_llm(prompt)
-            logger.debug(f"📝 [LLM调试] Raw响应长度: {len(response) if response else 0}")
-            logger.debug(f"📝 [LLM调试] Raw响应预览: {response[:500] if response else 'None'}")
 
             if not response:
                 logger.warning("⚠️ LLM 未返回有效响应")
@@ -1760,13 +1727,9 @@ class LLMReferenceParser:
         ])
 
         prompt = self.BATCH_PARSE_PROMPT.format(reference_list=ref_list_text)
-        logger.debug(f"📝 [LLM调试] Prompt长度: {len(prompt)} 字符")
-        logger.debug(f"📝 [LLM调试] Prompt前200字符: {prompt[:200]}")
 
         try:
             response = await self._call_llm(prompt)
-            logger.debug(f"📝 [LLM调试] Raw响应长度: {len(response) if response else 0}")
-            logger.debug(f"📝 [LLM调试] Raw响应前500字符: {response[:500] if response else 'None'}")
 
             if not response:
                 logger.warning("⚠️ LLM 未返回有效响应")
@@ -1774,8 +1737,6 @@ class LLMReferenceParser:
 
             # 提取 JSON
             json_str = self._extract_json(response)
-            logger.debug(f"📝 [LLM调试] 提取的JSON长度: {len(json_str) if json_str else 0}")
-            logger.debug(f"📝 [LLM调试] 提取的JSON前300字符: {json_str[:300] if json_str else 'None'}")
 
             if not json_str:
                 logger.warning("⚠️ 无法从 LLM 响应中提取 JSON")
@@ -1929,10 +1890,6 @@ async def process_references_with_llm(
     if not ref_section:
         logger.debug("📝 未找到参考文献部分")
         return [], chunks
-
-    # 📝 调试：查看参考文献部分内容
-    logger.debug(f"📝 参考文献部分预览 (前500字符):\n{ref_section[:500]}")
-    logger.debug(f"📝 参考文献部分总长度: {len(ref_section)} 字符, {len(ref_section.split(chr(10)))} 行")
 
     # 2. 直接将整段参考文献文本传给 LLM，让 LLM 自动分割+解析
     llm_parser = LLMReferenceParser(llm_config, arxiv_client)

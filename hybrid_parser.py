@@ -157,6 +157,7 @@ class HybridPDFParser:
                     "tables_count": metadata.get("tables_count", 0),
                     "formulas_count": metadata.get("formulas_count", 0),
                     "multimodal_data": metadata.get("multimodal_data", {}),
+                    "raw_text": text,  # 保存原始文本用于参考文献提取
                     "added_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
             )
@@ -250,9 +251,12 @@ class HybridPDFParser:
             all_nodes = []
             chunk_index = 0
 
-            # 保存原始文本用于引用提取
-            raw_text = documents[0].text
-
+            # 保存原始文本用于引用提取（不使用增强文本）
+            # 增强文本会跳过表格等内容，可能导致参考文献部分不完整
+            raw_text = documents[0].metadata.get("raw_text", documents[0].text)
+            logger.info(f"📝 原始文本总长度: {len(raw_text)} 字符, {len(raw_text.split(chr(10)))} 行")
+            # 调试：查找 References 在原始文本中的位置
+            lines = raw_text.split('\n')
             for doc in documents:
                 nodes = self._semantic_chunk(doc.text, doc.metadata, chunk_index)
                 all_nodes.extend(nodes)
