@@ -16,7 +16,9 @@ Qasper 数据集评估脚本
 用法:
     # 官方 Qasper 评估
     python run_evaluation_qasper.py --all                         # 生成 predictions 并评估
+    python run_evaluation_qasper.py --all --force_english          # 生成英文 predictions 并评估
     python run_evaluation_qasper.py --generate                    # 仅生成 predictions
+    python run_evaluation_qasper.py --generate --force_english     # 生成英文 predictions
     python run_evaluation_qasper.py --evaluate                    # 仅运行评估
 
     # RAGAS 评估（使用 Milvus Qasper 数据库）
@@ -212,7 +214,8 @@ async def generate_predictions(
     output_file: Path,
     batch_size: int = 10,
     delay_between_batches: float = 1.0,
-    resume: bool = True
+    resume: bool = True,
+    force_english: bool = False
 ) -> int:
     """
     生成预测文件
@@ -224,6 +227,7 @@ async def generate_predictions(
         batch_size: 每批处理的问题数
         delay_between_batches: 批次间的延迟（秒）
         resume: 是否启用断点续传（跳过已有答案的问题，默认True）
+        force_english: 强制使用英文回答（默认False）
 
     Returns:
         新生成的预测数量
@@ -289,11 +293,16 @@ async def generate_predictions(
         question = qa_info["question"]
 
         # 调用 RAG 引擎获取答案
+        evidence = []
         try:
-            result = await engine.search(question, mode="rag")
+            result = await engine.search(question, mode="rag", force_english=force_english)
 
             if result.get("type") == "rag":
                 answer = result.get("answer", "")
+                # 提取 evidence：从检索结果中获取来源文本
+                sources = result.get("sources", [])
+                for src in sources:
+                    evidence.append(src.get("text", ""))
             elif result.get("type") == "error":
                 answer = ""
                 print(f"  ⚠️  [{question_id}] 错误: {result.get('message', 'Unknown error')}")
@@ -307,7 +316,7 @@ async def generate_predictions(
         existing_predictions[question_id] = {
             "question_id": question_id,
             "predicted_answer": answer,
-            "predicted_evidence": []
+            "predicted_evidence": evidence
         }
 
         processed += 1
@@ -357,7 +366,7 @@ def run_evaluator(predictions_file: Path, gold_file: Path, output_dir: Path, tex
         sys.exit(1)
 
     # 使用官方评估脚本
-    evaluator_script = SCRIPT_DIR / "qasper_evaluator.py"
+    evaluator_script = SCRIPT_DIR / "datasets" / "qasper_evaluator.py"
     if not evaluator_script.exists():
         print(f"❌ 评估脚本不存在: {evaluator_script}")
         sys.exit(1)
@@ -725,7 +734,8 @@ async def main_async(args):
             predictions_file,
             batch_size=args.batch_size,
             delay_between_batches=args.delay,
-            resume=not args.no_resume
+            resume=not args.no_resume,
+            force_english=args.force_english
         )
 
     if args.evaluate or args.all:
@@ -744,12 +754,12 @@ async def main_async(args):
 
         if choice == "1":
             engine = await initialize_rag_engine(config, milvus_lite_path=milvus_qasper_path)
-            await generate_predictions(engine, test_data, predictions_file, resume=True)
+            await generate_predictions(engine, test_data, predictions_file, resume=True, force_english=args.force_english)
         elif choice == "2":
             run_evaluator(predictions_file, gold_file, output_dir, args.text_evidence_only)
         elif choice == "3":
             engine = await initialize_rag_engine(config, milvus_lite_path=milvus_qasper_path)
-            await generate_predictions(engine, test_data, predictions_file, resume=True)
+            await generate_predictions(engine, test_data, predictions_file, resume=True, force_english=args.force_english)
             run_evaluator(predictions_file, gold_file, output_dir, args.text_evidence_only)
         else:
             print("已退出")
@@ -763,7 +773,9 @@ def main():
 示例:
   # 官方 Qasper 评估
   python run_evaluation_qasper.py --all                         # 生成 predictions 并评估（支持断点续传）
+  python run_evaluation_qasper.py --all --force_english         # 生成英文 predictions 并评估
   python run_evaluation_qasper.py --generate                    # 仅生成 predictions（支持断点续传）
+  python run_evaluation_qasper.py --generate --force_english     # 生成英文 predictions
   python run_evaluation_qasper.py --generate --no_resume        # 禁用断点续传，重新生成所有预测
   python run_evaluation_qasper.py --evaluate                    # 仅运行评估
 
@@ -791,6 +803,8 @@ def main():
                         help="仅使用文本证据 (忽略表格/图片证据)")
     parser.add_argument("--no_resume", action="store_true",
                         help="禁用断点续传，重新生成所有预测（默认启用断点续传）")
+    parser.add_argument("--force_english", action="store_true",
+                        help="强制使用英文回答（用于英文数据集评估，默认关闭）")
 
     # RAGAS 评估参数
     parser.add_argument("--ragas", action="store_true", help="使用 RAGAS 评估模式 (Qasper)")

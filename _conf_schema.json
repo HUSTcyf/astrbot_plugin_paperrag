@@ -410,5 +410,110 @@
                 "hint": "同时处理的文本数量。较大的值速度更快但占用更多内存"
             }
         }
+    },
+    "enable_graph_rag": {
+        "description": "是否启用 Graph RAG（图谱增强检索）",
+        "type": "bool",
+        "hint": "启用后将使用知识图谱增强检索，支持复杂关系查询和多跳推理。需要额外构建图谱索引。",
+        "obvious_hint": true,
+        "default": false
+    },
+    "graph_rag": {
+        "description": "Graph RAG 配置",
+        "type": "object",
+        "hint": "配置图谱存储类型、Neo4j连接、检索参数等",
+        "obvious_hint": true,
+        "items": {
+            "storage_type": {
+                "description": "图谱存储类型",
+                "type": "string",
+                "default": "memory",
+                "enum": ["memory", "neo4j"],
+                "hint": "memory: 适合小规模/测试（默认）；neo4j: 适合生产环境，需要 Docker 和 Neo4j"
+            },
+            "neo4j_uri": {
+                "description": "Neo4j 连接 URI",
+                "type": "string",
+                "default": "bolt://localhost:7687",
+                "hint": "Neo4j 数据库的连接地址"
+            },
+            "neo4j_user": {
+                "description": "Neo4j 用户名",
+                "type": "string",
+                "default": "neo4j"
+            },
+            "neo4j_password": {
+                "description": "Neo4j 密码",
+                "type": "string",
+                "default": "",
+                "hint": "请确保密码正确，否则无法连接 Neo4j"
+            },
+            "max_triplets_per_chunk": {
+                "description": "每个chunk抽取的最大三元组数",
+                "type": "int",
+                "default": 5,
+                "minimum": 1,
+                "maximum": 20,
+                "hint": "从每个文档块抽取三元组时，最多抽取的数量"
+            },
+            "graph_retrieval_top_k": {
+                "description": "图谱检索返回数量",
+                "type": "int",
+                "default": 5,
+                "minimum": 1,
+                "maximum": 20,
+                "hint": "从知识图谱中检索相关实体时返回的数量"
+            },
+            "hybrid_alpha": {
+                "description": "混合检索权重（0=纯图，1=纯向量）",
+                "type": "float",
+                "default": 0.5,
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "hint": "RRF 融合中向量检索的权重。0.5 表示向量和图谱同等重要"
+            },
+            "auto_build": {
+                "description": "自动构建知识图谱",
+                "type": "bool",
+                "default": false,
+                "hint": "启用后，每添加一定数量的论文会自动更新知识图谱"
+            },
+            "auto_build_threshold": {
+                "description": "自动构建阈值",
+                "type": "int",
+                "default": 10,
+                "minimum": 1,
+                "maximum": 100,
+                "hint": "每添加这么多篇论文后自动构建一次知识图谱"
+            },
+            "multimodal_extraction": {
+                "description": "多模态图谱抽取配置",
+                "type": "object",
+                "hint": "配置多模态图谱抽取（图片+文本联合）",
+                "obvious_hint": true,
+                "items": {
+                    "enabled": {
+                        "description": "启用多模态图谱抽取",
+                        "type": "bool",
+                        "default": true,
+                        "hint": "启用后将使用图片+文本联合抽取三元组，需确保 PDF 已提取图片"
+                    },
+                    "max_images_per_chunk": {
+                        "description": "每个chunk最多处理图片数",
+                        "type": "int",
+                        "default": 1,
+                        "minimum": 0,
+                        "maximum": 5,
+                        "hint": "每个 chunk 最多处理的图片数量，0 表示禁用"
+                    },
+                    "extract_image_entities": {
+                        "description": "提取图片为实体",
+                        "type": "bool",
+                        "default": true,
+                        "hint": "是否将图片（图1、Table 2等）作为实体添加到图谱"
+                    }
+                }
+            }
+        }
     }
 }

@@ -320,9 +320,11 @@ class LlamaCppVLMProvider:
             else:
                 content = prompt or "Describe this image."
 
-            messages = [
-                {"role": "user", "content": content}
-            ]
+            # 添加系统消息（如果提供了 system_prompt）
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": content})
 
             # 在线程池中执行推理
             assert self._llama is not None, "Llama 未初始化"

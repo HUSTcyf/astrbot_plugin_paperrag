@@ -77,6 +77,35 @@ def load_qasper_data(data_dir: Path, split: str = "all") -> dict:
     return result
 
 
+def load_qasper_raw_data(qasper_json_file: Path, split: str = "all") -> dict:
+    """
+    加载原始格式的 Qasper 数据集（包含 figures_and_tables）
+
+    Args:
+        qasper_json_file: 原始格式的 JSON 文件 (如 qasper-test-v0.3.json)
+        split: "all", "train", "validation", "test" (保留参数兼容性)
+
+    Returns:
+        {paper_id: paper_data} 字典
+    """
+    if not qasper_json_file.exists():
+        print(f"⚠️  原始格式文件不存在: {qasper_json_file}")
+        return {}
+
+    print(f"加载原始格式数据集: {qasper_json_file}")
+    with open(qasper_json_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # 统计
+    has_figures = sum(1 for p in data.values() if p.get("figures_and_tables"))
+    total_figs = sum(len(p.get("figures_and_tables", [])) for p in data.values())
+    print(f"  加载了 {len(data)} 篇论文")
+    print(f"  含图表的论文: {has_figures}")
+    print(f"  图表总数: {total_figs}")
+
+    return data
+
+
 def prepare_figure_caption_nodes(paper: dict, paper_id: str) -> List[dict]:
     """
     从论文中提取图表 caption 作为独立节点
@@ -92,7 +121,8 @@ def prepare_figure_caption_nodes(paper: dict, paper_id: str) -> List[dict]:
     metadata = {
         "paper_id": paper_id,
         "file_name": paper_id,
-        "paper_title": paper.get("title", ""),
+        # 处理两种格式的标题字段
+        "paper_title": paper.get("title") or paper.get("paper_title", ""),
     }
 
     figures_and_tables = paper.get("figures_and_tables", [])
@@ -144,7 +174,9 @@ def prepare_nodes_from_paper(paper: dict, paper_id: str) -> tuple:
     metadata = {
         "paper_id": paper_id,
         "file_name": paper_id,  # 兼容 file_name 字段用于查询
-        "paper_title": paper.get("title", ""),  # Qasper 使用 title 而不是 paper_title
+        # 处理两种格式的标题字段
+        # 原始格式: "title", HuggingFace 格式: "paper_title"
+        "paper_title": paper.get("title") or paper.get("paper_title", ""),
         "abstract": paper.get("abstract", ""),
         "source_split": paper.get("source_split", ""),
         "doi": paper.get("doi"),
@@ -326,7 +358,8 @@ async def index_papers(
 
         all_nodes.extend(nodes)
         # Qasper 使用 paper_id 作为 file_name
-        paper_title = paper.get("title", paper_id)
+        # 处理两种格式的标题字段
+        paper_title = paper.get("title") or paper.get("paper_title", paper_id)
         paper_stats[paper_id] = {
             "file_name": paper_id,  # 使用 paper_id 作为 file_name
             "chunk_count": chunk_count,
@@ -387,8 +420,14 @@ async def main_async(args):
     data_dir = Path(args.data_dir) if args.data_dir else DEFAULT_DATA_DIR
 
     # 加载 Qasper 数据
-    print(f"\n加载 Qasper 数据集: {data_dir}")
-    papers_data = load_qasper_data(data_dir, split=args.split)
+    # 统一使用原始格式文件 qasper-test-v0.3.json 进行公平对比
+    # 原始格式包含 figures_and_tables，可用于 vision 模式
+    raw_qasper_file = SCRIPT_DIR / "datasets" / "qasper-test-v0.3.json"
+    print(f"\n加载 Qasper 原始格式数据集: {raw_qasper_file}")
+    papers_data = load_qasper_raw_data(raw_qasper_file)  # split 参数无意义，文件只有 test 集
+
+    # 是否包含图表 captions（vision 模式）
+    include_figures = args.include_figures_captions
 
     if not papers_data:
         print("❌ 没有加载到任何论文数据")
@@ -406,7 +445,7 @@ async def main_async(args):
 
     collection_name = "paper_embeddings"
 
-    # 根据是否包含图表 captions 选择数据库路径
+    # 根据是否包含图表 captions 选择数据库路径和统计文件
     include_figures = args.include_figures_captions
     if include_figures:
         default_qasper_path = str(SCRIPT_DIR / "data" / "milvus_qasper_vision.db")
@@ -417,7 +456,14 @@ async def main_async(args):
         default_stats_path = str(SCRIPT_DIR / "data" / "qasper_doc_stats_text.json")
         print("\n[INFO] text-only 模式")
 
+    # 如果用户显式指定了数据库路径，根据路径名自动选择 stats 文件
     milvus_qasper_path = args.milvus_qasper_path if args.milvus_qasper_path else default_qasper_path
+    if args.qasper_doc_stats:
+        stats_path = args.qasper_doc_stats
+    elif "vision" in milvus_qasper_path.lower():
+        stats_path = str(SCRIPT_DIR / "data" / "qasper_doc_stats_vision.json")
+    else:
+        stats_path = str(SCRIPT_DIR / "data" / "qasper_doc_stats_text.json")
     print(f"\n📦 Milvus Qasper 数据库路径: {milvus_qasper_path}")
 
     # 硬编码配置，不读取配置文件
@@ -446,8 +492,6 @@ async def main_async(args):
     )
 
     # 保存 qasper_doc_stats.json
-    stats_path = args.qasper_doc_stats if args.qasper_doc_stats else default_stats_path
-
     # 转换为与 paper_doc_stats.json 兼容的格式
     doc_stats = {}
     added_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")

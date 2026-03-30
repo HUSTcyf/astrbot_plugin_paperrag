@@ -19,7 +19,7 @@ import subprocess
 import requests
 from datetime import timedelta
 from pathlib import Path
-from typing import Optional, Union, TYPE_CHECKING
+from typing import Dict, Any, Optional, Union, TYPE_CHECKING, List, cast
 
 # 类型注解导入（仅在类型检查时导入，避免循环导入）
 if TYPE_CHECKING:
@@ -101,7 +101,7 @@ class CoreAPIClient:
     "paper_rag",
     "YourName",
     "本地文档库RAG检索插件 (支持PDF/Word/TXT/HTML, Gemini + Milvus Lite)",
-    "1.6.1",
+    "1.7.0",
     "https://github.com/your/repo"
 )
 class PaperRAGPlugin(Star):
@@ -120,6 +120,9 @@ class PaperRAGPlugin(Star):
         self.cache_ttl = self.config.get("cache_ttl_seconds", 3600)
         self.cache_max_size = self.config.get("cache_max_entries", 100)
         self._response_cache = {}
+
+        # Graph RAG 自动构建追踪
+        self._papers_since_graph_build = 0
 
         # RAG引擎（懒加载）
         self._engine = None
@@ -266,7 +269,18 @@ class PaperRAGPlugin(Star):
                     reranking_device=self.config.get("reranking_device", "auto"),
                     reranking_adaptive=self.config.get("reranking_adaptive", True),
                     reranking_threshold=self.config.get("reranking_threshold", 0.0),
-                    reranking_batch_size=self.config.get("reranking_batch_size", 32)
+                    reranking_batch_size=self.config.get("reranking_batch_size", 32),
+                    # Graph RAG 配置
+                    enable_graph_rag=self.config.get("enable_graph_rag", False),
+                    graph_storage_type=self.config.get("graph_rag", {}).get("storage_type", "memory"),
+                    graph_neo4j_uri=self.config.get("graph_rag", {}).get("neo4j_uri", "bolt://localhost:7687"),
+                    graph_neo4j_user=self.config.get("graph_rag", {}).get("neo4j_user", "neo4j"),
+                    graph_neo4j_password=self.config.get("graph_rag", {}).get("neo4j_password", ""),
+                    graph_max_triplets_per_chunk=self.config.get("graph_rag", {}).get("max_triplets_per_chunk", 5),
+                    graph_retrieval_top_k=self.config.get("graph_rag", {}).get("graph_retrieval_top_k", 5),
+                    graph_hybrid_alpha=self.config.get("graph_rag", {}).get("hybrid_alpha", 0.5),
+                    graph_auto_build=self.config.get("graph_rag", {}).get("auto_build", False),
+                    graph_auto_build_threshold=self.config.get("graph_rag", {}).get("auto_build_threshold", 10)
                 )
 
                 # 验证配置
@@ -321,6 +335,96 @@ class PaperRAGPlugin(Star):
             del self._response_cache[oldest_key]
 
         self._response_cache[cache_key] = (response, time.time())
+
+    async def _maybe_trigger_graph_auto_build(self, papers_added: int = 1) -> bool:
+        """
+        检查是否需要自动构建知识图谱
+
+        Args:
+            papers_added: 本次添加的论文数量
+
+        Returns:
+            是否触发了自动构建
+        """
+        if not self.config.get("enable_graph_rag", False):
+            return False
+
+        auto_build = self.config.get("graph_rag", {}).get("auto_build", False)
+        if not auto_build:
+            return False
+
+        self._papers_since_graph_build += papers_added
+        threshold = self.config.get("graph_rag", {}).get("auto_build_threshold", 10)
+
+        if self._papers_since_graph_build >= threshold:
+            logger.info(f"📚 自动构建知识图谱（已添加 {self._papers_since_graph_build} 篇论文）")
+            self._papers_since_graph_build = 0
+
+            # 执行图谱构建
+            try:
+                engine = self._get_engine()
+                if not engine:
+                    return False
+
+                # 触发构建（在后台异步执行，不阻塞命令响应）
+                # 注意：这会重新解析所有文档
+                import asyncio
+                asyncio.create_task(self._run_graph_build_in_background(engine))
+                return True
+            except Exception as e:
+                logger.error(f"自动构建知识图谱失败: {e}")
+                return False
+
+        return False
+
+    async def _run_graph_build_in_background(self, engine):
+        """后台运行图谱构建"""
+        try:
+            from .graph_rag_engine import GraphRAGEngine, GraphRAGConfig
+        except Exception:
+            from graph_rag_engine import GraphRAGEngine, GraphRAGConfig
+
+        graph_config = GraphRAGConfig(
+            enable_graph_rag=True,
+            storage_type=self.config.get("graph_rag", {}).get("storage_type", "memory"),
+            neo4j_uri=self.config.get("graph_rag", {}).get("neo4j_uri", "bolt://localhost:7687"),
+            neo4j_user=self.config.get("graph_rag", {}).get("neo4j_user", "neo4j"),
+            neo4j_password=self.config.get("graph_rag", {}).get("neo4j_password", ""),
+            max_triplets_per_chunk=self.config.get("graph_rag", {}).get("max_triplets_per_chunk", 5),
+            graph_retrieval_top_k=self.config.get("graph_rag", {}).get("graph_retrieval_top_k", 5),
+            hybrid_alpha=self.config.get("graph_rag", {}).get("hybrid_alpha", 0.5),
+            auto_build=self.config.get("graph_rag", {}).get("auto_build", False),
+            auto_build_threshold=self.config.get("graph_rag", {}).get("auto_build_threshold", 10),
+        )
+
+        graph_engine = GraphRAGEngine(graph_config, engine, self.context)
+        await graph_engine.initialize()
+
+        # 获取所有文档并构建图谱
+        from pathlib import Path
+        papers_dir = self.config.get("papers_dir", "./papers")
+        supported_extensions = ['.pdf', '.docx', '.doc', '.txt', '.md', '.html', '.htm']
+        doc_files = []
+        for ext in supported_extensions:
+            doc_files.extend(Path(papers_dir).glob(f"*{ext}"))
+        for ext in supported_extensions:
+            doc_files.extend(Path(papers_dir).glob(f"*{ext.upper()}"))
+        doc_files = [f for f in doc_files if not f.name.startswith("._")]
+
+        if not doc_files:
+            return
+
+        parser = engine._ensure_parser_initialized()
+        all_nodes = []
+        for doc_file in doc_files:
+            try:
+                nodes = await parser.parse_and_split(str(doc_file), {}, None)
+                all_nodes.extend(nodes)
+            except Exception:
+                pass
+
+        await graph_engine.build_graph_from_nodes(all_nodes)
+        logger.info("✅ 后台知识图谱构建完成")
 
     def _ensure_grobid_running(self):
         """
@@ -517,6 +621,9 @@ class PaperRAGPlugin(Star):
         arxiv_refs   - Download highly-cited reference papers from arxiv (Admin)
         arxiv_sync   - Sync MCP downloaded papers to paperrag database (Admin)
         arxiv_cleanup- Clean up old versions of arxiv papers (Admin)
+        graph_build  - Build knowledge graph from indexed documents
+        graph_stats  - Show knowledge graph statistics
+        graph_clear  - Clear knowledge graph (Admin)
         """
         pass
 
@@ -529,7 +636,7 @@ class PaperRAGPlugin(Star):
 
         Args:
             query: Search question
-            mode: Mode (rag=retrieval augmented generation, retrieve=retrieval only)
+            mode: Mode (rag=retrieval augmented generation, retrieve=retrieval only, auto=intent routing when Graph RAG enabled)
             top_k: Number of results to return
         """
         if not self.enabled:
@@ -557,8 +664,31 @@ class PaperRAGPlugin(Star):
         yield event.plain_result(f"🔍 Searching document library...\nQuestion: {query}")
 
         try:
+            # 意图识别与路由（当 mode="auto" 时）
+            actual_mode = mode
+            routing_info = ""
+            if mode == "auto" and self.config.get("enable_graph_rag", False):
+                try:
+                    from .graph_rag_router import create_router, RetrievalMode
+                except Exception:
+                    from graph_rag_router import create_router, RetrievalMode
+
+                router = create_router(context=self.context)
+                route_result = router.route(query)
+                actual_mode = route_result.mode.value
+                routing_info = f"\n📊 意图识别: {route_result.thinking}"
+                if route_result.entities:
+                    routing_info += f"\n🔑 实体: {', '.join(route_result.entities)}"
+                if route_result.query_refine != query:
+                    routing_info += f"\n🔄 查询优化: {route_result.query_refine}"
+                query = route_result.query_refine  # 使用优化后的查询
+                logger.info(f"🔀 路由决策: {actual_mode} - {route_result.thinking}")
+                yield event.plain_result(routing_info)
+            elif mode == "auto":
+                actual_mode = "rag"  # Graph RAG 未启用时默认回退到 RAG
+
             # Execute search
-            response = await engine.search(query, mode=mode)
+            response = await engine.search(query, mode=actual_mode)
 
             # 安全获取响应类型，避免 KeyError
             response_type = response.get("type", "unknown")
@@ -697,6 +827,12 @@ class PaperRAGPlugin(Star):
                         yield event.plain_result(
                             f"✅ [{idx}/{total_files}] {file_name} - {chunks_added} chunks"
                         )
+
+                        # 检查是否需要自动构建知识图谱
+                        if successful == 1:  # 只在第一批成功时检查
+                            auto_built = await self._maybe_trigger_graph_auto_build(successful)
+                            if auto_built:
+                                yield event.plain_result("📚 图谱自动构建已在后台触发")
                     else:
                         failed += 1
                         error_msg = result.get("message", "未知错误")
@@ -783,6 +919,11 @@ class PaperRAGPlugin(Star):
             if result.get("status") == "success":
                 chunks_added = result.get("chunks_added", 0)
                 yield event.plain_result(f"✅ {file_name}\n   └─ {chunks_added} chunks added")
+
+                # 检查是否需要自动构建知识图谱
+                auto_built = await self._maybe_trigger_graph_auto_build(1)
+                if auto_built:
+                    logger.info("📚 图谱自动构建已触发，将在后台运行")
             else:
                 error_msg = result.get("message", "Unknown error")
                 yield event.plain_result(f"❌ {file_name}\n   └─ {error_msg}")
@@ -1598,6 +1739,330 @@ class PaperRAGPlugin(Star):
 
         # Clear cache
         self._response_cache.clear()
+
+    @paper_commands.command("graph_build")
+    async def cmd_graph_build(self, event: AstrMessageEvent, confirm: str = ''):
+        """Build knowledge graph from indexed documents
+
+        Args:
+            confirm: Must be 'confirm' to proceed
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if confirm != "confirm":
+            yield event.plain_result(
+                "⚠️ 即将从已索引的文档构建知识图谱\n"
+                "注意：构建过程可能较慢（需要调用 LLM 抽取三元组）\n"
+                "使用 /paper graph_build confirm 确认执行"
+            )
+            return
+
+        # 检查 Graph RAG 是否启用
+        if not self.config.get("enable_graph_rag", False):
+            yield event.plain_result("❌ Graph RAG 功能未启用\n请在插件配置中启用 enable_graph_rag")
+            return
+
+        engine = self._get_engine()
+        if not engine:
+            yield event.plain_result("❌ RAG引擎未就绪")
+            return
+
+        yield event.plain_result("🔨 正在构建知识图谱...\n⏳ 请稍候，这可能需要几分钟...")
+
+        try:
+            # 获取索引管理器
+            index_manager = engine._ensure_index_manager_initialized()
+
+            # 获取所有论文列表（用于逐篇加载chunks）
+            yield event.plain_result("📖 正在从向量数据库读取论文列表...")
+
+            try:
+                papers = await index_manager.list_unique_documents()
+            except Exception as e:
+                yield event.plain_result(f"❌ 无法获取论文列表: {e}\n请确保已使用 /paper add 添加文档")
+                return
+
+            if not papers:
+                yield event.plain_result("📭 向量数据库中未找到已索引的文档\n请先使用 /paper add 添加文档")
+                return
+
+            paper_names = [p.get("file_name", "") for p in papers if p.get("file_name")]
+            yield event.plain_result(f"📚 找到 {len(paper_names)} 篇论文\n🔨 正在逐篇加载所有文档块...")
+
+            # 导入必要的模块
+            try:
+                from .graph_rag_engine import GraphRAGEngine, GraphRAGConfig, MemoryGraphStore
+            except Exception:
+                from graph_rag_engine import GraphRAGEngine, GraphRAGConfig, MemoryGraphStore
+
+            try:
+                from .graph_builder import MultimodalGraphBuilder
+            except Exception:
+                from graph_builder import MultimodalGraphBuilder
+
+            # ChunkNode 类用于适配 GraphBuilder
+            class ChunkNode:
+                """适配 GraphBuilder 的 Node 结构"""
+                def __init__(self, chunk: Dict[str, Any]):
+                    self.text = chunk.get("text", "")
+                    self.metadata = chunk.get("metadata", {})
+
+            import json
+
+            yield event.plain_result(f"📑 开始逐篇构建知识图谱 ({len(paper_names)} 篇论文)...")
+
+            # 创建 GraphRAGConfig（只创建一次）
+            graph_config = GraphRAGConfig(
+                enable_graph_rag=True,
+                storage_type=self.config.get("graph_rag", {}).get("storage_type", "memory"),
+                neo4j_uri=self.config.get("graph_rag", {}).get("neo4j_uri", "bolt://localhost:7687"),
+                neo4j_user=self.config.get("graph_rag", {}).get("neo4j_user", "neo4j"),
+                neo4j_password=self.config.get("graph_rag", {}).get("neo4j_password", ""),
+                max_triplets_per_chunk=self.config.get("graph_rag", {}).get("max_triplets_per_chunk", 5),
+                graph_retrieval_top_k=self.config.get("graph_rag", {}).get("graph_retrieval_top_k", 5),
+                hybrid_alpha=self.config.get("graph_rag", {}).get("hybrid_alpha", 0.5),
+                auto_build=self.config.get("graph_rag", {}).get("auto_build", False),
+                auto_build_threshold=self.config.get("graph_rag", {}).get("auto_build_threshold", 10),
+                multimodal_enabled=self.config.get("graph_rag", {}).get("multimodal_extraction", {}).get("enabled", True),
+                max_images_per_chunk=self.config.get("graph_rag", {}).get("multimodal_extraction", {}).get("max_images_per_chunk", 1),
+                extract_image_entities=self.config.get("graph_rag", {}).get("multimodal_extraction", {}).get("extract_image_entities", True),
+            )
+
+            # 创建图谱存储和构建器
+            graph_store = MemoryGraphStore()
+            builder = MultimodalGraphBuilder(config=graph_config, context=self.context)
+
+            # 初始化 LLM（只初始化一次）
+            await builder._ensure_llm_initialized()
+
+            # 逐篇处理：每篇论文处理完后立即构建图谱，不累积所有 chunks
+            total_stats = {
+                "entities_added": 0,
+                "text_triplets_added": 0,
+                "image_entities_added": 0,
+                "cross_modal_triplets_added": 0,
+                "chunks_processed": 0,
+                "chunks_with_images": 0,
+                "chunks_failed": 0,
+                "chunks_empty": 0
+            }
+
+            # 第二步：逐篇加载 chunks 并立即构建图谱
+            await index_manager._ensure_collection()
+            collection = index_manager._collection
+
+            for i, paper_name in enumerate(paper_names):
+                paper_name_escaped = paper_name.replace('"', '\\"')
+                try:
+                    # collection.query 是同步方法，需要用 run_in_executor 包装
+                    _collection = cast(Any, collection)
+                    raw_results = cast(
+                        List[Dict[str, Any]],
+                        await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda pn=paper_name_escaped: _collection.query(
+                                expr=f'metadata["file_name"] == "{pn}"',
+                                output_fields=["id", "text", "metadata"],
+                            )
+                        )
+                    )
+
+                    if not raw_results:
+                        continue
+
+                    yield event.plain_result(f"📄 [{i+1}/{len(paper_names)}] {paper_name} ({len(raw_results)} chunks)")
+
+                    # 解析该论文的 chunks
+                    paper_chunks = []
+                    for row in raw_results:
+                        chunk = {
+                            "id": row.get("id"),
+                            "text": row.get("text", ""),
+                        }
+                        meta = row.get("metadata", "{}")
+                        if isinstance(meta, str):
+                            try:
+                                meta = json.loads(meta)
+                            except Exception:
+                                meta = {"raw": meta}
+                        chunk["metadata"] = meta
+                        paper_chunks.append(chunk)
+
+                    # 立即为该论文创建节点并构建图谱
+                    nodes = [ChunkNode(chunk) for chunk in paper_chunks]
+                    stats = await builder.build_from_nodes(nodes, graph_store)
+
+                    # 累积统计
+                    total_stats["entities_added"] += stats.get("entities_added", 0)
+                    total_stats["text_triplets_added"] += stats.get("text_triplets_added", 0)
+                    total_stats["image_entities_added"] += stats.get("image_entities_added", 0)
+                    total_stats["cross_modal_triplets_added"] += stats.get("cross_modal_triplets_added", 0)
+                    total_stats["chunks_with_images"] += stats.get("chunks_with_images", 0)
+                    total_stats["chunks_failed"] += stats.get("chunks_failed", 0)
+                    total_stats["chunks_empty"] += stats.get("chunks_empty", 0)
+                    total_stats["chunks_processed"] += stats.get("chunks_processed", 0)
+
+                except Exception as e:
+                    logger.warning(f"处理论文 {paper_name} 失败: {e}")
+
+                # 每隔20篇论文重新确保连接有效
+                if (i + 1) % 20 == 0:
+                    await index_manager._ensure_collection()
+                    collection = index_manager._collection
+
+                # 更新进度
+                if (i + 1) % 5 == 0 or (i + 1) == len(paper_names):
+                    yield event.plain_result(f"📥 构建进度: {i + 1}/{len(paper_names)} 篇论文...")
+
+            # 保存图谱到磁盘
+            graph_store.save(force=True)
+
+            # 输出结果
+            text_triplets = total_stats.get('text_triplets_added', 0)
+            cross_triplets = total_stats.get('cross_modal_triplets_added', 0)
+            total_triplets_val = text_triplets + cross_triplets
+            output = f"""✅ **知识图谱构建完成**
+
+📊 构建统计：
+   • 处理论文：{len(paper_names)} 篇
+   • 处理文档块：{total_stats.get('chunks_processed', 0)}
+   • 添加实体：{total_stats.get('entities_added', 0)}
+   • 文本三元组：{text_triplets}
+   • 图片实体：{total_stats.get('image_entities_added', 0)}
+   • 跨模态三元组：{cross_triplets}
+   • 总三元组：{total_triplets_val}
+   • 空块数：{total_stats.get('chunks_empty', 0)}
+   • 失败块数：{total_stats.get('chunks_failed', 0)}
+
+💾 图谱已自动保存到磁盘
+💡 使用 /paper graph_stats 查看图谱详情"""
+            yield event.plain_result(output)
+
+        except Exception as e:
+            logger.error(f"构建知识图谱失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            yield event.plain_result(f"❌ 构建失败: {e}")
+
+    @paper_commands.command("graph_stats")
+    async def cmd_graph_stats(self, event: AstrMessageEvent):
+        """Show knowledge graph statistics"""
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if not self.config.get("enable_graph_rag", False):
+            yield event.plain_result("❌ Graph RAG 功能未启用\n请在插件配置中启用 enable_graph_rag")
+            return
+
+        engine = self._get_engine()
+        if not engine:
+            yield event.plain_result("❌ RAG引擎未就绪")
+            return
+
+        try:
+            from .graph_rag_engine import GraphRAGEngine, GraphRAGConfig
+        except Exception:
+            from graph_rag_engine import GraphRAGEngine, GraphRAGConfig
+
+        try:
+            graph_config = GraphRAGConfig(
+                enable_graph_rag=True,
+                storage_type=self.config.get("graph_rag", {}).get("storage_type", "memory"),
+                neo4j_uri=self.config.get("graph_rag", {}).get("neo4j_uri", "bolt://localhost:7687"),
+                neo4j_user=self.config.get("graph_rag", {}).get("neo4j_user", "neo4j"),
+                neo4j_password=self.config.get("graph_rag", {}).get("neo4j_password", ""),
+            )
+
+            graph_engine = GraphRAGEngine(graph_config, engine, self.context)
+            await graph_engine.initialize()
+
+            stats = await graph_engine.get_graph_stats()
+
+            storage_type = self.config.get("graph_rag", {}).get("storage_type", "memory")
+
+            # 获取持久化状态
+            is_dirty = stats.get('is_dirty', False)
+            last_save = stats.get('last_save_time', None)
+            storage_path = stats.get('storage_path', 'N/A')
+
+            dirty_indicator = "⚠️ 有未保存的变更" if is_dirty else "✅ 已保存"
+
+            output = f"""📊 **知识图谱统计**
+
+存储类型：{storage_type}
+   • 实体数量：{stats.get('entity_count', 0)}
+   • 关系数量：{stats.get('relation_count', 0)}
+   • 索引大小：{stats.get('index_size', 0)}
+
+💾 持久化状态：
+   • 状态：{dirty_indicator}
+   • 存储路径：{storage_path}
+   • 上次保存：{last_save if last_save else '从未保存'}
+
+💡 使用 /paper graph_build confirm 构建图谱
+💡 使用 /paper graph_clear confirm 清空图谱"""
+
+            yield event.plain_result(output)
+
+        except Exception as e:
+            logger.error(f"获取图谱统计失败: {e}")
+            yield event.plain_result(f"❌ 获取统计失败: {e}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @paper_commands.command("graph_clear")
+    async def cmd_graph_clear(self, event: AstrMessageEvent, confirm: str = ''):
+        """Clear knowledge graph (Admin)
+
+        Args:
+            confirm: Must be 'confirm' to proceed
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if not self.config.get("enable_graph_rag", False):
+            yield event.plain_result("❌ Graph RAG 功能未启用")
+            return
+
+        if confirm != "confirm":
+            yield event.plain_result("⚠️ 即将清空知识图谱\n此操作不可恢复！\n使用 /paper graph_clear confirm 确认执行")
+            return
+
+        engine = self._get_engine()
+        if not engine:
+            yield event.plain_result("❌ RAG引擎未就绪")
+            return
+
+        try:
+            from .graph_rag_engine import GraphRAGEngine, GraphRAGConfig
+        except Exception:
+            from graph_rag_engine import GraphRAGEngine, GraphRAGConfig
+
+        try:
+            graph_config = GraphRAGConfig(
+                enable_graph_rag=True,
+                storage_type=self.config.get("graph_rag", {}).get("storage_type", "memory"),
+                neo4j_uri=self.config.get("graph_rag", {}).get("neo4j_uri", "bolt://localhost:7687"),
+                neo4j_user=self.config.get("graph_rag", {}).get("neo4j_user", "neo4j"),
+                neo4j_password=self.config.get("graph_rag", {}).get("neo4j_password", ""),
+            )
+
+            graph_engine = GraphRAGEngine(graph_config, engine, self.context)
+            await graph_engine.initialize()
+
+            result = await graph_engine.clear_graph()
+
+            if result.get("status") == "success":
+                yield event.plain_result("✅ 知识图谱已清空")
+            else:
+                yield event.plain_result(f"❌ 清空失败: {result.get('message', '未知错误')}")
+
+        except Exception as e:
+            logger.error(f"清空图谱失败: {e}")
+            yield event.plain_result(f"❌ 清空失败: {e}")
 
     def _format_retrieve_response(self, sources: list) -> str:
         """Format retrieval results"""

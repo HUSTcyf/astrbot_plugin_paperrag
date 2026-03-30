@@ -1,8 +1,8 @@
-# 📚 Paper RAG Plugin v1.6.2 - 用户指南
+# 📚 Paper RAG Plugin v1.7.0 - 用户指南
 
 本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力（支持多模态VLM问答）。
 
-> **版本说明**：当前版本 v1.6.2，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
+> **版本说明**：当前版本 v1.7.1，完整更新历史见 [CHANGELOG.md](CHANGELOG.md)
 
 ## ✨ 核心功能
 
@@ -661,9 +661,9 @@ pip install -U FlagEmbedding
 | 文档 | 说明 |
 |------|------|
 | [README.md](README.md) | 用户指南（本文档） |
+| [CHANGELOG.md](CHANGELOG.md) | 变更记录 |
 | [docs/INDEX.md](docs/INDEX.md) | 文档索引 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 技术架构说明 |
-| [docs/CHANGELOG.md](docs/CHANGELOG.md) | 变更记录 |
 
 ---
 
@@ -768,6 +768,89 @@ evaluation_output/
 ### 详细文档
 
 详见 [evaluation/README_qasper.md](evaluation/README_qasper.md)
+
+---
+
+## 📋 待实现功能 (ToDo)
+
+以下功能正在规划中，将在未来的版本中逐步实现。
+
+### ✅ Graph RAG 模块
+
+将现有向量检索升级为**图增强 RAG**，支持多跳推理和关系查询。
+
+**已实现功能**：
+- [x] Graph RAG 引擎（`graph_rag_engine.py`）
+- [x] 知识图谱检索器与融合检索器（`graph_retriever.py`）
+- [x] 图谱构建器 - LLM 三元组抽取（`graph_builder.py`）
+- [x] 用户意图识别与智能路由（`graph_rag_router.py`）
+- [x] Memory 图谱存储（默认）
+- [x] Neo4j 图数据库支持（可选）
+- [x] 混合检索模式（向量 + 图谱 RRF 融合）
+- [x] 关系查询引擎（支持"A 和 B 的关系"类问题）
+- [x] 多跳推理增强
+- [x] 手动/自动图谱构建
+- [x] 新增命令：`/paper graph_build`、`/paper graph_stats`、`/paper graph_clear`
+
+**技术方案**：基于 LlamaIndex PropertyGraphIndex 实现
+
+**版本**：v1.7.0
+
+### 🛠️ Graph RAG 修复 (v1.7.1)
+
+**问题**：Qwen3.5 GGUF 模型在构建知识图谱时输出 thinking tokens 而非 JSON，导致解析失败。
+
+**修复内容**：
+- [x] 集成 `LlamaCppVLMProvider` 替代原有的 `LocalLLMProvider`
+- [x] 修复 `system_prompt` 未被正确使用的问题
+- [x] 增加 `max_tokens` 至 4096 避免 JSON 截断
+- [x] 添加 `_strip_thinking_tokens()` 移除 `<think>...</think>` 块
+- [x] 实现批量处理（batch_size=4）减少 LLM 调用次数
+- [x] 修复 `add_relation()` 参数错误（使用 head/tail 字符串而非 ID）
+- [x] Pure Text RAG 优先使用本地 LlamaCpp 模型
+
+**批量处理优化**：
+- 原调用次数：~1800 次（1800 chunks）
+- 优化后调用次数：~450 次（batch_size=4）
+- 预估 token 计算：4 chunks × ~500字符 + system prompt ≈ 2000-2300 tokens < 4096
+
+**模型自动降级**：
+- 优先使用 Qwen3.5-9B 模型
+- 9B 不可用时自动降级到 Qwen3.5-4B 模型
+
+---
+
+### 🔲 创意生成引擎
+
+融合本地知识库 + 网络搜索 + 创意生成，构建智能研究助手。
+
+**计划功能**：
+- [ ] 智能搜索规划（LLM 驱动的多源搜索查询生成）
+- [ ] 网络信息增强（Semantic Scholar / Tavily / GitHub API）
+- [ ] 多源知识融合（本地论文 + 网络结果统一上下文）
+- [ ] 研究提案生成（基于结构化 prompt 的 idea 生成）
+- [ ] 引文追踪与格式化
+
+**技术方案**：基于 LangGraph 工作流编排
+
+**预计版本**：v1.8.0
+
+---
+
+### 🔲 模型微调与强化学习（计划 v2.0+）
+
+**长期规划**：
+
+- [ ] RAG 系统评估数据收集与标注
+- [ ] Reward Model 训练（基于人类反馈的奖励模型）
+- [ ] RLHF 微调（使用 PPO/DPO 对检索/生成模型进行强化学习）
+- [ ] 个性化适应（根据用户反馈持续优化）
+
+**说明**：v2.0 之后实现，需要大量标注数据和训练资源。
+
+---
+
+> 💡 **欢迎贡献**：如果您对某个功能感兴趣，欢迎提交 PR 或参与讨论！
 
 ---
 

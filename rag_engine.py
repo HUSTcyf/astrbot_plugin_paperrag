@@ -86,6 +86,21 @@ class RAGConfig:
     freeapi_url: str = ""  # FreeAPI 服务地址
     freeapi_key: str = ""  # FreeAPI 密钥
 
+    # Graph RAG 配置
+    enable_graph_rag: bool = False  # 是否启用 Graph RAG
+    graph_storage_type: str = "memory"  # "memory" 或 "neo4j"
+    graph_neo4j_uri: str = "bolt://localhost:7687"
+    graph_neo4j_user: str = "neo4j"
+    graph_neo4j_password: str = ""
+    graph_max_triplets_per_chunk: int = 5
+    graph_retrieval_top_k: int = 5
+    graph_hybrid_alpha: float = 0.5  # 混合检索权重（0=纯图，1=纯向量）
+    graph_auto_build: bool = False  # 是否自动构建图谱
+    graph_auto_build_threshold: int = 10  # 自动构建阈值
+    graph_multimodal_enabled: bool = True  # 是否启用多模态图谱抽取
+    graph_max_images_per_chunk: int = 1  # 每个chunk最多处理图片数
+    graph_extract_image_entities: bool = True  # 是否提取图片为实体
+
     def __post_init__(self):
         """初始化后处理"""
         if self.authentication is None:

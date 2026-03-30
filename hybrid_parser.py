@@ -885,7 +885,7 @@ class HybridPDFParser:
                         continue
 
                     # 获取该页面的所有图片 bbox
-                    page = doc[page_num - 1]
+                    page: fitz.Page = doc[page_num - 1]  # type: ignore[assignment]
                     image_list = page.get_images(full=True)
 
                     # 构建该组图片的 bbox 列表

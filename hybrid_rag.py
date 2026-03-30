@@ -425,7 +425,7 @@ class HybridRAGEngine:
         return self._retriever
 
     async def _ensure_llm_initialized(self) -> Any:
-        """确保LLM Provider已初始化"""
+        """确保LLM Provider已初始化 - 优先使用本地模型"""
         if self._llm_initialized:
             assert self._llm_client is not None
             return self._llm_client
@@ -433,18 +433,7 @@ class HybridRAGEngine:
         # 优先使用配置的 provider_id
         provider_id = self.config.text_provider_id
         if not provider_id:
-            # 回退到获取当前正在使用的 provider
-            try:
-                if self.context is not None:
-                    self._llm_client = self.context.get_using_provider()
-                    if self._llm_client:
-                        logger.info("✅ 使用当前会话的 LLM Provider")
-                        self._llm_initialized = True
-                        return self._llm_client
-            except Exception as e:
-                logger.warning(f"⚠️ 获取当前Provider失败: {e}")
-
-            # 如果 context 为空或获取 provider 失败，尝试使用 LlamaCpp 作为文本生成备选
+            # 优先使用 LlamaCpp 本地模型
             if LLAMA_CPP_VLM_AVAILABLE:
                 try:
                     llama_model_path_raw = getattr(self.config, 'llama_vlm_model_path', './models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf')
@@ -477,9 +466,20 @@ class HybridRAGEngine:
                 except Exception as e:
                     logger.warning(f"⚠️ LlamaCpp 模型加载失败: {e}")
 
+            # 如果本地模型不可用，尝试获取AstrBot当前会话的Provider（云端）
+            try:
+                if self.context is not None:
+                    self._llm_client = self.context.get_using_provider()
+                    if self._llm_client:
+                        logger.info("✅ 使用当前会话的 LLM Provider (云端备选)")
+                        self._llm_initialized = True
+                        return self._llm_client
+            except Exception as e:
+                logger.warning(f"⚠️ 获取当前Provider失败: {e}")
+
             # 如果都获取不到，报错
             raise ValueError(
-                "未配置 text_provider_id、无法获取当前LLM Provider。"
+                "未配置 text_provider_id、本地模型不可用、无法获取当前LLM Provider。"
                 "请在插件配置中设置 text_provider_id 或确保 LlamaCpp 模型可用。"
             )
 
@@ -722,7 +722,8 @@ class HybridRAGEngine:
         self,
         query: str,
         mode: str = "rag",
-        images: Optional[List[str]] = None
+        images: Optional[List[str]] = None,
+        force_english: bool = False
     ) -> Dict[str, Any]:
         """
         搜索论文（支持多模态查询）
@@ -733,6 +734,7 @@ class HybridRAGEngine:
                 - "rag": 检索 + RAG生成
                 - "retrieve": 仅检索
             images: 图片路径列表（支持多模态查询）
+            force_english: 强制使用英文回答（用于评估场景）
 
         Returns:
             搜索结果
@@ -758,7 +760,7 @@ class HybridRAGEngine:
                 }
             else:
                 # RAG生成模式（支持多模态）
-                return await self._rag_query(query, images=images)
+                return await self._rag_query(query, images=images, force_english=force_english)
 
         except Exception as e:
             logger.error(f"❌ 搜索失败: {e}")
@@ -770,7 +772,8 @@ class HybridRAGEngine:
     async def _rag_query(
         self,
         query: str,
-        images: Optional[List[str]] = None
+        images: Optional[List[str]] = None,
+        force_english: bool = False
     ) -> Dict[str, Any]:
         """
         检索 + RAG生成（支持多模态）
@@ -784,6 +787,7 @@ class HybridRAGEngine:
         Args:
             query: 查询文本
             images: 用户直接上传的图片路径列表（可选）
+            force_english: 强制使用英文回答
         """
         try:
             # 确保LLM已初始化
@@ -849,7 +853,7 @@ class HybridRAGEngine:
 
             # 生成答案
             answer = await self._generate_answer_with_llm(
-                llm_provider, query, sources, images=final_images
+                llm_provider, query, sources, images=final_images, force_english=force_english
             )
 
             return {
@@ -974,7 +978,8 @@ class HybridRAGEngine:
         llm_provider: Any,
         query: str,
         sources: List[Dict[str, Any]],
-        images: Optional[List[str]] = None
+        images: Optional[List[str]] = None,
+        force_english: bool = False
     ) -> str:
         """
         使用LLM Provider生成答案（支持多模态）
@@ -984,6 +989,7 @@ class HybridRAGEngine:
             query: 查询文本
             sources: 检索到的源文档
             images: 图片路径列表（可选）
+            force_english: 强制使用英文回答
         """
         try:
             # 构建上下文
@@ -995,8 +1001,17 @@ class HybridRAGEngine:
 
             context = "\n\n".join(context_parts)
 
-            # 构建提示
-            text_prompt = f"""基于以下论文内容回答问题：
+            # 构建提示（根据 force_english 选择语言）
+            if force_english:
+                text_prompt = f"""Based on the following paper content, answer the question. Respond in English only.
+
+{context}
+
+Question: {query}
+
+Please provide a detailed answer and cite the relevant sources."""
+            else:
+                text_prompt = f"""基于以下论文内容回答问题：
 
 {context}
 

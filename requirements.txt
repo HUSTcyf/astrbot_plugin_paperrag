@@ -35,6 +35,10 @@ mlx-lm>=0.1.0   # Apple MLX LLM支持（纯文本对话模型）
 #   CMAKE_ARGS="-DGGML_METAL=on -DLLAMA_MTMD=on" pip install llama-cpp-python
 llama-cpp-python>=0.3.0  # Llama.cpp Python绑定（多模态VLM支持）
 
+# Graph RAG（图谱增强检索）
+# Neo4j 支持（可选，需要 Neo4j 时安装）
+llama-index-graph-stores-neo4j
+
 # 工具库
 httpx>=0.25.0  # 异步HTTP客户端
 pydantic>=2.0.0  # 配置验证

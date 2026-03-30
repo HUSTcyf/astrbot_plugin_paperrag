@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-03-30
+
+### Added
+
+- **Graph RAG 图谱增强检索**
+  - 新增 `graph_rag_engine.py` - Graph RAG 引擎核心模块
+  - 新增 `graph_retriever.py` - 知识图谱检索器和融合检索器
+  - 新增 `graph_builder.py` - 图谱构建器（三元组抽取）
+  - 新增 `graph_rag_router.py` - 用户意图识别与智能路由
+
+- **图谱存储支持**
+  - Memory 模式：适合小规模/测试，使用 Python 字典存储
+  - Neo4j 模式：适合生产环境，需要 Docker 和 Neo4j
+  - **磁盘持久化**：gzip 压缩 JSON 格式，自动保存/加载
+  - **增量更新**：自动检测变更，只在必要时写入磁盘
+  - **启动恢复**：重启后自动加载已有图谱数据
+
+- **检索模式**
+  - `vector` - 向量检索（默认，事实性问答、概念定义）
+  - `graph_local` - 图谱局部检索（实体关系、多跳推理）
+  - `graph_global` - 图谱全局检索（宏观趋势、领域总结）
+  - `hybrid` - 混合检索（向量 + 图谱 RRF 融合）
+
+- **智能路由**
+  - 模式匹配规则（关系查询、趋势分析、定义查询等）
+  - 关键词快速判断
+  - LLM 意图识别（可选）
+
+- **新增命令**
+  - `/paper graph_build` - 手动构建知识图谱
+  - `/paper graph_stats` - 查看图谱统计信息
+  - `/paper graph_clear` - 清空知识图谱
+
+- **自动构建**
+  - 每添加一定数量论文后自动更新知识图谱（可配置阈值）
+  - 后台异步执行，不阻塞主流程
+
+- **图谱构建优化**
+  - `/paper graph_build` 现在直接从 Milvus 向量数据库读取已索引的 chunks
+  - 不再重新解析 PDF，效率大幅提升
+  - 确保与原始索引数据完全同步
+
+### Changed
+
+- **RAGConfig 扩展**
+  - 新增 `enable_graph_rag` 配置项
+  - 新增 `graph_storage_type`、`graph_neo4j_uri`、`graph_neo4j_user`、`graph_neo4j_password`
+  - 新增 `graph_max_triplets_per_chunk`、`graph_retrieval_top_k`、`graph_hybrid_alpha`
+  - 新增 `graph_auto_build`、`graph_auto_build_threshold`
+
+- **检索流程优化**
+  - `cmd_search` 支持 `mode=auto` 自动路由
+  - 根据用户查询类型智能选择检索策略
+
 ## [1.6.2] - 2026-03-30
 
 ### Added

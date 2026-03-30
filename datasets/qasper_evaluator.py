@@ -31,6 +31,17 @@ def normalize_answer(s):
     return white_space_fix(remove_articles(remove_punc(lower(s))))
 
 
+def split_into_sentences(text):
+    """
+    Split text into sentences using simple heuristic.
+    This matches the official Qasper evaluation approach.
+    """
+    # Simple sentence splitting by common delimiters
+    # In production, use NLTK's sent_tokenize
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    return [s.strip() for s in sentences if s.strip()]
+
+
 def token_f1_score(prediction, ground_truth):
     """
     Taken from the official evaluation script for v1.1 of the SQuAD dataset.
@@ -48,14 +59,59 @@ def token_f1_score(prediction, ground_truth):
 
 
 def paragraph_f1_score(prediction, ground_truth):
+    """
+    Calculate F1 score for evidence paragraphs.
+
+    Supports two formats:
+    1. Index-based: [{"paragraph_index": 0, "sentence_index": 1}, ...]
+    2. String-based: ["evidence text 1", "evidence text 2", ...]
+    """
     if not ground_truth and not prediction:
-        # The question is unanswerable and the prediction is empty.
         return 1.0
+    if not ground_truth or not prediction:
+        return 0.0
+
+    # Check if using index-based format
+    if isinstance(prediction[0], dict) and "paragraph_index" in prediction[0]:
+        # Index-based format: compare paragraph_index + sentence_index tuples
+        pred_indices = set()
+        for p in prediction:
+            if "paragraph_index" in p and "sentence_index" in p:
+                pred_indices.add((p["paragraph_index"], p["sentence_index"]))
+
+        gold_indices = set()
+        for g in ground_truth:
+            if isinstance(g, dict) and "paragraph_index" in g and "sentence_index" in g:
+                gold_indices.add((g["paragraph_index"], g["sentence_index"]))
+            elif isinstance(g, str):
+                # If gold is string but prediction is index, we can't match
+                # Fall back to string comparison
+                return paragraph_f1_score_string(prediction, ground_truth)
+
+        num_same = len(pred_indices.intersection(gold_indices))
+    else:
+        # String-based format: compare evidence text directly
+        return paragraph_f1_score_string(prediction, ground_truth)
+
+    if num_same == 0:
+        return 0.0
+    precision = num_same / len(prediction)
+    recall = num_same / len(ground_truth)
+    f1 = (2 * precision * recall) / (precision + recall)
+    return f1
+
+
+def paragraph_f1_score_string(prediction, ground_truth):
+    """String-based evidence F1 score."""
+    if not ground_truth and not prediction:
+        return 1.0
+    if not ground_truth or not prediction:
+        return 0.0
     num_same = len(set(ground_truth).intersection(set(prediction)))
     if num_same == 0:
         return 0.0
     precision = num_same / len(prediction)
-    recall = num_same / len(ground_truth) 
+    recall = num_same / len(ground_truth)
     f1 = (2 * precision * recall) / (precision + recall)
     return f1
 

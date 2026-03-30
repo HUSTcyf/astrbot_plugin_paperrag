@@ -718,14 +718,11 @@ class HybridIndexManager:
                 "error": str(e)
             }
 
-    async def get_all_chunks(self, batch_size: int = 1000) -> List[Dict[str, Any]]:
+    async def get_all_chunks(self) -> List[Dict[str, Any]]:
         """
         从 Milvus 提取全量文本 chunks（用于生成评测数据集）
 
         使用按论文分组查询的方式，避免 Milvus Lite 全表扫描限制。
-
-        Args:
-            batch_size: 每批提取的数量（此参数已保留但不再用于全表分页）
 
         Returns:
             [{"text": str, "metadata": dict, "id": int}, ...]
@@ -788,8 +785,8 @@ class HybridIndexManager:
                     continue
 
                 # 进度显示
-                if (i + 1) % 20 == 0:
-                    logger.debug(f"  已处理 {i + 1}/{len(paper_names)} 篇论文...")
+                if (i + 1) % 10 == 0:
+                    logger.info(f"  已处理 {i + 1}/{len(paper_names)} 篇论文...")
 
             logger.info(f"✅ 共提取 {len(all_chunks)} 个 chunks")
 
@@ -1038,7 +1035,7 @@ class HybridIndexManager:
 
         try:
             # 从 Milvus 提取全量文本
-            chunks = await self.get_all_chunks(batch_size=1000)
+            chunks = await self.get_all_chunks() # batch_size=1000
 
             if not chunks:
                 logger.warning("⚠️ BM25 索引构建失败：Milvus 中无数据")
