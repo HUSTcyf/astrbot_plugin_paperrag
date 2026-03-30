@@ -140,12 +140,79 @@ async def initialize_rag_engine(config: dict, milvus_lite_path: str = ''):
     return engine
 
 
+def load_existing_predictions(output_file: Path) -> dict:
+    """
+    加载已存在的预测文件，返回 {question_id: prediction} 的字典
+
+    Args:
+        output_file: predictions.jsonl 文件路径
+
+    Returns:
+        包含已存在预测的字典，key为question_id
+    """
+    existing = {}
+    if output_file.exists():
+        with open(output_file, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    pred = json.loads(line.strip())
+                    qid = pred.get("question_id", "")
+                    if qid:
+                        existing[qid] = pred
+                except json.JSONDecodeError:
+                    continue
+    return existing
+
+
+def backup_predictions(output_file: Path) -> Optional[Path]:
+    """
+    备份已存在的预测文件
+
+    Args:
+        output_file: 预测文件路径
+
+    Returns:
+        备份文件路径，如果无需备份则返回None
+    """
+    if not output_file.exists():
+        return None
+
+    import shutil
+    from datetime import datetime
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_file = output_file.parent / f"predictions_backup_{timestamp}.jsonl"
+
+    # 只备份有内容的文件
+    with open(output_file, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+        if len(lines) > 0:
+            shutil.copy2(output_file, backup_file)
+            return backup_file
+    return None
+
+
+def save_predictions(predictions: dict, output_file: Path):
+    """
+    保存预测到JSONL文件
+
+    Args:
+        predictions: {question_id: prediction} 字典
+        output_file: 输出文件路径
+    """
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        for pred in predictions.values():
+            f.write(json.dumps(pred, ensure_ascii=False) + "\n")
+
+
 async def generate_predictions(
     engine,
     test_data: dict,
     output_file: Path,
     batch_size: int = 10,
-    delay_between_batches: float = 1.0
+    delay_between_batches: float = 1.0,
+    resume: bool = True
 ) -> int:
     """
     生成预测文件
@@ -156,24 +223,37 @@ async def generate_predictions(
         output_file: 输出文件路径
         batch_size: 每批处理的问题数
         delay_between_batches: 批次间的延迟（秒）
+        resume: 是否启用断点续传（跳过已有答案的问题，默认True）
 
     Returns:
-        生成的预测数量
+        新生成的预测数量
     """
     print("\n" + "=" * 60)
     print("生成 Predictions")
     print("=" * 60)
 
-    predictions = []
+    # 断点续传：加载已存在的预测
+    existing_predictions = {}
+    questions_to_process = []
     total_questions = 0
+    backup_file = None
 
-    # 统计问题数
+    if resume:
+        # 先备份原始文件
+        backup_file = backup_predictions(output_file)
+        if backup_file:
+            print(f"📂 已备份原始文件: {backup_file}")
+
+        existing_predictions = load_existing_predictions(output_file)
+        print(f"📂 已加载 {len(existing_predictions)} 条已有预测")
+
+    # 统计问题数并构建待处理列表
     for paper_id, paper_data in test_data.items():
         total_questions += len(paper_data.get("qas", []))
 
     print(f"总问题数: {total_questions}")
 
-    processed = 0
+    # 构建待处理问题列表（跳过已有有效答案的）
     for paper_id, paper_data in test_data.items():
         paper_title = paper_data.get("title", "Unknown")
         qas = paper_data.get("qas", [])
@@ -185,48 +265,71 @@ async def generate_predictions(
             if not question:
                 continue
 
-            # 调用 RAG 引擎获取答案
-            try:
-                result = await engine.search(question, mode="rag")
+            # 断点续传：跳过已有有效答案的问题
+            if resume and question_id in existing_predictions:
+                existing_answer = existing_predictions[question_id].get("predicted_answer", "")
+                if existing_answer and existing_answer.strip():
+                    continue  # 已有有效答案，跳过
 
-                if result.get("type") == "rag":
-                    answer = result.get("answer", "")
-                elif result.get("type") == "error":
-                    answer = ""
-                    print(f"  ⚠️  [{question_id}] 错误: {result.get('message', 'Unknown error')}")
-                else:
-                    answer = ""
-
-            except Exception as e:
-                answer = ""
-                print(f"  ⚠️  [{question_id}] 异常: {e}")
-
-            predictions.append({
+            questions_to_process.append({
                 "question_id": question_id,
-                "predicted_answer": answer,
-                "predicted_evidence": []
+                "question": question,
+                "paper_title": paper_title
             })
 
-            processed += 1
+    print(f"📝 本次需处理问题数: {len(questions_to_process)}")
+    if len(questions_to_process) == 0:
+        print("✅ 所有问题都已完成，无需处理")
+        print(f"   预测文件: {output_file}")
+        return 0
 
-            # 进度显示
-            if processed % 50 == 0:
-                print(f"  已处理 {processed}/{total_questions} 个问题...")
+    processed = 0
+    for qa_info in questions_to_process:
+        question_id = qa_info["question_id"]
+        question = qa_info["question"]
 
-            # 批次延迟，避免请求过快
-            if processed % batch_size == 0:
-                await asyncio.sleep(delay_between_batches)
+        # 调用 RAG 引擎获取答案
+        try:
+            result = await engine.search(question, mode="rag")
 
-    # 保存为 JSONL
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_file, "w", encoding="utf-8") as f:
-        for p in predictions:
-            f.write(json.dumps(p, ensure_ascii=False) + "\n")
+            if result.get("type") == "rag":
+                answer = result.get("answer", "")
+            elif result.get("type") == "error":
+                answer = ""
+                print(f"  ⚠️  [{question_id}] 错误: {result.get('message', 'Unknown error')}")
+            else:
+                answer = ""
 
-    print(f"\n✅ 已生成 {len(predictions)} 条预测")
+        except Exception as e:
+            answer = ""
+            print(f"  ⚠️  [{question_id}] 异常: {e}")
+
+        existing_predictions[question_id] = {
+            "question_id": question_id,
+            "predicted_answer": answer,
+            "predicted_evidence": []
+        }
+
+        processed += 1
+
+        # 进度显示
+        if processed % 50 == 0:
+            print(f"  已处理 {processed}/{len(questions_to_process)} 个问题...")
+
+        # 批次延迟，避免请求过快
+        if processed % batch_size == 0:
+            await asyncio.sleep(delay_between_batches)
+            # 定期保存，防止中断丢失数据
+            save_predictions(existing_predictions, output_file)
+
+    # 最终保存
+    save_predictions(existing_predictions, output_file)
+
+    print(f"\n✅ 本次新生成 {processed} 条预测")
+    print(f"   总计已有预测: {len(existing_predictions)} 条")
     print(f"   保存到: {output_file}")
 
-    return len(predictions)
+    return processed
 
 
 def run_evaluator(predictions_file: Path, gold_file: Path, output_dir: Path, text_evidence_only: bool = False):
@@ -342,12 +445,9 @@ async def run_ragas_full_evaluation(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # 加载 freeapi.json 配置
-    freeapi_config_path = Path(__file__).parent / "freeapi.json"
-    with open(freeapi_config_path, "r") as f:
-        freeapi_config = json.load(f)
-    llm_api_key = freeapi_config.get("API_KEY", "")
-    llm_base_url = freeapi_config.get("API_URL", "") + "/v1/"
+    # 从插件配置读取 freeapi 设置
+    llm_api_key = config.get("freeapi_key", "")
+    llm_base_url = config.get("freeapi_url", "") + "/v1/"
     llm_model = "gpt-4o-mini"
     embedding_model = "bge-m3"
 
@@ -355,6 +455,8 @@ async def run_ragas_full_evaluation(
     print(f"   Milvus Qasper 数据库: {milvus_qasper_path}")
     print(f"   Qasper 统计文件: {qasper_stats_path}")
     print(f"   LLM 模型: {llm_model}")
+    if not llm_api_key:
+        print(f"   ⚠️ 警告: freeapi_key 未配置，RAGAS 评估可能失败")
 
     # ========== 步骤 1: 生成测试集 ==========
     print("\n" + "=" * 60)
@@ -475,12 +577,9 @@ async def run_ragas_generate_only(
     if len(output_dir) == 0:
         output_dir = str(DEFAULT_RAGAS_OUTPUT)
 
-    # 加载 freeapi.json 配置
-    freeapi_config_path = Path(__file__).parent / "freeapi.json"
-    with open(freeapi_config_path, "r") as f:
-        freeapi_config = json.load(f)
-    llm_api_key = freeapi_config.get("API_KEY", "")
-    llm_base_url = freeapi_config.get("API_URL", "") + "/v1/"
+    # 从插件配置读取 freeapi 设置
+    llm_api_key = config.get("freeapi_key", "")
+    llm_base_url = config.get("freeapi_url", "") + "/v1/"
     llm_model = "gpt-4o-mini"
     embedding_model = "bge-m3"
 
@@ -625,7 +724,8 @@ async def main_async(args):
             test_data,
             predictions_file,
             batch_size=args.batch_size,
-            delay_between_batches=args.delay
+            delay_between_batches=args.delay,
+            resume=not args.no_resume
         )
 
     if args.evaluate or args.all:
@@ -644,12 +744,12 @@ async def main_async(args):
 
         if choice == "1":
             engine = await initialize_rag_engine(config, milvus_lite_path=milvus_qasper_path)
-            await generate_predictions(engine, test_data, predictions_file)
+            await generate_predictions(engine, test_data, predictions_file, resume=True)
         elif choice == "2":
             run_evaluator(predictions_file, gold_file, output_dir, args.text_evidence_only)
         elif choice == "3":
             engine = await initialize_rag_engine(config, milvus_lite_path=milvus_qasper_path)
-            await generate_predictions(engine, test_data, predictions_file)
+            await generate_predictions(engine, test_data, predictions_file, resume=True)
             run_evaluator(predictions_file, gold_file, output_dir, args.text_evidence_only)
         else:
             print("已退出")
@@ -662,8 +762,9 @@ def main():
         epilog="""
 示例:
   # 官方 Qasper 评估
-  python run_evaluation_qasper.py --all                         # 生成 predictions 并评估
-  python run_evaluation_qasper.py --generate                    # 仅生成 predictions
+  python run_evaluation_qasper.py --all                         # 生成 predictions 并评估（支持断点续传）
+  python run_evaluation_qasper.py --generate                    # 仅生成 predictions（支持断点续传）
+  python run_evaluation_qasper.py --generate --no_resume        # 禁用断点续传，重新生成所有预测
   python run_evaluation_qasper.py --evaluate                    # 仅运行评估
 
   # RAGAS 评估（使用 Milvus Qasper 数据库）
@@ -688,6 +789,8 @@ def main():
     parser.add_argument("--delay", type=float, default=1.0, help="批次间延迟秒数 (默认: 1.0)")
     parser.add_argument("--text_evidence_only", action="store_true",
                         help="仅使用文本证据 (忽略表格/图片证据)")
+    parser.add_argument("--no_resume", action="store_true",
+                        help="禁用断点续传，重新生成所有预测（默认启用断点续传）")
 
     # RAGAS 评估参数
     parser.add_argument("--ragas", action="store_true", help="使用 RAGAS 评估模式 (Qasper)")

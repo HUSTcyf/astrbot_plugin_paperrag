@@ -568,21 +568,16 @@ class HybridRAGEngine:
             effective_llm_config = llm_config
             if not effective_llm_config and self.config.enable_llm_reference_parsing:
                 try:
-                    # 尝试从 freeapi.json 读取配置
-                    import json
-                    freeapi_path = _PLUGIN_DIR / "evaluation" / "freeapi.json"
-                    if freeapi_path.exists():
-                        with open(freeapi_path, "r", encoding="utf-8") as f:
-                            freeapi_config = json.load(f)
-                        api_url = freeapi_config.get("API_URL", "")
-                        api_key = freeapi_config.get("API_KEY", "")
-                        if api_url and api_key:
-                            effective_llm_config = {
-                                "model": "gpt-4o-mini",
-                                "api_base": f"{api_url}/v1",
-                                "api_key": api_key
-                            }
-                            logger.debug("📝 使用 freeapi.json 配置进行 LLM 参考文献解析")
+                    # 优先使用 freeapi 配置（从插件配置读取）
+                    api_url = getattr(self.config, 'freeapi_url', '') or ''
+                    api_key = getattr(self.config, 'freeapi_key', '') or ''
+                    if api_url and api_key:
+                        effective_llm_config = {
+                            "model": "gpt-4o-mini",
+                            "api_base": f"{api_url}/v1",
+                            "api_key": api_key
+                        }
+                        logger.debug("📝 使用 freeapi 配置进行 LLM 参考文献解析")
                     else:
                         # 回退到从 provider 提取配置信息
                         provider = await self._ensure_llm_initialized()

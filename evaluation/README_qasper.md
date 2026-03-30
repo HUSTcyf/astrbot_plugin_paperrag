@@ -17,9 +17,9 @@
        ↓
 2. 索引论文到 Milvus (index_qasper.py)
        ↓
-3. 生成 predictions (run_evaluation.py --generate)
+3. 生成 predictions (run_evaluation_qasper.py --generate)
        ↓
-4. 运行评估 (run_evaluation.py --evaluate 或 --all)
+4. 运行评估 (run_evaluation_qasper.py --evaluate 或 --all)
 ```
 
 ---
@@ -51,7 +51,7 @@ python index_qasper.py --reinit
 ### 3. 生成 Predictions
 
 ```bash
-python run_evaluation.py --generate
+python run_evaluation_qasper.py --generate
 ```
 
 这会遍历测试集中的所有问题，使用 RAG 生成答案，保存到 `predictions.jsonl`。
@@ -59,13 +59,13 @@ python run_evaluation.py --generate
 ### 4. 运行评估
 
 ```bash
-python run_evaluation.py --evaluate
+python run_evaluation_qasper.py --evaluate
 ```
 
 或使用 `--all` 一步完成：
 
 ```bash
-python run_evaluation.py --all
+python run_evaluation_qasper.py --all
 ```
 
 ---
@@ -81,7 +81,7 @@ python run_evaluation.py --all
 | `--config` | 配置文件路径 | `data/config/astrbot_plugin_paperrag_config.json` |
 | `--data_dir` | 数据目录路径 | `./data/qasper` |
 
-### run_evaluation.py
+### run_evaluation_qasper.py
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
@@ -147,7 +147,7 @@ evaluation_output/
 **为什么不下载 PDF？**
 Qasper 官方不提供 PDF 文件，仅提供提取的文本。数据集中已包含完整的论文内容（sections + paragraphs），直接索引这些内容即可进行 RAG 评估。
 
-### run_evaluation.py
+### run_evaluation_qasper.py
 
 1. 初始化 RAG 引擎
 2. 遍历测试集问题

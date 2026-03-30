@@ -361,6 +361,20 @@
         "obvious_hint": true,
         "default": ""
     },
+    "freeapi_url": {
+        "description": "FreeAPI 服务地址（用于RAGAS评估的GPT-4o-mini调用）",
+        "type": "string",
+        "hint": "免费API获取方法见 https://github.com/popjane/free_chatgpt_api",
+        "obvious_hint": true,
+        "default": "https://free.v36.cm"
+    },
+    "freeapi_key": {
+        "description": "FreeAPI 密钥",
+        "type": "string",
+        "hint": "从 https://github.com/popjane/free_chatgpt_api 获取的API密钥",
+        "obvious_hint": true,
+        "default": ""
+    },
     "ollama": {
         "description": "Ollama本地Embedding配置",
         "type": "object",

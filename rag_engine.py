@@ -82,6 +82,10 @@ class RAGConfig:
     # LLM 参考文献解析配置
     enable_llm_reference_parsing: bool = True  # 是否启用 LLM-based 参考文献解析
 
+    # FreeAPI 配置（用于 RAGAS 评估）
+    freeapi_url: str = ""  # FreeAPI 服务地址
+    freeapi_key: str = ""  # FreeAPI 密钥
+
     def __post_init__(self):
         """初始化后处理"""
         if self.authentication is None:

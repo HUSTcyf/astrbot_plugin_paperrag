@@ -1,8 +1,8 @@
-# 📚 Paper RAG Plugin v1.6.1 - 用户指南
+# 📚 Paper RAG Plugin v1.6.2 - 用户指南
 
 本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力（支持多模态VLM问答）。
 
-> **版本说明**：当前版本 v1.6.1，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
+> **版本说明**：当前版本 v1.6.2，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
 
 ## ✨ 核心功能
 
@@ -671,6 +671,32 @@ pip install -U FlagEmbedding
 
 插件支持使用 Qasper 数据集评估 RAG 系统的性能。
 
+### 免费 API 配置
+
+RAGAS 评估流程需要使用 **GPT-4o-mini** 生成测试问题和评估答案。
+
+**免费 API 获取方法**：
+- 项目地址：[free_chatgpt_api](https://github.com/popjane/free_chatgpt_api)
+- 提供免费的 GPT-4o-mini API
+
+**配置步骤**：
+
+1. **在 WebUI 中配置**（推荐）：
+   - 插件配置 → `FreeAPI 服务地址`：填入如 `https://free.v36.cm`
+   - 插件配置 → `FreeAPI 密钥`：填入从 free_chatgpt_api 获取的 API Key
+
+2. **或手动编辑配置文件**：
+   ```
+   /Users/chenyifeng/AstrBot/data/config/astrbot_plugin_paperrag_config.json
+   ```
+   添加以下字段：
+   ```json
+   {
+     "freeapi_url": "https://free.v36.cm",
+     "freeapi_key": "你的API密钥"
+   }
+   ```
+
 ### Qasper 数据集说明
 
 **Qasper 数据集不包含 PDF 文件**，只包含从论文提取的文本内容（full_text）。
@@ -682,9 +708,9 @@ pip install -U FlagEmbedding
        ↓
 2. 索引论文到 Milvus (index_qasper.py)
        ↓
-3. 生成 predictions (run_evaluation.py --generate)
+3. 生成 predictions (run_evaluation_qasper.py --generate)
        ↓
-4. 运行评估 (run_evaluation.py --evaluate 或 --all)
+4. 运行评估 (run_evaluation_qasper.py --evaluate 或 --all)
 ```
 
 ### 快速开始
@@ -698,14 +724,14 @@ python qasper_downloader.py
 cd evaluation
 python index_qasper.py --reinit
 
-# 3. 生成 Predictions
-python run_evaluation.py --generate
+# 3. 生成 Predictions（支持断点续传）
+python run_evaluation_qasper.py --generate
 
 # 4. 运行评估
-python run_evaluation.py --evaluate
+python run_evaluation_qasper.py --evaluate
 
 # 或一步完成
-python run_evaluation.py --all
+python run_evaluation_qasper.py --all
 ```
 
 ### 命令行参数
@@ -716,12 +742,13 @@ python run_evaluation.py --all
 | `--split` | 数据集划分 | `all` |
 | `--reinit` | 重新初始化数据库 | False |
 
-**run_evaluation.py**：
+**run_evaluation_qasper.py**：
 | 参数 | 说明 |
 |------|------|
-| `--generate` | 仅生成 predictions |
+| `--generate` | 仅生成 predictions（支持断点续传） |
 | `--evaluate` | 仅运行评估 |
 | `--all` | 生成 + 评估 |
+| `--no_resume` | 禁用断点续传，重新生成所有预测 |
 
 ### 评估指标
 

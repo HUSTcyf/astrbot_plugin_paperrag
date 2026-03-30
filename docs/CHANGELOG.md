@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.2] - 2026-03-30
+
+### Added
+
+- **断点续传功能** (`run_evaluation_qasper.py`)
+  - 新增 `--resume` 参数（默认启用），跳过已有有效答案的问题
+  - 新增 `--no_resume` 参数，禁用断点续传，重新生成所有预测
+  - 新增 `load_existing_predictions()` 函数，从 JSONL 文件加载已有预测
+  - 新增 `backup_predictions()` 函数，生成前自动备份原始文件
+  - 新增 `save_predictions()` 函数，定期保存防止中断丢失数据
+  - 处理网络错误导致部分问题未生成回答的场景
+
+### Changed
+
+- **FreeAPI 配置迁移**
+  - `evaluation/freeapi.json` 配置文件已迁移到插件配置 `_conf_schema.json`
+  - 新增 `freeapi_url` 和 `freeapi_key` 配置项（通过 WebUI 配置）
+  - 更新 `hybrid_rag.py`、`run_evaluation_qasper.py`、`run_evaluation_ragas.py` 读取配置逻辑
+  - README 新增免费 API 获取说明
+
 ## [1.6.1] - 2026-03-30
 
 ### Changed
