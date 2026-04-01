@@ -59,10 +59,11 @@ def bert_f1_score(prediction, ground_truth):
 
     try:
         scorer = get_bert_scorer()
-        # BERTScore expects lists
+        # BERTScore expects lists, returns tuple of Tensors (P, R, F1)
         P, R, F1 = scorer.score([prediction], [ground_truth])
-        # F1 is a tensor, get the scalar value
-        return F1.item()
+        # Convert tensor to scalar (works for both tensor and float)
+        f1_value = F1.detach().cpu().item() if hasattr(F1, 'detach') else float(F1)
+        return float(f1_value)
     except Exception as e:
         # Fallback to token F1 if BERTScore fails
         return token_f1_score(prediction, ground_truth)
@@ -210,68 +211,101 @@ def get_answers_and_evidence(data, text_evidence_only):
     return answers_and_evidence
 
 
-def evaluate(gold, predicted, use_bert_f1=False):
+def evaluate(gold, predicted, use_bert_f1=False, verbose=True):
     """
     Evaluate predictions against gold answers.
 
     Args:
         gold: Gold answers dict {question_id: references}
         predicted: Predicted answers dict {question_id: {"answer": ..., "evidence": ...}}
-        use_bert_f1: If True, compute BERTScore F1 instead of token F1 for answers
+        use_bert_f1: If True, compute both Token F1 and BERTScore F1
+        verbose: If True, print progress updates
 
     Returns:
         Evaluation metrics dict
     """
+    import sys
+
     max_answer_f1s = []
-    max_evidence_f1s = []
+    max_answer_bert_f1s = []  # Separate list for BERT F1
     max_answer_f1s_by_type = {
         "extractive": [],
         "abstractive": [],
         "boolean": [],
         "none": [],
     }
+    max_answer_bert_f1s_by_type = {
+        "extractive": [],
+        "abstractive": [],
+        "boolean": [],
+        "none": [],
+    }
+    max_evidence_f1s = []
     num_missing_predictions = 0
 
-    # BERTScore: collect all pairs for batch evaluation (faster)
-    bert_pairs = []  # [(question_id, prediction, reference_answer, answer_type), ...]
-    bert_f1s = []   # parallel array for results
+    # Progress tracking
+    total_questions = len(gold)
+    processed = 0
+    print_interval = max(1, total_questions // 20)  # Print every 5%
+
+    if verbose:
+        print(f"\n开始评估 (共 {total_questions} 个问题)...")
+        if use_bert_f1:
+            print("  模式: Token F1 + BERTScore F1 (同时计算)")
+        else:
+            print("  模式: Token F1 (词汇重叠评估)")
+        print("-" * 50)
 
     for question_id, references in gold.items():
+        processed += 1
+
+        # Print progress
+        if verbose and processed % print_interval == 0:
+            pct = processed * 100 // total_questions
+            print(f"  进度: {processed}/{total_questions} ({pct}%)", flush=True)
+
         if question_id not in predicted:
             num_missing_predictions += 1
             max_answer_f1s.append(0.0)
+            max_answer_bert_f1s.append(0.0)
             max_evidence_f1s.append(0.0)
             continue
 
         predicted_answer = predicted[question_id]["answer"]
 
-        # For BERT F1, we need to find best matching reference
+        # Token F1 evaluation (always computed)
+        answer_f1s_and_types = [
+            (token_f1_score(predicted_answer, reference["answer"]),
+             reference["type"])
+            for reference in references
+        ]
+        max_answer_f1, answer_type = sorted(answer_f1s_and_types, key=lambda x: x[0], reverse=True)[0]
+        max_answer_f1s.append(max_answer_f1)
+        max_answer_f1s_by_type[answer_type].append(max_answer_f1)
+
+        # BERTScore F1 (only when use_bert_f1=True)
         if use_bert_f1:
             best_bert_f1 = 0.0
-            best_answer_type = "abstractive"
+            best_bert_type = "abstractive"
             for reference in references:
                 bert_f1 = bert_f1_score(predicted_answer, reference["answer"])
                 if bert_f1 > best_bert_f1:
                     best_bert_f1 = bert_f1
-                    best_answer_type = reference["type"]
-            max_answer_f1s.append(best_bert_f1)
-            max_answer_f1s_by_type[best_answer_type].append(best_bert_f1)
+                    best_bert_type = reference["type"]
+            max_answer_bert_f1s.append(best_bert_f1)
+            max_answer_bert_f1s_by_type[best_bert_type].append(best_bert_f1)
         else:
-            # Token F1 evaluation
-            answer_f1s_and_types = [
-                (token_f1_score(predicted_answer, reference["answer"]),
-                 reference["type"])
-                for reference in references
-            ]
-            max_answer_f1, answer_type = sorted(answer_f1s_and_types, key=lambda x: x[0], reverse=True)[0]
-            max_answer_f1s.append(max_answer_f1)
-            max_answer_f1s_by_type[answer_type].append(max_answer_f1)
+            max_answer_bert_f1s.append(0.0)  # Placeholder when not computed
 
         evidence_f1s = [
             paragraph_f1_score(predicted[question_id]["evidence"], reference["evidence"])
             for reference in references
         ]
         max_evidence_f1s.append(max(evidence_f1s))
+
+    if verbose:
+        print("-" * 50)
+        print(f"评估完成! ({total_questions}/{total_questions} 100%)")
 
     mean = lambda x: sum(x) / len(x) if x else 0.0
     result = {
@@ -281,12 +315,13 @@ def evaluate(gold, predicted, use_bert_f1=False):
         "Missing predictions": num_missing_predictions
     }
 
-    # Add BERT F1 metrics if requested
+    # Add BERT F1 metrics if computed
     if use_bert_f1:
-        result["Answer BERT F1"] = result["Answer F1"]  # Already computed with BERT
-        result["Answer BERT F1 by type"] = result["Answer F1 by type"]
+        result["Answer BERT F1"] = mean(max_answer_bert_f1s)
+        result["Answer BERT F1 by type"] = {key: mean(value) for key, value in max_answer_bert_f1s_by_type.items()}
 
     return result
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="QASPER Evaluation Script")
@@ -315,6 +350,11 @@ if __name__ == "__main__":
                 According to the paper, BERTScore F1 (0.62) is more appropriate for QASPER
                 than cosine-based token F1 (0.22), especially for long-document free-form answers."""
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="If set, suppress progress output and only print JSON result"
+    )
     args = parser.parse_args()
     gold_data = json.load(open(args.gold))
     gold_answers_and_evidence = get_answers_and_evidence(gold_data, args.text_evidence_only)
@@ -325,5 +365,5 @@ if __name__ == "__main__":
             "answer": prediction_data["predicted_answer"],
             "evidence": prediction_data["predicted_evidence"]
         }
-    evaluation_output = evaluate(gold_answers_and_evidence, predicted_answers_and_evidence, use_bert_f1=args.bert_score)
+    evaluation_output = evaluate(gold_answers_and_evidence, predicted_answers_and_evidence, use_bert_f1=args.bert_score, verbose=not args.quiet)
     print(json.dumps(evaluation_output, indent=2))

@@ -2,6 +2,81 @@
 
 所有值得注意的插件变更都会记录在这个文件中。
 
+## [1.7.3] - 2026-04-02
+
+### 图表提取优化
+
+#### 1. 图表索引与存储规范化
+
+**文件**: `multimodal_extractor.py`, `hybrid_parser.py`
+
+**目标**: 优化图表的索引、关联和存储，与 Qasper 评估数据集格式保持一致。
+
+**变更**:
+
+- `_extract_figure_number()` 返回纯编号（如 `"1"`, `"A1"`）而非 `"Figure 1"`
+- `_find_figure_caption()` 图片数量超过图注数量时返回 `None`
+- 新增 `_find_table_caption()` 方法提取 Table caption
+- 新增 `get_figures_and_tables()` 生成 Qasper 格式的图表列表
+- `_extract_tables_from_page()` 添加 `page_text` 参数并调用 caption 提取
+
+---
+
+#### 2. 修复子图文件名冲突
+
+**文件**: `hybrid_parser.py`
+
+**问题**: 同一 Figure 的多个子图互相覆盖
+
+**变更**: 引入 `caption_variant_counter` 解决子图覆盖问题
+
+```python
+# 构建 figure_id：{page}-{type}{num}-{variant}
+# 例如: 3-Table1-1.png, 3-Table1-2.png
+```
+
+---
+
+#### 3. 文件命名格式对齐 Qasper
+
+**文件**: `hybrid_parser.py`
+
+| 方面 | 修改前 | 修改后 |
+|------|--------|--------|
+| 文件名 | `{pdf_name}_p{page}_i{idx}.png` | `{page}-{type}{num}-{variant}.png` |
+| 示例 | `1911.10742_p3_i1.png` | `3-Table1-1.png` |
+
+---
+
+#### 4. 图表按论文分类存储
+
+**文件**: `hybrid_parser.py`
+
+**变更**: 图表按论文ID分类存储，目录结构与 Qasper 数据集一致
+
+```
+data/figures/
+├── 1911.10742/
+│   ├── 3-Table1-1.png
+│   └── 5-Figure1-1.png
+├── 1904.09131/
+│   └── ...
+```
+
+---
+
+#### 5. 修复 FlagEmbedding 与 transformers 版本冲突
+
+**文件**: `requirements.txt`
+
+**问题**: `transformers>=5.0` 与 `FlagEmbedding` 不兼容（`is_torch_fx_available` 被移除）
+
+**变更**:
+- `transformers>=4.40.0` → `transformers>=4.40.0,<5.0`
+- 移除 `mlx-lm`（与 `transformers<5.0` 冲突）
+
+---
+
 ## [1.7.2] - 2026-04-01
 
 ### 核心改进
@@ -543,3 +618,161 @@ logger.info(f"[PaperRAG] 正在加载 chunks... ({len(chunks)} 个)")
    - 如果图谱为空，检查 `[Graph-LLM]` 日志中是否有 JSON 解析错误
    - 如果模型加载失败，确认 GGUF 模型文件存在于 `models/` 目录
    - 如果VLM未按预期触发，检查 `[VLM路由]` 日志中的 `sources_have_figure_captions` 值
+
+---
+
+## [2026-04-02] v1.7.x - LLM-Only Reference Parsing
+
+### 1. 移除正则表达式参考文献解析，保留纯 LLM 方案
+
+**文件**: `reference_processor.py`
+
+**变更**: 删除所有正则表达式-based 解析代码，仅保留 LLM 解析
+
+**删除的组件**:
+- `ReferenceExtractor` 类 (~470 行) - 正则表达式提取器
+- `process_references_and_citations()` 函数 - 正则处理入口
+- `GrobidReferenceParser` 类 (~480 行) - GROBID API 解析器
+- `process_references_and_citations_grobid()` 函数 - GROBID 处理
+- `_merge_reference_lists()` 函数 - 引用列表合并
+
+**保留的组件**:
+- `CitationLinker` 类 - 引用链接
+- `LLMReferenceParser` 类 - LLM 解析器
+- `process_references_with_llm()` 函数 - LLM 处理入口
+
+**新增**:
+- 模块级 `_find_reference_section()` 函数 - 使用关键词匹配定位参考文献部分
+
+```python
+REFERENCE_SECTION_KEYWORDS = [
+    'references', 'reference', 'bibliography', 'works cited',
+    'reference list', 'literature cited'
+]
+
+def _find_reference_section(text: str) -> Optional[str]:
+    """找到参考文献部分"""
+    ...
+```
+
+**效果**: 文件从 1913 行缩减至 ~890 行（减少 54%）
+
+---
+
+### 2. 修复 LLM 输出截断问题
+
+**文件**: `reference_processor.py`
+
+**问题**: 1087 行参考文献超出 max_tokens 限制导致截断
+
+**修复**: 将 `_call_llm()` 中的 `max_tokens` 从 8192 提升至 16384
+
+```python
+"max_tokens": 16384,  # 模型最大支持 16384 tokens
+```
+
+**注意**: 如仍超出限制，需实现批量处理将参考文献分批处理
+
+---
+
+### 3. 更新 hybrid_parser.py 引用
+
+**文件**: `hybrid_parser.py`
+
+**变更**: 更新 import 语句，移除已删除的函数引用
+
+```python
+# 更新前
+from .reference_processor import (
+    ReferenceExtractor,
+    CitationLinker,
+    process_references_and_citations,
+    process_references_and_citations_grobid,
+    process_references_with_llm,
+    Reference
+)
+
+# 更新后
+from .reference_processor import (
+    CitationLinker,
+    process_references_with_llm,
+    Reference
+)
+```
+
+**引用处理逻辑**: 移除了正则 fallback，仅使用 LLM 解析
+
+```python
+if effective_llm_config:
+    try:
+        references, all_nodes = await process_references_with_llm(...)
+    except Exception as e:
+        logger.warning(f"⚠️ LLM引用处理失败: {e}")
+        references = []
+else:
+    references = []
+```
+
+---
+
+## 测试建议
+
+1. **验证引用解析**:
+   ```bash
+   # 处理包含大量参考文献的 PDF
+   /paper parse <pdf_path>
+   ```
+   检查日志中是否有截断警告。
+
+2. **检查语法**:
+   ```bash
+   python3 -m py_compile reference_processor.py
+   python3 -m py_compile hybrid_parser.py
+   ```
+
+---
+
+### 4. 修复 CRAG 评估 JSON 解析问题
+
+**文件**: `hybrid_rag.py`
+
+**问题**: LLM 返回的 JSON 中 reasoning 字段包含未转义引号（如 `如"10,000 条对话"`），导致 JSON 解析失败：
+```
+Expecting ',' delimiter: line 4 column 168 (char 209)
+```
+
+**修复**: 使用正则 fallback 直接提取 JSON 字段值，不依赖 `json.loads()`
+
+```python
+# hybrid_rag.py:544-556
+import re
+score_match = re.search(r'"score"\s*:\s*([0-9.]+)', matched_json)
+score = float(score_match.group(1)) if score_match else 0.5
+level_match = re.search(r'"level"\s*:\s*"([^"]+)"', matched_json)
+level = level_match.group(1) if level_match else "medium"
+reasoning_match = re.search(r'"reasoning"\s*:\s*"([^"]*)"', matched_json)
+reasoning = reasoning_match.group(1) if reasoning_match else ""
+```
+
+**同时修复**: `max_tokens` 从 200 提升至 1024，避免输出被截断
+
+### 5. 修复 LlamaCppVLMProvider 忽略调用者传入的 max_tokens
+
+**文件**: `llama_cpp_vlm_provider.py`
+
+**问题**: `text_chat()` 方法接受 `max_tokens` 参数但从未使用，始终使用 `self.max_tokens`（实例初始化时的值）
+
+**修复**: 修改 `text_chat()` 使用调用者传入的 `max_tokens`
+
+```python
+# llama_cpp_vlm_provider.py:333-341
+effective_max_tokens = kwargs.get('max_tokens', self.max_tokens)
+result = await loop.run_in_executor(
+    None,
+    lambda: llama.create_chat_completion(
+        messages=messages,
+        temperature=temp,
+        max_tokens=effective_max_tokens,  # 使用传入值而非 self.max_tokens
+    )
+)
+```

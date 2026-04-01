@@ -634,12 +634,18 @@ Query
 
 ### Q6: 重排序功能不可用
 
-**原因**：FlagEmbedding未安装
+**原因**：FlagEmbedding与transformers版本不兼容
 
 **解决**：
 ```bash
+# 确保 transformers 版本 < 5.0
+pip install "transformers>=4.40.0,<5.0"
 pip install -U FlagEmbedding
 ```
+
+**已知冲突**：
+- `mlx-lm`、`mlx-vlm` 与 `transformers<5.0` 冲突，如已安装请卸载
+- transformers 5.x 移除了 `is_torch_fx_available`，导致 FlagEmbedding 导入失败
 
 **MPS加速不可用**：
 - 检查macOS版本 ≥ 12.3

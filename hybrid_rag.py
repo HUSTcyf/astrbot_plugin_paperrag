@@ -522,7 +522,7 @@ class CragEvaluator:
                 prompt=prompt,
                 contexts=[],
                 temperature=0.1,
-                max_tokens=200
+                max_tokens=1024
             )
 
             response_text = ""
@@ -535,9 +535,29 @@ class CragEvaluator:
 
             # 解析 JSON
             import json, re
+            logger.debug(f"[CRAG LLM] 响应原文:\n{response_text}")
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
-                result = json.loads(json_match.group(0))
+                matched_json = json_match.group(0)
+                logger.debug(f"[CRAG LLM] 匹配的JSON:\n{matched_json}")
+
+                # 尝试标准 json.loads
+                try:
+                    result = json.loads(matched_json)
+                    logger.info("[CRAG] JSON解析成功")
+                except json.JSONDecodeError as e:
+                    logger.warning(f"[CRAG] JSON解析失败: {e}，使用正则提取...")
+                    # 正则提取
+                    import re
+                    score_match = re.search(r'"score"\s*:\s*([0-9.]+)', matched_json)
+                    score = float(score_match.group(1)) if score_match else 0.5
+                    level_match = re.search(r'"level"\s*:\s*"([^"]+)"', matched_json)
+                    level = level_match.group(1) if level_match else "medium"
+                    reasoning_match = re.search(r'"reasoning"\s*:\s*"([^"]*)"', matched_json)
+                    reasoning = reasoning_match.group(1) if reasoning_match else ""
+                    result = {"score": score, "level": level, "reasoning": reasoning}
+                    logger.info(f"[CRAG] 正则提取: score={score}, level={level}, reasoning={reasoning[:50]}...")
+
                 score = float(result.get("score", 0.5))
                 level = result.get("level", "medium")
                 reasoning = result.get("reasoning", "")
@@ -1624,32 +1644,20 @@ class HybridRAGEngine:
             # VLM路由判断
             # 用户直接上传图片 → 直接使用VLM
             # 否则根据查询和检索结果自动判断
-            logger.debug(f"[VLM Debug] 原始images参数: {images}")
-            logger.debug(f"[VLM Debug] 检索到的sources数量: {len(sources)}")
-            for i, src in enumerate(sources):
-                logger.debug(f"[VLM Debug] Source[{i}] metadata: {src.get('metadata', {})}")
-                img_path = src.get("metadata", {}).get("image_path")
-                if img_path:
-                    logger.debug(f"[VLM Debug] Source[{i}] 有image_path: {img_path}")
-
             if images:
                 # 用户上传了图片，直接使用VLM
                 final_images = images
                 logger.info(f"🖼️ 用户上传 {len(images)} 张图片，使用VLM模式")
-                for i, img in enumerate(images):
-                    logger.debug(f"[VLM Debug] 用户上传图片[{i}]: {img}")
             else:
                 # 自动路由：根据查询和检索结果判断
                 if self._should_use_vlm(query, sources):
                     # 从检索结果提取关联图片（force_all_paper_images=True当检测到视觉内容时获取论文所有图片）
                     final_images = self._extract_image_paths_from_sources(sources, force_all_paper_images=True)
-                    logger.debug(f"[VLM Debug] _extract_image_paths_from_sources返回: {final_images}")
                     if final_images:
                         logger.info(f"🖼️ 检索到 {len(final_images)} 张关联图片，使用VLM模式")
                         for i, img in enumerate(final_images):
                             exists = os.path.exists(img) if img else False
                             size = os.path.getsize(img) if exists else 0
-                            logger.debug(f"[VLM Debug] 检索图片[{i}]: {img} (exists={exists}, size={size})")
                     else:
                         # 有视觉关键词但没有关联图片，回退到LLM
                         logger.info(f"📝 检测到视觉关键词但无关联图片，使用LLM模式")
@@ -1658,7 +1666,6 @@ class HybridRAGEngine:
                     final_images = None
                     logger.info(f"📝 纯文本查询，使用LLM模式")
 
-            logger.debug(f"[VLM Debug] 最终final_images: {final_images}")
 
             # 生成答案
             answer = await self._generate_answer_with_llm(
@@ -1834,30 +1841,20 @@ Please provide a detailed answer and cite the relevant sources."""
             use_multimodal = images is not None
             provider_to_use = llm_provider  # 默认使用文本provider
 
-            logger.debug(f"[VLM Debug] ===== _generate_answer_with_llm 开始 =====")
-            logger.debug(f"[VLM Debug] 输入images: {images}")
-            logger.debug(f"[VLM Debug] use_multimodal: {use_multimodal}")
-            logger.debug(f"[VLM Debug] multimodal_provider_id配置: {getattr(self.config, 'multimodal_provider_id', 'NOT_SET')}")
 
             if use_multimodal and self.config.multimodal_provider_id:
                 try:
                     provider_manager = getattr(self.context, "provider_manager", None)
-                    logger.debug(f"[VLM Debug] provider_manager: {provider_manager}")
                     if provider_manager:
                         inst_map = getattr(provider_manager, "inst_map", None)
-                        logger.debug(f"[VLM Debug] inst_map: {inst_map}")
-                        logger.debug(f"[VLM Debug] inst_map类型: {type(inst_map)}")
                         if isinstance(inst_map, dict):
                             vlm_provider = inst_map.get(self.config.multimodal_provider_id)
-                            logger.debug(f"[VLM Debug] 从inst_map获取的vlm_provider: {vlm_provider}")
-                            logger.debug(f"[VLM Debug] vlm_provider类型: {type(vlm_provider) if vlm_provider else None}")
                             if vlm_provider:
                                 provider_to_use = vlm_provider
                                 provider_name = getattr(vlm_provider, 'model_name', None) or getattr(vlm_provider, 'model', None) or 'unknown'
                                 logger.info(f"🖼️ 使用VLM模式，多模态Provider: {self.config.multimodal_provider_id} (实际provider: {provider_name})")
                             else:
                                 logger.warning(f"⚠️ 未找到多模态Provider: {self.config.multimodal_provider_id}，回退到文本模式")
-                                logger.warning(f"[VLM Debug] inst_map的keys: {list(inst_map.keys()) if inst_map else []}")
                                 use_multimodal = False
                 except Exception as e:
                     logger.warning(f"⚠️ 获取多模态Provider失败: {e}，回退到文本模式")
@@ -1919,32 +1916,19 @@ Please provide a detailed answer and cite the relevant sources."""
                 image_urls = [str(Path(img_path).resolve()) for img_path in images]
 
                 logger.info(f"🖼️ 使用VLM模式查询 (图片数: {len(image_urls)})")
-                logger.debug(f"[VLM Debug] 解析后的image_urls: {image_urls}")
 
                 # 验证图片文件
                 for i, img_url in enumerate(image_urls):
                     exists = os.path.exists(img_url)
                     size = os.path.getsize(img_url) if exists else 0
-                    logger.debug(f"[VLM Debug] 图片[{i}] 路径: {img_url}")
-                    logger.debug(f"[VLM Debug] 图片[{i}] 存在: {exists}, 大小: {size} bytes")
                     if not exists:
-                        logger.warning(f"[VLM Debug] 图片[{i}] 文件不存在: {img_url}")
-
-                # 检查prompt长度
-                prompt_len = len(text_prompt)
-                logger.debug(f"[VLM Debug] prompt长度: {prompt_len} 字符")
-                logger.debug(f"[VLM Debug] prompt前200字符: {text_prompt[:200]}...")
+                        logger.warning(f"⚠️ 图片文件不存在: {img_url}")
 
                 # 使用 text_chat 接口（AstrBot Provider 统一接口）
                 # image_urls 支持本地文件路径或 URL
                 start_time = time.time()
                 if hasattr(provider_to_use, 'text_chat'):
                     try:
-                        provider_class_name = type(provider_to_use).__name__
-                        logger.info(f"[VLM Debug] 开始调用 {provider_class_name}.text_chat()")
-                        logger.debug(f"[VLM Debug] provider类型: {provider_class_name}")
-                        logger.debug(f"[VLM Debug] text_chat参数: prompt_len={prompt_len}, image_urls={image_urls}, temperature=0.7")
-
                         response = await provider_to_use.text_chat(
                             prompt=text_prompt,
                             image_urls=image_urls if image_urls else None,
@@ -1952,21 +1936,13 @@ Please provide a detailed answer and cite the relevant sources."""
                             temperature=0.7
                         )
 
-                        elapsed = time.time() - start_time
-                        logger.info(f"[VLM Debug] text_chat完成，耗时: {elapsed:.2f}秒")
-                        logger.debug(f"[VLM Debug] response类型: {type(response)}")
-                        logger.debug(f"[VLM Debug] response内容: {response}")
-
                         answer = self._extract_answer_from_response(response)
-                        logger.debug(f"[VLM Debug] 提取的answer: {answer[:200] if answer else 'None'}...")
-                        logger.debug(f"[VLM Debug] ===== _generate_answer_with_llm 成功完成 =====")
+                        elapsed = time.time() - start_time
+                        logger.info(f"✅ VLM模式完成，耗时: {elapsed:.2f}秒")
                         return answer
                     except Exception as e:
                         elapsed = time.time() - start_time
                         logger.error(f"❌ VLM模式失败: {e}，耗时: {elapsed:.2f}秒")
-                        logger.warning("[VLM Debug] VLM处理失败，尝试回退到LLM文本模式...")
-                        import traceback
-                        logger.debug(f"[VLM Debug] VLM异常详情: {traceback.format_exc()}")
                         # 回退到LLM文本模式
                         use_multimodal = False
                         llm_provider = await self._ensure_llm_initialized()

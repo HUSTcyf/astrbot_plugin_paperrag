@@ -448,6 +448,9 @@ class PaperRAGPlugin(Star):
                     reranking_adaptive=self.config.get("reranking_adaptive", True),
                     reranking_threshold=self.config.get("reranking_threshold", 0.0),
                     reranking_batch_size=self.config.get("reranking_batch_size", 32),
+                    enable_llm_reference_parsing=self.config.get("enable_llm_reference_parsing", True),
+                    freeapi_url=self.config.get("freeapi_url", ""),
+                    freeapi_key=self.config.get("freeapi_key", ""),
                     # Graph RAG 配置
                     enable_graph_rag=self.config.get("enable_graph_rag", False),
                     graph_storage_type=self.config.get("graph_rag", {}).get("storage_type", "memory"),

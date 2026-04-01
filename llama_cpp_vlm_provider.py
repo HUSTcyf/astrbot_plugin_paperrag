@@ -330,12 +330,15 @@ class LlamaCppVLMProvider:
             assert self._llama is not None, "Llama 未初始化"
             llama = self._llama
             loop = asyncio.get_event_loop()
+            # 使用调用者传入的 max_tokens，若无则用实例默认值
+            effective_max_tokens = kwargs.get('max_tokens', self.max_tokens)
+            logger.debug(f"[Llama.cpp-VLM] max_tokens: kwargs={kwargs.get('max_tokens')}, effective={effective_max_tokens}, self.max_tokens={self.max_tokens}")
             result = await loop.run_in_executor(
                 None,
                 lambda: llama.create_chat_completion(
                     messages=messages,
                     temperature=temp,
-                    max_tokens=self.max_tokens,
+                    max_tokens=effective_max_tokens,
                 )
             )
 

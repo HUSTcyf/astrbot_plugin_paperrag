@@ -751,6 +751,9 @@ def run_evaluator(predictions_file: Path, gold_file: Path, output_dir: Path, tex
     if use_bert_f1:
         cmd.append("--bert-score")
 
+    # Use quiet mode to get clean JSON output
+    cmd.append("--quiet")
+
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / "evaluation_results.json"
 
@@ -1108,7 +1111,9 @@ async def main_async(args):
         # 生成预测
         if args.llm_only:
             # 纯LLM基线模式（无检索）
-            predictions_file = output_dir / "predictions_llm_only.jsonl"
+            # 优先使用用户指定的 predictions_file，否则使用默认文件名
+            if not args.predictions_file:
+                predictions_file = output_dir / "predictions_llm_only.jsonl"
             print("⚠️  使用纯LLM基线模式（无检索）")
             await generate_predictions_llm_only(
                 engine,

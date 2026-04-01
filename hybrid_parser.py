@@ -34,19 +34,13 @@ except ImportError:
 # 导入引用处理器（兼容直接运行和包运行）
 try:
     from .reference_processor import (
-        ReferenceExtractor,
         CitationLinker,
-        process_references_and_citations,
-        process_references_and_citations_grobid,
         process_references_with_llm,
         Reference
     )
 except ImportError:
     from reference_processor import (
-        ReferenceExtractor,
         CitationLinker,
-        process_references_and_citations,
-        process_references_and_citations_grobid,
         process_references_with_llm,
         Reference
     )
@@ -268,9 +262,7 @@ class HybridPDFParser:
             if image_paths:
                 all_nodes = self._associate_images_with_chunks(all_nodes, image_paths, image_pages)
 
-            # 引用处理
-            # 优先使用 LLM-based 解析（如果提供了 LLM config）
-            # 否则使用正则表达式解析
+            # 引用处理 - 仅使用 LLM-based 解析
             effective_llm_config = llm_config or self.llm_config
             effective_arxiv_client = arxiv_client or self.arxiv_client
 
@@ -283,17 +275,11 @@ class HybridPDFParser:
                         arxiv_client=effective_arxiv_client
                     )
                 except Exception as e:
-                    logger.warning(f"⚠️ LLM引用处理失败，回退到正则解析: {e}")
-                    use_grobid = False
-                    references, all_nodes = process_references_and_citations_grobid(
-                        pdf_path, all_nodes, raw_text, use_grobid=use_grobid
-                    )
+                    logger.warning(f"⚠️ LLM引用处理失败: {e}")
+                    references = []
             else:
-                logger.debug(f"🔄 正则引用处理...")
-                use_grobid = False
-                references, all_nodes = process_references_and_citations_grobid(
-                    pdf_path, all_nodes, raw_text, use_grobid=use_grobid
-                )
+                logger.debug(f"🔄 未配置 LLM，跳过引用处理")
+                references = []
 
             if references and documents:
                 # 将参考文献信息添加到文档元数据

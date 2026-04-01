@@ -18,7 +18,7 @@ pillow>=9.0.0  # 图像处理（基础版本）
 
 # 多模态AI（可选 - 视觉编码器 + 重排序）
 # 这些包较大，只在需要图片向量化/重排序时安装
-transformers>=4.40.0  # HuggingFace transformers
+transformers>=4.40.0,<5.0  # HuggingFace transformers（5.x与FlagEmbedding不兼容）
 torch==2.10.0  # PyTorch（支持MPS/CPU自动选择）
 torchvision==0.25.0  # PyTorch视觉库（VLM依赖）
 torchaudio==2.10.0  # PyTorch音频库
@@ -27,7 +27,7 @@ FlagEmbedding>=1.2.0  # 重排序模型（支持MPS加速）
 
 # Apple Silicon MLX（可选 - 用于本地高速LLM推理）
 # 仅支持Apple M1/M2/M3/M4芯片，macOS 14+系统
-mlx-lm>=0.1.0   # Apple MLX LLM支持（纯文本对话模型）
+# mlx-lm>=0.1.0   # 已禁用：与 transformers<5.0 冲突
 
 # Llama.cpp（可选 - 用于本地VLM多模态推理）
 # 支持 GGUF 格式模型 + mmproj 视觉编码器
