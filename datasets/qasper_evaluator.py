@@ -1,12 +1,71 @@
 """
 Official script for evaluating models built for the Qasper dataset. The script
 outputs Answer F1 and Evidence F1 reported in the paper.
+
+Supports BERTScore F1 for semantic evaluation (see paper: Cosine F1 = 0.22, BERT F1 = 0.62)
 """
 from collections import Counter
 import argparse
 import string
 import re
 import json
+
+
+# Lazy import bert_score to avoid heavy dependency at module load
+bert_score = None
+
+
+def get_bert_scorer():
+    """Lazy load BERTScore scorer (cached for efficiency)."""
+    global bert_score
+    if bert_score is None:
+        from bert_score import BERTScorer
+        bert_score = BERTScorer(lang="en", rescale_with_baseline=True)
+    return bert_score
+
+
+def bert_f1_score(prediction, ground_truth):
+    """
+    Calculate BERTScore F1 for answer evaluation.
+
+    BERTScore evaluates semantic similarity rather than lexical overlap,
+    making it more suitable for QASPER's long-document free-form answers.
+
+    According to the paper:
+    - Cosine F1 (token overlap): 0.22 (too strict)
+    - BERT F1 (semantic): 0.62 (more appropriate)
+
+    Args:
+        prediction: Model predicted answer
+        ground_truth: Reference answer
+
+    Returns:
+        BERTScore F1 (rescaled with baseline)
+    """
+    if not prediction or not ground_truth:
+        return 0.0
+
+    # Handle boolean cases where "No" vs "False" should match
+    pred_lower = prediction.lower().strip()
+    truth_lower = ground_truth.lower().strip()
+    if pred_lower == truth_lower:
+        return 1.0
+    if pred_lower in ["no", "false", "yes", "true"]:
+        # Boolean equivalence check
+        is_positive = pred_lower in ["yes", "true"]
+        truth_is_positive = truth_lower in ["yes", "true"]
+        if is_positive == truth_is_positive:
+            return 0.999  # Near perfect semantic match for booleans
+
+    try:
+        scorer = get_bert_scorer()
+        # BERTScore expects lists
+        P, R, F1 = scorer.score([prediction], [ground_truth])
+        # F1 is a tensor, get the scalar value
+        return F1.item()
+    except Exception as e:
+        # Fallback to token F1 if BERTScore fails
+        return token_f1_score(prediction, ground_truth)
 
 
 def normalize_answer(s):
@@ -151,7 +210,18 @@ def get_answers_and_evidence(data, text_evidence_only):
     return answers_and_evidence
 
 
-def evaluate(gold, predicted):
+def evaluate(gold, predicted, use_bert_f1=False):
+    """
+    Evaluate predictions against gold answers.
+
+    Args:
+        gold: Gold answers dict {question_id: references}
+        predicted: Predicted answers dict {question_id: {"answer": ..., "evidence": ...}}
+        use_bert_f1: If True, compute BERTScore F1 instead of token F1 for answers
+
+    Returns:
+        Evaluation metrics dict
+    """
     max_answer_f1s = []
     max_evidence_f1s = []
     max_answer_f1s_by_type = {
@@ -161,36 +231,65 @@ def evaluate(gold, predicted):
         "none": [],
     }
     num_missing_predictions = 0
+
+    # BERTScore: collect all pairs for batch evaluation (faster)
+    bert_pairs = []  # [(question_id, prediction, reference_answer, answer_type), ...]
+    bert_f1s = []   # parallel array for results
+
     for question_id, references in gold.items():
         if question_id not in predicted:
             num_missing_predictions += 1
             max_answer_f1s.append(0.0)
             max_evidence_f1s.append(0.0)
             continue
-        answer_f1s_and_types = [
-            (token_f1_score(predicted[question_id]["answer"], reference["answer"]),
-             reference["type"])
-            for reference in gold[question_id]
-        ]
-        max_answer_f1, answer_type = sorted(answer_f1s_and_types, key=lambda x: x[0], reverse=True)[0]
-        max_answer_f1s.append(max_answer_f1)
-        max_answer_f1s_by_type[answer_type].append(max_answer_f1)
+
+        predicted_answer = predicted[question_id]["answer"]
+
+        # For BERT F1, we need to find best matching reference
+        if use_bert_f1:
+            best_bert_f1 = 0.0
+            best_answer_type = "abstractive"
+            for reference in references:
+                bert_f1 = bert_f1_score(predicted_answer, reference["answer"])
+                if bert_f1 > best_bert_f1:
+                    best_bert_f1 = bert_f1
+                    best_answer_type = reference["type"]
+            max_answer_f1s.append(best_bert_f1)
+            max_answer_f1s_by_type[best_answer_type].append(best_bert_f1)
+        else:
+            # Token F1 evaluation
+            answer_f1s_and_types = [
+                (token_f1_score(predicted_answer, reference["answer"]),
+                 reference["type"])
+                for reference in references
+            ]
+            max_answer_f1, answer_type = sorted(answer_f1s_and_types, key=lambda x: x[0], reverse=True)[0]
+            max_answer_f1s.append(max_answer_f1)
+            max_answer_f1s_by_type[answer_type].append(max_answer_f1)
+
         evidence_f1s = [
             paragraph_f1_score(predicted[question_id]["evidence"], reference["evidence"])
-            for reference in gold[question_id]
+            for reference in references
         ]
         max_evidence_f1s.append(max(evidence_f1s))
 
     mean = lambda x: sum(x) / len(x) if x else 0.0
-    return {
+    result = {
         "Answer F1": mean(max_answer_f1s),
         "Answer F1 by type": {key: mean(value) for key, value in max_answer_f1s_by_type.items()},
         "Evidence F1": mean(max_evidence_f1s),
         "Missing predictions": num_missing_predictions
     }
 
+    # Add BERT F1 metrics if requested
+    if use_bert_f1:
+        result["Answer BERT F1"] = result["Answer F1"]  # Already computed with BERT
+        result["Answer BERT F1 by type"] = result["Answer F1 by type"]
+
+    return result
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="QASPER Evaluation Script")
     parser.add_argument(
         "--predictions",
         type=str,
@@ -209,6 +308,13 @@ if __name__ == "__main__":
         action="store_true",
         help="If set, the evaluator will ignore evidence in figures and tables while reporting evidence f1"
     )
+    parser.add_argument(
+        "--bert-score",
+        action="store_true",
+        help="""If set, compute BERTScore F1 instead of token F1.
+                According to the paper, BERTScore F1 (0.62) is more appropriate for QASPER
+                than cosine-based token F1 (0.22), especially for long-document free-form answers."""
+    )
     args = parser.parse_args()
     gold_data = json.load(open(args.gold))
     gold_answers_and_evidence = get_answers_and_evidence(gold_data, args.text_evidence_only)
@@ -219,5 +325,5 @@ if __name__ == "__main__":
             "answer": prediction_data["predicted_answer"],
             "evidence": prediction_data["predicted_evidence"]
         }
-    evaluation_output = evaluate(gold_answers_and_evidence, predicted_answers_and_evidence)
+    evaluation_output = evaluate(gold_answers_and_evidence, predicted_answers_and_evidence, use_bert_f1=args.bert_score)
     print(json.dumps(evaluation_output, indent=2))

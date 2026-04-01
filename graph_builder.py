@@ -309,7 +309,7 @@ Extract ALL meaningful relationship triplets from the given paper text chunks. E
 3. Use English relation descriptions
 4. Confidence: 0.5-1.0 based on text clarity
 5. Max {max_triplets} triplets per chunk
-6. Include [Chunk X] in evidence to indicate source
+6. **IMPORTANT**: evidence field must ONLY contain "[Chunk X]" - do NOT include original text. This avoids JSON parsing issues with newlines and quotes.
 
 ## Example
 Chunks:
@@ -328,7 +328,7 @@ Output:
       "tail": "Transformer",
       "tail_type": "Model/Architecture",
       "confidence": 0.98,
-      "evidence": "BERT is based on the Transformer encoder [Chunk 1]"
+      "evidence": "[Chunk 1]"
     }},
     {{
       "head": "BERT",
@@ -338,7 +338,7 @@ Output:
       "tail": "GLUE benchmark",
       "tail_type": "Dataset",
       "confidence": 0.95,
-      "evidence": "achieves 86.4% accuracy on GLUE benchmark [Chunk 2]"
+      "evidence": "[Chunk 2]"
     }}
   ]
 }}
@@ -400,6 +400,7 @@ Extract ALL meaningful relationship triplets from the given paper text.
 3. Use English relation descriptions
 4. Confidence: 0.5-1.0 based on text clarity
 5. Max {max_triplets} triplets per chunk
+6. **IMPORTANT**: evidence field must be a SHORT phrase (max 50 chars) - do NOT include long text snippets. This avoids JSON parsing issues.
 
 ## Example
 Input: "BERT is based on the Transformer encoder architecture and achieves 86.4% accuracy on GLUE benchmark, outperforming all previous models."
@@ -416,7 +417,7 @@ Output:
       "tail": "Transformer",
       "tail_type": "Model/Architecture",
       "confidence": 0.98,
-      "evidence": "BERT is based on the Transformer encoder"
+      "evidence": "based on Transformer"
     }},
     {{
       "head": "BERT",
@@ -426,7 +427,7 @@ Output:
       "tail": "GLUE benchmark",
       "tail_type": "Dataset",
       "confidence": 0.95,
-      "evidence": "achieves 86.4% accuracy on GLUE benchmark"
+      "evidence": "86.4% on GLUE"
     }},
     {{
       "head": "BERT",
@@ -436,7 +437,7 @@ Output:
       "tail": "previous models",
       "tail_type": "Model/Architecture",
       "confidence": 0.85,
-      "evidence": "outperforming all previous models"
+      "evidence": "outperforms previous models"
     }}
   ],
   "entities": [
@@ -625,15 +626,24 @@ class MultimodalGraphBuilder:
     async def _ensure_llm_initialized(self):
         """确保 LLM 已初始化 - 使用 LlamaCppVLMProvider"""
         if self._llm is None:
-            from .llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
-            self._llm = get_llama_cpp_vlm_provider(
-                model_path=self._llm_config.model_path,
-                mmproj_path=self._llm_config.mmproj_path,
-                n_ctx=self._llm_config.n_ctx,
-                n_gpu_layers=self._llm_config.n_gpu_layers,
-                max_tokens=self._llm_config.max_tokens,
-                temperature=self._llm_config.temperature
+            from .llama_cpp_vlm_provider import (
+                get_llama_cpp_vlm_provider,
+                get_cached_llama_cpp_provider,
+                init_llama_cpp_vlm_provider,
             )
+            # 优先复用已初始化的单例
+            cached = get_cached_llama_cpp_provider()
+            if cached is not None:
+                self._llm = cached
+            else:
+                self._llm = init_llama_cpp_vlm_provider(
+                    model_path=self._llm_config.model_path,
+                    mmproj_path=self._llm_config.mmproj_path,
+                    n_ctx=self._llm_config.n_ctx,
+                    n_gpu_layers=self._llm_config.n_gpu_layers,
+                    max_tokens=self._llm_config.max_tokens,
+                    temperature=self._llm_config.temperature
+                )
         await self._llm.initialize()
 
     async def build_from_nodes(
@@ -688,6 +698,16 @@ class MultimodalGraphBuilder:
                 stats["chunks_with_images"] += result.get("chunks_with_images", 0)
                 stats["chunks_processed"] += result.get("chunks_with_triplets", 0)
                 stats["chunks_empty"] += result.get("chunks_empty", 0)
+                # 批次统计日志
+                batch_triplets = result.get("text_triplets_added", 0)
+                batch_entities = result.get("entities_added", 0)
+                batch_images = result.get("image_entities_added", 0)
+                batch_cross = result.get("cross_modal_triplets_added", 0)
+                logger.info(
+                    f"[Graph-LLM] 批次 {batch_idx + 1}/{total_batches} 完成: "
+                    f"实体+{batch_entities}, 文本三元组+{batch_triplets}, "
+                    f"图片实体+{batch_images}, 跨模态三元组+{batch_cross}"
+                )
 
         logger.info(
             f"✅ 图谱构建完成: "
@@ -1155,91 +1175,118 @@ Extract triplets:"""
         return stripped.strip()
 
     def _parse_json_response(self, response: str) -> List[Dict[str, Any]]:
-        """解析 JSON 响应"""
+        """解析 JSON 响应，支持截断时尝试恢复"""
+        if not response:
+            return []
+
+        json_str = response.strip().lstrip('\ufeff')
+        json_str = self._strip_thinking_tokens(json_str)
+        if not json_str:
+            return []
+
+        # 提取 ```json ... ``` 块
+        if json_str.startswith("```"):
+            lines = json_str.split("\n")
+            json_str = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+        # 第一次尝试：直接解析
         try:
-            if not response:
-                logger.warning(f"JSON 响应为空，原始类型: {type(response)}")
-                return []
-            json_str = response.strip().lstrip('\ufeff')  # 移除 UTF-8 BOM
-            # 移除 thinking tokens
-            json_str = self._strip_thinking_tokens(json_str)
-            if not json_str:
-                logger.warning("JSON 响应移除 thinking 后为空")
-                return []
-            if json_str.startswith("```"):
-                lines = json_str.split("\n")
-                json_str = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
-
             data = json.loads(json_str)
-
-            if isinstance(data, dict):
-                triplets = data.get("triplets", [])
-                if isinstance(triplets, list):
-                    result = []
-                    for item in triplets:
-                        if not all(k in item for k in ("head", "relation", "tail")):
-                            continue
-                        result.append({
-                            "head": str(item.get("head", "")),
-                            "head_type": item.get("head_type", ""),
-                            "relation": str(item.get("relation", "")),
-                            "relation_type": item.get("relation_type", ""),
-                            "tail": str(item.get("tail", "")),
-                            "tail_type": item.get("tail_type", ""),
-                            "confidence": float(item.get("confidence", 0.5)),
-                            "evidence": item.get("evidence", "")
-                        })
-                    result.sort(key=lambda x: x.get("confidence", 0), reverse=True)
-                    return result
-
-            elif isinstance(data, list):
-                return [
-                    {
-                        "head": str(item.get("head", "")),
-                        "head_type": "",
-                        "relation": str(item.get("relation", "")),
-                        "relation_type": "",
-                        "tail": str(item.get("tail", "")),
-                        "tail_type": "",
-                        "confidence": 0.5,
-                        "evidence": ""
-                    }
-                    for item in data
-                    if item.get("head") and item.get("relation") and item.get("tail")
-                ]
-
-            return []
-
+            return self._extract_triplets(data)
         except json.JSONDecodeError as e:
-            logger.warning(f"JSON 解析失败: {e}")
+            logger.warning(f"[Graph-LLM] JSON 解析失败: {e}")
+
+        # 第二次尝试：找到 triplets 数组的结束位置，截断后面的内容
+        triplets_start = json_str.find('"triplets":')
+        if triplets_start < 0:
+            triplets_start = json_str.find('"triplets" :')
+        if triplets_start >= 0:
+            array_start = json_str.find('[', triplets_start)
+            if array_start >= 0:
+                depth = 0
+                last_valid_pos = -1
+                for i in range(array_start, len(json_str)):
+                    if json_str[i] == '{':
+                        depth += 1
+                    elif json_str[i] == '}':
+                        depth -= 1
+                        if depth == 0:
+                            last_valid_pos = i + 1
+                            break
+
+                if last_valid_pos > 0:
+                    try:
+                        truncated = json_str[:last_valid_pos]
+                        data = json.loads(truncated)
+                        logger.info(f"[Graph-LLM] 截断恢复成功，长度: {len(truncated)}")
+                        return self._extract_triplets(data)
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"[Graph-LLM] 截断 JSON 解析失败: {e}")
+
+        logger.warning(f"[Graph-LLM] JSON 解析恢复失败")
+        return []
+
+    def _extract_triplets(self, data) -> List[Dict[str, Any]]:
+        """从解析后的数据中提取三元组"""
+        if isinstance(data, dict):
+            triplets = data.get("triplets", [])
+        elif isinstance(data, list):
+            triplets = data
+        else:
             return []
+
+        if not isinstance(triplets, list):
+            return []
+
+        result = []
+        for item in triplets:
+            if not isinstance(item, dict):
+                continue
+            head = item.get("head")
+            relation = item.get("relation")
+            tail = item.get("tail")
+            if head and relation and tail:
+                result.append({
+                    "head": str(head),
+                    "head_type": item.get("head_type", ""),
+                    "relation": str(relation),
+                    "relation_type": item.get("relation_type", ""),
+                    "tail": str(tail),
+                    "tail_type": item.get("tail_type", ""),
+                    "confidence": float(item.get("confidence", 0.5)),
+                    "evidence": item.get("evidence", "")
+                })
+
+        result.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+        return result
 
     def _parse_multimodal_response(self, response: str) -> Dict[str, Any]:
         """解析多模态响应"""
-        try:
-            if not response or not isinstance(response, str):
-                logger.warning(f"多模态响应无效: type={type(response)}, value={str(response)[:100] if response else 'None'}")
-                return {"text_triplets": [], "image_info": {}, "cross_modal_triplets": []}
-
-            json_str = response.strip().lstrip('\ufeff')  # 移除 UTF-8 BOM
-            # 移除 thinking tokens
-            json_str = self._strip_thinking_tokens(json_str)
-            if not json_str:
-                logger.warning(f"多模态响应移除 thinking 后为空，原始响应前200字符: {str(response)[:200]}")
-                return {"text_triplets": [], "image_info": {}, "cross_modal_triplets": []}
-            logger.info(f"[Graph-LLM] 移除 thinking 后响应前200字符: {json_str[:200]}")
-
-            if json_str.startswith("```"):
-                lines = json_str.split("\n")
-                json_str = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
-
-            return json.loads(json_str)
-
-        except json.JSONDecodeError as e:
-            logger.warning(f"多模态 JSON 解析失败: {e}, 响应内容: {str(response)[:200] if response else 'None'}")
+        if not response or not isinstance(response, str):
             return {"text_triplets": [], "image_info": {}, "cross_modal_triplets": []}
-        except Exception as e:
-            logger.warning(f"多模态响应解析异常: {e}, type={type(response)}")
+
+        json_str = response.strip().lstrip('\ufeff')
+        json_str = self._strip_thinking_tokens(json_str)
+        if not json_str:
+            return {"text_triplets": [], "image_info": {}, "cross_modal_triplets": []}
+
+        if json_str.startswith("```"):
+            lines = json_str.split("\n")
+            json_str = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError as e:
+            logger.warning(f"[Graph-LLM] 多模态 JSON 解析失败: {e}")
+            # 截断恢复：从后向前找到最后一个完整的 }
+            last_brace = json_str.rfind('}')
+            if last_brace > 0:
+                try:
+                    truncated = json.loads(json_str[:last_brace + 1])
+                    logger.info(f"[Graph-LLM] 多模态截断恢复成功")
+                    return truncated
+                except json.JSONDecodeError:
+                    pass
             return {"text_triplets": [], "image_info": {}, "cross_modal_triplets": []}
 
 

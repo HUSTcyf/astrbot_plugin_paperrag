@@ -42,6 +42,144 @@ from .rag_engine import (
 
 
 # ============================================================================
+# Neo4j 服务管理器
+# ============================================================================
+
+class Neo4jServiceManager:
+    """
+    Neo4j 原生服务管理：检查/启动 Neo4j 服务
+
+    使用方式：
+        manager = Neo4jServiceManager()
+        await manager.ensure_neo4j_running()
+    """
+
+    def __init__(
+        self,
+        neo4j_config: Optional[dict] = None
+    ):
+        self.neo4j_config = neo4j_config or {
+            "host": "localhost",
+            "port": 7687,
+            "http_port": 7474,
+            "user": "neo4j",
+            "password": "password",
+            "neo4j_home": "/usr/local/var/neo4j",  # macOS Homebrew 默认
+        }
+
+    def _is_neo4j_available(self) -> bool:
+        """检查 Neo4j 是否可用"""
+        try:
+            result = subprocess.run(
+                ["neo4j", "status"],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            return "running" in result.stdout.lower() or result.returncode == 0
+        except FileNotFoundError:
+            # neo4j 命令不存在，尝试其他方式检测
+            pass
+
+        # 尝试通过 bolt 端口检测
+        try:
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            result = sock.connect_ex(("localhost", self.neo4j_config["port"]))
+            sock.close()
+            return result == 0
+        except Exception:
+            return False
+
+    def _is_homebrew_neo4j_installed(self) -> bool:
+        """检查是否通过 Homebrew 安装了 Neo4j"""
+        import os
+        homebrew_paths = [
+            "/usr/local/bin/neo4j",
+            "/opt/homebrew/bin/neo4j",
+            "/usr/local/var/neo4j",
+            "/opt/homebrew/var/neo4j",
+        ]
+        for path in homebrew_paths:
+            if os.path.exists(path) or os.path.exists(os.path.dirname(path)):
+                return True
+        return False
+
+    def _get_neo4j_start_command(self) -> str:
+        """获取 Neo4j 启动命令"""
+        # Homebrew 安装
+        if os.path.exists("/usr/local/bin/neo4j") or os.path.exists("/opt/homebrew/bin/neo4j"):
+            return "neo4j start"
+        # 直接安装
+        return "sudo systemctl start neo4j"  # Linux systemd
+
+    async def ensure_neo4j_running(self) -> bool:
+        """
+        确保 Neo4j 正在运行
+
+        Returns:
+            Neo4j 是否就绪
+        """
+        if self._is_neo4j_available():
+            logger.info("[Neo4j] Neo4j 服务已运行")
+            return True
+
+        logger.info("[Neo4j] Neo4j 未运行，尝试启动...")
+
+        if not self._is_homebrew_neo4j_installed():
+            logger.warning("[Neo4j] 未检测到 Homebrew Neo4j 安装")
+            logger.info("[Neo4j] 请运行以下命令安装 Neo4j:")
+            logger.info("  brew install neo4j")
+            logger.info("  brew services start neo4j")
+            return False
+
+        try:
+            # 尝试启动 Neo4j
+            cmd = self._get_neo4j_start_command()
+            logger.info(f"[Neo4j] 执行: {cmd}")
+
+            result = subprocess.run(
+                cmd.split(),
+                capture_output=True,
+                text=True,
+                check=False
+            )
+
+            if result.returncode == 0:
+                # 等待 Neo4j 启动
+                await self._wait_for_neo4j_ready()
+                return True
+            else:
+                logger.error(f"[Neo4j] 启动失败: {result.stderr}")
+                return False
+
+        except Exception as e:
+            logger.error(f"[Neo4j] 启动异常: {e}")
+            return False
+
+    async def _wait_for_neo4j_ready(self, timeout: int = 60):
+        """等待 Neo4j 就绪"""
+        import time
+        start = time.time()
+        while time.time() - start < timeout:
+            if self._is_neo4j_available():
+                logger.info("[Neo4j] ✅ Neo4j 服务已就绪")
+                return
+            await asyncio.sleep(2)
+        logger.warning("[Neo4j] ⚠️ Neo4j 启动超时")
+
+    def get_connection_info(self) -> dict:
+        """获取 Neo4j 连接信息"""
+        return {
+            "uri": f"bolt://{self.neo4j_config['host']}:{self.neo4j_config['port']}",
+            "user": self.neo4j_config["user"],
+            "password": self.neo4j_config["password"],
+            "http_port": self.neo4j_config["http_port"],
+        }
+
+
+# ============================================================================
 # CORE API 客户端（替代 arXiv MCP）
 # ============================================================================
 
@@ -101,7 +239,7 @@ class CoreAPIClient:
     "paper_rag",
     "YourName",
     "本地文档库RAG检索插件 (支持PDF/Word/TXT/HTML, Gemini + Milvus Lite)",
-    "1.7.0",
+    "1.7.2",
     "https://github.com/your/repo"
 )
 class PaperRAGPlugin(Star):
@@ -142,6 +280,46 @@ class PaperRAGPlugin(Star):
 
         # 注册 LLM 可调用的论文搜索工具
         self._register_llm_tools()
+
+        # 自动启动 Neo4j 服务
+        if self.config.get("auto_start_neo4j", True):
+            self._start_neo4j_service_async()
+
+    def _start_neo4j_service_async(self):
+        """异步启动 Neo4j 服务（不阻塞插件初始化）"""
+        import threading
+
+        def _start():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+                # 获取 Neo4j 配置
+                graph_config = self.config.get("graph_rag", {})
+                neo4j_config = {
+                    "host": "localhost",
+                    "port": 7687,
+                    "http_port": 7474,
+                    "user": graph_config.get("neo4j_user", "neo4j"),
+                    "password": graph_config.get("neo4j_password", "password"),
+                }
+
+                manager = Neo4jServiceManager(neo4j_config=neo4j_config)
+                success = loop.run_until_complete(manager.ensure_neo4j_running())
+
+                if success:
+                    conn_info = manager.get_connection_info()
+                    logger.info(f"[Neo4j] ✅ 服务已就绪: {conn_info['uri']}")
+                else:
+                    logger.warning("[Neo4j] ⚠️ 服务未运行，请手动启动 Neo4j")
+
+                loop.close()
+            except Exception as e:
+                logger.warning(f"[Neo4j] 自动检查服务失败: {e}")
+
+        thread = threading.Thread(target=_start, daemon=True)
+        thread.start()
+        logger.info("[Neo4j] Neo4j 服务检查线程已启动（后台运行）")
 
     def _register_llm_tools(self):
         """注册 LLM 可调用的论文搜索工具"""

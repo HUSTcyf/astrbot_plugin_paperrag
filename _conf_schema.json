@@ -4,6 +4,13 @@
         "type": "bool",
         "default": true
     },
+    "auto_start_neo4j": {
+        "description": "插件启动时检查 Neo4j 服务状态",
+        "type": "bool",
+        "hint": "启用后会检查 Neo4j 是否运行，并提示用户启动。Neo4j 需要通过 Homebrew (macOS) 或 apt/yum (Linux) 原生安装。Milvus 使用内置 Lite 版本，无需额外安装。",
+        "obvious_hint": true,
+        "default": true
+    },
     "enable_llm_tools": {
         "description": "是否启用LLM可调用的论文搜索工具",
         "type": "bool",

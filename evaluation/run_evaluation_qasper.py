@@ -16,9 +16,8 @@ Qasper 数据集评估脚本
 用法:
     # 官方 Qasper 评估
     python run_evaluation_qasper.py --all                         # 生成 predictions 并评估
-    python run_evaluation_qasper.py --all --force_english          # 生成英文 predictions 并评估
     python run_evaluation_qasper.py --generate                    # 仅生成 predictions
-    python run_evaluation_qasper.py --generate --force_english     # 生成英文 predictions
+    python run_evaluation_qasper.py --generate --limit 10         # 仅处理前10个问题（快速评估）
     python run_evaluation_qasper.py --evaluate                    # 仅运行评估
 
     # RAGAS 评估（使用 Milvus Qasper 数据库）
@@ -54,6 +53,131 @@ DEFAULT_EVAL_OUTPUT = SCRIPT_DIR / "evaluation_output"
 DEFAULT_MILVUS_QASPER_PATH = SCRIPT_DIR / "data" / "milvus_qasper.db"
 DEFAULT_QASPER_DOC_STATS_PATH = SCRIPT_DIR / "data" / "qasper_doc_stats.json"
 DEFAULT_RAGAS_OUTPUT = SCRIPT_DIR / "results_qasper"
+
+
+def extract_evidence_spans(sources: List[Dict[str, Any]], query: str, answer: str = "", max_chars: int = 500) -> List[str]:
+    """
+    方法2：从检索到的chunks中找到与答案最匹配的精确文本作为evidence
+
+    思路：
+    1. 先解析答案，提取关键信息（数字、名词短语等）
+    2. 在chunks中精确匹配这些关键信息
+    3. 返回包含答案的精确文本片段（而非完整chunk）
+
+    Args:
+        sources: 检索到的源文档列表
+        query: 查询文本
+        answer: 生成的答案
+        max_chars: 最大总字符数
+
+    Returns:
+        精确的evidence spans列表
+    """
+    import re
+
+    if not answer or not sources:
+        # 如果没有答案，返回完整chunk（fallback）
+        return [src.get("text", "")[:500] for src in sources[:3]]
+
+    # 1. 从答案中提取关键信息
+    answer_lower = answer.lower()
+
+    # 提取数字（对于factual问题最重要）
+    answer_numbers = re.findall(r'[\d,.]+', answer)
+
+    # 提取名词短语（4个字母以上的词）
+    answer_nouns = set(re.findall(r'\b[a-z]{4,}\b', answer_lower))
+
+    # 提取被引用的术语（如 TABREF, FIGREF 等）
+    answer_refs = re.findall(r'(TABREF|FIGREF|REF)\d+', answer, re.IGNORECASE)
+
+    evidence_spans = []
+
+    for src in sources:
+        text = src.get("text", "")
+        if not text:
+            continue
+
+        # 2. 分割句子
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+
+        # 3. 对每个句子评分，找出包含答案的句子
+        scored_sentences = []
+        for sent in sentences:
+            sent_lower = sent.lower()
+
+            # 计算匹配分数
+            score = 0
+
+            # 数字匹配（权重最高）
+            for num in answer_numbers:
+                if num in sent_lower:
+                    score += 10
+                    # 检查数字周围的上下文
+                    num_idx = sent_lower.find(num)
+                    context_start = max(0, num_idx - 30)
+                    context_end = min(len(sent_lower), num_idx + len(num) + 30)
+                    # 如果数字在有意义的上下文中（不是页码等）
+                    context = sent_lower[context_start:context_end]
+                    if any(w in context for w in ['=', ':', '%', 'accuracy', 'precision', 'recall', 'f1', 'score', 'result', 'dataset', 'model']):
+                        score += 5
+
+            # 名词匹配
+            for noun in answer_nouns:
+                if noun in sent_lower:
+                    score += 2
+
+            # 引用匹配
+            for ref in answer_refs:
+                if ref.lower() in sent_lower.lower():
+                    score += 8
+
+            # 答案完整出现在句子中（最高权重）
+            if answer_lower[:50] in sent_lower:
+                score += 20
+
+            if score > 0:
+                scored_sentences.append((score, sent))
+
+        # 按分数排序
+        scored_sentences.sort(key=lambda x: x[0], reverse=True)
+
+        # 4. 选取高分句子直到达到max_chars
+        current_len = sum(len(e) for e in evidence_spans)
+        for score, sent in scored_sentences:
+            if current_len + len(sent) <= max_chars:
+                evidence_spans.append(sent)
+                current_len += len(sent)
+            if current_len >= max_chars:
+                break
+
+    # 5. 如果没有找到匹配的句子，fallback到包含关键词的句子
+    if not evidence_spans:
+        for src in sources[:3]:
+            text = src.get("text", "")
+            if text:
+                # 找第一句包含答案关键词的
+                sentences = re.split(r'(?<=[.!?])\s+', text)
+                for sent in sentences:
+                    sent_lower = sent.lower()
+                    if any(noun in sent_lower for noun in list(answer_nouns)[:5]):
+                        evidence_spans.append(sent)
+                        break
+                if evidence_spans:
+                    break
+
+    # 6. 去重并限制数量
+    seen = set()
+    unique_spans = []
+    for span in evidence_spans:
+        # 用前50字符作为key去重
+        span_key = re.sub(r'\s+', ' ', span[:50]).strip()
+        if span_key and span_key not in seen:
+            seen.add(span_key)
+            unique_spans.append(span)
+
+    return unique_spans[:5]
 
 
 def load_config(config_path: Path) -> dict:
@@ -111,7 +235,7 @@ async def initialize_rag_engine(config: dict, milvus_lite_path: str = ''):
         embed_dim=config.get("embed_dim", 1024),  # Qasper 使用 bge-m3 模型，固定 1024 维
         top_k=config.get("top_k", 5),
         similarity_cutoff=config.get("similarity_cutoff", 0.3),
-        papers_dir=config.get("papers_dir", "./papers"),
+        papers_dir="./papers",  # Qasper 评估时 BM25 已禁用，此参数不影响
         chunk_size=config.get("chunk_size", 512),
         chunk_overlap=config.get("chunk_overlap", 0),
         min_chunk_size=config.get("min_chunk_size", 100),
@@ -124,8 +248,8 @@ async def initialize_rag_engine(config: dict, milvus_lite_path: str = ''):
         reranking_adaptive=config.get("reranking_adaptive", True),
         reranking_threshold=config.get("reranking_threshold", 0.0),
         reranking_batch_size=config.get("reranking_batch_size", 32),
-        enable_bm25=config.get("enable_bm25", False),
-        bm25_top_k=config.get("bm25_top_k", 20),
+        enable_bm25=True,  # Qasper 评估启用 BM25 混合检索
+        bm25_top_k=config.get("bm25_top_k", 50),
         hybrid_alpha=config.get("hybrid_alpha", 0.5),
         hybrid_rrf_k=config.get("hybrid_rrf_k", 60),
     )
@@ -215,7 +339,7 @@ async def generate_predictions(
     batch_size: int = 10,
     delay_between_batches: float = 1.0,
     resume: bool = True,
-    force_english: bool = False
+    limit: int = 0
 ) -> int:
     """
     生成预测文件
@@ -227,7 +351,7 @@ async def generate_predictions(
         batch_size: 每批处理的问题数
         delay_between_batches: 批次间的延迟（秒）
         resume: 是否启用断点续传（跳过已有答案的问题，默认True）
-        force_english: 强制使用英文回答（默认False）
+        limit: 限制处理的问题数，0表示不限制（默认0）
 
     Returns:
         新生成的预测数量
@@ -281,7 +405,14 @@ async def generate_predictions(
                 "paper_title": paper_title
             })
 
-    print(f"📝 本次需处理问题数: {len(questions_to_process)}")
+            # 如果设置了 limit，达到数量后停止构建列表
+            if limit > 0 and len(questions_to_process) >= limit:
+                break
+
+        if limit > 0 and len(questions_to_process) >= limit:
+            break
+
+    print(f"📝 本次需处理问题数: {len(questions_to_process)}" + (f" (已限制前 {limit} 个)" if limit > 0 else ""))
     if len(questions_to_process) == 0:
         print("✅ 所有问题都已完成，无需处理")
         print(f"   预测文件: {output_file}")
@@ -292,31 +423,36 @@ async def generate_predictions(
         question_id = qa_info["question_id"]
         question = qa_info["question"]
 
-        # 调用 RAG 引擎获取答案
+        # 调用 RAG 引擎获取答案（使用Qasper专用方法生成简短答案）
         evidence = []
         try:
-            result = await engine.search(question, mode="rag", force_english=force_english)
+            result = await engine.search_for_qasper(question, mode="rag")
 
             if result.get("type") == "rag":
                 answer = result.get("answer", "")
-                # 提取 evidence：从检索结果中获取来源文本
+                unanswerable = result.get("unanswerable", False)
+                # 提取 evidence：从检索结果中提取精确的evidence spans
                 sources = result.get("sources", [])
-                for src in sources:
-                    evidence.append(src.get("text", ""))
+                if not unanswerable:
+                    evidence = extract_evidence_spans(sources, question, answer, max_chars=500)
             elif result.get("type") == "error":
                 answer = ""
+                unanswerable = False
                 print(f"  ⚠️  [{question_id}] 错误: {result.get('message', 'Unknown error')}")
             else:
                 answer = ""
+                unanswerable = False
 
         except Exception as e:
             answer = ""
+            unanswerable = False
             print(f"  ⚠️  [{question_id}] 异常: {e}")
 
         existing_predictions[question_id] = {
             "question_id": question_id,
             "predicted_answer": answer,
-            "predicted_evidence": evidence
+            "predicted_evidence": evidence,
+            "unanswerable": unanswerable
         }
 
         processed += 1
@@ -341,7 +477,179 @@ async def generate_predictions(
     return processed
 
 
-def run_evaluator(predictions_file: Path, gold_file: Path, output_dir: Path, text_evidence_only: bool = False):
+async def generate_predictions_llm_only(
+    engine,
+    test_data: dict,
+    output_file: Path,
+    batch_size: int = 10,
+    delay_between_batches: float = 1.0,
+    resume: bool = True,
+    limit: int = 0
+) -> int:
+    """
+    生成纯LLM基线预测（不进行检索，直接使用LLM回答）
+
+    Args:
+        engine: RAG 引擎实例
+        test_data: 测试数据
+        output_file: 输出文件路径
+        batch_size: 每批处理的问题数
+        delay_between_batches: 批次间的延迟（秒）
+        resume: 是否启用断点续传
+        limit: 限制处理的问题数，0表示不限制
+
+    Returns:
+        新生成的预测数量
+    """
+    print("\n" + "=" * 60)
+    print("生成 Predictions (纯LLM基线 - 无检索)")
+    print("=" * 60)
+
+    # 断点续传：加载已存在的预测
+    existing_predictions = {}
+    questions_to_process = []
+    total_questions = 0
+    backup_file = None
+
+    if resume:
+        backup_file = backup_predictions(output_file)
+        if backup_file:
+            print(f"📂 已备份原始文件: {backup_file}")
+
+        existing_predictions = load_existing_predictions(output_file)
+        print(f"📂 已加载 {len(existing_predictions)} 条已有预测")
+
+    # 统计问题数并构建待处理列表
+    for paper_id, paper_data in test_data.items():
+        total_questions += len(paper_data.get("qas", []))
+
+    print(f"总问题数: {total_questions}")
+
+    # 构建待处理问题列表（跳过已有有效答案的）
+    for paper_id, paper_data in test_data.items():
+        paper_title = paper_data.get("title", "Unknown")
+        qas = paper_data.get("qas", [])
+
+        for qa in qas:
+            question_id = qa.get("question_id", "")
+            question = qa.get("question", "")
+
+            if not question:
+                continue
+
+            # 断点续传：跳过已有有效答案的问题
+            if resume and question_id in existing_predictions:
+                existing_answer = existing_predictions[question_id].get("predicted_answer", "")
+                if existing_answer and existing_answer.strip():
+                    continue
+
+            questions_to_process.append({
+                "question_id": question_id,
+                "question": question,
+                "paper_title": paper_title,
+                "paper_id": paper_id,
+                "figures_and_tables": paper_data.get("figures_and_tables", [])
+            })
+
+            if limit > 0 and len(questions_to_process) >= limit:
+                break
+
+        if limit > 0 and len(questions_to_process) >= limit:
+            break
+
+    print(f"📝 本次需处理问题数: {len(questions_to_process)}" + (f" (已限制前 {limit} 个)" if limit > 0 else ""))
+    if len(questions_to_process) == 0:
+        print("✅ 所有问题都已完成，无需处理")
+        print(f"   预测文件: {output_file}")
+        return 0
+
+    # 视觉关键词（用于检测是否需要VLM模式，与hybrid_rag.py保持一致）
+    VISUAL_KEYWORDS = [
+        "图", "figure", "chart", "plot", "graph",
+        "表格", "table", "公式", "formula", "equation",
+        "架构", "architecture", "diagram", "示意图",
+        "图像", "picture", "photo", "image",
+        "多少", "数值", "数据", "哪个大", "哪个小",
+        "颜色", "曲线", "峰值", "趋势"
+    ]
+
+    # Qasper图片目录
+    figures_base_dir = SCRIPT_DIR / "datasets" / "test_figures_and_tables"
+
+    def question_has_visual_keyword(query: str) -> bool:
+        """检测问题是否包含视觉关键词"""
+        query_lower = query.lower()
+        return any(keyword in query_lower for keyword in VISUAL_KEYWORDS)
+
+    def build_paper_image_paths(paper_id: str, figures_and_tables: list) -> list:
+        """根据论文ID和图表列表构建完整的图片路径"""
+        image_paths = []
+        for fig in figures_and_tables:
+            if isinstance(fig, dict) and "file" in fig:
+                fig_path = figures_base_dir / paper_id / fig["file"]
+                if fig_path.exists():
+                    image_paths.append(str(fig_path.resolve()))
+        return image_paths
+
+    processed = 0
+    for qa_info in questions_to_process:
+        question_id = qa_info["question_id"]
+        question = qa_info["question"]
+        paper_id = qa_info.get("paper_id", "")
+        figures_and_tables = qa_info.get("figures_and_tables", [])
+
+        # VLM路由：若问题涉及视觉内容且论文有图片，则使用VLM模式
+        images = None
+        if question_has_visual_keyword(question) and figures_and_tables:
+            images = build_paper_image_paths(paper_id, figures_and_tables)
+            if images:
+                print(f"  🖼️  [{question_id}] VLM模式: 加载{len(images)}张图片")
+
+        # 调用 RAG 引擎获取答案（纯LLM模式，无检索）
+        evidence = []
+        try:
+            result = await engine.search_for_qasper_llm_only(question, images=images)
+
+            if result.get("type") == "llm_only":
+                answer = result.get("answer", "")
+                # 纯LLM模式没有evidence
+                sources = result.get("sources", [])
+            elif result.get("type") == "error":
+                answer = ""
+                print(f"  ⚠️  [{question_id}] 错误: {result.get('message', 'Unknown error')}")
+            else:
+                answer = ""
+
+        except Exception as e:
+            answer = ""
+            print(f"  ⚠️  [{question_id}] 异常: {e}")
+
+        existing_predictions[question_id] = {
+            "question_id": question_id,
+            "predicted_answer": answer,
+            "predicted_evidence": evidence,
+            "unanswerable": False  # 纯LLM模式不判断不可回答
+        }
+
+        processed += 1
+
+        if processed % 50 == 0:
+            print(f"  已处理 {processed}/{len(questions_to_process)} 个问题...")
+
+        if processed % batch_size == 0:
+            await asyncio.sleep(delay_between_batches)
+            save_predictions(existing_predictions, output_file)
+
+    save_predictions(existing_predictions, output_file)
+
+    print(f"\n✅ 本次新生成 {processed} 条预测")
+    print(f"   总计已有预测: {len(existing_predictions)} 条")
+    print(f"   保存到: {output_file}")
+
+    return processed
+
+
+def run_evaluator(predictions_file: Path, gold_file: Path, output_dir: Path, text_evidence_only: bool = False, use_bert_f1: bool = False):
     """
     运行官方评估脚本
 
@@ -350,9 +658,14 @@ def run_evaluator(predictions_file: Path, gold_file: Path, output_dir: Path, tex
         gold_file: gold 标准文件路径 (qasper-test-v0.3.json)
         output_dir: 输出目录
         text_evidence_only: 是否仅使用文本证据
+        use_bert_f1: 是否使用BERTScore F1评估（语义评估，更适合QASPER长文档）
     """
     print("\n" + "=" * 60)
     print("运行评估")
+    if use_bert_f1:
+        print("  [BERTScore F1 模式 - 语义评估]")
+    else:
+        print("  [Token F1 模式 - 词汇重叠评估]")
     print("=" * 60)
 
     if not predictions_file.exists():
@@ -365,22 +678,78 @@ def run_evaluator(predictions_file: Path, gold_file: Path, output_dir: Path, tex
         print("请先运行: python qasper_downloader.py")
         sys.exit(1)
 
+    # 加载预测文件
+    predictions = {}
+    with open(predictions_file, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                pred = json.loads(line)
+                qid = pred.get("question_id", "")
+                if qid:
+                    predictions[qid] = pred
+
+    num_predictions = len(predictions)
+    print(f"📊 预测数量: {num_predictions}")
+
     # 使用官方评估脚本
     evaluator_script = SCRIPT_DIR / "datasets" / "qasper_evaluator.py"
     if not evaluator_script.exists():
         print(f"❌ 评估脚本不存在: {evaluator_script}")
         sys.exit(1)
 
+    # 检查是否是子集评估（预测数量 < gold总数）
+    # 如果是，创建临时子集 gold 文件
+    import tempfile
+    gold_data = None
+    temp_gold_file = None
+    predicted_question_ids = set(predictions.keys())
+
+    with open(gold_file, "r", encoding="utf-8") as f:
+        gold_data = json.load(f)
+
+    total_gold_questions = sum(len(paper["qas"]) for paper in gold_data.values())
+    is_subset_evaluation = num_predictions < total_gold_questions
+
+    if is_subset_evaluation:
+        print(f"⚠️ 检测到子集评估: {num_predictions} < {total_gold_questions} (总数)")
+        print(f"   将只评估已有预测的问题，missing predictions 将为 0")
+
+        # 创建子集 gold 数据
+        gold_subset = {}
+        for paper_id, paper_data in gold_data.items():
+            subset_qas = []
+            for qa in paper_data.get("qas", []):
+                if qa.get("question_id") in predicted_question_ids:
+                    subset_qas.append(qa)
+            if subset_qas:
+                subset_paper = dict(paper_data)
+                subset_paper["qas"] = subset_qas
+                gold_subset[paper_id] = subset_paper
+
+        # 保存临时文件
+        temp_gold_file = output_dir / "gold_subset.json"
+        with open(temp_gold_file, "w", encoding="utf-8") as f:
+            json.dump(gold_subset, f, ensure_ascii=False)
+        print(f"   临时子集 gold 文件: {temp_gold_file}")
+
+        # 使用子集 gold 文件进行评估
+        effective_gold_file = temp_gold_file
+    else:
+        effective_gold_file = gold_file
+
     # 构建命令
     cmd = [
         sys.executable,
         str(evaluator_script),
         "--predictions", str(predictions_file),
-        "--gold", str(gold_file),
+        "--gold", str(effective_gold_file),
     ]
 
     if text_evidence_only:
         cmd.append("--text_evidence_only")
+
+    if use_bert_f1:
+        cmd.append("--bert-score")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / "evaluation_results.json"
@@ -414,6 +783,11 @@ def run_evaluator(predictions_file: Path, gold_file: Path, output_dir: Path, tex
         print("\n错误信息:")
         print(result.stderr)
 
+    # 清理临时文件
+    if temp_gold_file and temp_gold_file.exists():
+        temp_gold_file.unlink()
+        print(f"\n🗑️ 已清理临时文件: {temp_gold_file}")
+
     return result.returncode == 0
 
 
@@ -445,7 +819,7 @@ async def run_ragas_full_evaluation(
 
     results = {}
 
-    # RAGAS 专用路径
+    # RAGAS 专用路径（使用默认路径，RAGAS 模式不支持通过命令行选择数据库）
     milvus_qasper_path = str(DEFAULT_MILVUS_QASPER_PATH)
     qasper_stats_path = str(DEFAULT_QASPER_DOC_STATS_PATH)
 
@@ -702,7 +1076,7 @@ async def main_async(args):
 
     # ========== 官方 Qasper 评估模式 ==========
     # 使用 Qasper 专用 Milvus 数据库
-    milvus_qasper_path = str(DEFAULT_MILVUS_QASPER_PATH)
+    milvus_qasper_path = args.milvus_qasper_path if args.milvus_qasper_path else str(DEFAULT_MILVUS_QASPER_PATH)
 
     # 加载测试数据
     test_data_path = SCRIPT_DIR / "datasets" / "qasper-test-v0.3.json"
@@ -717,7 +1091,11 @@ async def main_async(args):
     print(f"  问题数: {total_questions}")
     print(f"  Milvus Qasper 数据库: {milvus_qasper_path}")
 
-    predictions_file = output_dir / "predictions.jsonl"
+    # 确定预测文件路径
+    if args.predictions_file:
+        predictions_file = Path(args.predictions_file)
+    else:
+        predictions_file = output_dir / "predictions.jsonl"
     gold_file = SCRIPT_DIR / "datasets" / "qasper-test-v0.3.json"
 
     if args.generate or args.all:
@@ -728,19 +1106,33 @@ async def main_async(args):
         engine = await initialize_rag_engine(config, milvus_lite_path=milvus_qasper_path)
 
         # 生成预测
-        await generate_predictions(
-            engine,
-            test_data,
-            predictions_file,
-            batch_size=args.batch_size,
-            delay_between_batches=args.delay,
-            resume=not args.no_resume,
-            force_english=args.force_english
-        )
+        if args.llm_only:
+            # 纯LLM基线模式（无检索）
+            predictions_file = output_dir / "predictions_llm_only.jsonl"
+            print("⚠️  使用纯LLM基线模式（无检索）")
+            await generate_predictions_llm_only(
+                engine,
+                test_data,
+                predictions_file,
+                batch_size=args.batch_size,
+                delay_between_batches=args.delay,
+                resume=not args.no_resume,
+                limit=args.limit
+            )
+        else:
+            await generate_predictions(
+                engine,
+                test_data,
+                predictions_file,
+                batch_size=args.batch_size,
+                delay_between_batches=args.delay,
+                resume=not args.no_resume,
+                limit=args.limit
+            )
 
     if args.evaluate or args.all:
         # 运行评估
-        run_evaluator(predictions_file, gold_file, output_dir, args.text_evidence_only)
+        run_evaluator(predictions_file, gold_file, output_dir, args.text_evidence_only, args.bert_score)
 
     if not args.generate and not args.evaluate and not args.all:
         # 交互式模式
@@ -754,13 +1146,13 @@ async def main_async(args):
 
         if choice == "1":
             engine = await initialize_rag_engine(config, milvus_lite_path=milvus_qasper_path)
-            await generate_predictions(engine, test_data, predictions_file, resume=True, force_english=args.force_english)
+            await generate_predictions(engine, test_data, predictions_file, resume=True)
         elif choice == "2":
-            run_evaluator(predictions_file, gold_file, output_dir, args.text_evidence_only)
+            run_evaluator(predictions_file, gold_file, output_dir, args.text_evidence_only, args.bert_score)
         elif choice == "3":
             engine = await initialize_rag_engine(config, milvus_lite_path=milvus_qasper_path)
-            await generate_predictions(engine, test_data, predictions_file, resume=True, force_english=args.force_english)
-            run_evaluator(predictions_file, gold_file, output_dir, args.text_evidence_only)
+            await generate_predictions(engine, test_data, predictions_file, resume=True)
+            run_evaluator(predictions_file, gold_file, output_dir, args.text_evidence_only, args.bert_score)
         else:
             print("已退出")
 
@@ -773,10 +1165,10 @@ def main():
 示例:
   # 官方 Qasper 评估
   python run_evaluation_qasper.py --all                         # 生成 predictions 并评估（支持断点续传）
-  python run_evaluation_qasper.py --all --force_english         # 生成英文 predictions 并评估
   python run_evaluation_qasper.py --generate                    # 仅生成 predictions（支持断点续传）
-  python run_evaluation_qasper.py --generate --force_english     # 生成英文 predictions
   python run_evaluation_qasper.py --generate --no_resume        # 禁用断点续传，重新生成所有预测
+  python run_evaluation_qasper.py --generate --limit 10         # 仅处理前10个问题（快速评估）
+  python run_evaluation_qasper.py --all --limit 20              # 评估前20个问题
   python run_evaluation_qasper.py --evaluate                    # 仅运行评估
 
   # RAGAS 评估（使用 Milvus Qasper 数据库）
@@ -787,6 +1179,8 @@ def main():
   python run_evaluation_qasper.py --config /path/to/config.json  # 指定配置文件
   python run_evaluation_qasper.py --data_dir /path/to/data    # 指定数据目录
   python run_evaluation_qasper.py --output /path/to/output    # 指定输出目录
+  python run_evaluation_qasper.py --milvus-qasper-path ./data/milvus_qasper_vision.db  # 指定 Milvus 数据库（vision 模式）
+  python run_evaluation_qasper.py --milvus-qasper-path ./data/milvus_qasper_text.db    # 指定 Milvus 数据库（text-only 模式）
         """
     )
 
@@ -801,10 +1195,16 @@ def main():
     parser.add_argument("--delay", type=float, default=1.0, help="批次间延迟秒数 (默认: 1.0)")
     parser.add_argument("--text_evidence_only", action="store_true",
                         help="仅使用文本证据 (忽略表格/图片证据)")
+    parser.add_argument("--bert_score", action="store_true",
+                        help="使用BERTScore F1进行评估（语义评估，更适合QASPER长文档自由形式答案）")
     parser.add_argument("--no_resume", action="store_true",
                         help="禁用断点续传，重新生成所有预测（默认启用断点续传）")
-    parser.add_argument("--force_english", action="store_true",
-                        help="强制使用英文回答（用于英文数据集评估，默认关闭）")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="限制处理的问题数量，0表示不限制（默认0，用于快速评估）")
+    parser.add_argument("--llm_only", action="store_true",
+                        help="纯LLM基线模式：不进行检索，直接使用LLM回答（用于基线对比）")
+    parser.add_argument("--predictions_file", type=str, default=None,
+                        help="指定预测文件路径（用于评估时选择不同基线的预测结果）")
 
     # RAGAS 评估参数
     parser.add_argument("--ragas", action="store_true", help="使用 RAGAS 评估模式 (Qasper)")
@@ -814,6 +1214,8 @@ def main():
     parser.add_argument("--ragas-output", type=str, default=None, help="RAGAS 输出目录 (默认: results_qasper)")
     parser.add_argument("--test-size", type=int, default=50, help="RAGAS 生成测试问题数量 (默认: 50)")
     parser.add_argument("--max-concurrent", type=int, default=5, help="RAGAS 最大并发数 (默认: 5)")
+    parser.add_argument("--milvus-qasper-path", type=str, default=None,
+                        help="Qasper 专用 Milvus 数据库路径 (默认: milvus_qasper.db)")
 
     args = parser.parse_args()
 

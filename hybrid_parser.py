@@ -244,7 +244,9 @@ class HybridPDFParser:
             image_pages = {}
             if documents and self.enable_multimodal:
                 multimodal_data = documents[0].metadata.get("multimodal_data", {})
-                image_paths, image_pages = self._extract_and_save_images(pdf_path, multimodal_data)
+                # 使用 PDF 文件名作为 paper_id（用于按论文分类存储）
+                paper_id = Path(pdf_path).stem
+                image_paths, image_pages = self._extract_and_save_images(pdf_path, multimodal_data, paper_id)
 
             # 语义分块
             logger.debug(f"🔄 语义分块处理...")
@@ -771,29 +773,39 @@ class HybridPDFParser:
 
     # ==================== 图片存储与关联（VLM支持） ====================
 
-    def _get_figures_dir(self, pdf_path: str) -> str:
+    def _get_figures_dir(self, pdf_path: str, paper_id: str = None) -> str:
         """
         获取图片存储目录
 
         Args:
             pdf_path: PDF文件路径
+            paper_id: 论文ID（用于按论文分类存储）
 
         Returns:
             图片存储目录路径
         """
         if self.figures_dir:
-            return self.figures_dir
+            base_dir = self.figures_dir
+        else:
+            # 默认使用插件目录下的 data/figures
+            plugin_dir = Path(__file__).parent
+            base_dir = str(plugin_dir / "data" / "figures")
 
-        # 默认使用插件目录下的 data/figures
-        plugin_dir = Path(__file__).parent
-        return str(plugin_dir / "data" / "figures")
+        # 按论文分类存储
+        if paper_id:
+            return str(Path(base_dir) / paper_id)
+        else:
+            # 降级：使用 PDF 文件名作为目录名
+            pdf_stem = Path(pdf_path).stem
+            return str(Path(base_dir) / pdf_stem)
 
     def _save_image_to_disk(
         self,
         image: Any,
         pdf_path: str,
         page_num: int,
-        image_index: Any
+        figure_id: str,  # 格式: "3-Table1-1" 或 "5-Figure1-2"
+        paper_id: str = None  # 论文ID，用于按论文分类存储
     ) -> Optional[str]:
         """
         保存图片到磁盘
@@ -805,7 +817,8 @@ class HybridPDFParser:
             image: PIL.Image 对象
             pdf_path: PDF文件路径
             page_num: 页码
-            image_index: 图片索引
+            figure_id: 图片标识符，格式如 "3-Table1-1"
+            paper_id: 论文ID，用于按论文分类存储
 
         Returns:
             图片文件路径，失败返回 None
@@ -814,15 +827,15 @@ class HybridPDFParser:
             from PIL import Image
             import io
 
-            figures_dir = self._get_figures_dir(pdf_path)
+            figures_dir = self._get_figures_dir(pdf_path, paper_id)
 
             # 确保目录存在
             figures_path = Path(figures_dir)
             figures_path.mkdir(parents=True, exist_ok=True)
 
-            # 生成唯一文件名：{pdf_name}_p{page}_i{index}.png
-            pdf_name = Path(pdf_path).stem
-            filename = f"{pdf_name}_p{page_num}_i{image_index}.png"
+            # 生成文件名：{figure_id}.png（对齐 Qasper 格式）
+            # 例如: 3-Table1-1.png, 5-Figure1-2.png
+            filename = f"{figure_id}.png"
             image_path = figures_path / filename
 
             # 保存为 PNG（原图保存，查询时再transform）
@@ -839,7 +852,7 @@ class HybridPDFParser:
             logger.warning(f"⚠️ 保存图片失败: {e}")
             return None
 
-    def _extract_and_save_images(self, pdf_path: str, multimodal_data: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, int]]:
+    def _extract_and_save_images(self, pdf_path: str, multimodal_data: Dict[str, Any], paper_id: str = None) -> Tuple[Dict[str, str], Dict[str, int]]:
         """
         提取并保存图片，返回图片路径映射
 
@@ -853,6 +866,7 @@ class HybridPDFParser:
         Args:
             pdf_path: PDF文件路径
             multimodal_data: 多模态数据（包含 images 列表）
+            paper_id: 论文ID（用于按论文分类存储）
 
         Returns:
             Tuple[Dict[str, str], Dict[str, int]]: (图注->图片路径, 图注->页码) 的映射
@@ -873,6 +887,9 @@ class HybridPDFParser:
         try:
             # 第一步：按图注分组图片
             caption_groups = self._group_images_by_caption(images)
+
+            # 跟踪每个 caption 的 variant 计数器（解决子图覆盖问题）
+            caption_variant_counter: Dict[str, int] = {}
 
             # 第二步：对每组图片，提取完整大图
             for caption, img_list in caption_groups.items():
@@ -909,10 +926,29 @@ class HybridPDFParser:
                     pil_image = self._pixmap_to_pil_image(clipped_image)
 
                     if pil_image:
-                        # 保存完整大图（使用图注作为索引）
+                        # 获取该 caption 的 variant（解决子图覆盖问题）
+                        if caption not in caption_variant_counter:
+                            caption_variant_counter[caption] = 0
+                        else:
+                            caption_variant_counter[caption] += 1
+                        variant = caption_variant_counter[caption] + 1
+
+                        # 构建 figure_id：对齐 Qasper 格式 {page}-{type}{num}-{variant}
+                        # 例如: 3-Table1-1.png, 5-Figure1-2.png
                         figure_idx = self._extract_figure_number(caption)
+                        if figure_idx:
+                            # 根据 caption 前缀判断是 Figure 还是 Table
+                            caption_upper = caption.upper()
+                            if caption_upper.startswith("TABLE"):
+                                figure_id = f"{page_num}-Table{figure_idx}-{variant}"
+                            else:
+                                figure_id = f"{page_num}-Figure{figure_idx}-{variant}"
+                        else:
+                            # 无法提取编号，使用 caption 哈希或默认名称
+                            figure_id = f"{page_num}-FigureUNK-{variant}"
+
                         image_path = self._save_image_to_disk(
-                            pil_image, pdf_path, page_num, figure_idx
+                            pil_image, pdf_path, page_num, figure_id, paper_id
                         )
                         if image_path:
                             # 每个图注只保存一次
@@ -928,7 +964,7 @@ class HybridPDFParser:
             doc.close()
 
         if image_paths:
-            figures_dir = self._get_figures_dir(pdf_path)
+            figures_dir = self._get_figures_dir(pdf_path, paper_id)
             logger.info(f"🖼️ 提取并保存 {len(image_paths)} 张图片至 {figures_dir}")
             for caption, path in image_paths.items():
                 logger.debug(f"   {caption} (页{image_pages[caption]}) → {Path(path).name}")

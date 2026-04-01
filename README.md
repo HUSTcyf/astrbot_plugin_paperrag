@@ -1,8 +1,8 @@
-# 📚 Paper RAG Plugin v1.7.0 - 用户指南
+# 📚 Paper RAG Plugin v1.7.2 - 用户指南
 
 本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力（支持多模态VLM问答）。
 
-> **版本说明**：当前版本 v1.7.1，完整更新历史见 [CHANGELOG.md](CHANGELOG.md)
+> **版本说明**：当前版本 v1.7.2，完整更新历史见 [CHANGELOG.md](CHANGELOG.md)
 
 ## ✨ 核心功能
 
@@ -365,7 +365,11 @@ API 配置从 `evaluation/freeapi.json` 读取，包含：
 | `multimodal.nms_iou_threshold` | 图片去重阈值 | `0.5` |
 | `multimodal.enable_nms` | 启用NMS去重 | `true` |
 
-> 💡 **VLM路由说明**：查询含视觉关键词（"图"、"表格"、"公式"等）或检索结果关联图片时，自动使用 `multimodal_provider_id` 配置的多模态模型进行回答。
+> 💡 **VLM路由说明**：满足以下任一条件时，自动使用 `multimodal_provider_id` 配置的多模态模型进行回答：
+> - 查询含视觉关键词（"图"、"表格"、"公式"、"架构"等）
+> - 查询询问数量/比较/性能指标（"How many...", "Which is better...", "accuracy"等）
+> - 检索文本内容提到 Figure/Table/Algorithm 等
+> - 检索结果关联图片或图表 captions
 
 **生产环境推荐配置**：
 ```json
@@ -749,13 +753,22 @@ python run_evaluation_qasper.py --all
 | `--evaluate` | 仅运行评估 |
 | `--all` | 生成 + 评估 |
 | `--no_resume` | 禁用断点续传，重新生成所有预测 |
+| `--llm_only` | 纯LLM基线模式：不进行检索，直接使用LLM回答（用于基线对比） |
+| `--bert_score` | 使用BERTScore F1进行语义评估（更适合QASPER长文档自由形式答案） |
+| `--limit N` | 限制处理的问题数量（默认0不限制，用于快速测试） |
 
 ### 评估指标
 
-- **Answer F1**: 答案 F1 分数
+- **Answer F1**: 答案 F1 分数（基于词汇重叠）
+- **Answer BERT F1**: 答案 BERTScore F1（基于语义相似度，更适合QASPER长文档）
 - **Answer F1 by type**: 按答案类型 (extractive/abstractive/boolean/none) 的 F1
 - **Evidence F1**: 证据 F1 分数
 - **Missing predictions**: 缺失预测数量
+
+> 💡 **为什么需要 BERTScore F1？**
+> QASPER 数据集平均上下文长度超过 23,000 字符，自由形式答案导致相同语义可用不同表达。
+> 研究表明：Cosine F1 = 0.22（过于严格），BERTScore F1 = 0.62（更合理）。
+> 布尔问题（No/False, Yes/True）语义等价但词汇不同，BERTScore 更公平。
 
 ### 输出文件
 
@@ -794,7 +807,7 @@ evaluation_output/
 
 **技术方案**：基于 LlamaIndex PropertyGraphIndex 实现
 
-**版本**：v1.7.0
+**版本**：v1.7.2
 
 ### 🛠️ Graph RAG 修复 (v1.7.1)
 

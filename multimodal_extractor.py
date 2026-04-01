@@ -272,7 +272,7 @@ class MultimodalPDFExtractor:
                     # 提取表格
                     if self.extract_tables:
                         try:
-                            page_tables = self._extract_tables_from_page(str(pdf_path), page_num)
+                            page_tables = self._extract_tables_from_page(str(pdf_path), page_num, text)
                             tables.extend(page_tables)
                         except Exception as e:
                             logger.debug(f"⚠️ 页 {page_num} 表格提取失败: {e}")
@@ -506,7 +506,7 @@ class MultimodalPDFExtractor:
 
         return inter_area / union_area
 
-    def _extract_tables_from_page(self, pdf_path: str, page_num: int) -> List[ExtractedTable]:
+    def _extract_tables_from_page(self, pdf_path: str, page_num: int, page_text: str = "") -> List[ExtractedTable]:
         """从页面提取表格（使用 pdfplumber）"""
         tables = []
 
@@ -528,6 +528,9 @@ class MultimodalPDFExtractor:
                         for row in table
                     ]
 
+                    # 提取表注
+                    table_caption = self._find_table_caption(page_text, table_index, (0, 0, 0, 0))
+
                     # 转换为不同格式
                     html = self._table_to_html(cleaned_table)
                     markdown = self._table_to_markdown(cleaned_table)
@@ -540,7 +543,8 @@ class MultimodalPDFExtractor:
                         html=html,
                         markdown=markdown,
                         csv=csv_data,
-                        data=cleaned_table  # 使用清理后的数据
+                        data=cleaned_table,  # 使用清理后的数据
+                        caption=table_caption
                     ))
 
         except Exception as e:
@@ -598,7 +602,7 @@ class MultimodalPDFExtractor:
             caption: 图注文本
 
         Returns:
-            图注编号，如 "Figure 1"，如果无法提取则返回 None
+            图注编号，如 "1"、"A1"、"S1-1"，如果无法提取则返回 None
         """
         if not caption:
             return None
@@ -613,7 +617,7 @@ class MultimodalPDFExtractor:
         for pattern in patterns:
             match = re.search(pattern, caption, re.IGNORECASE)
             if match:
-                return f"Figure {match.group(1)}"
+                return match.group(1)  # 返回纯编号，如 "1"、"A1"、"S1-1"
 
         return None
 
@@ -656,9 +660,48 @@ class MultimodalPDFExtractor:
             match, num, desc = all_matches[image_index]
             return f"Figure {num}: {desc}"
         else:
-            # 如果图片数量超过图注数量，使用最后一个图注
-            match, num, desc = all_matches[-1]
-            return f"Figure {num}: {desc}"
+            # 如果图片数量超过图注数量，返回 None（让调用方处理无图注情况）
+            return None
+
+    def _find_table_caption(self, text: str, table_index: int, bbox: Tuple[float, float, float, float] = (0, 0, 0, 0)) -> Optional[str]:
+        """
+        查找表注（Table X）
+
+        Args:
+            text: 页面文本
+            table_index: 表格索引
+            bbox: 表格在页面上的位置 (x1, y1, x2, y2)
+
+        Returns:
+            表注文本，如果找不到则返回 None
+        """
+        # 匹配 Table 开头的格式
+        # 支持: Table 1, Table 2, Table A1, 表1, 表 1 等
+        patterns = [
+            r'(?:Table|表)\s*(\d+[A-Za-z]?(?:-[A-Za-z0-9]+)*)[:.]\s*([^\n]+)',
+        ]
+
+        # 查找所有匹配
+        all_matches = []
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                all_matches.append((match, match.group(1), match.group(2).strip()))
+
+        if not all_matches:
+            return None
+
+        # 如果只有一个匹配，直接返回
+        if len(all_matches) == 1:
+            match, num, desc = all_matches[0]
+            return f"Table {num}: {desc}"
+
+        # 如果有多个匹配，根据 table_index 选择
+        if table_index < len(all_matches):
+            match, num, desc = all_matches[table_index]
+            return f"Table {num}: {desc}"
+        else:
+            # 如果表格数量超过表注数量，返回 None
+            return None
 
     def _get_context_before(self, text: str, bbox: Tuple[float, float, float, float], max_chars: int = 200) -> Optional[str]:
         """获取图片前的文本上下文"""
@@ -711,6 +754,74 @@ class MultimodalPDFExtractor:
             line = ",".join(str(cell or "") for cell in row)
             lines.append(line)
         return '\n'.join(lines)
+
+    def get_figures_and_tables(self, extracted: ExtractedContent) -> List[Dict[str, str]]:
+        """
+        生成 Qasper 格式的 figures_and_tables 列表
+
+        Args:
+            extracted: extract() 方法返回的 ExtractedContent 对象
+
+        Returns:
+            List[Dict]: [{"file": "3-Table1-1.png", "caption": "..."}, ...]
+        """
+        result = []
+
+        # 处理图片
+        for img in extracted.images:
+            if img.caption:
+                # 直接根据 caption 前缀判断是 Figure 还是 Table
+                caption_upper = img.caption.upper()
+                if caption_upper.startswith("FIGURE") or caption_upper.startswith("FIG."):
+                    figure_type = "Figure"
+                elif caption_upper.startswith("TABLE"):
+                    figure_type = "Table"
+                else:
+                    figure_type = "Figure"  # 默认当作 Figure
+
+                figure_num = self._extract_figure_number(img.caption) or str(img.image_index)
+                # 生成文件名格式: {page}-{type}{num}-{variant}.png
+                # 例如: 3-Table1-1.png, 5-Figure1-1.png
+                result.append({
+                    "file": f"{img.page_number}-{figure_type}{figure_num}-{img.image_index}.png",
+                    "caption": img.caption
+                })
+
+        # 处理表格（如果提取了 caption）
+        for table in extracted.tables:
+            if table.caption:
+                table_num = self._extract_table_number(table.caption) or str(table.table_index)
+                result.append({
+                    "file": f"{table.page_number}-Table{table_num}-{table.table_index}.png",
+                    "caption": table.caption
+                })
+
+        return result
+
+    def _extract_table_number(self, caption: Optional[str]) -> Optional[str]:
+        """
+        从表注中提取表格编号（如 "Table 1", "Table A1"）
+
+        Args:
+            caption: 表注文本
+
+        Returns:
+            表格编号，如 "1"、"A1"，如果无法提取则返回 None
+        """
+        if not caption:
+            return None
+
+        # 匹配 "Table 1:", "Table A1:", "表1" 等
+        patterns = [
+            r'(?:Table|表)\s*(\d+[A-Za-z]?(?:-[A-Za-z0-9]+)*)',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, caption, re.IGNORECASE)
+            if match:
+                return match.group(1)
+
+        return None
 
 
 # ============================================================================

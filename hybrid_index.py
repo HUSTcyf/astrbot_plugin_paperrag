@@ -116,7 +116,22 @@ class HybridIndexManager:
             plugin_dir = Path(__file__).parent
             db_dir = str(plugin_dir / "data")
 
-        self._doc_stats_file = os.path.join(db_dir, "paper_doc_stats.json")
+        # 根据 Milvus 数据库文件名自动选择对应的 doc_stats 文件
+        # 例如：milvus_qasper_text.db -> qasper_doc_stats_text.json
+        db_name = os.path.basename(self._lite_path) if self._lite_path else "milvus.db"
+
+        # 替换数据库文件名为 doc_stats 文件名
+        if "qasper" in db_name.lower():
+            if "text" in db_name.lower():
+                doc_stats_filename = "qasper_doc_stats_text.json"
+            elif "vision" in db_name.lower():
+                doc_stats_filename = "qasper_doc_stats_vision.json"
+            else:
+                doc_stats_filename = "qasper_doc_stats.json"
+        else:
+            doc_stats_filename = "paper_doc_stats.json"
+
+        self._doc_stats_file = os.path.join(db_dir, doc_stats_filename)
         self._load_doc_stats()
         logger.info(f"📊 文档统计文件: {self._doc_stats_file}")
 
@@ -750,9 +765,14 @@ class HybridIndexManager:
                     collection = cast(Collection, self._collection)
 
                 try:
+                    # Milvus 中存储的 file_name 不带 .pdf 后缀，需要去除
+                    query_name = paper_name
+                    if query_name.lower().endswith('.pdf'):
+                        query_name = query_name[:-4]
+
                     raw_results: Any = await loop.run_in_executor(
                         None,
-                        lambda pn=paper_name: collection.query(
+                        lambda pn=query_name: collection.query(
                             expr=f'metadata["file_name"] == "{pn}"',
                             output_fields=["id", "text", "metadata"],
                         )
@@ -959,7 +979,8 @@ class HybridIndexManager:
     async def bm25_search(
         self,
         query: str,
-        top_k: int = 20
+        top_k: int = 20,
+        llm_provider: Any = None  # 可选：复用的 LLM provider
     ) -> List[Dict[str, Any]]:
         """
         BM25 关键词检索（基于 rank_bm25）
@@ -967,6 +988,7 @@ class HybridIndexManager:
         Args:
             query: 查询文本
             top_k: 返回结果数量
+            llm_provider: 可选的 LLM provider，用于 Query Expansion（复用已加载实例）
 
         Returns:
             BM25 得分列表 [{"text", "metadata", "score"}, ...]
@@ -987,26 +1009,271 @@ class HybridIndexManager:
             return []
 
         try:
-            # 分词并计算 BM25 分数
-            tokenized_query = query.split()
-            scores = self._bm25.get_scores(tokenized_query)
+            # 使用jieba分词并标准化（与索引构建时一致）
+            import jieba
+            import re
 
-            # 构建 (index, score) 对，排序取 top_k
-            scored = list(enumerate(scores))
-            scored.sort(key=lambda x: x[1], reverse=True)
+            def tokenize_text(text: str) -> list:
+                """使用jieba分词并标准化：去除标点，合并被标点分隔的单词"""
+                text = text.lower()
+                text = re.sub(r'([a-z])[-_]([a-z])', r'\1\2', text)
+                tokens = list(jieba.cut(text))
+                tokens = [t for t in tokens if not re.match(r'^[\s\W]+$', t)]
+                return tokens
 
+            async def rewrite_query_by_llm(query: str, llm_provider) -> str:
+                """
+                LLM-based Query Rewriting：将原始查询重写为1个更精确的检索表述
+
+                级联策略第一步：先用LLM聚焦核心意图，生成1个优化查询
+                """
+                rewrite_prompt = f"""你是一个学术检索专家。请将以下查询重写为精确的检索表述。
+
+【要求】
+1. 使用领域标准术语
+2. 保留核心意图和关键标识（作者、年份等）
+3. 表述简洁清晰
+
+原始查询：{query}
+重写查询："""
+
+                try:
+                    response = await llm_provider.text_chat(
+                        prompt=rewrite_prompt,
+                        contexts=[],
+                        temperature=0.1,
+                        max_tokens=100
+                    )
+                    response_text = ""
+                    if hasattr(response, 'content'):
+                        response_text = response.content
+                    elif isinstance(response, dict):
+                        response_text = response.get("content", "") or response.get("text", "")
+                    else:
+                        response_text = str(response)
+
+                    # 清理反引号和多余空白
+                    response_text = response_text.strip().strip('`').strip()
+                    if response_text:
+                        logger.debug(f"[Query Rewrite] '{query}' → '{response_text}'")
+                        return response_text
+                except Exception as e:
+                    logger.warning(f"[Query Rewrite] LLM调用失败: {e}")
+
+                # 重写失败时返回原始查询
+                return query
+
+            def _detect_question_type(query: str) -> str:
+                """
+                检测问题类型，用于针对性扩展
+                返回: 'quantity' | 'comparison' | 'definition' | 'general'
+                """
+                query_lower = query.lower()
+
+                # 数量型问题
+                if any(kw in query_lower for kw in ['how many', 'how much', 'how big', 'how large',
+                                                      'how long', 'how far', 'how fast', 'how old',
+                                                      'how deep', 'how wide', 'how tall', 'how heavy',
+                                                      'size', 'number of', 'quantity', 'count', 'total']):
+                    return 'quantity'
+
+                # 对比型问题
+                if any(kw in query_lower for kw in ['compare', 'comparison', 'versus', 'vs ',
+                                                      'difference', 'better', 'worse', 'superior', 'inferior',
+                                                      'outperform', 'exceed', 'surpass']):
+                    return 'comparison'
+
+                # 定义型问题
+                if query_lower.startswith('what is') or query_lower.startswith('what are') \
+                   or query_lower.startswith('define') or query_lower.startswith('what does'):
+                    return 'definition'
+
+                return 'general'
+
+            async def expand_query_by_llm(query: str, llm_provider: Any = None) -> List[str]:
+                """
+                重写 + 扩展混合策略（级联策略）：
+                步骤1：先用LLM将原始查询重写为1个更精确的表述
+                步骤2：根据问题类型对重写后的查询进行针对性扩展
+
+                Args:
+                    query: 查询文本
+                    llm_provider: 可选的 LLM provider（复用已加载实例，避免重复加载）
+
+                返回：[原始查询, 重写查询, 扩展查询1, 扩展查询2, ...]
+                """
+                # 如果没有提供 LLM provider，尝试加载
+                if llm_provider is None:
+                    # 尝试获取缓存的 Provider
+                    try:
+                        try:
+                            from .llama_cpp_vlm_provider import (
+                                get_cached_llama_cpp_provider,
+                                check_llama_cpp_vlm_available
+                            )
+                        except ImportError:
+                            from llama_cpp_vlm_provider import (
+                                get_cached_llama_cpp_provider,
+                                check_llama_cpp_vlm_available
+                            )
+
+                        # 优先使用缓存的 Provider
+                        cached = get_cached_llama_cpp_provider()
+                        if cached is not None:
+                            llm_provider = cached
+                            logger.debug("[Query Expansion] 复用已缓存的 LlamaCpp 模型")
+                        elif check_llama_cpp_vlm_available():
+                            # 缓存不存在但模型文件存在，创建新 Provider
+                            from pathlib import Path
+                            plugin_dir = Path(__file__).parent
+                            llama_model_path = str(plugin_dir / "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf")
+                            llama_mmproj_path = str(plugin_dir / "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf")
+
+                            from .llama_cpp_vlm_provider import init_llama_cpp_vlm_provider
+                            llm_provider = init_llama_cpp_vlm_provider(
+                                model_path=llama_model_path,
+                                mmproj_path=llama_mmproj_path,
+                                n_ctx=4096,
+                                n_gpu_layers=99,
+                                max_tokens=512,
+                                temperature=0.3
+                            )
+                            logger.debug("[Query Expansion] 初始化新的 LlamaCpp 模型")
+                    except Exception as e:
+                        logger.debug(f"[Query Expansion] LlamaCpp获取失败: {e}")
+
+                # 如果没有本地模型，返回原始查询
+                if llm_provider is None:
+                    return [query]
+
+                # ========== 步骤1：查询重写 ==========
+                rewritten_query = await rewrite_query_by_llm(query, llm_provider)
+
+                # ========== 步骤2：查询扩展（问题类型感知） ==========
+                question_type = _detect_question_type(query)
+
+                # 根据问题类型选择不同的few-shot示例
+                if question_type == 'quantity':
+                    # 数量型问题：扩展为数字/统计相关词汇
+                    examples = '''示例：
+查询："how many sentences in dataset"
+扩展：["dataset number of sentences samples", "dataset corpus statistics size", "dataset collection total count"]
+
+查询："how big is the training set"
+扩展：["training set size samples number", "training data corpus volume", "training set statistics scope"]'''
+                elif question_type == 'comparison':
+                    # 对比型问题：扩展为对比/性能相关词汇
+                    examples = '''示例：
+查询："how does model compare to sota"
+扩展：["model performance versus baseline", "accuracy improvement sota comparison", "model results benchmark sota"]
+
+查询："what is accuracy compared tobert"
+扩展：["bert accuracy baseline comparison", "model versus bert performance", "accuracy improvement over bert"]'''
+                elif question_type == 'definition':
+                    # 定义型问题：扩展为术语解释相关
+                    examples = '''示例：
+查询："what is attention mechanism"
+扩展：["attention mechanism definition", "self-attention method explained", "attention architecture principle"]
+
+查询："what is proposed method"
+扩展：["proposed method approach technique", "our method framework model", "methodology contribution approach"]'''
+                else:
+                    # 通用型问题：保持多样化扩展
+                    examples = '''示例：
+查询："how big is the dataset"
+扩展：["dataset size number of samples", "dataset statistics corpus", "dataset scale collection"]
+
+查询："what is the accuracy compared to sota"
+扩展：["accuracy versus sota baseline", "model performance comparison", "accuracy improvement methods"]'''
+
+                expand_prompt = f"""你是一个检索专家。请将以下学术查询重写为3个不同表述的检索查询。
+
+{examples}
+
+查询："{rewritten_query}"
+扩展："""
+
+                try:
+                    response = await llm_provider.text_chat(
+                        prompt=expand_prompt,
+                        contexts=[],
+                        temperature=0.2,
+                        max_tokens=200
+                    )
+                    response_text = ""
+                    if hasattr(response, 'content'):
+                        response_text = response.content
+                    elif isinstance(response, dict):
+                        response_text = response.get("content", "") or response.get("text", "")
+                    else:
+                        response_text = str(response)
+
+                    # 解析JSON
+                    import json
+                    match = re.search(r'\[.*\]', response_text, re.DOTALL)
+                    if match:
+                        expanded = json.loads(match.group(0))
+                        if isinstance(expanded, list) and len(expanded) > 0:
+                            # 返回组合列表：[原始查询, 重写查询, 扩展查询1, 扩展查询2, ...]
+                            # 原始查询权重最高，重写次之，扩展变体最低
+                            result = [query, rewritten_query] + expanded
+                            logger.debug(f"[Query Expansion] '{query}' → 重写:'{rewritten_query}' + 扩展:{expanded}")
+                            return result
+
+                except Exception as e:
+                    logger.warning(f"[Query Expansion] LLM调用失败: {e}")
+
+                # 扩展失败时返回 [原始查询, 重写查询]
+                return [query, rewritten_query]
+
+            async def _bm25_search_single(expanded_query: str) -> List[tuple]:
+                """对单个扩展查询执行BM25搜索"""
+                tokenized_query = tokenize_text(expanded_query)
+                scores = self._bm25.get_scores(tokenized_query)
+                return list(enumerate(scores))
+
+            # 执行LLM扩展（获取多个查询变体，复用已加载的 LLM provider）
+            expanded_queries = await expand_query_by_llm(query, llm_provider=llm_provider)
+            all_scored = []
+
+            # 对每个扩展查询执行BM25
+            for eq in expanded_queries:
+                scored = await _bm25_search_single(eq)
+                all_scored.append(scored)
+
+            # 合并多查询结果（RRF-style fusion）
+            combined_scores: Dict[int, float] = {}
+            for q_idx, scored in enumerate(all_scored):
+                # 重写+扩展混合策略的权重分配：
+                # - 原始查询 (q_idx=0): 1.0
+                # - 重写查询 (q_idx=1): 0.9
+                # - 扩展变体 (q_idx>=2): 0.7
+                if q_idx == 0:
+                    weight = 1.0  # 原始查询
+                elif q_idx == 1:
+                    weight = 0.9  # 重写查询
+                else:
+                    weight = 0.7  # 扩展变体
+                for doc_idx, score in scored:
+                    if doc_idx not in combined_scores:
+                        combined_scores[doc_idx] = 0.0
+                    combined_scores[doc_idx] += weight * score
+
+            # 按融合分数排序
+            sorted_docs = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
+
+            # 构建最终结果
             results = []
             seen_texts: set = set()
-            for idx, score in scored[:top_k]:
-                if idx >= len(self._bm25_corpus_texts):
+            for doc_idx, fused_score in sorted_docs[:top_k * 2]:  # 取更多备选
+                if doc_idx >= len(self._bm25_corpus_texts):
                     continue
-                text = self._bm25_corpus_texts[idx]
-                # 去重：相同文本只保留第一个
+                text = self._bm25_corpus_texts[doc_idx]
                 if text in seen_texts:
                     continue
                 seen_texts.add(text)
 
-                metadata = self._bm25_corpus_metadata[idx]
+                metadata = self._bm25_corpus_metadata[doc_idx]
                 if isinstance(metadata, str):
                     try:
                         metadata = json.loads(metadata)
@@ -1018,10 +1285,12 @@ class HybridIndexManager:
                 results.append({
                     "text": text,
                     "metadata": metadata or {},
-                    "score": float(score)
+                    "score": float(fused_score)
                 })
+                if len(results) >= top_k:
+                    break
 
-            logger.debug(f"BM25 检索: query='{query}', 返回 {len(results)} 条结果")
+            logger.debug(f"BM25 检索: query='{query}', 扩展为{len(expanded_queries)}个查询, 返回 {len(results)} 条结果")
             return results
 
         except Exception as e:
@@ -1044,12 +1313,27 @@ class HybridIndexManager:
             self._bm25_corpus_texts = [c["text"] for c in chunks]
             self._bm25_corpus_metadata = [c.get("metadata", {}) for c in chunks]
 
-            # 构建 BM25 索引
+            # 构建 BM25 索引（使用jieba分词）
             from rank_bm25 import BM25Okapi
-            tokenized_corpus = [text.split() for text in self._bm25_corpus_texts]
+            import jieba
+            import re
+
+            def tokenize_text(text: str) -> list:
+                """使用jieba分词并标准化：去除标点，合并被标点分隔的单词"""
+                # 1. 转小写
+                text = text.lower()
+                # 2. 将连字符/下划线连接的词合并（如 anti-scam -> antiscam）
+                text = re.sub(r'([a-z])[-_]([a-z])', r'\1\2', text)
+                # 3. 使用jieba分词
+                tokens = list(jieba.cut(text))
+                # 4. 去除纯标点token
+                tokens = [t for t in tokens if not re.match(r'^[\s\W]+$', t)]
+                return tokens
+
+            tokenized_corpus = [tokenize_text(text) for text in self._bm25_corpus_texts]
             self._bm25 = BM25Okapi(tokenized_corpus)
 
-            logger.info(f"✅ BM25 索引构建完成: {len(self._bm25_corpus_texts)} 个 chunks")
+            logger.info(f"✅ BM25 索引构建完成: {len(self._bm25_corpus_texts)} 个 chunks (使用jieba分词)")
 
         except Exception as e:
             logger.error(f"BM25 索引构建失败: {e}")

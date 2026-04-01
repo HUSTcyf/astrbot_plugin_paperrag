@@ -392,15 +392,17 @@ class LlamaCppVLMProvider:
 
 
 # ============================================================================
-# 单例管理
+# ============================================================================
+# 单例模式管理
 # ============================================================================
 
+# 全局 Provider 单例
 _vlm_provider_instance: Optional[LlamaCppVLMProvider] = None
 
 
-def get_llama_cpp_vlm_provider(
-    model_path: str = "./models/Qwen3.5-9B-UD-Q4_K_XL.gguf",
-    mmproj_path: str = "./models/mmproj-BF16.gguf",
+def init_llama_cpp_vlm_provider(
+    model_path: str,
+    mmproj_path: str,
     n_ctx: int = 4096,
     n_gpu_layers: int = 99,
     max_tokens: int = 2560,
@@ -408,7 +410,7 @@ def get_llama_cpp_vlm_provider(
     n_parallel: int = 1,
 ) -> LlamaCppVLMProvider:
     """
-    获取 Llama.cpp VLM Provider 单例
+    初始化 Llama.cpp VLM Provider 单例（应用启动时调用一次）
 
     Args:
         model_path: GGUF 模型文件路径
@@ -424,29 +426,101 @@ def get_llama_cpp_vlm_provider(
     """
     global _vlm_provider_instance
 
-    if _vlm_provider_instance is None:
-        logger.info(f"[Llama.cpp-VLM] 创建新 Provider 实例: {model_path}")
-        _vlm_provider_instance = LlamaCppVLMProvider(
-            model_path=model_path,
-            mmproj_path=mmproj_path,
-            n_ctx=n_ctx,
-            n_gpu_layers=n_gpu_layers,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            n_parallel=n_parallel,
-        )
+    logger.info(f"[Llama.cpp-VLM] 初始化 Provider: model={model_path}")
+    _vlm_provider_instance = LlamaCppVLMProvider(
+        model_path=model_path,
+        mmproj_path=mmproj_path,
+        n_ctx=n_ctx,
+        n_gpu_layers=n_gpu_layers,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        n_parallel=n_parallel,
+    )
     return _vlm_provider_instance
 
 
+def get_llama_cpp_vlm_provider() -> LlamaCppVLMProvider:
+    """
+    获取 Llama.cpp VLM Provider 单例
+
+    返回已初始化的单例实例。如果尚未初始化，则创建默认配置的实例。
+
+    Returns:
+        LlamaCppVLMProvider 实例
+    """
+    global _vlm_provider_instance
+
+    if _vlm_provider_instance is None:
+        # 未初始化时，使用默认路径创建实例
+        logger.info("[Llama.cpp-VLM] 单例未初始化，创建默认实例")
+        from pathlib import Path
+        plugin_dir = Path(__file__).parent
+        model_path = str(plugin_dir / "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf")
+        mmproj_path = str(plugin_dir / "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf")
+        _vlm_provider_instance = LlamaCppVLMProvider(
+            model_path=model_path,
+            mmproj_path=mmproj_path,
+            n_ctx=4096,
+            n_gpu_layers=99,
+            max_tokens=2560,
+            temperature=0.7,
+            n_parallel=1,
+        )
+
+    return _vlm_provider_instance
+
+
+def get_cached_llama_cpp_provider() -> Optional[LlamaCppVLMProvider]:
+    """
+    获取已缓存的 LlamaCppVLMProvider 单例
+
+    Returns:
+        缓存的实例，或 None
+    """
+    return _vlm_provider_instance
+
+
+def check_llama_cpp_vlm_available(
+    model_path: str = "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf",
+    mmproj_path: str = "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf"
+) -> bool:
+    """
+    检查 Llama.cpp VLM 模型文件是否存在
+
+    Args:
+        model_path: GGUF 模型文件路径
+        mmproj_path: mmproj 视觉编码器文件路径
+
+    Returns:
+        True if both files exist, False otherwise
+    """
+    from pathlib import Path
+    plugin_dir = Path(__file__).parent
+    model_full_path = str((plugin_dir / model_path).resolve())
+    mmproj_full_path = str((plugin_dir / mmproj_path).resolve())
+
+    model_exists = os.path.exists(model_full_path)
+    mmproj_exists = os.path.exists(mmproj_full_path)
+
+    if not model_exists:
+        logger.debug(f"[Llama.cpp-VLM] 模型文件不存在: {model_full_path}")
+    if not mmproj_exists:
+        logger.debug(f"[Llama.cpp-VLM] mmproj文件不存在: {mmproj_full_path}")
+
+    return model_exists and mmproj_exists
+
+
 def reset_llama_cpp_vlm_provider() -> None:
-    """重置单例（用于重新加载模型或清理资源）"""
+    """
+    重置 Provider 单例（用于重新加载模型或清理资源）
+    """
     global _vlm_provider_instance
 
     if _vlm_provider_instance is not None:
-        # 显式删除 llama 实例
         if hasattr(_vlm_provider_instance, '_llama'):
             _vlm_provider_instance._llama = None
         _vlm_provider_instance._initialized = False
+        logger.debug("[Llama.cpp-VLM] Provider 单例已清理")
 
     _vlm_provider_instance = None
 
