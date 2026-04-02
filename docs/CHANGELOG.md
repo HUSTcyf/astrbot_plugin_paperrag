@@ -4,6 +4,18 @@
 
 ## [1.7.3] - 2026-04-02
 
+### Bug 修复
+
+#### 修复 get_all_chunks() 返回 0 的问题
+
+**文件**: `hybrid_index.py`
+
+**问题**: `get_all_chunks()` 查询时错误地去掉了 `.pdf` 后缀，但 Milvus 中存储的 `file_name` 包含 `.pdf`，导致查询永远匹配不到数据。
+
+**原因**: 注释声称"Milvus 中存储的 file_name 不带 .pdf 后缀"，但实际存储时是带 `.pdf` 的。
+
+**修复**: 移除错误的 `.pdf` stripping 逻辑，直接使用完整的 `file_name` 查询。
+
 ### 图表提取优化
 
 #### 1. 图表索引与存储规范化
@@ -74,6 +86,27 @@ data/figures/
 **变更**:
 - `transformers>=4.40.0` → `transformers>=4.40.0,<5.0`
 - 移除 `mlx-lm`（与 `transformers<5.0` 冲突）
+
+---
+
+#### 6. 修复 Query Expansion JSON 解析问题
+
+**文件**: `hybrid_index.py`
+
+**问题**: LLM 返回 Markdown 格式而非 JSON，导致 `json.loads()` 失败：
+```
+Expecting value: line 1 column 2 (char 1)
+```
+
+**修复**:
+1. `max_tokens: 200 → 1024` - 避免输出被截断
+2. 添加正则 fallback 从 Markdown 格式提取查询
+
+```python
+# 正则 fallback：从 Markdown 格式中提取查询
+quote_pattern = r'(?:^|\n)\s*\d*\.?\s*["""]([^"""]+)["""]'
+matches = re.findall(quote_pattern, response_text)
+```
 
 ---
 

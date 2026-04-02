@@ -91,6 +91,8 @@ class HybridIndexManager:
         self._doc_stats_file = None  # JSON 文件路径
         # file_name -> {chunk_count, added_time, chunk_index_start, chunk_index_end, milvus_id_start, milvus_id_end}
         self._doc_stats: Dict[str, Dict[str, Any]] = {}
+        # 存储的 file_name 是否带 .pdf 后缀（从 doc_stats 自动推断）
+        self._file_name_has_pdf_suffix: Optional[bool] = None
 
         # BM25 内存索引（延迟构建）
         self._bm25: Any = None  # BM25Okapi 实例
@@ -145,6 +147,12 @@ class HybridIndexManager:
             with open(self._doc_stats_file, 'r', encoding='utf-8') as f:
                 self._doc_stats = json.load(f)
             logger.info(f"📊 已加载文档统计: {len(self._doc_stats)} 个文件")
+
+            # 推断存储的 file_name 是否带 .pdf 后缀
+            if self._doc_stats:
+                first_file_name = next(iter(self._doc_stats.values())).get("file_name", "")
+                self._file_name_has_pdf_suffix = first_file_name.lower().endswith(".pdf")
+                logger.info(f"📊 file_name {'带' if self._file_name_has_pdf_suffix else '不带'} .pdf 后缀")
         except Exception as e:
             logger.warning(f"⚠️ 加载文档统计失败: {e}")
             self._doc_stats = {}
@@ -765,10 +773,15 @@ class HybridIndexManager:
                     collection = cast(Collection, self._collection)
 
                 try:
-                    # Milvus 中存储的 file_name 不带 .pdf 后缀，需要去除
+                    # 根据初始化时推断的格式构建查询表达式
                     query_name = paper_name
-                    if query_name.lower().endswith('.pdf'):
-                        query_name = query_name[:-4]
+                    if self._file_name_has_pdf_suffix is not None:
+                        # 如果数据库存储带 .pdf，但查询名称不带，则添加
+                        if self._file_name_has_pdf_suffix and not query_name.lower().endswith('.pdf'):
+                            query_name = query_name + ".pdf"
+                        # 如果数据库存储不带 .pdf，但查询名称带，则去除
+                        elif not self._file_name_has_pdf_suffix and query_name.lower().endswith('.pdf'):
+                            query_name = query_name[:-4]
 
                     raw_results: Any = await loop.run_in_executor(
                         None,
@@ -1198,7 +1211,7 @@ class HybridIndexManager:
                         prompt=expand_prompt,
                         contexts=[],
                         temperature=0.2,
-                        max_tokens=200
+                        max_tokens=1024
                     )
                     response_text = ""
                     if hasattr(response, 'content'):
@@ -1212,13 +1225,24 @@ class HybridIndexManager:
                     import json
                     match = re.search(r'\[.*\]', response_text, re.DOTALL)
                     if match:
-                        expanded = json.loads(match.group(0))
-                        if isinstance(expanded, list) and len(expanded) > 0:
-                            # 返回组合列表：[原始查询, 重写查询, 扩展查询1, 扩展查询2, ...]
-                            # 原始查询权重最高，重写次之，扩展变体最低
-                            result = [query, rewritten_query] + expanded
-                            logger.debug(f"[Query Expansion] '{query}' → 重写:'{rewritten_query}' + 扩展:{expanded}")
-                            return result
+                        try:
+                            expanded = json.loads(match.group(0))
+                            if isinstance(expanded, list) and len(expanded) > 0:
+                                result = [query, rewritten_query] + expanded
+                                logger.debug(f"[Query Expansion] '{query}' → 重写:'{rewritten_query}' + 扩展:{expanded}")
+                                return result
+                        except json.JSONDecodeError:
+                            pass  # JSON 解析失败，尝试正则 fallback
+
+                    # 正则 fallback：从 Markdown 格式中提取查询
+                    # 匹配 "query" 或 1. "query" 等格式
+                    quote_pattern = r'(?:^|\n)\s*\d*\.?\s*["""]([^"""]+)["""]'
+                    matches = re.findall(quote_pattern, response_text)
+                    if matches:
+                        expanded = [m.strip() for m in matches[:3]]  # 最多3个
+                        result = [query, rewritten_query] + expanded
+                        logger.debug(f"[Query Expansion] 正则fallback: '{query}' → 重写:'{rewritten_query}' + 扩展:{expanded}")
+                        return result
 
                 except Exception as e:
                     logger.warning(f"[Query Expansion] LLM调用失败: {e}")
