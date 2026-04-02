@@ -2245,6 +2245,303 @@ class PaperRAGPlugin(Star):
             logger.error(f"清空图谱失败: {e}")
             yield event.plain_result(f"❌ 清空失败: {e}")
 
+    # ==================== 创意生成命令 ====================
+
+    @filter.command_group("idea")
+    def idea_commands(self):
+        """研究创意生成命令组
+        explore     - 探索研究想法（完整流程）
+        analyze     - 分析研究主题
+        search      - 多源知识检索
+        generate    - 基于知识上下文生成想法
+        """
+        pass
+
+    @idea_commands.command("explore")
+    async def cmd_idea_explore(self, event: AstrMessageEvent,
+                                topic: str = '',
+                                depth: str = "standard",
+                                num_ideas: int = 3):
+        """
+        探索研究想法（完整流程）
+
+        Args:
+            topic: 研究主题描述
+            depth: 分析深度 (quick/standard/deep)
+            num_ideas: 生成想法数量
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if not topic:
+            yield event.plain_result("📚 Usage: /idea explore <研究主题>\nExample: /idea explore 大语言模型在医学诊断中的应用")
+            return
+
+        yield event.plain_result(f"🔍 正在分析研究主题...\n主题: {topic}")
+
+        try:
+            # 导入创意引擎
+            from .idea_engine import IdeaEngine
+
+            # 获取RAG引擎
+            rag_engine = self._get_engine()
+
+            # 创建创意引擎
+            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
+
+            # 1. 分析主题
+            yield event.plain_result("📊 正在分析研究领域...")
+            analysis = await idea_engine.analyze_topic(topic, depth)
+
+            if not analysis:
+                yield event.plain_result("❌ 主题分析失败")
+                return
+
+            analysis_output = f"""**📊 主题分析结果**
+
+**领域**: {analysis.domain}
+
+**关键词**: {', '.join(analysis.keywords[:8])}
+
+**探索角度**: {', '.join(analysis.exploration_angles)}
+
+**摘要**: {analysis.summary}
+"""
+            yield event.plain_result(analysis_output)
+
+            # 2. 检索知识
+            yield event.plain_result("🌐 正在检索网络资源 + 📚 本地论文库...")
+            all_queries = analysis.search_queries + analysis.local_rag_queries
+            knowledge = await idea_engine.search_knowledge(all_queries, local_rag_top_k=3, web_top_k=5)
+
+            stats_output = f"""
+✅ 检索完成
+- 网络资源: {knowledge['stats']['web_count']} 条
+- 本地论文: {knowledge['stats']['local_count']} 条
+"""
+            yield event.plain_result(stats_output)
+
+            # 3. 生成想法
+            yield event.plain_result("💡 正在生成研究想法...")
+            ideas = await idea_engine.generate_ideas(
+                knowledge_context=knowledge['fused_context'],
+                research_domain=analysis.domain,
+                num_ideas=num_ideas
+            )
+
+            if not ideas:
+                yield event.plain_result("❌ 想法生成失败")
+                return
+
+            # 格式化输出
+            ideas_output = f"**💡 研究想法 ({len(ideas)}个)**\n\n"
+
+            for i, idea in enumerate(ideas, 1):
+                feasibility_bar = "★" * int(idea.feasibility * 5) + "☆" * (5 - int(idea.feasibility * 5))
+
+                ideas_output += f"""---
+**[{i}] {idea.title}**
+
+**📝 描述**: {idea.description[:300]}...
+
+**✨ 创新点**: {idea.novelty[:150]}
+
+**🔧 方法论**: {idea.methodology[:150]}
+
+**⚠️ 挑战**: {', '.join(idea.potential_challenges[:2])}
+
+**📈 可行性**: {feasibility_bar} ({idea.feasibility:.0%})
+"""
+
+            ideas_output += "\n---\n💡 回复 /idea generate <想法序号> 可获取更详细的提案大纲"
+
+            yield event.plain_result(ideas_output)
+
+        except Exception as e:
+            logger.error(f"创意探索失败: {e}")
+            yield event.plain_result(f"❌ 创意探索失败: {e}")
+
+    @idea_commands.command("analyze")
+    async def cmd_idea_analyze(self, event: AstrMessageEvent,
+                               topic: str = '',
+                               depth: str = "standard"):
+        """
+        分析研究主题
+
+        Args:
+            topic: 研究主题描述
+            depth: 分析深度 (quick/standard/deep)
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if not topic:
+            yield event.plain_result("📚 Usage: /idea analyze <研究主题>")
+            return
+
+        yield event.plain_result(f"🔍 分析主题: {topic}")
+
+        try:
+            from .idea_engine import IdeaEngine
+            rag_engine = self._get_engine()
+            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
+
+            analysis = await idea_engine.analyze_topic(topic, depth)
+
+            if not analysis:
+                yield event.plain_result("❌ 主题分析失败")
+                return
+
+            output = f"""**📊 主题分析结果**
+
+**研究领域**: {analysis.domain}
+
+**核心关键词**:
+{chr(10).join(f"- {k}" for k in analysis.keywords[:8])}
+
+**搜索查询**:
+{chr(10).join(f"- {q}" for q in analysis.search_queries[:5])}
+
+**本地检索词**:
+{chr(10).join(f"- {q}" for q in analysis.local_rag_queries[:3])}
+
+**探索角度**:
+{', '.join(analysis.exploration_angles)}
+
+**摘要**: {analysis.summary}
+"""
+            yield event.plain_result(output)
+
+        except Exception as e:
+            logger.error(f"主题分析失败: {e}")
+            yield event.plain_result(f"❌ 分析失败: {e}")
+
+    @idea_commands.command("search")
+    async def cmd_idea_search(self, event: AstrMessageEvent,
+                              queries: str = '',
+                              local_k: int = 5,
+                              web_k: int = 10):
+        """
+        多源知识检索
+
+        Args:
+            queries: 逗号分隔的搜索查询
+            local_k: 本地RAG召回数
+            web_k: 网络搜索召回数
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if not queries:
+            yield event.plain_result("📚 Usage: /idea search <查询1>, <查询2>, ...\nExample: /idea search LLM medical diagnosis, GPT-4 clinical")
+            return
+
+        query_list = [q.strip() for q in queries.split(",") if q.strip()]
+
+        yield event.plain_result(f"🔍 执行多源检索: {query_list}")
+
+        try:
+            from .idea_engine import IdeaEngine
+            rag_engine = self._get_engine()
+            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
+
+            knowledge = await idea_engine.search_knowledge(query_list, local_rag_top_k=local_k, web_top_k=web_k)
+
+            output = f"""**✅ 检索完成**
+
+**统计**:
+- 网络资源: {knowledge['stats']['web_count']} 条
+- 本地论文: {knowledge['stats']['local_count']} 条
+
+---
+**📚 本地论文相关片段**:
+"""
+
+            for i, r in enumerate(knowledge['local_results'][:10], 1):
+                output += f"\n{i}. **{r['paper']}** (p.{r['page']})"
+                output += f"\n   {r['text'][:150]}..."
+
+            if knowledge['web_results']:
+                output += "\n\n---\n**🌐 网络资源**:\n"
+                for i, r in enumerate(knowledge['web_results'][:10], 1):
+                    output += f"\n{i}. **{r['title']}**"
+                    output += f"\n   {r['snippet'][:150]}..."
+
+            yield event.plain_result(output)
+
+        except Exception as e:
+            logger.error(f"检索失败: {e}")
+            yield event.plain_result(f"❌ 检索失败: {e}")
+
+    @idea_commands.command("generate")
+    async def cmd_idea_generate(self, event: AstrMessageEvent,
+                                context: str = '',
+                                domain: str = "",
+                                num: int = 3,
+                                focus: str = "all"):
+        """
+        基于知识上下文生成研究想法
+
+        Args:
+            context: 知识上下文（可直接粘贴检索结果）
+            domain: 研究领域
+            num: 生成数量
+            focus: 侧重点 (novelty/feasibility/impact/all)
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if not context:
+            yield event.plain_result("📚 Usage: /idea generate <知识上下文>\n建议先使用 /idea search 检索相关知识，然后将结果作为上下文传入")
+            return
+
+        yield event.plain_result(f"💡 正在生成 {num} 个研究想法...")
+
+        try:
+            from .idea_engine import IdeaEngine
+            rag_engine = self._get_engine()
+            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
+
+            ideas = await idea_engine.generate_ideas(
+                knowledge_context=context,
+                research_domain=domain,
+                num_ideas=num,
+                idea_focus=focus
+            )
+
+            if not ideas:
+                yield event.plain_result("❌ 想法生成失败")
+                return
+
+            output = f"**💡 研究想法 ({len(ideas)}个)**\n\n"
+
+            for i, idea in enumerate(ideas, 1):
+                feasibility_bar = "★" * int(idea.feasibility * 5) + "☆" * (5 - int(idea.feasibility * 5))
+
+                output += f"""---
+**[{i}] {idea.title}**
+
+**📝 描述**: {idea.description[:300]}
+
+**✨ 创新点**: {idea.novelty[:200]}
+
+**🔧 方法论**: {idea.methodology[:200]}
+
+**⚠️ 挑战**: {', '.join(idea.potential_challenges[:3])}
+
+**📈 可行性**: {feasibility_bar} ({idea.feasibility:.0%})
+"""
+
+            yield event.plain_result(output)
+
+        except Exception as e:
+            logger.error(f"想法生成失败: {e}")
+            yield event.plain_result(f"❌ 生成失败: {e}")
+
     def _format_retrieve_response(self, sources: list) -> str:
         """Format retrieval results"""
         output = "📚 **Document Search Results**\n\n"

@@ -685,22 +685,24 @@ class CragCorrector:
         query: str,
         original_results: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """中等质量修正：查询重写 + 补充检索"""
-        rewritten_query = await self._rewrite_query(query)
-        if rewritten_query == query:
+        """中等质量修正：多查询重写 + 补充检索 + RRF融合"""
+        rewritten_queries = await self._rewrite_query_multi(query)
+        if len(rewritten_queries) <= 1:
             return original_results
 
-        # 使用重写查询执行补充检索
+        # 使用多查询执行补充检索
         try:
-            query_embedding = await self._embed_provider.get_text_embedding(rewritten_query)
-            additional_results = await self._index_manager.search(
-                query_embedding=query_embedding,
-                top_k=5
-            )
+            all_results = list(original_results)
+            for rewritten_query in rewritten_queries[1:]:  # 跳过原查询
+                query_embedding = await self._embed_provider.get_text_embedding(rewritten_query)
+                additional_results = await self._index_manager.search(
+                    query_embedding=query_embedding,
+                    top_k=5
+                )
+                all_results.extend(additional_results)
 
-            # 融合原结果 + 新结果
-            all_results = original_results + additional_results
-            return self._deduplicate_and_merge(all_results, top_k=10)
+            # 使用RRF融合
+            return self._rrf_fusion(all_results, top_k=10)
         except Exception as e:
             logger.warning(f"[CRAG] 补充检索失败: {e}")
             return original_results
@@ -710,67 +712,141 @@ class CragCorrector:
         query: str,
         original_results: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """低质量修正：查询重写 + 重新检索 + 结果融合"""
-        rewritten_query = await self._rewrite_query(query)
+        """低质量修正：多查询重写 + 混合检索 + RRF融合"""
+        rewritten_queries = await self._rewrite_query_multi(query)
 
         try:
-            # 并行执行向量和BM25检索
-            query_embedding = await self._embed_provider.get_text_embedding(rewritten_query)
-            vector_results = await self._index_manager.search(
-                query_embedding=query_embedding,
-                top_k=20
-            )
-            bm25_results = await self._index_manager.bm25_search(
-                query=rewritten_query,
-                top_k=20,
-                llm_provider=self._llm_provider  # 复用已加载的 LLM
-            )
+            all_results = []
 
-            # 简单的分数融合
-            combined = self._simple_fusion(vector_results, bm25_results)
+            for rewritten_query in rewritten_queries:
+                # 并行执行向量和BM25检索
+                query_embedding = await self._embed_provider.get_text_embedding(rewritten_query)
+                vector_results = await self._index_manager.search(
+                    query_embedding=query_embedding,
+                    top_k=15
+                )
+                bm25_results = await self._index_manager.bm25_search(
+                    query=rewritten_query,
+                    top_k=15,
+                    llm_provider=self._llm_provider
+                )
+
+                # 简单融合后加入结果集
+                combined = self._simple_fusion(vector_results, bm25_results, top_k=15)
+                all_results.extend(combined)
 
             # 与原结果融合
-            all_results = combined + original_results
-            return self._deduplicate_and_merge(all_results, top_k=10)
+            all_results.extend(original_results)
+
+            # 使用RRF融合
+            return self._rrf_fusion(all_results, top_k=10)
         except Exception as e:
             logger.warning(f"[CRAG] 重新检索失败: {e}")
             return original_results
 
-    async def _rewrite_query(self, query: str) -> str:
-        """使用LLM重写查询"""
+    async def _rewrite_query_multi(self, query: str) -> List[str]:
+        """使用LLM生成多个查询改写（多查询扩展）"""
         if not self._llm_provider:
-            # 无LLM时返回原查询
-            return query
+            return [query]
 
         try:
-            prompt = f"""将以下学术查询重写为更精确的检索表述，保持核心意图。
+            # 提取相关术语增强改写
+            relevant_terms = await self._extract_relevant_terms(query)
+
+            prompt = f"""将以下学术查询改写为3-5个不同的检索表述，覆盖不同角度。
+保持核心术语不变，仅改变句式和表达方式。
 
 原始查询：{query}
-重写查询："""
+{relevant_terms}
+改写查询（每行一个，不要编号）：
+"""
 
             response = await self._llm_provider.text_chat(
                 prompt=prompt,
                 contexts=[],
-                temperature=0.2,
+                temperature=0.3,
+                max_tokens=300
+            )
+
+            rewritten_text = ""
+            if hasattr(response, 'content'):
+                rewritten_text = response.content
+            elif isinstance(response, dict):
+                rewritten_text = response.get("content", "") or response.get("text", "")
+            else:
+                rewritten_text = str(response)
+
+            # 解析多行改写结果
+            rewritten_queries = []
+            for line in rewritten_text.strip().split('\n'):
+                line = line.strip().strip('`').strip('0123456789.、、').strip()
+                if line and len(line) > 5 and line != query:
+                    rewritten_queries.append(line)
+
+            if rewritten_queries:
+                logger.debug(f"[CRAG] 多查询改写: '{query}' → {rewritten_queries}")
+                return [query] + rewritten_queries[:4]  # 最多4个改写 + 原查询
+        except Exception as e:
+            logger.warning(f"[CRAG] 多查询改写失败: {e}")
+
+        return [query]
+
+    async def _extract_relevant_terms(self, query: str) -> str:
+        """从已索引论文中提取与查询相关的术语"""
+        try:
+            # 获取部分chunk用于术语提取
+            chunks = await self._index_manager.get_all_chunks()
+            if not chunks:
+                return ""
+
+            # 简单采样：从开头和随机位置取一些chunks
+            import random
+            sample_size = min(50, len(chunks))
+            sampled = random.sample(chunks, sample_size) if len(chunks) > sample_size else chunks
+
+            # 提取文本片段
+            sample_texts = []
+            for chunk in sampled[:20]:
+                text = chunk.get("text", "")[:500]  # 限制长度
+                if text:
+                    sample_texts.append(text)
+
+            if not sample_texts:
+                return ""
+
+            context = "\n".join(sample_texts[:10])
+
+            extract_prompt = f"""从以下论文片段中提取与查询相关的专业术语（仅提取，不解释）。
+查询：{query}
+
+片段：
+{context}
+
+相关术语（用逗号分隔）：
+"""
+
+            response = await self._llm_provider.text_chat(
+                prompt=extract_prompt,
+                contexts=[],
+                temperature=0.1,
                 max_tokens=100
             )
 
-            rewritten = ""
+            terms = ""
             if hasattr(response, 'content'):
-                rewritten = response.content
+                terms = response.content
             elif isinstance(response, dict):
-                rewritten = response.get("content", "") or response.get("text", "")
+                terms = response.get("content", "") or response.get("text", "")
             else:
-                rewritten = str(response)
+                terms = str(response)
 
-            rewritten = rewritten.strip().strip('`').strip()
-            if rewritten and len(rewritten) > 5:
-                logger.debug(f"[CRAG] 查询重写: '{query}' → '{rewritten}'")
-                return rewritten
+            terms = terms.strip().strip('`').strip()
+            if terms and len(terms) > 2:
+                return f"本地论文库相关术语：{terms}"
         except Exception as e:
-            logger.warning(f"[CRAG] 查询重写失败: {e}")
+            logger.debug(f"[CRAG] 术语提取失败: {e}")
 
-        return query
+        return ""
 
     def _simple_fusion(
         self,
@@ -821,6 +897,61 @@ class CragCorrector:
             })
 
         return results
+
+    def _rrf_fusion(
+        self,
+        results: List[Dict[str, Any]],
+        top_k: int = 10,
+        k: int = 60
+    ) -> List[Dict[str, Any]]:
+        """
+        使用 Reciprocal Rank Fusion (RRF) 融合多轮检索结果
+
+        Args:
+            results: 检索结果列表（可能来自多轮检索）
+            top_k: 返回结果数量
+            k: RRF常数（默认60）
+        """
+        # 按查询轮次分组（通过metadata中的query标记，如果存在）
+        # 否则假设所有结果来自同一轮
+        text_to_rrf_score: Dict[str, float] = {}
+        text_to_metadata: Dict[str, Dict] = {}
+
+        for r in results:
+            text = r["text"]
+            score = r.get("score", 0.0)
+
+            # 累加 RRF 分数（每个text在每轮检索中取最高分）
+            if text not in text_to_rrf_score:
+                # 首次出现，获得 1/k 的基础分数
+                text_to_rrf_score[text] = 1.0 / (k + 1)
+            else:
+                # 已有该text，累加（同一text在多轮检索中都出现说明相关）
+                text_to_rrf_score[text] += 1.0 / (k + 1)
+
+            # 保留最高分数的metadata
+            if text not in text_to_metadata or score > text_to_metadata[text].get("_raw_score", 0):
+                metadata = dict(r.get("metadata", {}))
+                metadata["_raw_score"] = score
+                text_to_metadata[text] = metadata
+
+        # 按 RRF 分数排序
+        sorted_items = sorted(text_to_rrf_score.items(), key=lambda x: x[1], reverse=True)
+
+        # 构建结果
+        fused_results = []
+        for text, rrf_score in sorted_items[:top_k]:
+            metadata = text_to_metadata.get(text, {})
+            # 移除内部字段
+            if "_raw_score" in metadata:
+                del metadata["_raw_score"]
+            fused_results.append({
+                "text": text,
+                "metadata": metadata,
+                "score": rrf_score
+            })
+
+        return fused_results
 
     def _deduplicate_and_merge(
         self,
