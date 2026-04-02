@@ -286,7 +286,7 @@ BM25检索结果（Top 5）：
                     temperature=0.1,
                     max_tokens=100
                 )
-                response_text = self._extract_llm_response(response)
+                response_text = self._extract_answer_from_response(response)
             else:
                 return self._alpha
 
@@ -320,16 +320,6 @@ BM25检索结果（Top 5）：
         except Exception as e:
             logger.warning(f"[LLM融合权重决策失败: {e}]")
             return self._alpha
-
-    def _extract_llm_response(self, response: Any) -> str:
-        """从LLM响应中提取文本"""
-        if isinstance(response, str):
-            return response
-        if isinstance(response, dict):
-            return response.get("content", "") or response.get("text", "") or str(response)
-        if hasattr(response, "content"):
-            return response.content
-        return str(response)
 
     def _rrf_fusion(
         self,
@@ -953,26 +943,6 @@ class CragCorrector:
 
         return fused_results
 
-    def _deduplicate_and_merge(
-        self,
-        results: List[Dict[str, Any]],
-        top_k: int = 10
-    ) -> List[Dict[str, Any]]:
-        """去重 + 合并"""
-        seen_texts: set = set()
-        deduped = []
-
-        for r in results:
-            text = r["text"]
-            if text not in seen_texts:
-                seen_texts.add(text)
-                deduped.append(r)
-
-            if len(deduped) >= top_k:
-                break
-
-        return deduped
-
 
 class HybridRAGEngine:
     """
@@ -1135,6 +1105,27 @@ class HybridRAGEngine:
         assert self._retriever is not None
         return self._retriever
 
+    def _get_llama_cpp_vlm_config(self) -> Dict[str, Any]:
+        """
+        获取 LlamaCpp VLM 配置
+
+        从配置中解析模型路径和参数，支持相对路径（基于插件目录）
+
+        Returns:
+            包含 model_path, mmproj_path, max_tokens, temperature, n_ctx, n_gpu_layers 的字典
+        """
+        model_path_raw = getattr(self.config, 'llama_vlm_model_path', './models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf')
+        mmproj_path_raw = getattr(self.config, 'llama_vlm_mmproj_path', './models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf')
+
+        return {
+            'model_path': str((_PLUGIN_DIR / model_path_raw).resolve()),
+            'mmproj_path': str((_PLUGIN_DIR / mmproj_path_raw).resolve()),
+            'max_tokens': getattr(self.config, 'llama_vlm_max_tokens', 2560),
+            'temperature': getattr(self.config, 'llama_vlm_temperature', 0.7),
+            'n_ctx': getattr(self.config, 'llama_vlm_n_ctx', 4096),
+            'n_gpu_layers': getattr(self.config, 'llama_vlm_n_gpu_layers', 99),
+        }
+
     async def _ensure_llm_initialized(self) -> Any:
         """确保LLM Provider已初始化 - 优先使用本地模型"""
         if self._llm_initialized:
@@ -1147,17 +1138,8 @@ class HybridRAGEngine:
             # 优先使用 LlamaCpp 本地模型
             if LLAMA_CPP_VLM_AVAILABLE:
                 try:
-                    # 解析模型路径
-                    llama_model_path_raw = getattr(self.config, 'llama_vlm_model_path', './models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf')
-                    llama_mmproj_path_raw = getattr(self.config, 'llama_vlm_mmproj_path', './models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf')
-
-                    llama_model_path = str((_PLUGIN_DIR / llama_model_path_raw).resolve())
-                    llama_mmproj_path = str((_PLUGIN_DIR / llama_mmproj_path_raw).resolve())
-
-                    llama_max_tokens = getattr(self.config, 'llama_vlm_max_tokens', 2560)
-                    llama_temperature = getattr(self.config, 'llama_vlm_temperature', 0.7)
-                    llama_n_ctx = getattr(self.config, 'llama_vlm_n_ctx', 4096)
-                    llama_n_gpu_layers = getattr(self.config, 'llama_vlm_n_gpu_layers', 99)
+                    # 获取 LlamaCpp 配置
+                    llama_config = self._get_llama_cpp_vlm_config()
 
                     try:
                         from .llama_cpp_vlm_provider import (
@@ -1180,12 +1162,12 @@ class HybridRAGEngine:
                     else:
                         # 初始化新的 Provider（设置全局配置）
                         self._llm_client = init_llama_cpp_vlm_provider(
-                            model_path=llama_model_path,
-                            mmproj_path=llama_mmproj_path,
-                            n_ctx=llama_n_ctx,
-                            n_gpu_layers=llama_n_gpu_layers,
-                            max_tokens=llama_max_tokens,
-                            temperature=llama_temperature
+                            model_path=llama_config['model_path'],
+                            mmproj_path=llama_config['mmproj_path'],
+                            n_ctx=llama_config['n_ctx'],
+                            n_gpu_layers=llama_config['n_gpu_layers'],
+                            max_tokens=llama_config['max_tokens'],
+                            temperature=llama_config['temperature']
                         )
                         logger.info("✅ 初始化 LlamaCpp 本地模型进行文本生成")
 
@@ -1601,11 +1583,11 @@ class HybridRAGEngine:
 
             # 快速检查：若检索结果为空或分数极低，直接返回空答案
             if len(results_dict_for_eval) == 0:
-                logger.info(f"[Qasper] 检索无结果，返回空答案（不可回答）")
+                logger.info(f"[Qasper] 检索无结果，返回Unanswerable")
                 return {
                     "type": "rag",
                     "query": query,
-                    "answer": "",  # 空答案表示不可回答
+                    "answer": "Unanswerable",  # Qasper评估要求对不可回答问题返回"Unanswerable"
                     "sources": [],
                     "unanswerable": True
                 }
@@ -1613,22 +1595,16 @@ class HybridRAGEngine:
             # 使用 LLM 评估检索质量（仅在有结果但质量可能不足时）
             max_score = max(r["score"] for r in results_dict_for_eval) if results_dict_for_eval else 0.0
 
-            # ========== 策略1: 动态检索阈值 ==========
-            # 根据问题类型调整阈值：none类型用更严格标准
-            unanswerable_patterns = [
-                "does the paper", "does not", "doesn't", "is not mentioned",
-                "not mention", "whether the paper", "is there any", "what is the name of",
-                "who proposed", "who suggested", "when was", "where did"
-            ]
-            is_none_type_query = any(p in query.lower() for p in unanswerable_patterns)
-            threshold = 0.35 if is_none_type_query else 0.15  # 不可回答问题用更高阈值
+            # ========== 策略5: 答案类型检测 + 动态检索阈值 ==========
+            # 检测问题类型并调整阈值
+            question_type, threshold = self._detect_question_type_for_qasper(query)
 
-            if max_score < threshold:  # 分数低于动态阈值，认为不可回答
-                logger.info(f"[Qasper] 检索质量低于阈值（max_score={max_score:.3f}, threshold={threshold}），返回空答案（不可回答）")
+            if max_score < threshold:
+                logger.info(f"[Qasper] 检索质量低于阈值（max_score={max_score:.3f}, threshold={threshold}，type={question_type}），返回Unanswerable")
                 return {
                     "type": "rag",
                     "query": query,
-                    "answer": "",
+                    "answer": "Unanswerable",  # Qasper评估要求对不可回答问题返回"Unanswerable"
                     "sources": [],
                     "unanswerable": True
                 }
@@ -1663,6 +1639,22 @@ class HybridRAGEngine:
             answer = await self._generate_answer_for_qasper(
                 llm_provider, query, sources, images=final_images
             )
+
+            # ========== Evidence验证：答案-证据蕴含检验 ==========
+            # 如果答案已生成但不被证据支持，对none类型问题返回Unanswerable
+            if answer and question_type == "none":
+                is_supported, confidence = await self._verify_answer_evidence_entailment(
+                    query, answer, sources, llm_provider
+                )
+                if not is_supported and confidence > 0.6:
+                    logger.info(f"[Qasper-Evidence] 答案不被证据支持（confidence={confidence:.2f}），返回Unanswerable")
+                    return {
+                        "type": "rag",
+                        "query": query,
+                        "answer": "Unanswerable",
+                        "sources": sources,
+                        "unanswerable": True
+                    }
 
             return {
                 "type": "rag",
@@ -2009,30 +2001,21 @@ Please provide a detailed answer and cite the relevant sources."""
                     elif LLAMA_CPP_VLM_AVAILABLE:
                         # 需要初始化新的 LlamaCpp VLM Provider
                         try:
-                            # 解析路径（相对路径基于插件目录）
-                            llama_model_path_raw = getattr(self.config, 'llama_vlm_model_path', './models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf')
-                            llama_mmproj_path_raw = getattr(self.config, 'llama_vlm_mmproj_path', './models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf')
-
-                            llama_model_path = str((_PLUGIN_DIR / llama_model_path_raw).resolve())
-                            llama_mmproj_path = str((_PLUGIN_DIR / llama_mmproj_path_raw).resolve())
-
-                            llama_max_tokens = getattr(self.config, 'llama_vlm_max_tokens', 2560)
-                            llama_temperature = getattr(self.config, 'llama_vlm_temperature', 0.7)
-                            llama_n_ctx = getattr(self.config, 'llama_vlm_n_ctx', 4096)
-                            llama_n_gpu_layers = getattr(self.config, 'llama_vlm_n_gpu_layers', 99)
+                            # 获取 LlamaCpp 配置
+                            llama_config = self._get_llama_cpp_vlm_config()
                             try:
                                 from .llama_cpp_vlm_provider import init_llama_cpp_vlm_provider
                             except ImportError:
                                 from llama_cpp_vlm_provider import init_llama_cpp_vlm_provider
                             provider_to_use = init_llama_cpp_vlm_provider(
-                                model_path=llama_model_path,
-                                mmproj_path=llama_mmproj_path,
-                                n_ctx=llama_n_ctx,
-                                n_gpu_layers=llama_n_gpu_layers,
-                                max_tokens=llama_max_tokens,
-                                temperature=llama_temperature
+                                model_path=llama_config['model_path'],
+                                mmproj_path=llama_config['mmproj_path'],
+                                n_ctx=llama_config['n_ctx'],
+                                n_gpu_layers=llama_config['n_gpu_layers'],
+                                max_tokens=llama_config['max_tokens'],
+                                temperature=llama_config['temperature']
                             )
-                            logger.info(f"🖼️ 初始化 LlamaCpp VLM Provider: {llama_model_path}")
+                            logger.info(f"🖼️ 初始化 LlamaCpp VLM Provider: {llama_config['model_path']}")
                         except Exception as e:
                             logger.error(f"❌ Llama.cpp VLM Provider初始化失败: {e}，回退到文本模式")
                             use_multimodal = False
@@ -2255,14 +2238,8 @@ Answer requirements:
                 else:
                     # 需要加载新的 LlamaCpp VLM Provider
                     try:
-                        llama_model_path_raw = getattr(self.config, 'llama_vlm_model_path', './models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf')
-                        llama_mmproj_path_raw = getattr(self.config, 'llama_vlm_mmproj_path', './models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf')
-                        llama_model_path = str((_PLUGIN_DIR / llama_model_path_raw).resolve())
-                        llama_mmproj_path = str((_PLUGIN_DIR / llama_mmproj_path_raw).resolve())
-                        llama_max_tokens = getattr(self.config, 'llama_vlm_max_tokens', 2560)
-                        llama_temperature = getattr(self.config, 'llama_vlm_temperature', 0.7)
-                        llama_n_ctx = getattr(self.config, 'llama_vlm_n_ctx', 4096)
-                        llama_n_gpu_layers = getattr(self.config, 'llama_vlm_n_gpu_layers', 99)
+                        # 获取 LlamaCpp 配置
+                        llama_config = self._get_llama_cpp_vlm_config()
                         try:
                             from .llama_cpp_vlm_provider import (
                                 get_llama_cpp_vlm_provider,
@@ -2282,12 +2259,12 @@ Answer requirements:
                             logger.debug("[Qasper] 复用已缓存的 LlamaCppVLMProvider")
                         else:
                             provider_to_use = init_llama_cpp_vlm_provider(
-                                model_path=llama_model_path,
-                                mmproj_path=llama_mmproj_path,
-                                n_ctx=llama_n_ctx,
-                                n_gpu_layers=llama_n_gpu_layers,
-                                max_tokens=llama_max_tokens,
-                                temperature=llama_temperature
+                                model_path=llama_config['model_path'],
+                                mmproj_path=llama_config['mmproj_path'],
+                                n_ctx=llama_config['n_ctx'],
+                                n_gpu_layers=llama_config['n_gpu_layers'],
+                                max_tokens=llama_config['max_tokens'],
+                                temperature=llama_config['temperature']
                             )
                         await provider_to_use.initialize()
                         logger.info(f"🖼️ Qasper评估使用Llama.cpp VLM Provider")
@@ -2554,18 +2531,21 @@ Answer requirements:
         """
         从检索结果中提取所有关联的图片路径
 
+        改进版：不限制图片数量，但根据相关性做筛选
+
         Args:
             sources: 检索到的源文档
             force_all_paper_images: 若为True，当检测到视觉内容但无明确图片时，提取论文所有图片
 
         Returns:
-            图片路径列表（去重，最多返回3个）
+            图片路径列表（去重，按相关性排序）
         """
         import re
 
-        image_paths = []
+        image_paths = []  # (path, priority) 元组列表
         seen = set()
-        paper_ids_with_visual_content = set()
+        paper_ids_with_visual_content = {}  # paper_id -> 提及的figure模式列表
+        source_texts_figures = []  # 各source中提到的figure引用
 
         # 获取插件目录（用于构建Qasper图片路径）
         plugin_dir = Path(__file__).parent
@@ -2575,35 +2555,54 @@ Answer requirements:
             if not isinstance(metadata, dict):
                 continue
 
-            # 1. 直接的 image_path 字段（普通PDF场景）
+            text = src.get("text", "")
+            paper_id = metadata.get("paper_id", "")
+
+            # 提取文本中提到的所有figure引用
+            mentioned_figures = set()
+            for pattern in self.STRICT_VISUAL_PATTERNS:
+                matches = re.findall(pattern, text, re.IGNORECASE)
+                mentioned_figures.update(matches)
+
+            # 1. 直接的 image_path 字段（普通PDF场景，优先级最高）
             image_path = metadata.get("image_path")
             if image_path and image_path not in seen:
                 seen.add(image_path)
-                image_paths.append(image_path)
-                continue  # 已找到图片，跳过figure_file处理
+                image_paths.append((image_path, 100))  # 高优先级
+                continue
 
             # 2. figure_file 字段（Qasper等数据集场景）
             figure_file = metadata.get("figure_file")
-            paper_id = metadata.get("paper_id")
             if figure_file and paper_id:
-                # Qasper图片路径格式: {plugin_dir}/datasets/test_figures_and_tables/{paper_id}/{figure_file}
+                # 计算优先级：基于是否在文本中被提及
+                priority = 80
+                fig_lower = figure_file.lower()
+                # 如果图片文件名在文本中提及，优先级提高
+                if any(fig_lower in m.lower() or m.lower() in fig_lower for m in mentioned_figures):
+                    priority = 95
+                # 如果有其他同paper的图片已被收录，降低优先级
+                existing_paper_images = [p for p, pri in image_paths if paper_id in p]
+                if existing_paper_images:
+                    priority = 50
+
                 qasper_fig_path = str(plugin_dir / "datasets" / "test_figures_and_tables" / paper_id / figure_file)
                 if qasper_fig_path not in seen:
                     seen.add(qasper_fig_path)
-                    image_paths.append(qasper_fig_path)
-                continue
+                    image_paths.append((qasper_fig_path, priority))
 
             # 3. 检查文本是否提及视觉内容
-            text = src.get("text", "")
-            for pattern in self.STRICT_VISUAL_PATTERNS:
-                if re.search(pattern, text, re.IGNORECASE):
-                    if paper_id:
-                        paper_ids_with_visual_content.add(paper_id)
-                    break
+            if mentioned_figures and paper_id:
+                if paper_id not in paper_ids_with_visual_content:
+                    paper_ids_with_visual_content[paper_id] = set()
+                paper_ids_with_visual_content[paper_id].update(mentioned_figures)
+
+            # 记录source文本中提到的figure引用（用于后续筛选）
+            if mentioned_figures:
+                source_texts_figures.append((paper_id, mentioned_figures))
 
         # 4. 若检测到视觉内容但没有找到明确图片，尝试获取论文所有图片
-        if force_all_paper_images and not image_paths and paper_ids_with_visual_content:
-            for pid in paper_ids_with_visual_content:
+        if force_all_paper_images and not [p for p, pri in image_paths if pri >= 80] and paper_ids_with_visual_content:
+            for pid, mentioned in paper_ids_with_visual_content.items():
                 fig_dir = plugin_dir / "datasets" / "test_figures_and_tables" / pid
                 if fig_dir.exists():
                     for img_file in fig_dir.iterdir():
@@ -2611,14 +2610,212 @@ Answer requirements:
                             img_path = str(img_file.resolve())
                             if img_path not in seen:
                                 seen.add(img_path)
-                                image_paths.append(img_path)
-                                if len(image_paths) >= 3:
-                                    break
-                if len(image_paths) >= 3:
-                    break
+                                # 根据文件名是否匹配提及的figure来设置优先级
+                                img_name_lower = img_file.stem.lower()  # 不带扩展名的文件名
+                                priority = 30  # 默认低优先级
 
-        # 限制最多3张图片
-        return image_paths[:3]
+                                # 检查图片名是否匹配任意提及的figure
+                                for mentioned_fig in mentioned:
+                                    mentioned_clean = re.sub(r'[^a-z0-9]', '', mentioned_fig.lower())
+                                    img_name_clean = re.sub(r'[^a-z0-9]', '', img_name_lower)
+                                    if mentioned_clean in img_name_clean or img_name_clean in mentioned_clean:
+                                        priority = 70
+                                        break
+
+                                image_paths.append((img_path, priority))
+
+        # 按优先级排序（高优先级在前）
+        image_paths.sort(key=lambda x: x[1], reverse=True)
+
+        # 返回所有图片（不限制数量，但确保高优先级的在前）
+        return [path for path, priority in image_paths]
+
+    def _detect_question_type_for_qasper(self, query: str) -> tuple:
+        """
+        检测问题类型并返回类型和对应的检索阈值
+
+        Qasper问题类型：
+        - boolean: 是否类问题（Yes/No）
+        - extractive: 抽取类问题（数字、人名、术语等具体答案）
+        - abstractive: 摘要类问题（需要理解和总结）
+        - none: 不可回答类问题
+
+        Returns:
+            (question_type: str, threshold: float)
+        """
+        import re
+        query_lower = query.lower()
+
+        # 1. Boolean类型检测 - 包含明确的是/否关键词
+        boolean_patterns = [
+            r'^is\s+', r'^are\s+', r'^do\s+', r'^does\s+', r'^did\s+',
+            r'^can\s+', r'^could\s+', r'^would\s+', r'^should\s+',
+            r'^(yes|no)\s', r'\?$',
+            r'whether\s+', r'is it true that',
+            r'does the paper claim', r'does the author',
+            r'was the model', r'were the results'
+        ]
+        if any(re.search(p, query_lower) for p in boolean_patterns):
+            # Boolean问题用中等阈值
+            return ("boolean", 0.15)
+
+        # 2. Extractive类型检测 - 包含具体实体/数量关键词
+        extractive_patterns = [
+            # 数量类（最重要的extractvie类型，需要低阈值）
+            r'how\s+(many|much|long)', r'what\s+(number|count|size)',
+            r'how\s+many\s+\w+\s+does', r'how\s+many\s+\w+\s+are',
+            r'how\s+many\s+\w+\s+were', r'how\s+many\s+\w+\s+was',
+            r'number\s+of', r'count\s+of', r'total\s+of',
+            r'percentage', r'percent', r'ratio', r'score',
+            # 人名/机构名
+            r'who\s+(proposed|introduced|suggested|developed|created|authored)',
+            r'what\s+(author|researcher|scientist)',
+            r'name\s+of\s+the', r'which\s+(author|researcher)',
+            # 术语/方法名
+            r'what\s+(is\s+the\s+)?name\s+of', r'what\s+is\s+called',
+            r'which\s+(method|model|algorithm|technique|approach|framework)',
+            r'what\s+(method|model|algorithm)',
+            # 年份/时间
+            r'when\s+(was|did|were)', r'what\s+year', r'what\s+date',
+            # 其他具体实体
+            r'which\s+dataset', r'which\s+corpus', r'what\s+language',
+            r'which\s+(language|framework|dataset)'
+        ]
+        if any(re.search(p, query_lower) for p in extractive_patterns):
+            # Extractive问题用低阈值（这些问题的答案通常在检索结果中能找到）
+            return ("extractive", 0.05)
+
+        # 3. None类型检测 - 明确问是否提及/是否存在
+        none_patterns = [
+            r'does\s+not\s+mention', r'doesn\'t\s+mention', r'does\s+the\s+paper\s+mention',
+            r'is\s+not\s+mentioned', r'is\s+mentioned',
+            r'whether\s+the\s+paper', r'if\s+the\s+paper',
+            r'does the paper (say|state|claim|report|discuss)',
+            r'is there any (mention|reference|discussion)',
+            r'what\s+is\s+the\s+name\s+of',  # 陷阱：这类问题实际很难回答
+            r'who\s+proposed', r'who\s+suggested'  # 这类需要精确召回
+        ]
+        if any(p in query_lower for p in none_patterns):
+            # None类型用较高阈值（宁可返回空答案）
+            return ("none", 0.35)
+
+        # 4. Abstractive类型检测 - 需要理解和总结
+        abstractive_patterns = [
+            r'what\s+is\s+(the\s+)?', r'how\s+does', r'how\s+do',
+            r'why\s+does', r'why\s+do', r'why\s+is', r'why\s+are',
+            r'explain', r'describe', r'summarize', r'illustrate',
+            r'what\s+does\s+(the\s+)?paper\s+(say|describe|explain)',
+            r'what\s+is\s+the\s+(main|key|primary|core)',
+            r'what\s+are\s+the\s+(main|key|primary)',
+            r'what\s+happens', r'what\s+occurs'
+        ]
+        if any(re.search(p, query_lower) for p in abstractive_patterns):
+            # Abstractive问题用中等阈值
+            return ("abstractive", 0.20)
+
+        # 5. 默认：使用中等阈值
+        return ("unknown", 0.15)
+
+    async def _verify_answer_evidence_entailment(
+        self,
+        query: str,
+        answer: str,
+        sources: List[Dict[str, Any]],
+        llm_provider: Any
+    ) -> tuple:
+        """
+        验证生成的答案是否能被检索到的证据支持
+
+        思路：
+        1. 构建包含问题和答案的prompt，让LLM判断答案是否被证据支持
+        2. 返回 (is_supported: bool, confidence: float)
+
+        Args:
+            query: 问题
+            answer: 生成的答案
+            sources: 检索到的源文档
+            llm_provider: LLM Provider
+
+        Returns:
+            (is_supported: bool, confidence: float)
+            - is_supported: True表示答案被证据支持，False表示不被支持
+            - confidence: 支持程度分数 0.0-1.0
+        """
+        if not answer or not sources:
+            return (False, 0.0)
+
+        # 构建证据文本（不限制每个source长度，但限制总长度防止超出context窗口）
+        evidence_texts = []
+        total_chars = 0
+        max_total_chars = 4000  # 限制总证据文本长度
+
+        for i, src in enumerate(sources[:5]):  # 最多用5个source
+            text = src.get("text", "")
+            if not text:
+                continue
+            # 检查加上这个source是否会超过总长度限制
+            if total_chars + len(text) > max_total_chars:
+                # 截断而非跳过，保留部分内容
+                remaining = max_total_chars - total_chars
+                if remaining > 200:  # 至少保留200字符
+                    text = text[:remaining]
+                else:
+                    break
+            if text:
+                evidence_texts.append(f"[Evidence {i+1}]\n{text}")
+                total_chars += len(text)
+
+        evidence_context = "\n\n".join(evidence_texts)
+
+        prompt = f"""Given the question and answer, determine if the answer is directly supported by the evidence.
+
+Question: {query}
+
+Answer: {answer}
+
+Evidence:
+{evidence_context}
+
+Analyze whether the answer is DIRECTLY supported by the evidence (not just related to the topic).
+Output a JSON object with:
+{{
+    "is_supported": true/false,
+    "confidence": 0.0-1.0 (how confident you are in this assessment),
+    "reasoning": "brief explanation"
+}}
+
+Output only JSON, no other text:"""
+
+        try:
+            if hasattr(llm_provider, 'text_chat'):
+                response = await llm_provider.text_chat(
+                    prompt=prompt,
+                    contexts=[],
+                    temperature=0.1,
+                    max_tokens=1024  # 增加max_tokens处理更长的context
+                )
+                response_text = self._extract_answer_from_response(response)
+            else:
+                return (True, 0.5)  # 无法验证，默认通过
+
+            # 解析JSON响应
+            import json, re
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                try:
+                    result = json.loads(json_match.group())
+                    is_supported = result.get("is_supported", True)
+                    confidence = float(result.get("confidence", 0.5))
+                    logger.debug(f"[Evidence验证] is_supported={is_supported}, confidence={confidence:.2f}")
+                    return (is_supported, confidence)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+        except Exception as e:
+            logger.warning(f"[Evidence验证] 验证失败: {e}")
+
+        # 验证失败时默认通过（避免过度拒绝）
+        return (True, 0.5)
 
     async def list_documents(self) -> List[Dict[str, Any]]:
         """列出所有文档（按文件分组）"""

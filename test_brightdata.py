@@ -10,6 +10,7 @@ Bright Data MCP 网络搜索功能测试
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 
@@ -81,8 +82,15 @@ async def test_search_engine():
         }
     }
 
-    # API Token
-    api_token = "88b654f6-f6b0-4e8d-85d5-c50dc5e2d3c5"
+    # API Token - 从 mcp_server.json 读取
+    mcp_config_path = Path(__file__).parent.parent / "mcp_server.json"
+    api_token = ""
+    try:
+        with open(mcp_config_path, "r", encoding="utf-8") as f:
+            mcp_config = json.load(f)
+        api_token = mcp_config.get("mcpServers", {}).get("BrightData", {}).get("env", {}).get("API_TOKEN", "")
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"⚠️ 警告: 无法从 {mcp_config_path} 读取 BrightData API Token: {e}")
 
     try:
         print("发送请求...")
@@ -90,7 +98,7 @@ async def test_search_engine():
         print(f"来源: web")
         print(f"数量: 5")
 
-        env = {**subprocess.os.environ, "API_TOKEN": api_token}
+        env = {**subprocess.os.environ, "API_TOKEN": api_token} if api_token else subprocess.os.environ.copy()
 
         proc = await asyncio.create_subprocess_exec(
             "npx", "@brightdata/mcp",
@@ -171,14 +179,21 @@ async def test_search_engine_batch():
         }
     }
 
-    api_token = "88b654f6-f6b0-4e8d-85d5-c50dc5e2d3c5"
+    # API Token - 从 mcp_server.json 读取
+    if not api_token:
+        try:
+            with open(mcp_config_path, "r", encoding="utf-8") as f:
+                mcp_config = json.load(f)
+            api_token = mcp_config.get("mcpServers", {}).get("BrightData", {}).get("env", {}).get("API_TOKEN", "")
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
 
     try:
         print("发送批量搜索请求...")
         print(f"查询数量: 3")
         print(f"每个查询结果数: 3")
 
-        env = {**subprocess.os.environ, "API_TOKEN": api_token}
+        env = {**subprocess.os.environ, "API_TOKEN": api_token} if api_token else subprocess.os.environ.copy()
 
         proc = await asyncio.create_subprocess_exec(
             "npx", "@brightdata/mcp",

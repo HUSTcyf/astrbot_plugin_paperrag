@@ -2,6 +2,42 @@
 
 所有值得注意的插件变更都会记录在这个文件中。
 
+## [1.8.1] - 2026-04-02
+
+### 代码审查与优化
+
+- 移除重复导入语句（`main.py`, `reference_processor.py`, `graph_builder.py`, `embedding_providers.py`）
+- 提取模块级常量 `SUPPORTED_DOC_EXTENSIONS` 和辅助函数 `_is_hidden_file()` 消除 `main.py` 中的重复代码
+- 预编译行号正则表达式 `_LINE_NUMBER_PATTERNS` 到 `multimodal_extractor.py` 模块级别
+- 提取 `_get_llama_cpp_vlm_config()` helper 方法消除 `hybrid_rag.py` 中的重复代码
+- 合并 `_extract_llm_response` 和 `_extract_answer_from_response` 消除重复方法
+- 删除未使用的死代码 `_deduplicate_and_merge`
+
+### Bug 修复
+
+- 修复 `hybrid_index.py` 中重复的 `return []` 死代码
+- 修复 `reference_processor.py` 中 `extract_evidence_spans` 去重逻辑的 IndexError 问题
+- 修复评估脚本中的临时文件处理
+
+### 安全改进
+
+- 移除 `idea_engine.py` 和 `test_brightdata.py` 中的硬编码 API Token
+- 改为从 `mcp_server.json` 读取配置
+- 添加 `arxiv_mcp_storage_path` 配置项支持跨平台配置
+
+### 相对路径改进
+
+- `test_hybrid.py` 中测试目录改为使用相对路径，支持 `--papers-dir` 命令行参数
+- `evaluation/run_evaluation_qasper.py` 注释中的绝对路径改为相对路径
+
+### CRAG 多查询扩展（已在之前版本实现）
+
+- 多查询改写生成 3-5 个不同表述
+- 从已索引论文中提取相关术语增强改写质量
+- RRF 融合多轮检索结果
+
+---
+
 ## [1.8.0] - 2026-04-02
 
 ### 功能增强

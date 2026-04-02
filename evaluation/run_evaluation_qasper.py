@@ -32,6 +32,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -43,7 +44,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 # 默认配置路径
 # 插件目录: .../data/plugins/astrbot_plugin_paperrag/
-# 配置文件: /Users/chenyifeng/AstrBot/data/config/astrbot_plugin_paperrag_config.json
+# 配置文件: {插件目录}/../../config/astrbot_plugin_paperrag_config.json
 DEFAULT_CONFIG_PATH = SCRIPT_DIR.parent.parent / "config" / "astrbot_plugin_paperrag_config.json"
 DEFAULT_DATA_DIR = SCRIPT_DIR / "data"
 DEFAULT_CACHE_DIR = SCRIPT_DIR / "cache"
@@ -54,15 +55,36 @@ DEFAULT_MILVUS_QASPER_PATH = SCRIPT_DIR / "data" / "milvus_qasper.db"
 DEFAULT_QASPER_DOC_STATS_PATH = SCRIPT_DIR / "data" / "qasper_doc_stats.json"
 DEFAULT_RAGAS_OUTPUT = SCRIPT_DIR / "results_qasper"
 
+# Evidence span 提取常量
+TARGET_SPAN_LEN = 250  # 目标 span 长度
+MIN_SPAN_LEN = 80      # 最小 span 长度
+MAX_SPAN_LEN = 300     # 最大 span 长度
+MIN_SPAN_DIFF = 50     # 去重时判定为相同位置的字符距离阈值
+MIN_SPAN_TEXT_LEN = 50 # 最小有效 span 文本长度
+MAX_SPAN_TEXT_LEN = 500 # 最大有效 span 文本长度
+MAX_EVIDENCE_SPANS = 5  # 最大返回的 evidence spans 数量
+
+# 句子边界扩展常量
+SENTENCE_EXTEND_MIN = 20   # 最小扩展量
+SENTENCE_EXTEND_MAX = 100  # 最大扩展量
+
+# 视觉关键词（VLM路由）
+VISUAL_KEYWORDS = [
+    "图", "figure", "chart", "plot", "graph",
+    "表格", "table", "公式", "formula", "equation",
+    "架构", "architecture", "diagram", "示意图",
+    "图像", "picture", "photo", "image",
+    "多少", "数值", "数据", "哪个大", "哪个小",
+    "颜色", "曲线", "峰值", "趋势"
+]
+
 
 def extract_evidence_spans(sources: List[Dict[str, Any]], query: str, answer: str = "", max_chars: int = 500) -> List[str]:
     """
-    方法2：从检索到的chunks中找到与答案最匹配的精确文本作为evidence
+    从检索到的chunks中找到与答案最匹配的精确文本作为evidence
 
-    思路：
-    1. 先解析答案，提取关键信息（数字、名词短语等）
-    2. 在chunks中精确匹配这些关键信息
-    3. 返回包含答案的精确文本片段（而非完整chunk）
+    改进版：返回100-300字符的精确span，而非完整句子
+    Qasper gold evidence通常是包含答案关键词的100-300字符片段
 
     Args:
         sources: 检索到的源文档列表
@@ -71,113 +93,175 @@ def extract_evidence_spans(sources: List[Dict[str, Any]], query: str, answer: st
         max_chars: 最大总字符数
 
     Returns:
-        精确的evidence spans列表
+        精确的evidence spans列表（100-300字符长度）
     """
-    import re
+    if not sources:
+        return []
 
-    if not answer or not sources:
-        # 如果没有答案，返回完整chunk（fallback）
-        return [src.get("text", "")[:500] for src in sources[:3]]
-
-    # 1. 从答案中提取关键信息
-    answer_lower = answer.lower()
-
-    # 提取数字（对于factual问题最重要）
-    answer_numbers = re.findall(r'[\d,.]+', answer)
-
-    # 提取名词短语（4个字母以上的词）
-    answer_nouns = set(re.findall(r'\b[a-z]{4,}\b', answer_lower))
-
-    # 提取被引用的术语（如 TABREF, FIGREF 等）
-    answer_refs = re.findall(r'(TABREF|FIGREF|REF)\d+', answer, re.IGNORECASE)
+    # 如果没有答案，尝试从查询推断关键词
+    if not answer:
+        # 从查询中提取关键词作为fallback
+        answer_keywords = re.findall(r'\b[a-z]{4,}\b', query.lower())
+        answer_numbers = re.findall(r'\d+', query)
+    else:
+        answer_lower = answer.lower()
+        # 提取数字（对于factual问题最重要）
+        answer_numbers = re.findall(r'[\d,.]+', answer)
+        # 提取名词短语（4个字母以上的词）
+        answer_keywords = list(set(re.findall(r'\b[a-z]{4,}\b', answer_lower)))
+        # 提取被引用的术语（如 TABREF, FIGREF 等）
+        answer_refs = re.findall(r'(TABREF|FIGREF|REF)\d+', answer, re.IGNORECASE)
+        answer_keywords.extend(answer_refs)
 
     evidence_spans = []
+    span_start_positions = []  # 记录每个span的起始位置，用于去重
 
     for src in sources:
         text = src.get("text", "")
         if not text:
             continue
 
-        # 2. 分割句子
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        sentences = [s.strip() for s in sentences if s.strip()]
+        # 找到所有关键词在文本中的位置
+        keyword_positions = []
 
-        # 3. 对每个句子评分，找出包含答案的句子
-        scored_sentences = []
-        for sent in sentences:
-            sent_lower = sent.lower()
-
-            # 计算匹配分数
-            score = 0
-
-            # 数字匹配（权重最高）
-            for num in answer_numbers:
-                if num in sent_lower:
-                    score += 10
-                    # 检查数字周围的上下文
-                    num_idx = sent_lower.find(num)
-                    context_start = max(0, num_idx - 30)
-                    context_end = min(len(sent_lower), num_idx + len(num) + 30)
-                    # 如果数字在有意义的上下文中（不是页码等）
-                    context = sent_lower[context_start:context_end]
-                    if any(w in context for w in ['=', ':', '%', 'accuracy', 'precision', 'recall', 'f1', 'score', 'result', 'dataset', 'model']):
-                        score += 5
-
-            # 名词匹配
-            for noun in answer_nouns:
-                if noun in sent_lower:
-                    score += 2
-
-            # 引用匹配
-            for ref in answer_refs:
-                if ref.lower() in sent_lower.lower():
-                    score += 8
-
-            # 答案完整出现在句子中（最高权重）
-            if answer_lower[:50] in sent_lower:
-                score += 20
-
-            if score > 0:
-                scored_sentences.append((score, sent))
-
-        # 按分数排序
-        scored_sentences.sort(key=lambda x: x[0], reverse=True)
-
-        # 4. 选取高分句子直到达到max_chars
-        current_len = sum(len(e) for e in evidence_spans)
-        for score, sent in scored_sentences:
-            if current_len + len(sent) <= max_chars:
-                evidence_spans.append(sent)
-                current_len += len(sent)
-            if current_len >= max_chars:
-                break
-
-    # 5. 如果没有找到匹配的句子，fallback到包含关键词的句子
-    if not evidence_spans:
-        for src in sources[:3]:
-            text = src.get("text", "")
-            if text:
-                # 找第一句包含答案关键词的
-                sentences = re.split(r'(?<=[.!?])\s+', text)
-                for sent in sentences:
-                    sent_lower = sent.lower()
-                    if any(noun in sent_lower for noun in list(answer_nouns)[:5]):
-                        evidence_spans.append(sent)
-                        break
-                if evidence_spans:
+        # 数字位置（权重更高）
+        for num in answer_numbers:
+            pos = 0
+            while True:
+                idx = text.lower().find(num.lower(), pos)
+                if idx == -1:
                     break
+                # 检查数字周围是否有有意义上下文
+                context_start = max(0, idx - 20)
+                context_end = min(len(text), idx + len(num) + 20)
+                context = text[context_start:context_end].lower()
+                if any(w in context for w in ['=', ':', '%', 'accuracy', 'precision', 'recall', 'f1', 'score', 'result', 'dataset', 'model', 'number', 'count', 'total']):
+                    keyword_positions.append((idx, 15))  # 高权重
+                else:
+                    keyword_positions.append((idx, 5))  # 低权重
+                pos = idx + 1
 
-    # 6. 去重并限制数量
-    seen = set()
+        # 关键词位置
+        for keyword in answer_keywords:
+            pos = 0
+            while True:
+                idx = text.lower().find(keyword.lower(), pos)
+                if idx == -1:
+                    break
+                keyword_positions.append((idx, 10))
+                pos = idx + 1
+
+        if not keyword_positions:
+            continue
+
+        # 按位置排序
+        keyword_positions.sort(key=lambda x: x[0])
+
+        # 合并相邻位置（距离小于50字符的视为同一span）
+        merged_spans = []
+        if keyword_positions:
+            current_start, current_weight = keyword_positions[0]
+            max_pos, max_weight = current_start, current_weight
+
+            for pos, weight in keyword_positions[1:]:
+                if pos - max_pos < 50:
+                    # 合并
+                    max_pos = max(max_pos, pos)
+                    max_weight = max(max_weight, weight)
+                else:
+                    # 保存当前span
+                    merged_spans.append((current_start, max_pos, max_weight))
+                    current_start, max_pos, max_weight = pos, pos, weight
+
+            # 保存最后一个span
+            merged_spans.append((current_start, max_pos, max_weight))
+
+        # 为每个合并后的span提取100-300字符的精确片段
+        for start, end, weight in merged_spans:
+            # 以关键词为中心，扩展到目标长度
+            center = (start + end) // 2
+            target_len = min(TARGET_SPAN_LEN, max(MIN_SPAN_LEN, end - start + SENTENCE_EXTEND_MIN))
+
+            # 尝试扩展到目标长度
+            span_len = target_len
+
+            # 找到合适的句子边界（句号、逗号等）
+            left_bound = max(0, center - span_len // 2)
+            right_bound = min(len(text), left_bound + span_len)
+
+            # 左扩展：尝试到达句子开头
+            while left_bound > 0 and text[left_bound] not in ' \n\t':
+                left_bound -= 1
+            # 跳过空格
+            while left_bound > 0 and text[left_bound] in ' \n\t':
+                left_bound -= 1
+            # 找到句子开头
+            while left_bound > 0 and text[left_bound] not in '.!?\n':
+                left_bound -= 1
+            if left_bound > 0:
+                left_bound += 1  # 跳过句号
+
+            # 右扩展：到达句子结尾
+            while right_bound < len(text) and text[right_bound] not in '.!?\n':
+                right_bound += 1
+            if right_bound < len(text):
+                right_bound += 1  # 包含句号
+
+            # 确保长度在有效范围内
+            span_text = text[left_bound:right_bound].strip()
+            if len(span_text) < MIN_SPAN_LEN and right_bound < len(text):
+                # 扩展到右边
+                additional = min(MAX_SPAN_LEN - len(span_text), SENTENCE_EXTEND_MAX)
+                right_bound = min(len(text), right_bound + additional)
+                span_text = text[left_bound:right_bound].strip()
+
+            if len(span_text) < MIN_SPAN_LEN:
+                # 太短，使用完整chunk fallback
+                span_text = text[left_bound:right_bound].strip() if text[left_bound:right_bound].strip() else text[:MAX_SPAN_LEN]
+
+            if MIN_SPAN_TEXT_LEN < len(span_text) <= MAX_SPAN_TEXT_LEN and span_text not in evidence_spans:
+                evidence_spans.append(span_text)
+                span_start_positions.append(left_bound)
+
+    # 去重：基于起始位置去重（相似位置的只保留一个）
+    # 构建 span -> 所有出现位置 的映射，避免 index() 总是返回第一个的问题
+    span_to_positions: Dict[str, List[int]] = {}
+    for i, span in enumerate(evidence_spans):
+        if span not in span_to_positions:
+            span_to_positions[span] = []
+        span_to_positions[span].append(span_start_positions[i])
+
     unique_spans = []
-    for span in evidence_spans:
-        # 用前50字符作为key去重
-        span_key = re.sub(r'\s+', ' ', span[:50]).strip()
-        if span_key and span_key not in seen:
-            seen.add(span_key)
-            unique_spans.append(span)
+    seen_starts = set()
+    span_occurrence_idx: Dict[str, int] = {}  # 跟踪每个 span 的第几次出现
 
-    return unique_spans[:5]
+    for span in evidence_spans:
+        # 获取该 span 本次出现对应的位置
+        if span not in span_occurrence_idx:
+            span_occurrence_idx[span] = 0
+        else:
+            span_occurrence_idx[span] += 1
+
+        pos_idx = span_occurrence_idx[span]
+        start = span_to_positions[span][pos_idx]
+
+        # 如果没有相似起始位置的，保留
+        is_duplicate = any(abs(start - s) < MIN_SPAN_DIFF for s in seen_starts)
+        if not is_duplicate:
+            unique_spans.append(span)
+            seen_starts.add(start)
+
+    # 限制总长度和数量
+    result = []
+    total_len = 0
+    for span in unique_spans:
+        if total_len + len(span) <= max_chars and len(result) < MAX_EVIDENCE_SPANS:
+            result.append(span)
+            total_len += len(span)
+        else:
+            break
+
+    return result
 
 
 def load_config(config_path: Path) -> dict:
@@ -211,7 +295,7 @@ async def initialize_rag_engine(config: dict, milvus_lite_path: str = ''):
     from rag_engine import RAGConfig, create_rag_engine
 
     # 使用 Qasper 专用数据库路径（如果提供）
-    effective_milvus_path = milvus_lite_path if len(milvus_lite_path) > 0 else config.get("milvus_lite_path", "")
+    effective_milvus_path = milvus_lite_path or config.get("milvus_lite_path", "")
 
     # 创建 RAG 配置
     rag_config = RAGConfig(
@@ -312,7 +396,7 @@ def backup_predictions(output_file: Path) -> Optional[Path]:
     # 只备份有内容的文件
     with open(output_file, "r", encoding="utf-8") as f:
         lines = f.readlines()
-        if len(lines) > 0:
+        if lines:
             shutil.copy2(output_file, backup_file)
             return backup_file
     return None
@@ -413,7 +497,7 @@ async def generate_predictions(
             break
 
     print(f"📝 本次需处理问题数: {len(questions_to_process)}" + (f" (已限制前 {limit} 个)" if limit > 0 else ""))
-    if len(questions_to_process) == 0:
+    if not questions_to_process:
         print("✅ 所有问题都已完成，无需处理")
         print(f"   预测文件: {output_file}")
         return 0
@@ -558,20 +642,10 @@ async def generate_predictions_llm_only(
             break
 
     print(f"📝 本次需处理问题数: {len(questions_to_process)}" + (f" (已限制前 {limit} 个)" if limit > 0 else ""))
-    if len(questions_to_process) == 0:
+    if not questions_to_process:
         print("✅ 所有问题都已完成，无需处理")
         print(f"   预测文件: {output_file}")
         return 0
-
-    # 视觉关键词（用于检测是否需要VLM模式，与hybrid_rag.py保持一致）
-    VISUAL_KEYWORDS = [
-        "图", "figure", "chart", "plot", "graph",
-        "表格", "table", "公式", "formula", "equation",
-        "架构", "architecture", "diagram", "示意图",
-        "图像", "picture", "photo", "image",
-        "多少", "数值", "数据", "哪个大", "哪个小",
-        "颜色", "曲线", "峰值", "趋势"
-    ]
 
     # Qasper图片目录
     figures_base_dir = SCRIPT_DIR / "datasets" / "test_figures_and_tables"
@@ -628,7 +702,7 @@ async def generate_predictions_llm_only(
             "question_id": question_id,
             "predicted_answer": answer,
             "predicted_evidence": evidence,
-            "unanswerable": False  # 纯LLM模式不判断不可回答
+            "unanswerable": False  # LLM-only模式无检索结果，无法判断是否不可回答
         }
 
         processed += 1
@@ -826,7 +900,7 @@ async def run_ragas_full_evaluation(
     milvus_qasper_path = str(DEFAULT_MILVUS_QASPER_PATH)
     qasper_stats_path = str(DEFAULT_QASPER_DOC_STATS_PATH)
 
-    if len(output_dir) == 0:
+    if not output_dir:
         output_dir = str(DEFAULT_RAGAS_OUTPUT)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -960,7 +1034,7 @@ async def run_ragas_generate_only(
     milvus_qasper_path = str(DEFAULT_MILVUS_QASPER_PATH)
     qasper_stats_path = str(DEFAULT_QASPER_DOC_STATS_PATH)
 
-    if len(output_dir) == 0:
+    if not output_dir:
         output_dir = str(DEFAULT_RAGAS_OUTPUT)
 
     # 从插件配置读取 freeapi 设置

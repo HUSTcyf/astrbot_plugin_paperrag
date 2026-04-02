@@ -29,6 +29,16 @@ except ImportError as e:
     PDFPLUMBER_IMPORT_ERROR = str(e)
     logger.warning(f"⚠️ pdfplumber 不可用，表格提取功能将被禁用: {e}")
 
+# 预编译的行号正则表达式模式（用于检测页边距行号）
+_LINE_NUMBER_PATTERNS = [
+    re.compile(r'^\s*\d+\s*$', re.IGNORECASE),            # 纯数字: "1", "  2  "
+    re.compile(r'^\s*\d+\.\s*$', re.IGNORECASE),          # "1.", "2."
+    re.compile(r'^\s*\d+\)\s*$', re.IGNORECASE),          # "1)", "2)"
+    re.compile(r'^\s*\[\d+\]\s*$', re.IGNORECASE),       # "[1]", "[2]"
+    re.compile(r'^\s*\(\d+\)\s*$', re.IGNORECASE),       # "(1)", "(2)"
+    re.compile(r'^\s*\d+[a-zA-Z]?\s*$', re.IGNORECASE),  # "1a", "2b"
+]
+
 
 @dataclass
 class ExtractedImage:
@@ -162,16 +172,7 @@ class MultimodalPDFExtractor:
         left_margin_threshold = page_width * 0.08   # 左侧8%以内认为是行号
         right_margin_threshold = page_width * 0.92    # 右侧92%以外认为是行号
 
-        # 行号匹配模式
-        line_number_patterns = [
-            r'^\s*\d+\s*$',           # 纯数字: "1", "  2  "
-            r'^\s*\d+\.\s*$',          # 数字+点: "1.", "2."
-            r'^\s*\d+\)\s*$',          # 数字+括号: "1)", "2)"
-            r'^\s*\(\d+\)\s*$',        # 括号包裹: "(1)", "(2)"
-            r'^\s*\d+[a-zA-Z]?\s*$',  # 数字+字母: "1a", "2b"
-        ]
-        line_number_regex = [re.compile(p, re.IGNORECASE) for p in line_number_patterns]
-
+        # 使用预编译的行号正则表达式
         # 使用 "dict" 模式获取带位置信息的文本块
         page_dict = page.get_text("dict")
 
@@ -202,7 +203,7 @@ class MultimodalPDFExtractor:
                 # 判断是否是行号
                 is_line_number = False
                 if (is_left_edge or is_right_edge):
-                    for pattern in line_number_regex:
+                    for pattern in _LINE_NUMBER_PATTERNS:
                         if pattern.match(line_text.strip()):
                             is_line_number = True
                             break
@@ -1000,15 +1001,6 @@ class PDFParserAdvanced:
         left_margin_threshold = page_width * 0.08
         right_margin_threshold = page_width * 0.92
 
-        line_number_patterns = [
-            r'^\s*\d+\s*$',
-            r'^\s*\d+\.\s*$',
-            r'^\s*\d+\)\s*$',
-            r'^\s*\(\d+\)\s*$',
-            r'^\s*\d+[a-zA-Z]?\s*$',
-        ]
-        line_number_regex = [re.compile(p, re.IGNORECASE) for p in line_number_patterns]
-
         page_dict = page.get_text("dict")
 
         text_lines = []
@@ -1034,7 +1026,7 @@ class PDFParserAdvanced:
 
                 is_line_number = False
                 if (is_left_edge or is_right_edge):
-                    for pattern in line_number_regex:
+                    for pattern in _LINE_NUMBER_PATTERNS:
                         if pattern.match(line_text.strip()):
                             is_line_number = True
                             break

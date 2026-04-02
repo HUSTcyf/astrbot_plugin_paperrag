@@ -195,8 +195,17 @@ class IdeaEngine:
         results = []
 
         try:
-            # API Token
-            api_token = "88b654f6-f6b0-4e8d-85d5-c50dc5e2d3c5"
+            # API Token - 从 mcp_server.json 读取
+            mcp_config_path = Path(__file__).parent.parent.parent / "mcp_server.json"
+            try:
+                with open(mcp_config_path, "r", encoding="utf-8") as f:
+                    mcp_config = json.load(f)
+                api_token = mcp_config.get("mcpServers", {}).get("BrightData", {}).get("env", {}).get("API_TOKEN", "")
+            except (FileNotFoundError, json.JSONDecodeError) as e:
+                raise ValueError(f"无法从 {mcp_config_path} 读取 BrightData API Token: {e}")
+
+            if not api_token:
+                raise ValueError("BrightData API Token 未配置")
 
             # 启动Bright Data MCP服务器
             env = {**os.environ, "API_TOKEN": api_token}

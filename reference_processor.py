@@ -9,6 +9,9 @@
 
 import re
 import json
+import asyncio
+import aiohttp
+import time
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from astrbot.api import logger
@@ -489,10 +492,6 @@ class LLMReferenceParser:
 
     async def _call_llm(self, prompt: str, max_retries: int = 3) -> Optional[str]:
         """调用 LLM 生成文本（使用官方 OpenAI API），支持重试"""
-        import aiohttp
-        import asyncio
-        import time
-
         # 获取或创建信号量（限制并发）
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(4)

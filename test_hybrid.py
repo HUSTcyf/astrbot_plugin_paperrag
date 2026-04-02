@@ -6,10 +6,15 @@
 1. 测试PDF解析
 2. 测试索引创建
 3. 测试混合检索
+
+用法：
+    python test_hybrid.py                     # 使用默认 papers 目录
+    python test_hybrid.py --papers-dir /path/to/pdfs  # 指定目录
 """
 
 import sys
 import asyncio
+import argparse
 from pathlib import Path
 
 # 添加插件路径
@@ -32,11 +37,12 @@ class MockContext:
     pass
 
 
-async def test_pdf_parsing():
+async def test_pdf_parsing(papers_dir: Path):
     """测试PDF解析"""
     print("=" * 60)
     print("测试1: PDF解析")
     print("=" * 60)
+    print(f"📁 PDF目录: {papers_dir}")
 
     # 创建解析器
     parser = HybridPDFParser(
@@ -45,8 +51,6 @@ async def test_pdf_parsing():
         chunk_overlap=50
     )
 
-    # 查找测试PDF
-    papers_dir = Path("/Volumes/ext/Master/final/")
     if not papers_dir.exists():
         print("❌ papers目录不存在，跳过PDF解析测试")
         return
@@ -152,12 +156,41 @@ async def test_hybrid_rag():
         traceback.print_exc()
 
 
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(
+        description="测试混合架构RAG系统",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例：
+    python test_hybrid.py
+    python test_hybrid.py --papers-dir ./my_papers
+    python test_hybrid.py -p /Volumes/data/papers
+        """
+    )
+    parser.add_argument(
+        "-p", "--papers-dir",
+        type=str,
+        default=None,
+        help="PDF文件目录路径（默认：插件目录下的 papers 文件夹）"
+    )
+    return parser.parse_args()
+
+
 async def main():
     """主测试函数"""
+    args = parse_args()
+
+    # 确定 papers 目录
+    if args.papers_dir:
+        papers_dir = Path(args.papers_dir)
+    else:
+        papers_dir = plugin_dir.parent / "papers"
+
     print("\n🧪 混合架构RAG系统测试\n")
 
     # 测试1: PDF解析
-    await test_pdf_parsing()
+    await test_pdf_parsing(papers_dir)
 
     # 测试2: 索引管理器
     await test_index_manager()

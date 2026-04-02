@@ -599,7 +599,6 @@ class HybridIndexManager:
 
             if results is None:
                 return []
-                return []
 
             # 转换结果
             import json

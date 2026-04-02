@@ -22,6 +22,7 @@ Graph Builder - 多模态知识图谱构建器
 import json
 import asyncio
 import os
+import concurrent.futures
 from typing import Dict, Any, List, Optional, Union, TYPE_CHECKING
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -125,7 +126,6 @@ class LocalLLMProvider:
                     self.config.mmproj_path = str(fallback_mmproj)
 
             try:
-                import concurrent.futures
                 from llama_cpp import Llama
 
                 def _load_llama():
@@ -180,8 +180,6 @@ class LocalLLMProvider:
         """
         if not self._initialized:
             await self.initialize()
-
-        import concurrent.futures
 
         def _do_completion():
             try:

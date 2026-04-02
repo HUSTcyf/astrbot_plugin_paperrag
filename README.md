@@ -1,8 +1,8 @@
-# 📚 Paper RAG Plugin v1.8.0 - 用户指南
+# 📚 Paper RAG Plugin v1.8.1 - 用户指南
 
 本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力（支持多模态VLM问答）。
 
-> **版本说明**：当前版本 v1.8.0，完整更新历史见 [CHANGELOG.md](CHANGELOG.md)
+> **版本说明**：当前版本 v1.8.1，完整更新历史见 [CHANGELOG.md](CHANGELOG.md)
 
 ## ✨ 核心功能
 
@@ -852,7 +852,7 @@ evaluation_output/
 
 **技术方案**：基于 LangGraph 工作流编排
 
-**预计版本**：v1.8.0
+**预计版本**：v1.8.1
 
 ---
 

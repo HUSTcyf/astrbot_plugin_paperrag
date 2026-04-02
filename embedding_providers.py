@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import re
 from typing import List, Dict, Any, Optional, Union
 from dataclasses import dataclass
 import httpx
@@ -141,7 +142,6 @@ class OllamaEmbeddingProvider:
         # 移除可能导致问题的控制字符
         text = ''.join(char for char in text if ord(char) >= 32 or char in '\n\r\t')
         # 压缩多余空白
-        import re
         text = re.sub(r'\s+', ' ', text)
         return text.strip()
 

@@ -42,6 +42,19 @@ from .rag_engine import (
 
 
 # ============================================================================
+# 模块常量
+# ============================================================================
+
+SUPPORTED_DOC_EXTENSIONS = ['.pdf', '.docx', '.doc', '.txt', '.md', '.html', '.htm']
+"""支持的文档扩展名列表"""
+
+
+def _is_hidden_file(file_path: Path) -> bool:
+    """检测文件是否为 macOS 元数据文件（以 ._ 开头）"""
+    return file_path.name.startswith("._")
+
+
+# ============================================================================
 # Neo4j 服务管理器
 # ============================================================================
 
@@ -94,7 +107,6 @@ class Neo4jServiceManager:
 
     def _is_homebrew_neo4j_installed(self) -> bool:
         """检查是否通过 Homebrew 安装了 Neo4j"""
-        import os
         homebrew_paths = [
             "/usr/local/bin/neo4j",
             "/opt/homebrew/bin/neo4j",
@@ -584,13 +596,12 @@ class PaperRAGPlugin(Star):
         # 获取所有文档并构建图谱
         from pathlib import Path
         papers_dir = self.config.get("papers_dir", "./papers")
-        supported_extensions = ['.pdf', '.docx', '.doc', '.txt', '.md', '.html', '.htm']
         doc_files = []
         for ext in supported_extensions:
             doc_files.extend(Path(papers_dir).glob(f"*{ext}"))
         for ext in supported_extensions:
             doc_files.extend(Path(papers_dir).glob(f"*{ext.upper()}"))
-        doc_files = [f for f in doc_files if not f.name.startswith("._")]
+        doc_files = [f for f in doc_files if not _is_hidden_file(f)]
 
         if not doc_files:
             return
@@ -961,16 +972,15 @@ class PaperRAGPlugin(Star):
 
         try:
             # Scan supported document files
-            supported_extensions = ['.pdf', '.docx', '.doc', '.txt', '.md', '.html', '.htm']
             doc_files = []
-            for ext in supported_extensions:
+            for ext in SUPPORTED_DOC_EXTENSIONS:
                 doc_files.extend(Path(papers_dir).glob(f"*{ext}"))
             # Also support uppercase extensions
-            for ext in supported_extensions:
+            for ext in SUPPORTED_DOC_EXTENSIONS:
                 doc_files.extend(Path(papers_dir).glob(f"*{ext.upper()}"))
 
             # Filter out macOS metadata files (starting with "._")
-            doc_files = [f for f in doc_files if not f.name.startswith("._")]
+            doc_files = [f for f in doc_files if not _is_hidden_file(f)]
 
             if not doc_files:
                 yield event.plain_result("📭 No supported document files found\nSupported formats: PDF, Word, TXT, Markdown, HTML")
@@ -1079,9 +1089,8 @@ class PaperRAGPlugin(Star):
             return
 
         # Check supported format
-        supported_extensions = ['.pdf', '.docx', '.doc', '.txt', '.md', '.html', '.htm']
         ext = os.path.splitext(file_path)[1].lower()
-        if ext not in supported_extensions:
+        if ext not in SUPPORTED_DOC_EXTENSIONS:
             yield event.plain_result(f"❌ Unsupported format: {ext}\nSupported: {', '.join(supported_extensions)}")
             return
 
@@ -1583,8 +1592,8 @@ class PaperRAGPlugin(Star):
             yield event.plain_result("⚠️ 即将扫描 MCP 已下载的论文并添加到数据库\n使用 /paper arxiv_sync confirm 确认执行")
             return
 
-        # Get MCP storage path from configuration
-        mcp_storage_path = "/Volumes/ext/arxiv"
+        # Get MCP storage path from configuration（支持跨平台配置）
+        mcp_storage_path = self.config.get("arxiv_mcp_storage_path", "/Volumes/ext/arxiv")
 
         if not os.path.exists(mcp_storage_path):
             yield event.plain_result(f"❌ MCP存储路径不存在: {mcp_storage_path}")
@@ -1603,7 +1612,7 @@ class PaperRAGPlugin(Star):
             pdf_files = list(mcp_path.glob("*.pdf"))
 
             # Filter out macOS metadata files
-            pdf_files = [f for f in pdf_files if not f.name.startswith("._")]
+            pdf_files = [f for f in pdf_files if not _is_hidden_file(f)]
 
             if not pdf_files:
                 yield event.plain_result("📭 MCP目录中没有找到PDF文件")
@@ -1692,7 +1701,7 @@ class PaperRAGPlugin(Star):
             yield event.plain_result("⚠️ 即将清理arXiv论文旧版本，只保留最新版本\n使用 /paper arxiv_cleanup confirm 确认执行")
             return
 
-        mcp_storage_path = "/Volumes/ext/arxiv"
+        mcp_storage_path = self.config.get("arxiv_mcp_storage_path", "/Volumes/ext/arxiv")
 
         if not os.path.exists(mcp_storage_path):
             yield event.plain_result(f"❌ MCP存储路径不存在: {mcp_storage_path}")
@@ -1707,7 +1716,7 @@ class PaperRAGPlugin(Star):
             mcp_path = Path(mcp_storage_path)
 
             # Find all PDF files (excluding macOS metadata files)
-            pdf_files = [f for f in mcp_path.glob("*.pdf") if not f.name.startswith("._")]
+            pdf_files = [f for f in mcp_path.glob("*.pdf") if not _is_hidden_file(f)]
 
             if not pdf_files:
                 yield event.plain_result("📭 MCP目录中没有找到PDF文件")
@@ -1866,14 +1875,13 @@ class PaperRAGPlugin(Star):
         yield event.plain_result("🔄 Step 3/4: Scanning documents...")
 
         # Scan documents
-        supported_extensions = ['.pdf', '.docx', '.doc', '.txt', '.md', '.html', '.htm']
         doc_files = []
-        for ext in supported_extensions:
+        for ext in SUPPORTED_DOC_EXTENSIONS:
             doc_files.extend(Path(papers_dir).glob(f"*{ext}"))
-        for ext in supported_extensions:
+        for ext in SUPPORTED_DOC_EXTENSIONS:
             doc_files.extend(Path(papers_dir).glob(f"*{ext.upper()}"))
 
-        doc_files = [f for f in doc_files if not f.name.startswith("._")]
+        doc_files = [f for f in doc_files if not _is_hidden_file(f)]
 
         if not doc_files:
             yield event.plain_result("📭 No supported documents found")
