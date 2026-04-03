@@ -101,6 +101,14 @@ cp ~/Downloads/*.pdf papers/
 | `/paper arxiv_refs [top_k] [每篇数量]` | 下载高频引用论文（需管理员） | `/paper arxiv_refs 10 3` |
 | `/paper arxiv_sync confirm` | 同步MCP已下载论文到数据库（需管理员） | `/paper arxiv_sync confirm` |
 | `/paper arxiv_cleanup confirm` | 清理arXiv论文旧版本（需管理员） | `/paper arxiv_cleanup confirm` |
+| `/paper graph_build` | 构建知识图谱（需管理员） | `/paper graph_build` |
+| `/paper graph_stats` | 查看图谱统计信息 | `/paper graph_stats` |
+| `/paper graph_rebuild confirm` | 重建知识图谱（清空+重建） | `/paper graph_rebuild confirm` |
+| `/paper graph_clear confirm` | 清空知识图谱（需管理员） | `/paper graph_clear confirm` |
+| `/paper graph_backup [online\|offline]` | 备份图谱（需管理员） | `/paper graph_backup online` |
+| `/paper graph_backup_list` | 列出可用备份 | `/paper graph_backup_list` |
+| `/paper graph_restore [文件名]` | 恢复图谱备份（需管理员） | `/paper graph_restore neo4j_backup_xxx.json.gz` |
+| `/paper graph_link [status\|create\|remove]` | 管理Neo4j符号链接 | `/paper graph_link status` |
 
 ### 使用示例
 
@@ -809,7 +817,7 @@ evaluation_output/
 - [x] 关系查询引擎（支持"A 和 B 的关系"类问题）
 - [x] 多跳推理增强
 - [x] 手动/自动图谱构建
-- [x] 新增命令：`/paper graph_build`、`/paper graph_stats`、`/paper graph_clear`
+- [x] 新增命令：`/paper graph_build`、`/paper graph_stats`、`/paper graph_rebuild`、`/paper graph_clear`、`/paper graph_backup`、`/paper graph_restore`、`/paper graph_backup_list`、`/paper graph_link`
 
 **技术方案**：基于 LlamaIndex PropertyGraphIndex 实现
 
