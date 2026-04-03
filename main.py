@@ -831,7 +831,7 @@ class PaperRAGPlugin(Star):
         delete       - Delete a specific paper from knowledge base
         clear        - Clear knowledge base
         rebuild      - Clear and re-add all documents
-        refstats     - Show reference title frequency statistics
+        refstats     - Show reference title frequency statistics (-1 for zero-ref papers)
         arxiv_add    - Search arxiv and download papers, then add to database (Admin)
         arxiv_refs   - Download highly-cited reference papers from arxiv (Admin)
         arxiv_sync   - Sync MCP downloaded papers to paperrag database (Admin)
@@ -1206,7 +1206,7 @@ class PaperRAGPlugin(Star):
         """Show reference title frequency statistics
 
         Args:
-            top_k: Number of top references to show (default: 20)
+            top_k: Number of top references to show (default: 20). Use -1 to list papers with zero references.
         """
         if not self.enabled:
             yield event.plain_result("❌ Plugin is disabled")
@@ -1218,10 +1218,53 @@ class PaperRAGPlugin(Star):
             return
 
         try:
-            yield event.plain_result("📊 正在统计参考文献...")
-
             # 获取索引管理器
             index_manager = engine._ensure_index_manager_initialized()
+
+            # top_k = -1 表示列出参考文献数量为0的论文
+            if top_k == -1:
+                yield event.plain_result("📊 正在查找无参考文献的论文...")
+
+                result = await index_manager.get_papers_with_zero_references()
+
+                if "error" in result:
+                    yield event.plain_result(f"❌ 获取失败: {result['error']}")
+                    return
+
+                papers = result.get("papers", [])
+                total_papers = result.get("total_papers", 0)
+                total_zero_ref = result.get("total_zero_ref", 0)
+
+                # total_papers == 0 表示未能成功获取论文列表
+                if total_papers == 0:
+                    yield event.plain_result("⚠️ 未能获取到论文列表，请检查索引是否初始化")
+                    return
+
+                if not papers:
+                    yield event.plain_result("✅ 所有论文都已提取到参考文献")
+                    return
+
+                # 格式化输出
+                output = f"📚 **无参考文献的论文** ({total_zero_ref}/{total_papers})\n\n"
+
+                for i, paper in enumerate(papers, 1):
+                    file_name = paper.get("file_name", "unknown")
+                    chunk_count = paper.get("chunk_count", 0)
+
+                    if len(file_name) > 70:
+                        file_name_display = file_name[:67] + "..."
+                    else:
+                        file_name_display = file_name
+
+                    output += f"{i:3d}. **{file_name_display}**\n"
+                    output += f"      └─ chunks: {chunk_count}\n"
+
+                yield event.plain_result(output.strip())
+                return
+
+            # 正常模式：显示高频引用论文统计
+            yield event.plain_result("📊 正在统计参考文献...")
+
             stats = await index_manager.get_all_references()
 
             if "error" in stats:
@@ -1275,6 +1318,179 @@ class PaperRAGPlugin(Star):
         except Exception as e:
             logger.error(f"Failed to get refstats: {e}")
             yield event.plain_result(f"❌ 获取参考文献统计失败: {e}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @paper_commands.command("reparse_zero_ref")
+    async def cmd_reparse_zero_ref(self, event: AstrMessageEvent, confirm: str = ''):
+        """Batch re-parse papers with zero references (Admin)
+
+        Args:
+            confirm: Must be 'confirm' to proceed
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if confirm != 'confirm':
+            yield event.plain_result("⚠️ This will re-parse all papers with zero references.\n"
+                                   "This operation may take a long time.\n"
+                                   "Usage: /paper reparse_zero_ref confirm")
+            return
+
+        engine = self._get_engine()
+        if not engine:
+            yield event.plain_result("❌ RAG engine is not ready")
+            return
+
+        try:
+            index_manager = engine._ensure_index_manager_initialized()
+
+            # Step 1: Get papers with zero references
+            yield event.plain_result("🔍 Step 1/4: Finding papers with zero references...")
+
+            result = await index_manager.get_papers_with_zero_references()
+
+            if "error" in result:
+                yield event.plain_result(f"❌ 获取失败: {result['error']}")
+                return
+
+            papers = result.get("papers", [])
+            total_zero_ref = result.get("total_zero_ref", 0)
+
+            if not papers:
+                yield event.plain_result("✅ All papers have extracted references")
+                return
+
+            yield event.plain_result(f"📊 Found {total_zero_ref} papers with zero references")
+
+            # Step 2: Find file paths for each paper
+            yield event.plain_result("🔍 Step 2/4: Locating paper files...")
+
+            papers_dir = self.config.get("papers_dir", "./papers")
+            papers_path = Path(papers_dir)
+
+            if not papers_path.exists():
+                yield event.plain_result(f"❌ Papers directory does not exist: {papers_dir}")
+                return
+
+            # Build a mapping of file_name to full path
+            file_path_map: Dict[str, Path] = {}
+            for ext in SUPPORTED_DOC_EXTENSIONS:
+                for f in papers_path.glob(f"*{ext}"):
+                    file_path_map[f.name] = f
+                for f in papers_path.glob(f"*{ext.upper()}"):
+                    file_path_map[f.name] = f
+
+            # Also search subdirectories
+            for ext in SUPPORTED_DOC_EXTENSIONS:
+                for f in papers_path.rglob(f"*{ext}"):
+                    file_path_map[f.name] = f
+                for f in papers_path.rglob(f"*{ext.upper()}"):
+                    file_path_map[f.name] = f
+
+            # Match papers with their file paths
+            papers_to_reparse = []
+            not_found = []
+
+            for paper in papers:
+                file_name = paper.get("file_name", "")
+                if file_name in file_path_map:
+                    papers_to_reparse.append({
+                        "file_name": file_name,
+                        "file_path": str(file_path_map[file_name]),
+                        "chunk_count": paper.get("chunk_count", 0)
+                    })
+                else:
+                    not_found.append(file_name)
+
+            if not_found:
+                yield event.plain_result(f"⚠️ {len(not_found)} papers not found in {papers_dir}:")
+                for fn in not_found[:5]:
+                    yield event.plain_result(f"   - {fn}")
+                if len(not_found) > 5:
+                    yield event.plain_result(f"   ... and {len(not_found) - 5} more")
+
+            if not papers_to_reparse:
+                yield event.plain_result("❌ No paper files found for zero-ref papers")
+                return
+
+            yield event.plain_result(f"✅ Found {len(papers_to_reparse)} paper files")
+
+            # Step 3: Delete from database
+            yield event.plain_result("🔍 Step 3/4: Deleting from database and figures...")
+
+            deleted_count = 0
+            for paper in papers_to_reparse:
+                file_name = paper["file_name"]
+                file_path = paper.get("file_path")
+                try:
+                    result = await engine.delete_paper(file_name, file_path)
+                    if result.get("status") == "success":
+                        deleted_count += 1
+                    else:
+                        logger.warning(f"删除失败: {file_name} - {result.get('message')}")
+                except Exception as e:
+                    logger.error(f"Failed to delete {file_name}: {e}")
+
+                if deleted_count % 10 == 0:
+                    yield event.plain_result(f"   Deleted {deleted_count}/{len(papers_to_reparse)}...")
+
+            yield event.plain_result(f"✅ Deleted {deleted_count} papers from database")
+
+            # Step 4: Re-parse and re-vectorize
+            yield event.plain_result("🔍 Step 4/4: Re-parsing and vectorizing...")
+
+            import time
+            start_time = time.time()
+            success_count = 0
+            fail_count = 0
+            total_chunks = 0
+
+            for i, paper in enumerate(papers_to_reparse, 1):
+                try:
+                    result = await engine.add_paper(paper["file_path"])
+
+                    if result.get("status") == "success":
+                        chunks_added = result.get("chunks_added", 0)
+                        total_chunks += chunks_added
+                        success_count += 1
+                    else:
+                        fail_count += 1
+                        logger.warning(f"Failed to re-parse {paper['file_name']}: {result.get('message')}")
+                except Exception as e:
+                    fail_count += 1
+                    logger.error(f"Failed to re-parse {paper['file_name']}: {e}")
+
+                # Progress update every 5 papers
+                if i % 5 == 0 or i == len(papers_to_reparse):
+                    elapsed = time.time() - start_time
+                    yield event.plain_result(
+                        f"   Progress: {i}/{len(papers_to_reparse)} "
+                        f"(success: {success_count}, failed: {fail_count})"
+                    )
+
+            elapsed_time = time.time() - start_time
+
+            output = f"""✅ **Reparse Complete**
+
+📊 Statistics:
+  • Total zero-ref papers: {total_zero_ref}
+  • Files found: {len(papers_to_reparse)}
+  • Successfully re-parsed: {success_count}
+  • Failed: {fail_count}
+  • Chunks created: {total_chunks}
+  • Time: {elapsed_time:.1f}s
+
+💡 Tip: Use /paper refstats -1 to check again"""
+
+            if not_found:
+                output += f"\n\n⚠️ {len(not_found)} papers not found in filesystem"
+
+            yield event.plain_result(output.strip())
+
+        except Exception as e:
+            logger.error(f"Failed to reparse zero-ref papers: {e}")
+            yield event.plain_result(f"❌ 操作失败: {e}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @paper_commands.command("arxiv_add")

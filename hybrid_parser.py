@@ -315,6 +315,30 @@ class HybridPDFParser:
             logger.error(f"❌ PDF分块失败 {pdf_path}: {e}")
             return []
 
+    def _build_lightweight_metadata(
+        self,
+        base_metadata: Dict[str, Any],
+        chunk_index: int = 0
+    ) -> Dict[str, Any]:
+        """
+        构建轻量级 chunk metadata，避免大数据字段导致 Milvus 消息超限
+
+        排除以下大字段:
+        - raw_text: 整篇论文原文（可能数百KB）
+        - multimodal_data: 包含所有表格markdown等（可能很大）
+        """
+        # 保留的轻量级字段
+        lightweight_fields = [
+            "file_name", "file_path", "parser", "total_pages",
+            "images_count", "tables_count", "formulas_count",
+            "added_time"
+        ]
+        metadata = {"chunk_index": chunk_index}
+        for key in lightweight_fields:
+            if key in base_metadata:
+                metadata[key] = base_metadata[key]
+        return metadata
+
     def _semantic_chunk(
         self,
         text: str,
@@ -361,7 +385,7 @@ class HybridPDFParser:
                 for sub_chunk in sub_chunks:
                     nodes.append(Node(
                         text=sub_chunk,
-                        metadata={**base_metadata, "chunk_index": chunk_index}
+                        metadata=self._build_lightweight_metadata(base_metadata, chunk_index)
                     ))
                     chunk_index += 1
             else:
@@ -402,7 +426,7 @@ class HybridPDFParser:
 
                 nodes.append(Node(
                     text=chunk_text,
-                    metadata={**base_metadata, "chunk_index": chunk_index}
+                    metadata=self._build_lightweight_metadata(base_metadata, chunk_index)
                 ))
                 chunk_index += 1
 

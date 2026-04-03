@@ -51,11 +51,186 @@ class CitationInText:
 
 
 
-# 参考文献部分的常见标题
+# 参考文献部分的常见标题（精确匹配）
 REFERENCE_SECTION_KEYWORDS = [
-    'references', 'reference', 'bibliography', 'works cited',
+    'references', 'bibliography', 'works cited',
     'reference list', 'literature cited'
 ]
+
+# 附录参考文献的标题（正文参考文献之后的部分）
+APPENDIX_REFERENCE_KEYWORDS = [
+    'appendix a. references', 'appendix b. references',
+    'appendix c. references', 'appendix d. references',
+    'supplementary references', 'additional references',
+    'references s1', 'references s2',  # 补充材料中的编号
+    's1 references', 's2 references',  # 补充材料另一种格式
+]
+
+
+def _is_reference_section_title(line_lower: str) -> bool:
+    """
+    判断一行是否是参考文献章节标题（精确匹配）
+
+    避免误匹配如 "Reference Point Feature", "Reference Frame" 等论文章节
+    """
+    # 精确匹配（去掉首尾空格后完全相等）
+    if line_lower in [kw.lower() for kw in REFERENCE_SECTION_KEYWORDS]:
+        return True
+
+    # 附录格式匹配: "Appendix A. References" 或 "References S1"
+    for kw in APPENDIX_REFERENCE_KEYWORDS:
+        if line_lower == kw.lower() or line_lower.startswith(kw.lower() + ' '):
+            return True
+
+    # 通用格式匹配: 参考文献 后面只接受结束符、空格、或换行
+    # 例如 "References." 结尾是可以接受的
+    for kw in ['references', 'bibliography']:
+        if line_lower.startswith(kw.lower()) and len(line_lower) > len(kw):
+            suffix = line_lower[len(kw):]
+            # 后缀只能是: 空格、句号、换行、或只有空格
+            if suffix and not suffix[0].isalnum():
+                return True
+
+    return False
+
+
+def _find_ref_section_end(
+    lines_text: List[str],
+    ref_start: int,
+    has_line_numbers: bool = False
+) -> int:
+    """
+    从 ref_start 开始，找到参考文献部分的结束位置
+
+    Args:
+        lines_text: 文本行列表
+        ref_start: 参考文献开始行索引
+        has_line_numbers: 是否需要清洗行号
+
+    Returns:
+        参考文献结束位置（不包含）
+    """
+    def clean_line(line: str) -> str:
+        if has_line_numbers:
+            cleaned = re.sub(r'^\[[0-9]+\]\s*', '', line)
+            return cleaned
+        return line
+
+    ref_end = len(lines_text)
+
+    for i, line in enumerate(lines_text[ref_start:], start=ref_start):
+        stripped = clean_line(line).strip()
+
+        # 遇到 Markdown 表格分隔行 | --- | --- | 直接截断
+        if stripped.startswith('|') and stripped.count('|') >= 3:
+            ref_end = i
+            break
+
+        # 遇到数学公式行（如 $...$ 或纯公式行）直接截断
+        if stripped.startswith('$') or stripped.endswith('$'):
+            ref_end = i
+            break
+
+        # 遇到附录/补充材料/Acknowledgment时截断
+        if re.search(r'\b(Acknowledgment|Appendix|Supplementary Material)\b', stripped, re.IGNORECASE):
+            ref_end = i
+            break
+
+        # 检查是否有新的参考文献编号（清洗后检查）
+        has_ref_number = bool(re.match(r'^\[[0-9]+\]', stripped)) or bool(re.match(r'^[0-9]+\.\s+[A-Z]', stripped))
+
+        if has_ref_number:
+            ref_end = i + 1
+
+    return ref_end
+
+
+def _find_all_reference_sections(text: str) -> Dict[str, str]:
+    """
+    找到所有参考文献部分（支持正文+附录参考文献）
+
+    策略：
+    1. 检测每个 "References" 或 "Appendix X. References" 标题
+    2. 每个标题单独作为一个 section
+    3. 按在文本中的顺序处理
+
+    Args:
+        text: PDF 原始文本
+
+    Returns:
+        Dict[str, str]: section_name -> 参考文献文本
+        例如: {"ref_1": "...", "ref_2": "..."}
+        section_name 格式: ref_1, ref_2, ... 按顺序编号
+    """
+    lines_text = text.split('\n')
+    sections: Dict[str, str] = {}
+
+    # 查找所有参考文献标题位置
+    ref_titles: List[Tuple[int, str]] = []  # (行索引, 标题名称)
+
+    for i, line in enumerate(lines_text):
+        line_stripped = line.strip().lower()
+
+        # 使用精确匹配函数判断是否是参考文献标题
+        if _is_reference_section_title(line_stripped):
+            ref_titles.append((i, line.strip()))
+
+    if not ref_titles:
+        return {}
+
+    # 处理每个参考文献部分
+    ref_count = 0  # 全局参考文献部分计数器
+
+    for idx, (start_line, title) in enumerate(ref_titles):
+        ref_start = start_line + 1
+
+        # 检测行号格式（跳过空行查找第一行非空内容）
+        has_line_numbers = False
+        for j in range(ref_start, min(ref_start + 10, len(lines_text))):
+            first_line = lines_text[j].strip()
+            if first_line:
+                has_line_numbers = bool(re.match(r'^\[[0-9]+\]\s*\[[0-9]+\]', first_line)) or \
+                                  bool(re.match(r'^\[[0-9]+\]\s*[0-9]+\.', first_line))
+                break
+
+        # 确定结束位置：使用下一个 section 的开始位置
+        if idx + 1 < len(ref_titles):
+            ref_end = ref_titles[idx + 1][0]
+        else:
+            # 最后一个 section，扫描到下一个可能的 section 标题或文本末尾
+            ref_end = _find_ref_section_end(lines_text, ref_start, has_line_numbers)
+
+            # 如果结束位置太靠后，尝试查找下一个 section
+            if ref_end >= len(lines_text) - 5:
+                for j in range(ref_start + 1, len(lines_text)):
+                    line_lower = lines_text[j].strip().lower()
+                    for kw in REFERENCE_SECTION_KEYWORDS + APPENDIX_REFERENCE_KEYWORDS:
+                        if line_lower == kw or line_lower.startswith(kw + ' '):
+                            ref_end = j
+                            break
+                    if ref_end != len(lines_text):
+                        break
+
+        if ref_start >= ref_end:
+            continue
+
+        # 清洗并拼接
+        def clean_line(line: str) -> str:
+            if has_line_numbers:
+                cleaned = re.sub(r'^\[[0-9]+\]\s*', '', line)
+                return cleaned
+            return line
+
+        result_lines = [clean_line(lines_text[i]) for i in range(ref_start, ref_end)]
+        result = '\n'.join(result_lines)
+
+        if result.strip():
+            ref_count += 1
+            section_name = f"ref_{ref_count}"
+            sections[section_name] = result
+            logger.info(f"📝 提取 [{title}] -> {section_name}: {len(result)} 字符, {ref_end - ref_start} 行")
+
+    return sections
 
 
 def _find_reference_section(text: str) -> Optional[str]:
@@ -147,11 +322,19 @@ class CitationLinker:
     CITATION_PATTERN = re.compile(r'\[(\d+(?:[,\-\s]+\d+)*)\]')
 
     # 匹配 author-year 引用格式的正则
-    # 格式: (Smith, 2020), (Smith et al., 2020), Smith (2020), Smith et al. (2020)
+    # 格式:
+    #   - Smith, 2020
+    #   - Smith (2020)
+    #   - Smith et al. 2021 (AAAI格式，无逗号无括号)
+    #   - (Smith et al. 2021) 括号包裹
     AUTHOR_YEAR_PATTERN = re.compile(
         r'([A-Z][a-z]+(?:\s+(?:et\s+al\.?|and\s+[A-Z][a-z]+))?)\s*,\s*(\d{4})|'
-        r'([A-Z][a-z]+(?:\s+(?:et\s+al\.?|and\s+[A-Z][a-z]+))?)\s+\((\d{4})\)'
+        r'([A-Z][a-z]+(?:\s+(?:et\s+al\.?|and\s+[A-Z][a-z]+))?)\s+\((\d{4})\)|'
+        r'\(([A-Z][a-z]+(?:\s+(?:et\s+al\.?|and\s+[A-Z][a-z]+))?)\s+(\d{4})\)'
     )
+
+    # 匹配括号内的多引用: (Smith et al. 2021; Chen et al. 2024; Zhang, Liu, and Han 2024)
+    MULTI_CITATION_PATTERN = re.compile(r'\(([^)]+)\)')
 
     def find_citations_in_text(self, text: str) -> List[CitationInText]:
         """
@@ -236,7 +419,39 @@ class CitationLinker:
                 if 'et al' not in first_author.lower():
                     key_et_al = f"{first_author} et al.{year}"
                     author_year_map[key_et_al.lower()] = ref.ref_id
+                    # AAAI格式: "Smith et al. 2021" (无逗号)
+                    key_aaai = f"{first_author.lower()} et al.{year}"
+                    author_year_map[key_aaai] = ref.ref_id
         return author_year_map
+
+    def _match_author_in_map(self, author: str, year: str, author_year_map: Dict[str, str]) -> Optional[str]:
+        """
+        尝试将 author-year 匹配到 ref_id
+
+        Args:
+            author: 作者名
+            year: 年份
+            author_year_map: author-year -> ref_id 映射
+
+        Returns:
+            ref_id 或 None
+        """
+        author_lower = author.lower()
+        year_str = str(year)
+
+        # 尝试多种作者名格式
+        variants = [
+            author_lower,  # 直接匹配
+            f"{author_lower} et al.",  # 带 et al.
+            author_lower.split()[0] if ' ' in author_lower else author_lower,  # 仅姓氏
+        ]
+
+        for variant in variants:
+            key = f"{variant}{year_str}"
+            if key in author_year_map:
+                return author_year_map[key]
+
+        return None
 
     def find_author_year_citations(self, text: str, author_year_map: Dict[str, str]) -> List[CitationInText]:
         """
@@ -262,6 +477,10 @@ class CitationLinker:
                 # 格式: Smith (2020) 或 Smith et al. (2020)
                 author = match.group(3).strip()
                 year = match.group(4)
+            elif match.group(5) and match.group(6):
+                # 格式: (Smith et al. 2021) - AAAI格式，括号包裹
+                author = match.group(5).strip()
+                year = match.group(6)
             else:
                 continue
 
@@ -271,25 +490,7 @@ class CitationLinker:
             seen_positions.add(match.start())
 
             # 尝试多种作者名格式匹配
-            ref_id = None
-            author_lower = author.lower()
-
-            # 直接匹配
-            if author_lower in author_year_map:
-                ref_id = author_year_map[author_lower]
-            else:
-                # 尝试添加 " et al." 变体
-                author_et_al = author_lower + ' et al.'
-                if author_et_al in author_year_map:
-                    ref_id = author_year_map[author_et_al]
-                else:
-                    # 尝试只用姓氏匹配
-                    surname = author_lower.split()[0] if ' ' in author_lower else author_lower
-                    surname_et_al = surname + ' et al.'
-                    if surname in author_year_map:
-                        ref_id = author_year_map[surname]
-                    elif surname_et_al in author_year_map:
-                        ref_id = author_year_map[surname_et_al]
+            ref_id = self._match_author_in_map(author, year, author_year_map)
 
             if ref_id:
                 start = max(0, match.start() - 50)
@@ -516,7 +717,7 @@ class LLMReferenceParser:
                 logger.info(f"📝 [LLM调用] 获得信号量，开始请求...")
                 try:
                     async with aiohttp.ClientSession() as session:
-                        async with session.post(url, headers=headers, json=data, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                        async with session.post(url, headers=headers, json=data, timeout=aiohttp.ClientTimeout(total=600)) as resp:
                             logger.info(f"📝 [LLM调用] 收到响应状态码: {resp.status}")
                             if resp.status == 429:
                                 # 速率限制，等待后重试
@@ -570,6 +771,8 @@ class LLMReferenceParser:
         """
         解析整段参考文献文本（让LLM自动分割+解析）
 
+        当文本超过32768字符时，自动分批处理，每批按序号分割避免截断参考文献。
+
         Args:
             ref_section: 参考文献部分的完整文本（可能跨多行）
             ref_id_prefix: ref_id 前缀
@@ -580,34 +783,74 @@ class LLMReferenceParser:
         if not ref_section or not ref_section.strip():
             return []
 
-        logger.info(f"📝 开始 LLM 参考文献解析（整段模式），文本长度: {len(ref_section)} 字符")
+        text_length = len(ref_section)
+        logger.info(f"📝 开始 LLM 参考文献解析（整段模式），文本长度: {text_length} 字符")
 
+        # 文本超过32768字符时分批处理
+        if text_length > 32768:
+            logger.info(f"📝 文本超过32768字符，自动分批处理")
+            batches = self._split_reference_section_by_numbers(ref_section)
+            logger.info(f"📝 分成 {len(batches)} 批进行处理")
+
+            all_results = []
+            for i, batch_text in enumerate(batches):
+                logger.info(f"📝 处理第 {i+1}/{len(batches)} 批，字符数: {len(batch_text)}")
+                batch_results = await self._parse_single_batch(batch_text, ref_id_prefix, i)
+                all_results.extend(batch_results)
+
+            # 重新编号
+            for j, ref in enumerate(all_results):
+                ref.ref_id = f"{ref_id_prefix}_{j + 1}"
+
+            logger.info(f"📚 LLM 解析参考文献: 成功 {len(all_results)} 条")
+            return all_results
+
+        # 正常单次处理
+        return await self._parse_single_batch(ref_section, ref_id_prefix, 0)
+
+    async def _parse_single_batch(
+        self,
+        ref_section: str,
+        ref_id_prefix: str,
+        batch_index: int
+    ) -> List[Reference]:
+        """
+        解析单批参考文献文本
+
+        Args:
+            ref_section: 参考文献文本
+            ref_id_prefix: ref_id 前缀
+            batch_index: 批次索引（用于日志）
+
+        Returns:
+            Reference 对象列表
+        """
         prompt = self.SECTION_PARSE_PROMPT.format(ref_section=ref_section)
 
         try:
             response = await self._call_llm(prompt)
 
             if not response:
-                logger.warning("⚠️ LLM 未返回有效响应")
+                logger.warning(f"⚠️ 批次 {batch_index+1}: LLM 未返回有效响应")
                 return []
 
             # 提取 JSON
             json_str = self._extract_json(response)
             if not json_str:
-                logger.warning(f"⚠️ 无法从 LLM 响应中提取 JSON，响应长度: {len(response)} 字符")
-                logger.warning(f"========== LLM 原始输出 ==========\n{response}\n========== END ==========")
+                logger.warning(f"⚠️ 批次 {batch_index+1}: 无法从 LLM 响应中提取 JSON，响应长度: {len(response)} 字符")
+                logger.warning(f"========== LLM 原始输出 ==========\n{response[:500]}\n========== END ==========")
                 return []
 
             parsed_list = json.loads(json_str)
             if not isinstance(parsed_list, list):
-                logger.warning(f"⚠️ LLM 返回的不是数组: {type(parsed_list)}")
+                logger.warning(f"⚠️ 批次 {batch_index+1}: LLM 返回的不是数组: {type(parsed_list)}")
                 return []
 
             results = []
             for j, parsed in enumerate(parsed_list):
                 try:
                     ref = Reference(
-                        ref_id=f"{ref_id_prefix}_{j + 1}",
+                        ref_id=f"{ref_id_prefix}_{j + 1}",  # 暂时编号，后面会重新编号
                         raw_text="",  # 整段模式不保留raw_text
                         ref_title=parsed.get("title", ""),
                         ref_authors=parsed.get("authors", ""),
@@ -617,18 +860,99 @@ class LLMReferenceParser:
                     )
                     results.append(ref)
                 except Exception as e:
-                    logger.debug(f"⚠️ 解析第 {j} 条失败: {e}, 数据: {parsed}")
+                    logger.debug(f"⚠️ 批次 {batch_index+1} 解析第 {j} 条失败: {e}, 数据: {parsed}")
                     continue
 
-            logger.info(f"📚 LLM 解析参考文献: 成功 {len(results)} 条")
+            logger.info(f"📚 批次 {batch_index+1}: 解析成功 {len(results)} 条")
             return results
 
         except json.JSONDecodeError as e:
-            logger.warning(f"⚠️ JSON 解析失败: {e}")
+            logger.warning(f"⚠️ 批次 {batch_index+1}: JSON 解析失败: {e}")
             return []
         except Exception as e:
-            logger.warning(f"⚠️ 参考文献解析失败: {e}")
+            logger.warning(f"⚠️ 批次 {batch_index+1}: 参考文献解析失败: {e}")
             return []
+
+    def _split_reference_section_by_numbers(
+        self,
+        ref_section: str,
+        max_chars: int = 32768
+    ) -> List[str]:
+        """
+        按参考文献序号分割文本，确保每批不超过 max_chars 字符
+
+        分割点: [1], [2], 1., 2., [12], [123] 等序号模式
+        每批按序号分割，避免参考文献被从中间截断
+
+        Args:
+            ref_section: 参考文献文本
+            max_chars: 每批最大字符数
+
+        Returns:
+            分割后的文本列表
+        """
+        import re
+
+        # 匹配参考文献序号的模式: [数字], 数字., [数字数字...], 数字数字... .
+        # 例如: [1], [12], 1., 2., 123., [123]
+        ref_pattern = re.compile(r'(?=\[\d+\]|\[\d+\s)|(?<=^\d+\.)|(?<=\[\d+\])\s*(?=[A-Z])|(?<=^\[\d+\])\s*(?=[A-Z])')
+
+        # 找到所有可能的分割点
+        # 序号模式: [数字] 或 数字.
+        number_pattern = re.compile(r'(?=\[?\d+\]?\s*[\.\:]|\[\d+\]\s*(?=[A-Z]))')
+
+        lines = ref_section.split('\n')
+        batches = []
+        current_batch = []
+        current_char_count = 0
+
+        for line in lines:
+            line_char_count = len(line)
+
+            # 检查是否在当前批次添加后超过限制
+            if current_char_count + line_char_count > max_chars and current_batch:
+                # 检查是否是新的参考文献开始（行首有序号）
+                is_new_ref = bool(re.match(r'^\s*\[?\d+\]?\s*[\.\:]', line.strip()))
+
+                if not is_new_ref and current_char_count < max_chars * 0.9:
+                    # 不是新参考文献开始，且当前批次未达到90%容量，继续添加
+                    current_batch.append(line)
+                    current_char_count += line_char_count
+                    continue
+
+                # 保存当前批次
+                batches.append('\n'.join(current_batch))
+                current_batch = []
+                current_char_count = 0
+
+            current_batch.append(line)
+            current_char_count += line_char_count
+
+        # 添加最后一批
+        if current_batch:
+            batches.append('\n'.join(current_batch))
+
+        # 如果分割后仍有批次超过限制（单行就超过限制），强制按字符数截断
+        final_batches = []
+        for batch in batches:
+            if len(batch) > max_chars:
+                # 找到最后一个换行符位置，尽量在行边界分割
+                lines = batch.split('\n')
+                sub_batch = []
+                sub_char_count = 0
+                for line in lines:
+                    if sub_char_count + len(line) > max_chars and sub_batch:
+                        final_batches.append('\n'.join(sub_batch))
+                        sub_batch = []
+                        sub_char_count = 0
+                    sub_batch.append(line)
+                    sub_char_count += len(line)
+                if sub_batch:
+                    final_batches.append('\n'.join(sub_batch))
+            else:
+                final_batches.append(batch)
+
+        return final_batches
 
     async def parse_references(
         self,
@@ -855,6 +1179,8 @@ async def process_references_with_llm(
     """
     使用 LLM 解析参考文献并建立引用关联
 
+    支持正文+附录参考文献的PDF，会分拆处理后合并。
+
     Args:
         pdf_path: PDF 文件路径
         chunks: 分块后的 Node 列表
@@ -865,25 +1191,52 @@ async def process_references_with_llm(
     Returns:
         (references列表, 更新后的chunks列表)
     """
-    # 1. 使用正则表达式提取参考文献部分
-    ref_section = _find_reference_section(text)
+    # 1. 提取所有参考文献部分
+    ref_sections = _find_all_reference_sections(text)
 
-    if not ref_section:
+    if not ref_sections:
         logger.debug("📝 未找到参考文献部分")
         return [], chunks
 
-    # 2. 直接将整段参考文献文本传给 LLM，让 LLM 自动分割+解析
+    # 2. 如果有多个参考文献部分，按顺序处理
     llm_parser = LLMReferenceParser(llm_config, arxiv_client)
-    references = await llm_parser.parse_reference_section(ref_section)
+    all_references = []
 
-    if not references:
-        logger.warning("⚠️ LLM 解析参考文献失败")
-    else:
-        logger.info(f"📚 LLM 解析成功: {len(references)} 条参考文献")
+    # ref_1, ref_2, ref_3... 自然顺序已经是正确的处理顺序
+    section_names = sorted(ref_sections.keys())
+
+    logger.info(f"📝 发现 {len(ref_sections)} 个参考文献部分: {section_names}")
+
+    # 全局序号偏移
+    global_offset = 0
+
+    for section_name in section_names:
+        ref_section = ref_sections[section_name]
+        logger.info(f"📝 处理 {section_name} 参考文献，字符数: {len(ref_section)}")
+
+        # 调用 LLM 解析
+        refs = await llm_parser.parse_reference_section(ref_section)
+
+        if not refs:
+            logger.warning(f"⚠️ {section_name} 参考文献 LLM 解析失败")
+            continue
+
+        # 重新编号（加上全局偏移）
+        for ref in refs:
+            global_offset += 1
+            ref.ref_id = f"ref_{global_offset}"
+
+        all_references.extend(refs)
+        logger.info(f"📚 {section_name} 解析成功: {len(refs)} 条，当前总计: {global_offset} 条")
+
+    if not all_references:
+        logger.warning("⚠️ 所有参考文献解析失败")
+        return [], chunks
+
+    logger.info(f"📚 LLM 解析成功: 共 {len(all_references)} 条参考文献")
 
     # 3. 建立引用关联
-    if references:
-        linker = CitationLinker()
-        chunks = linker.link_citations_to_references(chunks, references)
+    linker = CitationLinker()
+    chunks = linker.link_citations_to_references(chunks, all_references)
 
-    return references, chunks
+    return all_references, chunks

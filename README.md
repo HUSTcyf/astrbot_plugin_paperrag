@@ -1,8 +1,8 @@
-# 📚 Paper RAG Plugin v1.9.0 - 用户指南
+# 📚 Paper RAG Plugin v1.9.1 - 用户指南
 
 本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力（支持多模态VLM问答）。
 
-> **版本说明**：当前版本 v1.9.0，完整更新历史见 [CHANGELOG.md](CHANGELOG.md)
+> **版本说明**：当前版本 v1.9.1，完整更新历史见 [CHANGELOG.md](CHANGELOG.md)
 
 ## ✨ 核心功能
 
@@ -97,6 +97,8 @@ cp ~/Downloads/*.pdf papers/
 | `/paper rebuild [目录] confirm` | 清空并重建知识库 | `/paper rebuild ./papers confirm` |
 | `/paper clear confirm` | 清空知识库（需管理员） | `/paper clear confirm` |
 | `/paper refstats [top_k]` | 查看参考文献引用统计（需管理员） | `/paper refstats 20` |
+| `/paper refstats -1` | 列出无参考文献的论文 | `/paper refstats -1` |
+| `/paper reparse_zero_ref confirm` | 批量重新解析无参考文献的论文（需管理员） | `/paper reparse_zero_ref confirm` |
 | `/paper arxiv_add <关键词> [数量]` | 从arXiv搜索下载论文并添加（需管理员） | `/paper arxiv_add attention is all you need 3` |
 | `/paper arxiv_refs [top_k] [每篇数量]` | 下载高频引用论文（需管理员） | `/paper arxiv_refs 10 3` |
 | `/paper arxiv_sync confirm` | 同步MCP已下载论文到数据库（需管理员） | `/paper arxiv_sync confirm` |

@@ -529,6 +529,18 @@ class HybridIndexManager:
                     "metadata": metadata_str
                 })
 
+            # 统计 chunks 大小信息
+            total_text_size = sum(len(d["text"]) for d in data)
+            total_metadata_size = sum(len(d["metadata"]) for d in data)
+            total_vector_size = sum(len(d["vector"]) * 4 for d in data)  # float32 = 4 bytes
+            total_data_size = total_text_size + total_metadata_size + total_vector_size
+
+            logger.info(f"📊 Chunks 统计: {len(data)} 个, "
+                       f"文本 {total_text_size / 1024:.1f}KB, "
+                       f"元数据 {total_metadata_size / 1024:.1f}KB, "
+                       f"向量 {total_vector_size / 1024:.1f}KB, "
+                       f"总大小 {total_data_size / 1024 / 1024:.2f}MB")
+
             # 插入数据 - 使用线程池避免阻塞事件循环
             collection = cast(Collection, self._collection)
             loop = asyncio.get_event_loop()
@@ -737,6 +749,126 @@ class HybridIndexManager:
                 "references": [],
                 "total_refs": 0,
                 "total_chunks": 0,
+                "error": str(e)
+            }
+
+    async def get_papers_with_zero_references(self) -> Dict[str, Any]:
+        """
+        获取参考文献数量为0的论文列表
+
+        Returns:
+            Dict containing:
+            - papers: List of papers with zero references
+            - total_papers: Total number of papers checked
+            - total_zero_ref: Number of papers with zero references
+        """
+        try:
+            import json
+
+            await self._ensure_collection()
+            collection = cast(Collection, self._collection)
+            loop = asyncio.get_event_loop()
+
+            # 获取所有论文列表
+            papers = await self.list_unique_documents()
+            paper_names = [p.get("file_name", "") for p in papers if p.get("file_name")]
+
+            logger.info(f"🔍 开始检查 {len(paper_names)} 篇论文的参考文献数量...")
+
+            zero_ref_papers = []
+            checked_count = 0
+
+            for i, paper_name in enumerate(paper_names):
+                if i % 20 == 0:
+                    await self._ensure_collection()
+                    collection = cast(Collection, self._collection)
+
+                try:
+                    # 构建查询表达式
+                    query_name = paper_name
+                    if self._file_name_has_pdf_suffix is not None:
+                        if self._file_name_has_pdf_suffix and not query_name.lower().endswith('.pdf'):
+                            query_name = query_name + ".pdf"
+                        elif not self._file_name_has_pdf_suffix and query_name.lower().endswith('.pdf'):
+                            query_name = query_name[:-4]
+
+                    # 查询论文所有 chunks (Milvus Lite limit: 16384)
+                    all_results: Any = await loop.run_in_executor(
+                        None,
+                        lambda pn=query_name: collection.query(
+                            expr=f'metadata["file_name"] == "{pn}"',
+                            output_fields=["metadata"],
+                            limit=16384
+                        )
+                    )
+                    all_results = cast(List[Dict[str, Any]], all_results)
+
+                    if not all_results:
+                        zero_ref_papers.append({
+                            "file_name": paper_name,
+                            "chunk_count": 0
+                        })
+                        checked_count += 1
+                        continue
+
+                    # 检查是否所有 chunks 都没有参考文献
+                    # 注意：必须检查字段是否存在，而不是检查值是否非空
+                    # 因为 CitationLinker 会为没有引用的 chunk 设置 cited_references = []（空列表）
+                    has_any_ref = False
+                    refs_found_count = 0
+                    chunks_with_refs = 0
+                    chunks_without_field = 0
+                    for row in all_results:
+                        meta = row.get("metadata", "{}")
+                        if isinstance(meta, str):
+                            try:
+                                meta = json.loads(meta)
+                            except json.JSONDecodeError:
+                                meta = {}
+
+                        # 检查字段是否存在，且值是非空列表
+                        if "cited_references" in meta:
+                            cited_refs = meta["cited_references"]
+                            if isinstance(cited_refs, list) and len(cited_refs) > 0:
+                                has_any_ref = True
+                                refs_found_count += len(cited_refs)
+                                chunks_with_refs += 1
+                        else:
+                            # 字段不存在
+                            chunks_without_field += 1
+
+                    if chunks_with_refs > 0 or chunks_without_field > 0:
+                        logger.debug(f"📝 {paper_name}: {chunks_with_refs}/{len(all_results)} chunks有引用, {chunks_without_field} chunks无字段, 共 {refs_found_count} 条")
+                    elif chunks_with_refs == 0 and chunks_without_field == 0:
+                        # 对问题论文详细记录
+                        logger.info(f"📝 {paper_name}: {len(all_results)} chunks, 有引用chunks: {chunks_with_refs}, 无字段: {chunks_without_field}")
+
+                    if not has_any_ref:
+                        zero_ref_papers.append({
+                            "file_name": paper_name,
+                            "chunk_count": len(all_results)
+                        })
+
+                    checked_count += 1
+
+                except Exception as e:
+                    logger.warning(f"⚠️ 检查论文 {paper_name} 失败: {e}")
+                    continue
+
+            logger.info(f"📊 检查完成: {checked_count} 篇论文, {len(zero_ref_papers)} 篇无参考文献")
+
+            return {
+                "papers": zero_ref_papers,
+                "total_papers": checked_count,
+                "total_zero_ref": len(zero_ref_papers)
+            }
+
+        except Exception as e:
+            logger.error(f"获取零引用论文列表失败: {e}")
+            return {
+                "papers": [],
+                "total_papers": 0,
+                "total_zero_ref": 0,
                 "error": str(e)
             }
 

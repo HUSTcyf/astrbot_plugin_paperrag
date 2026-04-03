@@ -2,6 +2,114 @@
 
 所有值得注意的插件变更都会记录在这个文件中。
 
+## [1.9.1] - 2026-04-04
+
+### Docling PDF 多模态提取（默认方案）
+
+**文件**: `multimodal_extractor.py`, `hybrid_parser.py`
+
+**概述**: 使用 Docling 替代 PyMuPDF 作为默认 PDF 提取方案，支持图片、表格、公式的多模态提取。
+
+**新增功能**:
+- `DoclingExtractor` 类 - 使用 docling-project 进行 PDF 解析
+- 图片提取：保存至 `data/figures/{paper_id}/images/`
+- 表格提取：保存为 CSV 和 PNG 两种格式
+- 公式提取：保存 LaTeX 文本
+- 保留原 PyMuPDF 方案作为 fallback
+
+**表格保存逻辑**:
+- 表格保存为 CSV 文件（结构化数据）
+- 同时保存为 PNG 图片（可视化）
+- 路径记录在 `saved_csv_path` 和 `saved_png_path` 字段
+
+### Chunk Metadata 优化
+
+**文件**: `hybrid_parser.py`, `hybrid_index.py`
+
+**问题**: 每个 chunk 的 metadata 包含完整 `raw_text` 和 `multimodal_data`，导致 Milvus 消息超限（710MB > 256MB限制）
+
+**修复**: 新增 `_build_lightweight_metadata()` 方法，排除以下大字段:
+- `raw_text`: 整篇论文原文
+- `multimodal_data`: 所有表格markdown等
+
+**新增日志**: 插入前显示 chunks 统计信息
+```
+📊 Chunks 统计: 948 个, 文本 395.7KB, 元数据 320.6KB, 向量 3792.0KB, 总大小 4.40MB
+```
+
+### /paper refstats -1 功能
+
+**文件**: `hybrid_index.py`, `main.py`
+
+**功能**: 列出参考文献数量为 0 的论文
+
+**使用**: `/paper refstats -1`
+
+**输出示例**:
+```
+📚 **无参考文献的论文** (3/90)
+
+  1. **SAM2.pdf**
+      └─ chunks: 1710
+```
+
+### 多个参考文献部分处理
+
+**文件**: `reference_processor.py`
+
+**概述**: 支持正文 + 附录两处参考文献，分拆处理后合并
+
+**新增函数**:
+- `_find_all_reference_sections()` - 检测所有参考文献部分
+- `_is_reference_section_title()` - 精确匹配参考文献标题
+- `_find_ref_section_end()` - 确定参考文献结束位置
+
+**关键词**:
+```python
+APPENDIX_REFERENCE_KEYWORDS = [
+    'appendix a. references', 'appendix b. references',
+    'supplementary references', 'additional references',
+    'references s1', 'references s2',
+]
+```
+
+**处理流程**: ref_1 (正文) → ref_2 (附录) → 统一编号
+
+### AAAI 格式 Author-Year 引用支持
+
+**文件**: `reference_processor.py`
+
+**引用格式**: `(Smith et al. 2021; Chen et al. 2024)`
+
+**新增正则**:
+```python
+r'\(([A-Z][a-z]+(?:\s+(?:et\s+al\.?|and\s+[A-Z][a-z]+))?)\s+(\d{4})\)'
+```
+
+**匹配示例**:
+| 格式 | 示例 |
+|------|------|
+| 逗号分隔 | `Smith, 2020` |
+| 括号包裹 | `(Smith et al. 2021)` |
+| AAAI格式 | `Smith et al. 2021` |
+
+### 其他优化
+
+**文件**: `reference_processor.py`
+
+- 参考文献解析超时：120秒 → 600秒
+- 空列表判断修复：检查字段是否存在而非值是否非空
+
+---
+
+## [1.9.1] - 2026-04-04
+
+### Version Bump
+
+- Updated version to 1.9.1
+
+---
+
 ## [1.9.0] - 2026-04-03
 
 ### Version Bump

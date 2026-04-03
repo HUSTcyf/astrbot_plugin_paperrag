@@ -2885,12 +2885,13 @@ Output only JSON, no other text:"""
         """清空知识库（别名方法，向后兼容）"""
         return await self.clear_index()
 
-    async def delete_paper(self, file_name: str) -> Dict[str, Any]:
+    async def delete_paper(self, file_name: str, file_path: str = None) -> Dict[str, Any]:
         """
-        删除指定论文的向量数据
+        删除指定论文的向量数据和图表
 
         Args:
             file_name: 要删除的文件名
+            file_path: 文件完整路径（可选，用于定位图表目录）
 
         Returns:
             删除结果
@@ -2907,6 +2908,9 @@ Output only JSON, no other text:"""
                 if self.config.enable_bm25:
                     index_manager.refresh_bm25_index()
 
+                # 删除图表目录
+                await self._delete_figures_dir(file_name, file_path)
+
             return result
 
         except Exception as e:
@@ -2915,3 +2919,41 @@ Output only JSON, no other text:"""
                 "status": "error",
                 "message": f"删除论文失败: {e}"
             }
+
+    async def _delete_figures_dir(self, file_name: str, file_path: str = None) -> bool:
+        """
+        删除论文对应的图表目录
+
+        Args:
+            file_name: 文件名（如 attention.pdf）
+            file_path: 文件完整路径（可选）
+
+        Returns:
+            是否成功删除
+        """
+        try:
+            import shutil
+
+            # 确定 paper_id
+            if file_path:
+                paper_id = Path(file_path).stem
+            else:
+                # 从 file_name 推断 paper_id（去掉 .pdf 等扩展名）
+                paper_id = Path(file_name).stem
+
+            # 获取图表存储目录
+            plugin_dir = Path(__file__).parent
+            figures_base_dir = plugin_dir / "data" / "figures"
+            figures_dir = figures_base_dir / paper_id
+
+            if figures_dir.exists() and figures_dir.is_dir():
+                shutil.rmtree(figures_dir)
+                logger.info(f"✅ 已删除图表目录: {figures_dir}")
+                return True
+            else:
+                logger.debug(f"图表目录不存在，跳过删除: {figures_dir}")
+                return False
+
+        except Exception as e:
+            logger.warning(f"⚠️ 删除图表目录失败: {e}")
+            return False
