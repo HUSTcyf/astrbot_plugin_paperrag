@@ -302,12 +302,14 @@ Extract ALL meaningful relationship triplets from the given paper text chunks. E
 - publishes_in, collaborates_with
 
 ## Extraction Rules
-1. Extract ALL meaningful relations from ALL chunks
-2. Entity names MUST come from the original text
-3. Use English relation descriptions
-4. Confidence: 0.5-1.0 based on text clarity
-5. Max {max_triplets} triplets per chunk
-6. **IMPORTANT**: evidence field must ONLY contain "[Chunk X]" - do NOT include original text. This avoids JSON parsing issues with newlines and quotes.
+1. Extract ONLY the MOST IMPORTANT relationships (prioritize high-impact relations)
+2. Focus on key entities: major models, methods, datasets, metrics
+3. Entity names MUST come from the original text
+4. Use English relation descriptions
+5. Confidence: 0.5-1.0 based on text clarity
+6. **STRICT LIMIT**: Maximum {max_triplets} triplets TOTAL for ALL chunks combined
+7. **IMPORTANT**: evidence field must ONLY contain "[Chunk X]" - do NOT include original text
+8. Keep entity names concise (max 30 chars), use abbreviations if needed
 
 ## Example
 Chunks:
@@ -393,12 +395,14 @@ Extract ALL meaningful relationship triplets from the given paper text.
 - publishes_in, collaborates_with
 
 ## Extraction Rules
-1. Extract ALL meaningful relations from the text
-2. Entity names MUST come from the original text
-3. Use English relation descriptions
-4. Confidence: 0.5-1.0 based on text clarity
-5. Max {max_triplets} triplets per chunk
-6. **IMPORTANT**: evidence field must be a SHORT phrase (max 50 chars) - do NOT include long text snippets. This avoids JSON parsing issues.
+1. Extract ONLY the MOST IMPORTANT relationships (prioritize key findings and major contributions)
+2. Focus on: major models, methods, datasets, metrics, SOTA results
+3. Entity names MUST come from the original text
+4. Use English relation descriptions
+5. Confidence: 0.5-1.0 based on text clarity
+6. **STRICT LIMIT**: Maximum {max_triplets} triplets TOTAL
+7. **IMPORTANT**: evidence field must be a SHORT phrase (max 50 chars) - do NOT include long text snippets
+8. Keep entity names concise (max 30 chars)
 
 ## Example
 Input: "BERT is based on the Transformer encoder architecture and achieves 86.4% accuracy on GLUE benchmark, outperforming all previous models."
@@ -616,7 +620,7 @@ class MultimodalGraphBuilder:
             mmproj_path=mmproj_path,
             n_ctx=4096,
             n_gpu_layers=99,
-            max_tokens=32768,  # 无限制输出（32k，远超 n_ctx=4096）
+            max_tokens=32768,  # 最大输出限制（实际受 n_ctx=4096 限制，最多生成 ~3000 tokens）
             temperature=0.1,
             vision_enabled=self.config.multimodal_enabled
         )
@@ -675,6 +679,7 @@ class MultimodalGraphBuilder:
         # 批量处理：每批 4 个 chunks
         # 安全计算：4 chunks × ~500字符 ≈ 2000字符 ≈ 500-800 tokens
         # 加上 system prompt ≈ 1500 tokens，总计 ≈ 2000-2300 tokens < 4096
+        # prompt 中限制最多提取 {max_triplets} 个三元组，确保输出不会过长
         batch_size = 4
         total_batches = (len(nodes) + batch_size - 1) // batch_size
 
@@ -788,9 +793,13 @@ class MultimodalGraphBuilder:
             assert self._llm is not None
             response = await self._llm.text_chat(
                 prompt=user_prompt,
-                system_prompt=system_prompt
+                system_prompt=system_prompt,
+                max_tokens=32768  # 无限制输出（使用最大值避免 JSON 被截断）
             )
             response_text = response.content if hasattr(response, 'content') else str(response)
+
+            # 调试：记录响应长度和末尾内容（判断是否截断）
+            logger.info(f"[Graph-LLM] 批次 {batch_idx + 1} LLM响应长度: {len(response_text)}, 末尾: {repr(response_text[-150:] if len(response_text) > 150 else response_text)}")
 
             # 解析 JSON 响应
             triplets = self._parse_json_response(response_text)
@@ -818,12 +827,15 @@ class MultimodalGraphBuilder:
                         result["cross_modal_triplets_added"] += multimodal_result.get("cross_modal_triplets_added", 0)
 
             # 添加文本三元组
+            # Track entities counted in this batch to avoid double-counting
+            counted_entities: set = set()
+
             for triplet in triplets:
                 head = triplet.get("head", "").strip()
                 relation = triplet.get("relation", "").strip()
                 tail = triplet.get("tail", "").strip()
 
-                if not head or not relation or tail:
+                if not head or not relation or not tail:
                     continue
 
                 # 从 evidence 中提取 chunk 索引
@@ -838,13 +850,13 @@ class MultimodalGraphBuilder:
                 metadata = node.metadata if hasattr(node, 'metadata') else {}
                 chunk_id = metadata.get("chunk_id", metadata.get("file_name", ""))
 
-                # 添加实体
-                graph_store.add_entity(
+                # 添加实体（去重后只计算真正新增的实体）
+                head_id = graph_store.add_entity(
                     name=head,
                     entity_type=self._normalize_entity_type(triplet.get("head_type", "")),
                     chunk_id=chunk_id
                 )
-                graph_store.add_entity(
+                tail_id = graph_store.add_entity(
                     name=tail,
                     entity_type=self._normalize_entity_type(triplet.get("tail_type", "")),
                     chunk_id=chunk_id
@@ -861,8 +873,13 @@ class MultimodalGraphBuilder:
 
                 if rel_id:
                     result["text_triplets_added"] += 1
-                    result["entities_added"] += 2
-                result["text_triplets_added"] += 1
+                    # 只统计真正新增的实体（避免同一实体在多个三元组中出现被重复计数）
+                    if head.lower() not in counted_entities:
+                        result["entities_added"] += 1
+                        counted_entities.add(head.lower())
+                    if tail.lower() not in counted_entities:
+                        result["entities_added"] += 1
+                        counted_entities.add(tail.lower())
 
             if result["text_triplets_added"] > 0:
                 result["chunks_with_triplets"] = len(valid_nodes)
@@ -947,11 +964,15 @@ class MultimodalGraphBuilder:
             assert self._llm is not None
             response = await self._llm.text_chat(
                 prompt=user_prompt,
-                system_prompt=system_prompt
+                system_prompt=system_prompt,
+                max_tokens=32768  # 无限制输出（使用最大值避免 JSON 被截断）
             )
             response_text = response.content if hasattr(response, 'content') else str(response)
 
             triplets = self._parse_json_response(response_text)
+
+            # Track entities counted in this extraction to avoid double-counting
+            counted_entities: set = set()
 
             for triplet in triplets:
                 head = triplet.get("head", "").strip()
@@ -982,7 +1003,13 @@ class MultimodalGraphBuilder:
 
                 if rel_id:
                     result["text_triplets_added"] += 1
-                    result["entities_added"] += 2
+                    # 只统计真正新增的实体（避免同一实体在多个三元组中出现被重复计数）
+                    if head.lower() not in counted_entities:
+                        result["entities_added"] += 1
+                        counted_entities.add(head.lower())
+                    if tail.lower() not in counted_entities:
+                        result["entities_added"] += 1
+                        counted_entities.add(tail.lower())
 
         except Exception as e:
             logger.warning(f"文本三元组抽取失败: {e}")
@@ -1026,7 +1053,8 @@ Extract triplets:"""
             response = await self._llm.text_chat(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
-                image_urls=[image_path] if self.config.multimodal_enabled else None
+                image_urls=[image_path] if self.config.multimodal_enabled else None,
+                max_tokens=32768  # 无限制输出（使用最大值避免 JSON 被截断）
             )
             response_text = response.content if hasattr(response, 'content') else str(response)
 
@@ -1034,6 +1062,9 @@ Extract triplets:"""
 
             # 1. 存储文本三元组
             text_triplets = data.get("text_triplets", [])
+            # Track entities counted in this extraction to avoid double-counting
+            counted_entities: set = set()
+
             for triplet in text_triplets[:self.config.max_triplets_per_chunk]:
                 head = triplet.get("head", "").strip()
                 relation = triplet.get("relation", "").strip()
@@ -1063,7 +1094,13 @@ Extract triplets:"""
 
                 if rel_id:
                     result["text_triplets_added"] += 1
-                    result["entities_added"] += 2
+                    # 只统计真正新增的实体（避免同一实体在多个三元组中出现被重复计数）
+                    if head.lower() not in counted_entities:
+                        result["entities_added"] += 1
+                        counted_entities.add(head.lower())
+                    if tail.lower() not in counted_entities:
+                        result["entities_added"] += 1
+                        counted_entities.add(tail.lower())
 
             # 2. 存储图片实体
             image_info = data.get("image_info", {})
@@ -1192,7 +1229,25 @@ Extract triplets:"""
             data = json.loads(json_str)
             return self._extract_triplets(data)
         except json.JSONDecodeError as e:
-            logger.warning(f"[Graph-LLM] JSON 解析失败: {e}")
+            # 分析截断情况
+            truncated_indicators = ['"confidence":', '"evidence":', '"tail":', '"relation":']
+            is_likely_truncated = any(json_str.rstrip().endswith(ind) for ind in truncated_indicators)
+            last_chars = json_str[-100:] if len(json_str) > 100 else json_str
+
+            # 显示错误位置附近的内容 (char 位置)
+            err_pos = e.pos if hasattr(e, 'pos') else 0
+            start_pos = max(0, err_pos - 200)
+            end_pos = min(len(json_str), err_pos + 200)
+            near_error = json_str[start_pos:end_pos]
+
+            logger.warning(
+                f"[Graph-LLM] JSON 解析失败: {e}\n"
+                f"  响应总长度: {len(json_str)} 字符\n"
+                f"  错误位置(char): {err_pos}\n"
+                f"  错误位置附近内容 [{start_pos}:{end_pos}]:\n{repr(near_error)}\n"
+                f"  响应末尾(最后100字符): {repr(last_chars)}\n"
+                f"  疑似截断: {'是' if is_likely_truncated else '否'}"
+            )
 
         # 第二次尝试：找到 triplets 数组的结束位置，截断后面的内容
         triplets_start = json_str.find('"triplets":')
@@ -1220,6 +1275,26 @@ Extract triplets:"""
                         return self._extract_triplets(data)
                     except json.JSONDecodeError as e:
                         logger.warning(f"[Graph-LLM] 截断 JSON 解析失败: {e}")
+
+        # 第三次尝试：如果以上都失败，尝试找到最后一个完整对象
+        # 在字符串中间截断的情况（如 "name": "Diffusion Mod）
+        last_complete_brace = json_str.rfind('}')
+        if last_complete_brace > 0:
+            try:
+                # 尝试从开头到最后一个完整对象
+                truncated = json_str[:last_complete_brace + 1]
+                # 如果开头是 {，找到对应的 ]
+                if truncated.startswith('{'):
+                    # 查找 triplets 数组
+                    arr_match = truncated.rfind('[')
+                    if arr_match > 0:
+                        # 确保数组有开始的 [
+                        test_str = truncated[:last_complete_brace + 1]
+                        data = json.loads(test_str)
+                        logger.info(f"[Graph-LLM] 最后完整对象恢复成功")
+                        return self._extract_triplets(data)
+            except json.JSONDecodeError:
+                pass
 
         logger.warning(f"[Graph-LLM] JSON 解析恢复失败")
         return []

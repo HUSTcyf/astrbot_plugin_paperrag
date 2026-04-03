@@ -12,12 +12,13 @@ AstrBot Paper RAG Plugin
 """
 
 import asyncio
+import gc
 import json
 import os
 import re
 import subprocess
 import requests
-from datetime import timedelta
+from datetime import timedelta, datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, Union, TYPE_CHECKING, List, cast
 
@@ -278,14 +279,18 @@ class PaperRAGPlugin(Star):
         self._engine = None
         self._config_valid = False
 
+        # 后台服务线程追踪
+        self._grobid_thread = None
+        self._neo4j_thread = None
+
         # 根据配置决定是否启动 Grobid 服务
         enable_grobid = self.config.get("enable_grobid", False)
         if enable_grobid:
             # 异步启动 Grobid 服务（用于参考文献解析）
             # 不阻塞插件初始化，服务在后台启动
             import threading
-            grobid_thread = threading.Thread(target=self._ensure_grobid_running, daemon=True)
-            grobid_thread.start()
+            self._grobid_thread = threading.Thread(target=self._ensure_grobid_running, daemon=True)
+            self._grobid_thread.start()
             logger.info("📚 Document RAG Plugin initialized (支持PDF/Word/TXT/HTML, Grobid已启用)")
         else:
             logger.info("📚 Document RAG Plugin initialized (支持PDF/Word/TXT/HTML, Grobid未启用)")
@@ -329,8 +334,8 @@ class PaperRAGPlugin(Star):
             except Exception as e:
                 logger.warning(f"[Neo4j] 自动检查服务失败: {e}")
 
-        thread = threading.Thread(target=_start, daemon=True)
-        thread.start()
+        self._neo4j_thread = threading.Thread(target=_start, daemon=True)
+        self._neo4j_thread.start()
         logger.info("[Neo4j] Neo4j 服务检查线程已启动（后台运行）")
 
     def _register_llm_tools(self):
@@ -420,6 +425,38 @@ class PaperRAGPlugin(Star):
             logger.info("✅ Paper RAG LLM工具已注册: search_papers, retrieve_papers")
         except Exception as e:
             logger.error(f"注册LLM工具失败: {e}")
+
+    def _scan_documents(self, directory: str) -> List[Any]:
+        """扫描目录中的支持文档文件"""
+        from pathlib import Path
+        papers_dir = directory or self.config.get("papers_dir", "./papers")
+        doc_files = []
+        for ext in SUPPORTED_DOC_EXTENSIONS:
+            doc_files.extend(Path(papers_dir).glob(f"*{ext}"))
+        for ext in SUPPORTED_DOC_EXTENSIONS:
+            doc_files.extend(Path(papers_dir).glob(f"*{ext.upper()}"))
+        return [f for f in doc_files if not _is_hidden_file(f)]
+
+    def _create_graph_rag_config(self) -> "GraphRAGConfig":
+        """创建 GraphRAGConfig（从配置中读取所有设置）"""
+        from .graph_rag_engine import GraphRAGConfig
+        graph_rag_config = self.config.get("graph_rag", {})
+        multimodal_config = graph_rag_config.get("multimodal_extraction", {})
+        return GraphRAGConfig(
+            enable_graph_rag=True,
+            storage_type=graph_rag_config.get("storage_type", "memory"),
+            neo4j_uri=graph_rag_config.get("neo4j_uri", "bolt://localhost:7687"),
+            neo4j_user=graph_rag_config.get("neo4j_user", "neo4j"),
+            neo4j_password=graph_rag_config.get("neo4j_password", ""),
+            max_triplets_per_chunk=graph_rag_config.get("max_triplets_per_chunk", 5),
+            graph_retrieval_top_k=graph_rag_config.get("graph_retrieval_top_k", 5),
+            hybrid_alpha=graph_rag_config.get("hybrid_alpha", 0.5),
+            auto_build=graph_rag_config.get("auto_build", False),
+            auto_build_threshold=graph_rag_config.get("auto_build_threshold", 10),
+            multimodal_enabled=multimodal_config.get("enabled", True),
+            max_images_per_chunk=multimodal_config.get("max_images_per_chunk", 1),
+            extract_image_entities=multimodal_config.get("extract_image_entities", True),
+        )
 
     def _get_engine(self) -> "Optional[HybridRAGEngine]":
         """获取RAG引擎（单例模式，带缓存）"""
@@ -577,46 +614,32 @@ class PaperRAGPlugin(Star):
         except Exception:
             from graph_rag_engine import GraphRAGEngine, GraphRAGConfig
 
-        graph_config = GraphRAGConfig(
-            enable_graph_rag=True,
-            storage_type=self.config.get("graph_rag", {}).get("storage_type", "memory"),
-            neo4j_uri=self.config.get("graph_rag", {}).get("neo4j_uri", "bolt://localhost:7687"),
-            neo4j_user=self.config.get("graph_rag", {}).get("neo4j_user", "neo4j"),
-            neo4j_password=self.config.get("graph_rag", {}).get("neo4j_password", ""),
-            max_triplets_per_chunk=self.config.get("graph_rag", {}).get("max_triplets_per_chunk", 5),
-            graph_retrieval_top_k=self.config.get("graph_rag", {}).get("graph_retrieval_top_k", 5),
-            hybrid_alpha=self.config.get("graph_rag", {}).get("hybrid_alpha", 0.5),
-            auto_build=self.config.get("graph_rag", {}).get("auto_build", False),
-            auto_build_threshold=self.config.get("graph_rag", {}).get("auto_build_threshold", 10),
-        )
+        try:
+            graph_config = self._create_graph_rag_config()
 
-        graph_engine = GraphRAGEngine(graph_config, engine, self.context)
-        await graph_engine.initialize()
+            graph_engine = GraphRAGEngine(graph_config, engine, self.context)
+            await graph_engine.initialize()
 
-        # 获取所有文档并构建图谱
-        from pathlib import Path
-        papers_dir = self.config.get("papers_dir", "./papers")
-        doc_files = []
-        for ext in supported_extensions:
-            doc_files.extend(Path(papers_dir).glob(f"*{ext}"))
-        for ext in supported_extensions:
-            doc_files.extend(Path(papers_dir).glob(f"*{ext.upper()}"))
-        doc_files = [f for f in doc_files if not _is_hidden_file(f)]
+            # 获取所有文档并构建图谱
+            papers_dir = self.config.get("papers_dir", "./papers")
+            doc_files = self._scan_documents(papers_dir)
 
-        if not doc_files:
-            return
+            if not doc_files:
+                return
 
-        parser = engine._ensure_parser_initialized()
-        all_nodes = []
-        for doc_file in doc_files:
-            try:
-                nodes = await parser.parse_and_split(str(doc_file), {}, None)
-                all_nodes.extend(nodes)
-            except Exception:
-                pass
+            parser = engine._ensure_parser_initialized()
+            all_nodes = []
+            for doc_file in doc_files:
+                try:
+                    nodes = await parser.parse_and_split(str(doc_file), {}, None)
+                    all_nodes.extend(nodes)
+                except Exception:
+                    pass
 
-        await graph_engine.build_graph_from_nodes(all_nodes)
-        logger.info("✅ 后台知识图谱构建完成")
+            await graph_engine.build_graph_from_nodes(all_nodes)
+            logger.info("✅ 后台知识图谱构建完成")
+        except Exception as e:
+            logger.error(f"❌ 后台知识图谱构建失败: {e}")
 
     def _ensure_grobid_running(self):
         """
@@ -814,6 +837,7 @@ class PaperRAGPlugin(Star):
         arxiv_sync   - Sync MCP downloaded papers to paperrag database (Admin)
         arxiv_cleanup- Clean up old versions of arxiv papers (Admin)
         graph_build  - Build knowledge graph from indexed documents
+        graph_rebuild- Rebuild knowledge graph from scratch (clear + rebuild)
         graph_stats  - Show knowledge graph statistics
         graph_clear  - Clear knowledge graph (Admin)
         """
@@ -972,15 +996,7 @@ class PaperRAGPlugin(Star):
 
         try:
             # Scan supported document files
-            doc_files = []
-            for ext in SUPPORTED_DOC_EXTENSIONS:
-                doc_files.extend(Path(papers_dir).glob(f"*{ext}"))
-            # Also support uppercase extensions
-            for ext in SUPPORTED_DOC_EXTENSIONS:
-                doc_files.extend(Path(papers_dir).glob(f"*{ext.upper()}"))
-
-            # Filter out macOS metadata files (starting with "._")
-            doc_files = [f for f in doc_files if not _is_hidden_file(f)]
+            doc_files = self._scan_documents(papers_dir)
 
             if not doc_files:
                 yield event.plain_result("📭 No supported document files found\nSupported formats: PDF, Word, TXT, Markdown, HTML")
@@ -1091,7 +1107,7 @@ class PaperRAGPlugin(Star):
         # Check supported format
         ext = os.path.splitext(file_path)[1].lower()
         if ext not in SUPPORTED_DOC_EXTENSIONS:
-            yield event.plain_result(f"❌ Unsupported format: {ext}\nSupported: {', '.join(supported_extensions)}")
+            yield event.plain_result(f"❌ Unsupported format: {ext}\nSupported: {', '.join(SUPPORTED_DOC_EXTENSIONS)}")
             return
 
         # Get engine
@@ -1875,13 +1891,7 @@ class PaperRAGPlugin(Star):
         yield event.plain_result("🔄 Step 3/4: Scanning documents...")
 
         # Scan documents
-        doc_files = []
-        for ext in SUPPORTED_DOC_EXTENSIONS:
-            doc_files.extend(Path(papers_dir).glob(f"*{ext}"))
-        for ext in SUPPORTED_DOC_EXTENSIONS:
-            doc_files.extend(Path(papers_dir).glob(f"*{ext.upper()}"))
-
-        doc_files = [f for f in doc_files if not _is_hidden_file(f)]
+        doc_files = self._scan_documents(papers_dir)
 
         if not doc_files:
             yield event.plain_result("📭 No supported documents found")
@@ -2003,24 +2013,25 @@ class PaperRAGPlugin(Star):
             yield event.plain_result(f"📑 开始逐篇构建知识图谱 ({len(paper_names)} 篇论文)...")
 
             # 创建 GraphRAGConfig（只创建一次）
-            graph_config = GraphRAGConfig(
-                enable_graph_rag=True,
-                storage_type=self.config.get("graph_rag", {}).get("storage_type", "memory"),
-                neo4j_uri=self.config.get("graph_rag", {}).get("neo4j_uri", "bolt://localhost:7687"),
-                neo4j_user=self.config.get("graph_rag", {}).get("neo4j_user", "neo4j"),
-                neo4j_password=self.config.get("graph_rag", {}).get("neo4j_password", ""),
-                max_triplets_per_chunk=self.config.get("graph_rag", {}).get("max_triplets_per_chunk", 5),
-                graph_retrieval_top_k=self.config.get("graph_rag", {}).get("graph_retrieval_top_k", 5),
-                hybrid_alpha=self.config.get("graph_rag", {}).get("hybrid_alpha", 0.5),
-                auto_build=self.config.get("graph_rag", {}).get("auto_build", False),
-                auto_build_threshold=self.config.get("graph_rag", {}).get("auto_build_threshold", 10),
-                multimodal_enabled=self.config.get("graph_rag", {}).get("multimodal_extraction", {}).get("enabled", True),
-                max_images_per_chunk=self.config.get("graph_rag", {}).get("multimodal_extraction", {}).get("max_images_per_chunk", 1),
-                extract_image_entities=self.config.get("graph_rag", {}).get("multimodal_extraction", {}).get("extract_image_entities", True),
-            )
+            graph_config = self._create_graph_rag_config()
 
-            # 创建图谱存储和构建器
-            graph_store = MemoryGraphStore()
+            # 根据配置决定存储类型
+            if graph_config.storage_type == "neo4j":
+                from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
+                from .graph_rag_engine import SimplePropertyGraphStoreAdapter
+                raw_store = Neo4jPropertyGraphStore(
+                    url=graph_config.neo4j_uri,
+                    username=graph_config.neo4j_user,
+                    password=graph_config.neo4j_password,
+                    database="neo4j",
+                    refresh_schema=True
+                )
+                graph_store = SimplePropertyGraphStoreAdapter(raw_store)
+                logger.info(f"[GraphRAG] 使用 Neo4j 存储: {graph_config.neo4j_uri}")
+            else:
+                graph_store = MemoryGraphStore()
+                logger.info("[GraphRAG] 使用内存存储")
+
             builder = MultimodalGraphBuilder(config=graph_config, context=self.context)
 
             # 初始化 LLM（只初始化一次）
@@ -2082,6 +2093,11 @@ class PaperRAGPlugin(Star):
                     # 立即为该论文创建节点并构建图谱
                     nodes = [ChunkNode(chunk) for chunk in paper_chunks]
                     stats = await builder.build_from_nodes(nodes, graph_store)
+
+                    # 每篇论文处理完后保存并清理内存
+                    if hasattr(graph_store, 'save'):
+                        graph_store.save(force=True)
+                    gc.collect()
 
                     # 累积统计
                     total_stats["entities_added"] += stats.get("entities_added", 0)
@@ -2157,13 +2173,7 @@ class PaperRAGPlugin(Star):
             from graph_rag_engine import GraphRAGEngine, GraphRAGConfig
 
         try:
-            graph_config = GraphRAGConfig(
-                enable_graph_rag=True,
-                storage_type=self.config.get("graph_rag", {}).get("storage_type", "memory"),
-                neo4j_uri=self.config.get("graph_rag", {}).get("neo4j_uri", "bolt://localhost:7687"),
-                neo4j_user=self.config.get("graph_rag", {}).get("neo4j_user", "neo4j"),
-                neo4j_password=self.config.get("graph_rag", {}).get("neo4j_password", ""),
-            )
+            graph_config = self._create_graph_rag_config()
 
             graph_engine = GraphRAGEngine(graph_config, engine, self.context)
             await graph_engine.initialize()
@@ -2192,6 +2202,7 @@ class PaperRAGPlugin(Star):
    • 上次保存：{last_save if last_save else '从未保存'}
 
 💡 使用 /paper graph_build confirm 构建图谱
+💡 使用 /paper graph_rebuild confirm 重新构建图谱
 💡 使用 /paper graph_clear confirm 清空图谱"""
 
             yield event.plain_result(output)
@@ -2199,6 +2210,206 @@ class PaperRAGPlugin(Star):
         except Exception as e:
             logger.error(f"获取图谱统计失败: {e}")
             yield event.plain_result(f"❌ 获取统计失败: {e}")
+
+    @paper_commands.command("graph_rebuild")
+    async def cmd_graph_rebuild(self, event: AstrMessageEvent, confirm: str = ''):
+        """Rebuild knowledge graph from scratch (clear + rebuild)
+
+        Args:
+            confirm: Must be 'confirm' to proceed
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if confirm != "confirm":
+            yield event.plain_result(
+                "⚠️ 即将清空并重新构建知识图谱\n"
+                "此操作不可恢复！\n"
+                "使用 /paper graph_rebuild confirm 确认执行"
+            )
+            return
+
+        if not self.config.get("enable_graph_rag", False):
+            yield event.plain_result("❌ Graph RAG 功能未启用\n请在插件配置中启用 enable_graph_rag")
+            return
+
+        engine = self._get_engine()
+        if not engine:
+            yield event.plain_result("❌ RAG引擎未就绪")
+            return
+
+        try:
+            from .graph_rag_engine import GraphRAGEngine, GraphRAGConfig, MemoryGraphStore
+        except Exception:
+            from graph_rag_engine import GraphRAGEngine, GraphRAGConfig, MemoryGraphStore
+
+        # 步骤1: 清空现有图谱
+        yield event.plain_result("🗑️ 正在清空现有知识图谱...")
+
+        try:
+            graph_config = self._create_graph_rag_config()
+
+            graph_engine = GraphRAGEngine(graph_config, engine, self.context)
+            await graph_engine.initialize()
+
+            clear_result = await graph_engine.clear_graph()
+            if clear_result.get("status") == "success":
+                yield event.plain_result("✅ 现有图谱已清空")
+            else:
+                logger.warning(f"清空图谱返回: {clear_result}")
+        except Exception as e:
+            logger.error(f"清空图谱失败: {e}")
+            yield event.plain_result(f"⚠️ 清空图谱时出现错误，继续重建: {e}")
+
+        # 步骤2: 重新构建图谱（复用 graph_build 的逻辑）
+        yield event.plain_result("\n🔨 正在重新构建知识图谱...\n⏳ 请稍候，这可能需要几分钟...")
+
+        try:
+            index_manager = engine._ensure_index_manager_initialized()
+
+            yield event.plain_result("📖 正在从向量数据库读取论文列表...")
+
+            try:
+                papers = await index_manager.list_unique_documents()
+            except Exception as e:
+                yield event.plain_result(f"❌ 无法获取论文列表: {e}\n请确保已使用 /paper add 添加文档")
+                return
+
+            if not papers:
+                yield event.plain_result("📭 向量数据库中未找到已索引的文档\n请先使用 /paper add 添加文档")
+                return
+
+            paper_names = [p.get("file_name", "") for p in papers if p.get("file_name")]
+            yield event.plain_result(f"📚 找到 {len(paper_names)} 篇论文\n🔨 正在逐篇加载所有文档块...")
+
+            try:
+                from .graph_builder import MultimodalGraphBuilder
+            except Exception:
+                from graph_builder import MultimodalGraphBuilder
+
+            class ChunkNode:
+                """适配 GraphBuilder 的 Node 结构"""
+                def __init__(self, chunk: Dict[str, Any]):
+                    self.text = chunk.get("text", "")
+                    self.metadata = chunk.get("metadata", {})
+
+            yield event.plain_result(f"📑 开始逐篇构建知识图谱 ({len(paper_names)} 篇论文)...")
+
+            graph_config = self._create_graph_rag_config()
+
+            # 根据配置决定存储类型
+            if graph_config.storage_type == "neo4j":
+                from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
+                from .graph_rag_engine import SimplePropertyGraphStoreAdapter
+                raw_store = Neo4jPropertyGraphStore(
+                    url=graph_config.neo4j_uri,
+                    username=graph_config.neo4j_user,
+                    password=graph_config.neo4j_password,
+                    database="neo4j",
+                    refresh_schema=True
+                )
+                graph_store = SimplePropertyGraphStoreAdapter(raw_store)
+                logger.info(f"[GraphRAG] 使用 Neo4j 存储: {graph_config.neo4j_uri}")
+            else:
+                graph_store = MemoryGraphStore()
+                logger.info("[GraphRAG] 使用内存存储")
+
+            builder = MultimodalGraphBuilder(config=graph_config, context=self.context)
+            await builder._ensure_llm_initialized()
+
+            total_stats = {
+                "entities_added": 0,
+                "text_triplets_added": 0,
+                "image_entities_added": 0,
+                "cross_modal_triplets_added": 0,
+                "chunks_processed": 0,
+                "chunks_with_images": 0,
+                "chunks_failed": 0,
+                "chunks_empty": 0
+            }
+
+            await index_manager._ensure_collection()
+            collection = index_manager._collection
+
+            for i, paper_name in enumerate(paper_names):
+                paper_name_escaped = paper_name.replace('"', '\\"')
+                try:
+                    _collection = cast(Any, collection)
+                    raw_results = cast(
+                        List[Dict[str, Any]],
+                        await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda pn=paper_name_escaped: _collection.query(
+                                expr=f'metadata["file_name"] == "{pn}"',
+                                output_fields=["id", "text", "metadata"],
+                            )
+                        )
+                    )
+
+                    chunks = []
+                    for r in raw_results:
+                        text = r.get("text", "")
+                        if text and len(text) >= 50:
+                            chunks.append(ChunkNode(r))
+
+                    if not chunks:
+                        continue
+
+                    # 使用批量构建（每篇论文一个批次）
+                    result = await builder.build_from_nodes(chunks, graph_store)
+
+                    total_stats["entities_added"] += result.get("entities_added", 0)
+                    total_stats["text_triplets_added"] += result.get("text_triplets_added", 0)
+                    total_stats["image_entities_added"] += result.get("image_entities_added", 0)
+                    total_stats["cross_modal_triplets_added"] += result.get("cross_modal_triplets_added", 0)
+                    total_stats["chunks_processed"] += result.get("chunks_processed", 0)
+                    total_stats["chunks_with_images"] += result.get("chunks_with_images", 0)
+                    total_stats["chunks_failed"] += result.get("chunks_failed", 0)
+                    total_stats["chunks_empty"] += result.get("chunks_empty", 0)
+
+                    if (i + 1) % 5 == 0 or i == len(paper_names) - 1:
+                        yield event.plain_result(
+                            f"📊 进度: {i + 1}/{len(paper_names)} 篇论文\n"
+                            f"   本批次: 实体+{result.get('entities_added', 0)}, "
+                            f"三元组+{result.get('text_triplets_added', 0)}"
+                        )
+
+                except Exception as e:
+                    logger.error(f"处理论文 {paper_name} 失败: {e}")
+                    total_stats["chunks_failed"] += 1
+                    continue
+
+            # 保存图谱
+            if graph_config.storage_type == "memory":
+                graph_engine._graph_store = graph_store
+            else:
+                await graph_engine._save_to_neo4j(graph_store)
+
+            # 更新内存图谱引用
+            if hasattr(graph_engine, '_graph_store'):
+                graph_engine._graph_store = graph_store
+
+            output = f"""🎉 **知识图谱重建完成！**
+
+📊 **构建统计**
+   • 实体数量：{total_stats['entities_added']}
+   • 文本三元组：{total_stats['text_triplets_added']}
+   • 图片实体：{total_stats['image_entities_added']}
+   • 跨模态三元组：{total_stats['cross_modal_triplets_added']}
+   • 处理块数：{total_stats['chunks_processed']}
+   • 失败块数：{total_stats['chunks_failed']}
+
+💾 图谱已自动保存到磁盘
+💡 使用 /paper graph_stats 查看图谱详情"""
+
+            yield event.plain_result(output)
+
+        except Exception as e:
+            logger.error(f"重建知识图谱失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            yield event.plain_result(f"❌ 重建失败: {e}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @paper_commands.command("graph_clear")
@@ -2231,13 +2442,7 @@ class PaperRAGPlugin(Star):
             from graph_rag_engine import GraphRAGEngine, GraphRAGConfig
 
         try:
-            graph_config = GraphRAGConfig(
-                enable_graph_rag=True,
-                storage_type=self.config.get("graph_rag", {}).get("storage_type", "memory"),
-                neo4j_uri=self.config.get("graph_rag", {}).get("neo4j_uri", "bolt://localhost:7687"),
-                neo4j_user=self.config.get("graph_rag", {}).get("neo4j_user", "neo4j"),
-                neo4j_password=self.config.get("graph_rag", {}).get("neo4j_password", ""),
-            )
+            graph_config = self._create_graph_rag_config()
 
             graph_engine = GraphRAGEngine(graph_config, engine, self.context)
             await graph_engine.initialize()
@@ -2252,6 +2457,576 @@ class PaperRAGPlugin(Star):
         except Exception as e:
             logger.error(f"清空图谱失败: {e}")
             yield event.plain_result(f"❌ 清空失败: {e}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @paper_commands.command("graph_backup")
+    async def cmd_graph_backup(self, event: AstrMessageEvent, mode: str = 'online'):
+        """Backup Neo4j knowledge graph (Admin)
+
+        Args:
+            mode: 'online' (Cypher export, no downtime) or 'offline' (file copy, requires stop)
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if not self.config.get("enable_graph_rag", False):
+            yield event.plain_result("❌ Graph RAG 功能未启用")
+            return
+
+        from .graph_rag_engine import GraphRAGConfig
+        graph_config = self._create_graph_rag_config()
+
+        if graph_config.storage_type != "neo4j":
+            yield event.plain_result("❌ 只有 Neo4j 存储模式支持备份")
+            return
+
+        yield event.plain_result(f"🔄 开始备份图谱 (模式: {mode})...")
+
+        try:
+            if mode == 'offline':
+                result = await self._offline_backup(graph_config)
+            else:
+                result = await self._online_backup(graph_config)
+
+            if result["status"] == "success":
+                backup_file = result.get("backup_file", "unknown")
+                size = result.get("size", 0)
+                nodes = result.get("nodes", 0)
+                rels = result.get("relations", 0)
+
+                output = f"""✅ **图谱备份完成！**
+
+📦 **备份文件**: `{backup_file}`
+📊 **数据统计**:
+   • 节点数: {nodes}
+   • 关系数: {rels}
+   • 文件大小: {size}
+
+💡 使用 `/paper graph_restore {backup_file}` 恢复备份"""
+
+                if mode == 'offline':
+                    output += "\n⚠️ 离线备份已完成，Neo4j 服务已恢复"
+
+                yield event.plain_result(output)
+            else:
+                yield event.plain_result(f"❌ 备份失败: {result.get('message', '未知错误')}")
+
+        except Exception as e:
+            logger.error(f"备份图谱失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            yield event.plain_result(f"❌ 备份失败: {e}")
+
+    async def _online_backup(self, graph_config: "GraphRAGConfig") -> dict:
+        """在线备份：使用 Cypher 导出为 JSON"""
+        import json
+        import gzip
+        from pathlib import Path
+        from datetime import datetime
+
+        try:
+            from neo4j import GraphDatabase
+        except ImportError:
+            return {"status": "error", "message": "请安装 neo4j 驱动: pip install neo4j"}
+
+        # 连接到 Neo4j
+        driver = GraphDatabase.driver(
+            graph_config.neo4j_uri,
+            auth=(graph_config.neo4j_user, graph_config.neo4j_password)
+        )
+
+        # 获取插件目录（用于相对路径）
+        plugin_dir = Path(__file__).parent
+        backup_dir = plugin_dir / "data" / "graph_store"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_file = backup_dir / f"neo4j_backup_{timestamp}.json.gz"
+
+        try:
+            with driver.session() as session:
+                # 导出节点
+                nodes_data = session.run("""
+                    MATCH (n)
+                    RETURN labels(n) as labels,
+                           properties(n) as props,
+                           elementId(n) as id
+                """).data()
+
+                # 导出关系
+                rels_data = session.run("""
+                    MATCH (a)-[r]->(b)
+                    RETURN type(r) as rel_type,
+                           properties(r) as props,
+                           elementId(startNode(r)) as start_id,
+                           elementId(endNode(r)) as end_id
+                """).data()
+
+            nodes_count = len(nodes_data)
+            rels_count = len(rels_data)
+
+            backup = {
+                "version": "1.0",
+                "timestamp": datetime.now().isoformat(),
+                "mode": "online",
+                "nodes": nodes_data,
+                "relationships": rels_data,
+                "node_count": nodes_count,
+                "rel_count": rels_count
+            }
+
+            # 压缩写入
+            with gzip.open(backup_file, 'wt', encoding='utf-8') as f:
+                json.dump(backup, f, indent=2, ensure_ascii=False)
+
+            size = backup_file.stat().st_size
+            size_str = self._format_size(size)
+
+            logger.info(f"[GraphRAG] 在线备份完成: {backup_file}, {nodes_count} 节点, {rels_count} 关系")
+
+            return {
+                "status": "success",
+                "backup_file": str(backup_file.relative_to(plugin_dir)),
+                "size": size_str,
+                "nodes": nodes_count,
+                "relations": rels_count
+            }
+
+        finally:
+            driver.close()
+
+    async def _offline_backup(self, graph_config: "GraphRAGConfig") -> dict:
+        """离线备份：复制 Neo4j 数据目录"""
+        import shutil
+        import subprocess
+        from pathlib import Path
+        from datetime import datetime
+
+        # Neo4j 数据目录
+        neo4j_data_dir = Path("/opt/homebrew/var/neo4j/data")
+
+        if not neo4j_data_dir.exists():
+            return {"status": "error", "message": f"Neo4j 数据目录不存在: {neo4j_data_dir}"}
+
+        # 获取插件目录（用于相对路径）
+        plugin_dir = Path(__file__).parent
+        backup_dir = plugin_dir / "data" / "graph_store"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_subdir = backup_dir / f"neo4j_backup_{timestamp}"
+        backup_subdir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # 检查 neo4j 命令是否可用
+            neo4j_bin = shutil.which("neo4j")
+            if not neo4j_bin:
+                return {"status": "error", "message": "neo4j 命令未找到，请确保 Neo4j 已安装"}
+
+            # 停止 Neo4j
+            logger.info("[GraphRAG] 停止 Neo4j 服务...")
+            stop_result = subprocess.run(["neo4j", "stop"], capture_output=True, text=True)
+            if stop_result.returncode != 0:
+                logger.warning(f"[GraphRAG] neo4j stop 返回: {stop_result.stdout} {stop_result.stderr}")
+
+            # 等待服务完全停止
+            import time
+            time.sleep(3)
+
+            # 复制数据目录
+            source_db = neo4j_data_dir / "databases" / "neo4j"
+            dest_db = backup_subdir / "databases" / "neo4j"
+
+            if source_db.exists():
+                shutil.copytree(source_db, dest_db)
+            else:
+                return {"status": "error", "message": f"数据库目录不存在: {source_db}"}
+
+            # 复制事务日志（可选）
+            source_tx = neo4j_data_dir / "transactions" / "neo4j"
+            dest_tx = backup_subdir / "transactions" / "neo4j"
+            if source_tx.exists():
+                shutil.copytree(source_tx, dest_tx)
+
+            # 重启 Neo4j
+            logger.info("[GraphRAG] 重启 Neo4j 服务...")
+            start_result = subprocess.run(["neo4j", "start"], capture_output=True, text=True)
+            if start_result.returncode != 0:
+                logger.warning(f"[GraphRAG] neo4j start 返回: {start_result.stdout} {start_result.stderr}")
+
+            # 等待 Neo4j 启动
+            time.sleep(5)
+
+            # 计算备份大小
+            total_size = sum(f.stat().st_size for f in backup_subdir.rglob('*') if f.is_file())
+            size_str = self._format_size(total_size)
+
+            # 节点数估计（通过文件数）
+            node_files = list((backup_subdir / "databases" / "neo4j").rglob("*.db"))[:5]
+            nodes_est = "多个"
+
+            logger.info(f"[GraphRAG] 离线备份完成: {backup_subdir}")
+
+            return {
+                "status": "success",
+                "backup_file": str(backup_subdir.relative_to(plugin_dir)),
+                "size": size_str,
+                "nodes": nodes_est,
+                "relations": "多个"
+            }
+
+        except Exception as e:
+            logger.error(f"[GraphRAG] 离线备份失败: {e}")
+            # 尝试重启 Neo4j
+            try:
+                subprocess.run(["neo4j", "start"], capture_output=True)
+            except:
+                pass
+            return {"status": "error", "message": str(e)}
+
+    def _format_size(self, size: int) -> str:
+        """格式化文件大小"""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size < 1024:
+                return f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} TB"
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @paper_commands.command("graph_restore")
+    async def cmd_graph_restore(self, event: AstrMessageEvent, backup_file: str = ''):
+        """Restore Neo4j knowledge graph from backup (Admin)
+
+        Args:
+            backup_file: 备份文件名（从 data/graph_store 目录）
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if not self.config.get("enable_graph_rag", False):
+            yield event.plain_result("❌ Graph RAG 功能未启用")
+            return
+
+        if not backup_file:
+            # 列出可用备份
+            from pathlib import Path
+            plugin_dir = Path(__file__).parent
+            backup_dir = plugin_dir / "data" / "graph_store"
+
+            backups = sorted(backup_dir.glob("neo4j_backup_*"), reverse=True)
+            if not backups:
+                yield event.plain_result("❌ 未找到任何备份文件")
+                return
+
+            msg = "📦 **可用备份列表**:\n\n"
+            for i, b in enumerate(backups[:10], 1):
+                size = b.stat().st_size
+                size_str = self._format_size(size)
+                mtime = datetime.fromtimestamp(b.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                msg += f"{i}. `{b.name}`\n   大小: {size_str}, 修改: {mtime}\n\n"
+
+            msg += "💡 使用 `/paper graph_restore <文件名>` 恢复备份"
+            yield event.plain_result(msg)
+            return
+
+        from .graph_rag_engine import GraphRAGConfig
+        graph_config = self._create_graph_rag_config()
+
+        if graph_config.storage_type != "neo4j":
+            yield event.plary_result("❌ 只有 Neo4j 存储模式支持恢复")
+            return
+
+        yield event.plain_result(f"🔄 正在恢复备份: {backup_file}...")
+
+        try:
+            result = await self._restore_backup(backup_file, graph_config)
+
+            if result["status"] == "success":
+                yield event.plain_result(f"""✅ **备份恢复完成！**
+
+📦 **已恢复**: `{backup_file}`
+📊 **数据**: {result.get('nodes', '?')} 节点, {result.get('relations', '?')} 关系
+
+⚠️ 如果使用离线备份，恢复后需要重启 Neo4j 服务""")
+            else:
+                yield event.plain_result(f"❌ 恢复失败: {result.get('message', '未知错误')}")
+
+        except Exception as e:
+            logger.error(f"恢复备份失败: {e}")
+            yield event.plain_result(f"❌ 恢复失败: {e}")
+
+    async def _restore_backup(self, backup_file: str, graph_config: "GraphRAGConfig") -> dict:
+        """从备份恢复"""
+        import json
+        import gzip
+        from pathlib import Path
+
+        try:
+            from neo4j import GraphDatabase
+        except ImportError:
+            return {"status": "error", "message": "请安装 neo4j 驱动: pip install neo4j"}
+
+        plugin_dir = Path(__file__).parent
+        backup_path = plugin_dir / "data" / "graph_store" / backup_file
+
+        if not backup_path.exists():
+            return {"status": "error", "message": f"备份文件不存在: {backup_path}"}
+
+        driver = GraphDatabase.driver(
+            graph_config.neo4j_uri,
+            auth=(graph_config.neo4j_user, graph_config.neo4j_password)
+        )
+
+        try:
+            # 根据文件扩展名判断格式
+            if str(backup_path).endswith('.gz'):
+                with gzip.open(backup_path, 'rt', encoding='utf-8') as f:
+                    backup = json.load(f)
+            else:
+                with open(backup_path, 'r', encoding='utf-8') as f:
+                    backup = json.load(f)
+
+            nodes = backup.get("nodes", [])
+            rels = backup.get("relationships", [])
+
+            with driver.session() as session:
+                # 清空现有数据
+                session.run("MATCH (n) DETACH DELETE n")
+
+                # 恢复节点
+                for node in nodes:
+                    labels = node.get("labels", [])
+                    props = node.get("props", {})
+                    label_str = ":" + ":".join(labels) if labels else ""
+
+                    # 过滤不支持的属性类型
+                    clean_props = {}
+                    for k, v in props.items():
+                        if isinstance(v, (str, int, float, bool)) or v is None:
+                            clean_props[k] = v
+
+                    if clean_props:
+                        props_str = "{" + ", ".join(
+                            f"k: {repr(v)}" for k, v in clean_props.items()
+                        ) + "}"
+                        session.run(f"CREATE (n{label_str} {props_str})")
+                    else:
+                        session.run(f"CREATE (n{label_str})")
+
+                # 恢复关系
+                for rel in rels:
+                    rel_type = rel.get("rel_type", "REL")
+                    start_id = rel.get("start_id")
+                    end_id = rel.get("end_id")
+                    props = rel.get("props", {})
+
+                    if start_id and end_id:
+                        clean_props = {}
+                        for k, v in props.items():
+                            if isinstance(v, (str, int, float, bool)) or v is None:
+                                clean_props[k] = v
+
+                        if clean_props:
+                            props_str = "{" + ", ".join(
+                                f"k: {repr(v)}" for k, v in clean_props.items()
+                            ) + "}"
+                            session.run(f"""
+                                MATCH (a), (b)
+                                WHERE elementId(a) = $start_id AND elementId(b) = $end_id
+                                CREATE (a)-[r:{rel_type} {props_str}]->(b)
+                            """, start_id=start_id, end_id=end_id)
+                        else:
+                            session.run(f"""
+                                MATCH (a), (b)
+                                WHERE elementId(a) = $start_id AND elementId(b) = $end_id
+                                CREATE (a)-[r:{rel_type}]->(b)
+                            """, start_id=start_id, end_id=end_id)
+
+            logger.info(f"[GraphRAG] 备份恢复完成: {len(nodes)} 节点, {len(rels)} 关系")
+
+            return {
+                "status": "success",
+                "nodes": len(nodes),
+                "relations": len(rels)
+            }
+
+        finally:
+            driver.close()
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @paper_commands.command("graph_backup_list")
+    async def cmd_graph_backup_list(self, event: AstrMessageEvent):
+        """List available graph backups (Admin)
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if not self.config.get("enable_graph_rag", False):
+            yield event.plain_result("❌ Graph RAG 功能未启用")
+            return
+
+        from pathlib import Path
+        from datetime import datetime
+
+        plugin_dir = Path(__file__).parent
+        backup_dir = plugin_dir / "data" / "graph_store"
+
+        # 查找两种备份格式
+        json_backups = list(backup_dir.glob("neo4j_backup_*.json.gz"))
+        dir_backups = list(backup_dir.glob("neo4j_backup_*/"))
+
+        all_backups = []
+        for b in json_backups:
+            all_backups.append({
+                "name": b.name,
+                "path": b,
+                "size": b.stat().st_size,
+                "mtime": b.stat().st_mtime,
+                "type": "online (JSON.gz)"
+            })
+        for b in dir_backups:
+            total_size = sum(f.stat().st_size for f in b.rglob("*") if f.is_file())
+            all_backups.append({
+                "name": b.name,
+                "path": b,
+                "size": total_size,
+                "mtime": b.stat().st_mtime,
+                "type": "offline (directory)"
+            })
+
+        if not all_backups:
+            yield event.plain_result("❌ 未找到任何备份文件\n\n💡 使用 `/paper graph_backup` 创建备份")
+            return
+
+        # 按时间排序
+        all_backups.sort(key=lambda x: x["mtime"], reverse=True)
+
+        msg = "📦 **图谱备份列表**:\n\n"
+        for i, b in enumerate(all_backups[:10], 1):
+            size_str = self._format_size(b["size"])
+            mtime = datetime.fromtimestamp(b["mtime"]).strftime("%Y-%m-%d %H:%M:%S")
+            msg += f"{i}. `{b['name']}`\n"
+            msg += f"   类型: {b['type']}, 大小: {size_str}\n"
+            msg += f"   时间: {mtime}\n\n"
+
+        msg += "💡 使用 `/paper graph_restore <文件名>` 恢复备份\n"
+        msg += "💡 使用 `/paper graph_backup` 创建新备份"
+
+        yield event.plain_result(msg)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @paper_commands.command("graph_link")
+    async def cmd_graph_link(self, event: AstrMessageEvent, action: str = 'status'):
+        """Manage Neo4j data symlink (Admin)
+
+        Args:
+            action: 'create' | 'remove' | 'status' (default: status)
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        from pathlib import Path
+        import os
+
+        # Neo4j 原始数据目录
+        neo4j_db_path = Path("/opt/homebrew/var/neo4j/data/databases/neo4j")
+
+        # 插件内的链接目标路径
+        plugin_dir = Path(__file__).parent
+        graph_store_dir = plugin_dir / "data" / "graph_store"
+        graph_store_dir.mkdir(parents=True, exist_ok=True)
+        symlink_path = graph_store_dir / "neo4j_data"
+
+        if action == 'status':
+            # 检查符号链接状态
+            if symlink_path.is_symlink():
+                target = os.readlink(symlink_path)
+                exists = symlink_path.exists()
+                real_path = symlink_path.resolve()
+
+                status = "✅ 正常" if exists else "⚠️ 链接断裂（目标不存在）"
+
+                msg = f"""📊 **Neo4j 符号链接状态**
+
+🔗 链接路径: `data/graph_store/neo4j_data`
+📍 目标路径: `{target}`
+📁 解析路径: `{real_path}`
+📦 状态: {status}
+
+💡 可用操作:
+  `/paper graph_link create` - 创建/重建链接
+  `/paper graph_link remove` - 删除链接"""
+            elif symlink_path.exists():
+                status = "⚠️ 存在同名文件/目录（非符号链接）"
+                msg = f"""📊 **Neo4j 符号链接状态**
+
+⚠️  `data/graph_store/neo4j_data` 已存在但不是符号链接
+   状态: {status}
+
+💡 请先删除或备份后再创建链接:
+  `/paper graph_link remove`"""
+            else:
+                msg = f"""📊 **Neo4j 符号链接状态**
+
+❌ 符号链接未创建
+
+💡 创建链接:
+  `/paper graph_link create`"""
+
+            yield event.plain_result(msg)
+
+        elif action == 'create':
+            if not neo4j_db_path.exists():
+                yield event.plain_result(f"❌ Neo4j 数据目录不存在: `{neo4j_db_path}`\n\n请确保 Neo4j 已安装并初始化")
+                return
+
+            # 如果已存在符号链接，先删除
+            if symlink_path.is_symlink():
+                symlink_path.unlink()
+                logger.info(f"[GraphRAG] 已删除旧符号链接")
+            elif symlink_path.exists():
+                yield event.plain_result(f"⚠️ `data/graph_store/neo4j_data` 已存在且不是符号链接\n请先手动删除后再试")
+                return
+
+            try:
+                # 创建符号链接（使用相对路径）
+                # 从 graph_store 目录到 neo4j 数据目录的相对路径
+                rel_path = os.path.relpath(neo4j_db_path, graph_store_dir)
+                os.symlink(rel_path, symlink_path)
+
+                yield event.plain_result(f"""✅ **符号链接创建成功！**
+
+🔗 链接: `data/graph_store/neo4j_data`
+📍 指向: `{rel_path}` (相对路径)
+
+💡 现在可以直接在 `data/graph_store/neo4j_data` 访问 Neo4j 数据
+
+⚠️ 注意: 删除此链接不会影响原始数据，但重建需要此命令""")
+
+            except Exception as e:
+                yield event.plain_result(f"❌ 创建符号链接失败: {e}")
+
+        elif action == 'remove':
+            if not symlink_path.exists():
+                yield event.plain_result("❌ 符号链接不存在，无需删除")
+                return
+
+            if not symlink_path.is_symlink():
+                yield event.plain_result("⚠️ `data/graph_store/neo4j_data` 不是符号链接，无法使用此命令删除\n请手动删除")
+                return
+
+            try:
+                symlink_path.unlink()
+                yield event.plain_result("✅ 符号链接已删除\n\n⚠️ 删除链接不影响原始 Neo4j 数据\n💡 使用 `/paper graph_link create` 重新创建链接")
+            except Exception as e:
+                yield event.plain_result(f"❌ 删除符号链接失败: {e}")
+
+        else:
+            yield event.plain_result(f"❌ 未知操作: {action}\n\n可用操作: `status` | `create` | `remove`")
 
     # ==================== 创意生成命令 ====================
 

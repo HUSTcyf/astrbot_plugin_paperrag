@@ -2,6 +2,115 @@
 
 所有值得注意的插件变更都会记录在这个文件中。
 
+## [1.8.2] - 2026-04-03
+
+### Graph RAG 引擎重构
+
+**文件**: `graph_rag_engine.py`
+
+**概述**: 委托 LlamaIndex 处理图谱存储和检索，删除自定义封装类。
+
+**变更**:
+
+1. **删除自定义 MemoryGraphStore**
+   - 移除了 ~300 行自定义内存图谱存储代码
+   - 移除了 JSON/gzip 持久化逻辑
+   - 移除了自定义 entity_index 索引管理
+
+2. **删除自定义 Neo4jGraphStore**
+   - 移除了 Neo4j 图数据库封装
+   - 统一使用 LlamaIndex 的 Neo4jGraphStore
+
+3. **新增 SimplePropertyGraphStoreAdapter**
+   - 创建简化适配器直接使用 LlamaIndex PropertyGraphStore
+   - 核心思路：直接使用实体名作为标识符，不转换内部数字 ID
+   - entity_id 只用于外部追踪统计，不参与业务逻辑
+
+4. **存储后端变更**
+   - `memory`: 现在使用 LlamaIndex SimplePropertyGraphStore
+   - `neo4j`: 现在使用 LlamaIndex Neo4jGraphStore
+
+**文件**: `graph_retriever.py`
+
+**变更**: 已删除 - 检索功能已整合到 graph_rag_engine.py
+
+### 新增功能
+
+#### 图谱备份/恢复功能
+
+**文件**: `main.py`
+
+新增以下命令用于图谱数据备份和恢复：
+
+1. **graph_backup** - 图谱备份命令
+   - 备份当前 Neo4j 图谱数据到本地文件
+   - 使用方式: `/paper graph_backup [online|offline]`
+   - 备份文件存储在 `data/graph_store` 目录
+   - online 模式: 连接 Neo4j 在线备份
+   - offline 模式: 复制数据库文件进行备份
+
+2. **graph_backup_list** - 列出可用备份
+   - 查看所有已创建的备份文件
+   - 显示备份时间、文件大小等信息
+
+3. **graph_restore** - 恢复备份
+   - 从备份文件恢复图谱数据
+   - 使用方式: `/paper graph_restore {backup_file}`
+
+#### Neo4j 符号链接管理
+
+**文件**: `main.py`
+
+**graph_link** 命令 - 管理 Neo4j 数据库符号链接
+
+- `/paper graph_link status` - 查看当前链接状态
+- `/paper graph_link create` - 创建/重建符号链接
+- `/paper graph_link remove` - 删除符号链接
+
+**特点**:
+- 符号链接使用相对路径
+- 删除符号链接不影响原始 Neo4j 数据
+- 便于管理多个图谱数据目录
+
+#### graph_rebuild 命令
+
+**文件**: `main.py`
+
+**新增 `graph_rebuild` 命令**
+- 用于从零开始重建知识图谱（清空 + 重建）
+- 使用方式: `/paper graph_rebuild confirm`
+
+### Bug 修复
+
+**文件**: `graph_builder.py`
+
+1. **修复 `add_relation()` 条件错误**
+   ```python
+   # 修复前（错误）
+   if not head or not relation or tail:
+   # 修复后（正确）
+   if not head or not relation or not tail:
+   ```
+
+2. **增加 max_tokens 避免 JSON 截断**
+   - 在 `text_chat()` 调用中增加 `max_tokens=8192`
+   - 防止 LLM 输出被截断导致 JSON 解析失败
+
+3. **修复实体重复计数问题**
+   - 添加 `counted_entities` set 避免同一实体在多个三元组中被重复计数
+
+4. **改进 JSON 解析错误日志**
+   - 解析失败时输出响应内容前 500 字符便于调试
+
+### 依赖更新
+
+**文件**: `requirements.txt`
+
+- `llama-index-core>=0.10.0` -> `llama-index>=0.10.0` (完整包，包含 graph_stores)
+- 新增 `platformdirs>=2.0.0` 依赖
+
+---
+
 ## [1.8.1] - 2026-04-02
 
 ### 代码审查与优化

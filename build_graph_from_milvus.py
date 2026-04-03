@@ -120,7 +120,7 @@ def build_neo4j_graph(
     }
 
     try:
-        from llama_index.graph_stores.neo4j import Neo4jGraphStore
+        from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
         from llama_index.core import PropertyGraphIndex
         import llama_cpp
 
@@ -169,7 +169,7 @@ def build_neo4j_graph(
 
         # 连接 Neo4j
         print(f"🔗 连接 Neo4j: {neo4j_config['url']}")
-        graph_store = Neo4jGraphStore(
+        graph_store = Neo4jPropertyGraphStore(
             url=neo4j_config["url"],
             username=neo4j_config["username"],
             password=neo4j_config["password"],

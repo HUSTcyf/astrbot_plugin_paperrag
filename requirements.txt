@@ -5,7 +5,7 @@ pymilvus[milvus_lite]>=2.5.4,<3.0.0  # Milvus Lite 向量数据库
 PyMuPDF>=1.23.0  # PDF解析 (fitz)
 
 # llama-index依赖（新RAG引擎）
-llama-index-core>=0.10.0  # llama-index核心库
+llama-index>=0.10.0  # 完整包（包含 core, graph_stores 等）
 llama-index-vector-stores-milvus>=0.2.0  # Milvus向量存储（需要更版本以支持新的导入路径）
 llama-index-llms-openai>=0.1.0  # OpenAI兼容接口（用于智谱GLM，避免pyjwt冲突）
 # llama-index-llms-zhipuai>=0.1.0  # 智谱GLM LLM（已弃用：pyjwt版本冲突）
@@ -36,7 +36,9 @@ FlagEmbedding>=1.2.0  # 重排序模型（支持MPS加速）
 llama-cpp-python>=0.3.0  # Llama.cpp Python绑定（多模态VLM支持）
 
 # Graph RAG（图谱增强检索）
-# Neo4j 支持（可选，需要 Neo4j 时安装）
+llama-index-core>=0.10.0  # 核心库（包含 graph_stores）
+platformdirs>=2.0.0  # llama_index.core 依赖
+# Neo4j 支持（可选）
 llama-index-graph-stores-neo4j
 
 # 工具库

@@ -343,6 +343,9 @@ class LlamaCppVLMProvider:
             )
 
             # 解析响应
+            if not isinstance(result, dict) or "choices" not in result or not result["choices"]:
+                logger.error(f"[Llama.cpp-VLM] 响应结构异常: {type(result)}, keys: {result.keys() if isinstance(result, dict) else 'N/A'}")
+                raise ValueError(f"Unexpected LLM response structure: {type(result)}")
             response_text = result["choices"][0]["message"]["content"]
 
             elapsed = time.time() - start_time
