@@ -1323,7 +1323,7 @@ class HybridRAGEngine:
             texts = [node.text for node in nodes]
             embeddings = await embed_provider.get_text_embeddings_batch(texts)
 
-            logger.info(f"🔍 [DEBUG] 生成embeddings: texts数量={len(texts)}, embeddings数量={len(embeddings) if embeddings else 'None'}")
+            logger.info(f"🔍 生成embeddings: texts数量={len(texts)}, embeddings数量={len(embeddings) if embeddings else 'None'}")
 
             # 使用 zip_longest 配对，确保不漏掉任何 node（缺失的 embedding 填 None）
             pairs = list(zip_longest(nodes, embeddings if embeddings else [None] * len(nodes), fillvalue=None))

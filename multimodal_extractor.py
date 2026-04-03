@@ -17,6 +17,16 @@ logger = logging.getLogger(__name__)
 from PIL import Image
 import fitz  # PyMuPDF
 
+# Docling 预导入（在 AstrBot 事件循环中避免延迟导入崩溃）
+try:
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling_core.types.doc import PictureItem, TableItem, FormulaItem
+    _DOCLING_PREIMPORTED = True
+except ImportError:
+    _DOCLING_PREIMPORTED = False
+
 # 多模态可用标志
 MULTIMODAL_AVAILABLE = True
 
@@ -52,6 +62,7 @@ class ExtractedImage:
     caption: Optional[str] = None  # 图注（Figure X）
     context_before: Optional[str] = None  # 前文
     context_after: Optional[str] = None  # 后文
+    saved_path: Optional[str] = None  # 文件系统路径（docling 保存后填充）
 
 
 @dataclass
@@ -66,6 +77,8 @@ class ExtractedTable:
     data: Optional[List[List[str]]] = None  # 原始数据
     caption: Optional[str] = None  # 表注（Table X）
     context: Optional[str] = None  # 上下文
+    saved_csv_path: Optional[str] = None  # CSV 文件路径
+    saved_png_path: Optional[str] = None  # PNG 图片路径
 
 
 @dataclass
@@ -826,6 +839,428 @@ class MultimodalPDFExtractor:
 
 
 # ============================================================================
+# DoclingExtractor - 基于 docling 的 PDF 多模态提取器
+# ============================================================================
+
+
+# 模块级标志：确保全局配置只执行一次
+_GLOBAL_DOCLING_CONFIGURED = False
+
+
+def _configure_docling_globals() -> None:
+    """
+    配置 docling 全局设置（在进程级别只执行一次）
+
+    这个函数配置：
+    1. HuggingFace 模型缓存目录
+    2. PyTorch 设备选项（避免 MPS 崩溃）
+    3. docling settings
+
+    必须在任何 docling/transformers/torch 导入之前调用，或在首次使用时调用。
+    """
+    global _GLOBAL_DOCLING_CONFIGURED
+    if _GLOBAL_DOCLING_CONFIGURED:
+        return
+
+    import os
+    from pathlib import Path
+
+    models_dir = Path(__file__).parent / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. 设置 HF_HOME，使 huggingface_hub 缓存到本地目录
+    os.environ.setdefault("HF_HOME", str(models_dir))
+    os.environ.setdefault("TRANSFORMERS_CACHE", str(models_dir))
+    os.environ.setdefault("HF_DATASETS_CACHE", str(models_dir))
+
+    # 2. 强制 CPU 模式（避免 Apple Silicon MPS 崩溃）
+    # 注意：这些设置需要在 torch 导入之前或首次使用时设置
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
+    # 3. 设置 docling settings
+    from docling.datamodel.settings import settings
+    settings.cache_dir = str(models_dir)
+    settings.artifacts_path = str(models_dir)
+
+    _GLOBAL_DOCLING_CONFIGURED = True
+    logger.info(f"🔧 [DoclingExtractor] 全局配置完成: cache_dir={settings.cache_dir}")
+
+
+class DoclingExtractor:
+    """基于 docling 的 PDF 多模态提取器，支持图片和表格提取"""
+
+    # 本地模型目录（插件目录下）
+    _LOCAL_MODELS_DIR = Path(__file__).parent / "models"
+
+    def __init__(self, fallback_extractor: Optional["MultimodalPDFExtractor"] = None):
+        """
+        初始化 DoclingExtractor
+
+        Args:
+            fallback_extractor: 降级使用的提取器（MultimodalPDFExtractor）
+        """
+        self.fallback = fallback_extractor
+        self._available = self._check_available()
+        self._plugin_dir = Path(__file__).parent
+        self._figures_base = self._plugin_dir / "data" / "figures"
+        self._tables_base = self._plugin_dir / "data" / "tables"
+
+        # 配置本地模型目录（全局配置，只在首次执行）
+        if self._available:
+            _configure_docling_globals()
+
+        if self._available:
+            self._figures_base.mkdir(parents=True, exist_ok=True)
+            self._tables_base.mkdir(parents=True, exist_ok=True)
+
+        # 调试日志：检查模型状态
+        if self._available:
+            self._log_model_status(self._LOCAL_MODELS_DIR)
+
+    def _log_model_status(self, models_dir: Path) -> None:
+        """输出模型加载状态调试信息"""
+        logger.info(f"🔧 [DoclingExtractor] 本地模型目录: {models_dir}")
+
+        # 检查各模型是否存在（使用正确的 repo_cache_folder 名称）
+        expected_models = [
+            ("布局模型", "docling-project--docling-models"),
+            ("公式模型", "docling-project--CodeFormulaV2"),
+            ("图片分类器", "docling-project--DocumentFigureClassifier-v2.5"),
+            ("RapidOCR", "RapidOcr"),
+        ]
+
+        all_found = True
+        for name, folder in expected_models:
+            model_path = models_dir / folder
+            if model_path.exists():
+                # 尝试估算大小
+                try:
+                    size = sum(
+                        f.stat().st_size
+                        for f in model_path.rglob("*")
+                        if f.is_file()
+                    )
+                    size_mb = size / (1024 * 1024)
+                    logger.info(f"   ✅ {name}: {size_mb:.1f} MB")
+                except Exception:
+                    logger.info(f"   ✅ {name}: 已存在")
+            else:
+                logger.warning(f"   ⚠️ {name}: 未找到 ({folder})")
+                all_found = False
+
+        if all_found:
+            logger.info(f"✅ [DoclingExtractor] 所有模型已就绪，将从本地加载")
+        else:
+            logger.warning(f"⚠️ [DoclingExtractor] 部分模型缺失，将自动从 HuggingFace 下载")
+
+    def _check_available(self) -> bool:
+        """检测 docling 是否可用"""
+        # 使用预导入的模块标志
+        return _DOCLING_PREIMPORTED
+
+    def extract(self, pdf_path: str) -> ExtractedContent:
+        """
+        使用 docling 提取 PDF 多模态内容
+
+        Args:
+            pdf_path: PDF 文件路径
+
+        Returns:
+            ExtractedContent: 提取的内容（图片、表格、文本）
+        """
+        if not self._available:
+            if self.fallback:
+                logger.warning(f"[DoclingExtractor] docling 不可用，使用 PyMuPDF fallback")
+                return self.fallback.extract(pdf_path)
+            return ExtractedContent(file_name=Path(pdf_path).name, images=[], tables=[], formulas=[], text="")
+
+        # 确保全局配置已执行（可能在 __init__ 时 docling 未导入）
+        _configure_docling_globals()
+
+        try:
+            return self._extract_with_docling(pdf_path)
+        except (Exception, KeyboardInterrupt) as e:
+            logger.warning(f"[DoclingExtractor] docling extraction failed, falling back: {e}")
+            if self.fallback:
+                return self.fallback.extract(pdf_path)
+            return ExtractedContent(file_name=Path(pdf_path).name, images=[], tables=[], formulas=[], text="")
+
+    def _extract_with_docling(self, pdf_path: str) -> ExtractedContent:
+        """
+        使用 docling 提取 PDF 内容（支持图片、表格、公式）
+
+        由于 AstrBot 环境下 docling convert() 会触发 segfault，
+        使用独立进程执行以隔离运行环境。
+        """
+        import subprocess
+        import sys
+        import tempfile
+        import json
+        import os
+
+        pdf_path = Path(pdf_path)
+        paper_id = pdf_path.stem
+
+        figures_dir = self._figures_base / paper_id
+        tables_dir = self._tables_base / paper_id
+        figures_dir.mkdir(parents=True, exist_ok=True)
+        tables_dir.mkdir(parents=True, exist_ok=True)
+
+        plugin_dir = Path(__file__).parent
+
+        # 构建子进程脚本
+        script = f'''
+import sys
+import os
+import io
+import json
+from pathlib import Path
+
+models_dir = Path("{plugin_dir}") / "models"
+os.environ["HF_HOME"] = str(models_dir)
+os.environ["TRANSFORMERS_CACHE"] = str(models_dir)
+
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling_core.types.doc import PictureItem, TableItem, FormulaItem
+
+def _table_data_to_csv(data):
+    lines = []
+    for row in data:
+        # 将每个元素转为字符串，处理嵌套列表
+        cells = []
+        for cell in row:
+            if isinstance(cell, list):
+                cell = str(cell)
+            cells.append(str(cell) if cell is not None else "")
+        line = ",".join(cells)
+        lines.append(line)
+    return "\\n".join(lines)
+
+def _csv_to_markdown(data):
+    """将 CSV 数据转换为 Markdown 表格格式"""
+    if not data:
+        return ""
+    lines = []
+    row_count = 0
+    for i, row in enumerate(data):
+        row_count += 1
+        cells = []
+        for cell in row:
+            if isinstance(cell, list):
+                cell = str(cell)
+            cell_str = str(cell) if cell is not None else ""
+            # 转义管道符和换行符（f-string中需要双写反斜杠）
+            cell_str = cell_str.replace("|", "\\\\|").replace("\\n", " ")
+            cells.append(cell_str)
+        lines.append("| " + " | ".join(cells) + " |")
+        # 添加表头分隔符
+        if i == 0:
+            separator = "| " + " | ".join(["---"] * len(cells)) + " |"
+            lines.append(separator)
+    if row_count == 0:
+        return ""
+    return "\\n".join(lines)
+
+pdf_path = Path("{pdf_path}")
+paper_id = "{paper_id}"
+figures_dir = Path("{figures_dir}")
+tables_dir = Path("{tables_dir}")
+
+pipeline_options = PdfPipelineOptions(
+    generate_picture_images=True,
+    generate_page_images=False,
+    do_table_structure=True,
+    do_ocr=True,
+    do_formula_enrichment=False,
+    images_scale=2.0,
+)
+
+converter = DocumentConverter(
+    format_options={{
+        InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+    }}
+)
+
+result = converter.convert(pdf_path)
+
+images = []
+tables = []
+formulas = []
+text_parts = []
+figure_counters = {{}}
+table_counters = {{}}
+formula_counters = {{}}
+
+for element, _level in result.document.iterate_items():
+    if isinstance(element, PictureItem):
+        page_no = element.prov[0].page_no
+        figure_idx = figure_counters.get(page_no, 0) + 1
+        figure_counters[page_no] = figure_idx
+        if element.image is None:
+            continue
+        pil_image = element.image.pil_image
+        filename = f"{{page_no}}-Figure{{figure_idx}}.png"
+        save_path = figures_dir / filename
+        pil_image.save(save_path, format="PNG")
+        images.append({{
+            "page_number": page_no,
+            "image_index": figure_idx,
+            "bbox": [0, 0, 0, 0],
+            "caption": f"Figure {{figure_idx}}",
+            "saved_path": str(save_path),
+        }})
+    elif isinstance(element, TableItem):
+        page_no = element.prov[0].page_no
+        table_idx = table_counters.get(page_no, 0) + 1
+        table_counters[page_no] = table_idx
+        table_csv = _table_data_to_csv(element.data)
+        csv_filename = f"{{page_no}}-Table{{table_idx}}.csv"
+        png_filename = f"{{page_no}}-Table{{table_idx}}.png"
+        csv_path = tables_dir / csv_filename
+        png_path = tables_dir / png_filename
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write(table_csv)
+        saved_png_path = None
+        if element.image is not None:
+            pil_image = element.image.pil_image
+            pil_image.save(png_path, format="PNG")
+            saved_png_path = str(png_path)
+        table_markdown = _csv_to_markdown(element.data)
+        tables.append({{
+            "page_number": page_no,
+            "table_index": table_idx,
+            "bbox": [0, 0, 0, 0],
+            "csv": table_csv,
+            "markdown": table_markdown,
+            "caption": f"Table {{table_idx}}",
+            "saved_csv_path": str(csv_path),
+            "saved_png_path": saved_png_path,
+        }})
+    elif isinstance(element, FormulaItem):
+        page_no = element.prov[0].page_no if element.prov else 1
+        formula_idx = formula_counters.get(page_no, 0) + 1
+        formula_counters[page_no] = formula_idx
+        latex_text = element.text or ""
+        formulas.append({{
+            "page_number": page_no,
+            "formula_index": formula_idx,
+            "text": latex_text,
+            "bbox": [0, 0, 0, 0],
+            "type": "display",
+        }})
+
+if result.document.texts:
+    text_parts.extend([t.text for t in result.document.texts])
+
+result_json = json.dumps({{
+    "file_name": pdf_path.name,
+    "images": images,
+    "tables": tables,
+    "formulas": formulas,
+    "text": "\\\\n".join(text_parts),
+}})
+
+print(result_json)
+'''
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            f.write(script)
+            script_path = f.name
+
+        try:
+            result = subprocess.run(
+                [sys.executable, script_path],
+                capture_output=True,
+                text=True,
+                cwd=str(plugin_dir),
+            )
+
+            if result.returncode != 0:
+                raise RuntimeError(f"docling extraction failed: {result.stderr}")
+
+            output = result.stdout.strip()
+            if not output:
+                raise RuntimeError("docling extraction returned empty result")
+
+            data = json.loads(output)
+
+            # 构建 ExtractedContent
+            images_out = [
+                ExtractedImage(
+                    page_number=img["page_number"],
+                    image_index=img["image_index"],
+                    bbox=tuple(img["bbox"]),
+                    caption=img.get("caption"),
+                    saved_path=img.get("saved_path"),
+                )
+                for img in data.get("images", [])
+            ]
+
+            tables_out = [
+                ExtractedTable(
+                    page_number=tbl["page_number"],
+                    table_index=tbl["table_index"],
+                    bbox=tuple(tbl["bbox"]),
+                    csv=tbl.get("csv"),
+                    markdown=tbl.get("markdown"),
+                    caption=tbl.get("caption"),
+                    saved_csv_path=tbl.get("saved_csv_path"),
+                    saved_png_path=tbl.get("saved_png_path"),
+                )
+                for tbl in data.get("tables", [])
+            ]
+
+            formulas_out = [
+                ExtractedFormula(
+                    page_number=frm["page_number"],
+                    formula_index=frm["formula_index"],
+                    text=frm["text"],
+                    bbox=tuple(frm["bbox"]) if frm.get("bbox") else None,
+                    type=frm.get("type", "unknown"),
+                )
+                for frm in data.get("formulas", [])
+            ]
+
+            logger.info(f"[DoclingExtractor] 提取完成: 图片={len(images_out)}, 表格={len(tables_out)}, 公式={len(formulas_out)}")
+
+            return ExtractedContent(
+                file_name=data.get("file_name", ""),
+                images=images_out,
+                tables=tables_out,
+                formulas=formulas_out,
+                text=data.get("text", ""),
+            )
+
+        finally:
+            os.unlink(script_path)
+
+    def _pil_to_bytes(self, pil_image: Image.Image) -> bytes:
+        """将 PIL Image 转换为 bytes"""
+        buffered = io.BytesIO()
+        pil_image.save(buffered, format="PNG")
+        return buffered.getvalue()
+
+    def _table_data_to_csv(self, data: List[List[str]]) -> str:
+        """将表格数据转换为 CSV 格式"""
+        lines = []
+        for row in data:
+            line = ",".join(f'"{cell}"' if ',' in cell else cell for cell in row)
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _extract_figure_caption(self, element, index: int) -> Optional[str]:
+        """从 PictureItem 提取图注"""
+        return f"Figure {index}"
+
+    def _extract_table_caption(self, element, index: int) -> Optional[str]:
+        """从 TableItem 提取表注"""
+        return f"Table {index}"
+
+
+# ============================================================================
 # PDFParserAdvanced - 高级PDF解析器，集成多模态提取和分块
 # ============================================================================
 
@@ -840,6 +1275,49 @@ class Chunk:
     image_data: Optional[bytes] = None
     table_data: Optional[str] = None
     formula_latex: Optional[str] = None
+
+
+def _build_extracted_content_from_json(data: Dict[str, Any]) -> ExtractedContent:
+    """从子进程返回的 JSON 数据构建 ExtractedContent"""
+    images = []
+    for img in data.get("images", []):
+        images.append(ExtractedImage(
+            page_number=img["page_number"],
+            image_index=img["image_index"],
+            bbox=tuple(img["bbox"]),
+            caption=img.get("caption"),
+            saved_path=img.get("saved_path"),
+        ))
+
+    tables = []
+    for tbl in data.get("tables", []):
+        tables.append(ExtractedTable(
+            page_number=tbl["page_number"],
+            table_index=tbl["table_index"],
+            bbox=tuple(tbl["bbox"]),
+            csv=tbl.get("csv"),
+            caption=tbl.get("caption"),
+            saved_csv_path=tbl.get("saved_csv_path"),
+            saved_png_path=tbl.get("saved_png_path"),
+        ))
+
+    formulas = []
+    for frm in data.get("formulas", []):
+        formulas.append(ExtractedFormula(
+            page_number=frm["page_number"],
+            formula_index=frm["formula_index"],
+            text=frm["text"],
+            bbox=tuple(frm["bbox"]) if frm.get("bbox") else None,
+            type=frm.get("type", "unknown"),
+        ))
+
+    return ExtractedContent(
+        file_name=data.get("file_name", ""),
+        images=images,
+        tables=tables,
+        formulas=formulas,
+        text=data.get("text", ""),
+    )
 
 
 class PDFParserAdvanced:
@@ -870,7 +1348,8 @@ class PDFParserAdvanced:
                     extract_formulas=True,
                     fallback_to_text=True
                 )
-                logger.info("✅ 多模态提取器已启用")
+                self.docling_extractor = DoclingExtractor(fallback_extractor=self.multimodal_extractor)
+                logger.info("✅ DoclingExtractor 已启用（默认），MultimodalPDFExtractor 作为 fallback")
             except Exception as e:
                 logger.warning(f"⚠️ 多模态提取器初始化失败: {e}")
                 self.enable_multimodal = False
@@ -900,27 +1379,27 @@ class PDFParserAdvanced:
             raise Exception(f"PDF解析失败 {filename}: {e}")
 
     def _parse_with_multimodal(self, pdf_path: str) -> tuple[str, Dict[str, Any]]:
-        """使用多模态提取器解析"""
-        extracted = self.multimodal_extractor.extract(pdf_path)
+        """使用 DoclingExtractor 提取图片/表格/公式 + PyMuPDF 提取完整文本"""
+        # 1. DoclingExtractor 提取多模态内容（图片、表格、公式）
+        extracted = self.docling_extractor.extract(pdf_path)
 
+        # 2. PyMuPDF 提取完整文本（用于 chunks 和参考文献解析）
+        pymupdf_text, _ = self._parse_with_pymupdf(pdf_path)
+
+        # 3. 构建增强文本（PyMuPDF 文本 + Docling 提取的表格/公式）
         text_parts = []
 
-        # 添加原始文本（已过滤行号）
-        if extracted.text:
-            text_parts.append(extracted.text)
+        # 添加 PyMuPDF 提取的文本
+        if pymupdf_text:
+            text_parts.append(pymupdf_text)
 
-        # 添加图片占位符
-        if extracted.images:
-            for img in extracted.images:
-                caption = f" [{img.caption or f'Figure on page {img.page_number}'}]"
-
-        # 添加表格
+        # 添加 Docling 表格 markdown
         if extracted.tables:
             for table in extracted.tables:
                 if table.markdown:
                     text_parts.append(f"\n{table.markdown}\n")
 
-        # 添加公式
+        # 添加 Docling 公式
         if extracted.formulas:
             for formula in extracted.formulas:
                 text_parts.append(f"\n$$ {formula.text} $$\n")
@@ -930,7 +1409,7 @@ class PDFParserAdvanced:
         metadata = {
             "file_name": extracted.file_name,
             "total_pages": extracted.text.count('[Page ') if extracted.text else 0,
-            "parser": "PyMuPDF-Multimodal",
+            "parser": "Docling-Multimodal",
             "images_count": len(extracted.images),
             "tables_count": len(extracted.tables),
             "formulas_count": len(extracted.formulas),
@@ -941,7 +1420,8 @@ class PDFParserAdvanced:
                         "image_index": img.image_index,
                         "caption": img.caption,
                         "bbox": img.bbox,
-                        "has_image_bytes": img.image_bytes is not None
+                        "has_image_bytes": img.image_bytes is not None,
+                        "saved_path": img.saved_path
                     }
                     for img in extracted.images
                 ],
@@ -951,7 +1431,9 @@ class PDFParserAdvanced:
                         "table_index": table.table_index,
                         "caption": table.caption,
                         "rows": len(table.data) if table.data else 0,
-                        "markdown": table.markdown
+                        "markdown": table.markdown,
+                        "saved_csv_path": table.saved_csv_path,
+                        "saved_png_path": table.saved_png_path
                     }
                     for table in extracted.tables
                 ],
@@ -967,7 +1449,8 @@ class PDFParserAdvanced:
             }
         }
 
-        return full_text, metadata
+        # 返回: (增强文本用于chunks, PyMuPDF原文用于参考文献解析, metadata)
+        return full_text, pymupdf_text, metadata
 
     def _parse_with_pymupdf(self, pdf_path: str) -> tuple[str, Dict[str, Any]]:
         """使用 PyMuPDF 解析（结构化提取，过滤行号）"""

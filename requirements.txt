@@ -49,3 +49,6 @@ openai>=1.0.0  # OpenAI SDK（用于智谱GLM，避免pyjwt版本冲突）
 
 # 数据集处理
 datasets>=2.14.0  # HuggingFace 数据集加载
+
+# Docling PDF 多模态提取
+docling==2.84.0  # PDF 多模态提取（图片、表格）

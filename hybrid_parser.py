@@ -134,7 +134,14 @@ class HybridPDFParser:
 
             # 使用自定义解析器提取多模态内容
             logger.debug(f"🔍 解析PDF: {filename}")
-            text, metadata = self.pdf_parser.parse_pdf(pdf_path)
+            result = self.pdf_parser.parse_pdf(pdf_path)
+
+            # 处理 Docling Multimodal 返回的 3-tuple
+            if len(result) == 3:
+                text, raw_text, metadata = result  # Docling Multimodal
+            else:
+                text, metadata = result  # 普通 PyMuPDF
+                raw_text = text
 
             # 构建增强的文本（包含多模态占位符）
             enhanced_text = self._build_enhanced_text(text, metadata)
@@ -151,7 +158,7 @@ class HybridPDFParser:
                     "tables_count": metadata.get("tables_count", 0),
                     "formulas_count": metadata.get("formulas_count", 0),
                     "multimodal_data": metadata.get("multimodal_data", {}),
-                    "raw_text": text,  # 保存原始文本用于参考文献提取
+                    "raw_text": raw_text,  # 保存原始文本用于参考文献提取
                     "added_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
             )
@@ -236,11 +243,17 @@ class HybridPDFParser:
             # 提取并保存图片（获取图片路径映射）
             image_paths = {}
             image_pages = {}
+            table_paths = {}
+            table_pages = {}
+            formula_refs = {}
+            formula_pages = {}
             if documents and self.enable_multimodal:
                 multimodal_data = documents[0].metadata.get("multimodal_data", {})
                 # 使用 PDF 文件名作为 paper_id（用于按论文分类存储）
                 paper_id = Path(pdf_path).stem
                 image_paths, image_pages = self._extract_and_save_images(pdf_path, multimodal_data, paper_id)
+                table_paths, table_pages = self._extract_and_save_tables(pdf_path, multimodal_data, paper_id)
+                formula_refs, formula_pages = self._extract_formula_refs(multimodal_data)
 
             # 语义分块
             logger.debug(f"🔄 语义分块处理...")
@@ -261,6 +274,14 @@ class HybridPDFParser:
             # 通过图片引用将图片关联到文本块
             if image_paths:
                 all_nodes = self._associate_images_with_chunks(all_nodes, image_paths, image_pages)
+
+            # 通过表格引用将表格关联到文本块
+            if table_paths:
+                all_nodes = self._associate_tables_with_chunks(all_nodes, table_paths, table_pages)
+
+            # 通过公式引用将公式关联到文本块
+            if formula_refs:
+                all_nodes = self._associate_formulas_with_chunks(all_nodes, formula_refs, formula_pages)
 
             # 引用处理 - 仅使用 LLM-based 解析
             effective_llm_config = llm_config or self.llm_config
@@ -842,12 +863,9 @@ class HybridPDFParser:
         """
         提取并保存图片，返回图片路径映射
 
-        核心：提取图片保存到磁盘，供 VLM 后续加载。
-
-        改进：基于图注和位置聚类，提取完整大图
-        - 将相同图注（Figure 1, Figure 2）的图片按位置聚类
-        - 计算覆盖所有子图的外接矩形
-        - 从 PDF 页面直接裁剪外接矩形区域，得到完整大图
+        策略（优先使用 docling 已保存的图片，避免重复提取）：
+        1. docling 已保存图片（saved_path 存在）→ 复制到 paper_id 目录
+        2. 无 saved_path（如 MultimodalPDFExtractor fallback）→ PyMuPDF 重新提取
 
         Args:
             pdf_path: PDF文件路径
@@ -864,98 +882,76 @@ class HybridPDFParser:
         if not images:
             return image_paths, image_pages
 
-        try:
-            doc = fitz.open(pdf_path)
-        except Exception as e:
-            logger.warning(f"⚠️ 无法打开PDF提取图片: {pdf_path}, {e}")
-            return image_paths, image_pages
+        # 直接使用 docling flat 路径（已包含页码，不会冲突）
+        # 图片路径: data/figures/{page}-Figure{idx}.png
+        for idx, img_info in enumerate(images):
+            saved_path = img_info.get("saved_path")
+            caption = img_info.get("caption") or ""
+            page_num = img_info.get("page_number", 0)
 
-        try:
-            # 第一步：按图注分组图片
-            caption_groups = self._group_images_by_caption(images)
-
-            # 跟踪每个 caption 的 variant 计数器（解决子图覆盖问题）
-            caption_variant_counter: Dict[str, int] = {}
-
-            # 第二步：对每组图片，提取完整大图
-            for caption, img_list in caption_groups.items():
-                if not img_list:
-                    continue
-
-                try:
-                    page_num = img_list[0].get("page_number", 0)
-                    if page_num == 0:
-                        continue
-
-                    # 获取该页面的所有图片 bbox
-                    page: fitz.Page = doc[page_num - 1]  # type: ignore[assignment]
-                    image_list = page.get_images(full=True)
-
-                    # 构建该组图片的 bbox 列表
-                    group_bboxes = []
-                    for img_info in img_list:
-                        img_idx = img_info.get("image_index", 0)
-                        if img_idx < len(image_list):
-                            # 获取图片在页面上的位置
-                            img_rects = page.get_image_rects(image_list[img_idx][0])
-                            if img_rects:
-                                group_bboxes.append(img_rects[0])
-
-                    if not group_bboxes:
-                        continue
-
-                    # 计算外接矩形
-                    merged_rect = self._merge_bboxes(group_bboxes)
-
-                    # 从 PDF 页面裁剪外接矩形区域
-                    clipped_image = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=merged_rect)
-                    pil_image = self._pixmap_to_pil_image(clipped_image)
-
-                    if pil_image:
-                        # 获取该 caption 的 variant（解决子图覆盖问题）
-                        if caption not in caption_variant_counter:
-                            caption_variant_counter[caption] = 0
-                        else:
-                            caption_variant_counter[caption] += 1
-                        variant = caption_variant_counter[caption] + 1
-
-                        # 构建 figure_id：对齐 Qasper 格式 {page}-{type}{num}-{variant}
-                        # 例如: 3-Table1-1.png, 5-Figure1-2.png
-                        figure_idx = self._extract_figure_number(caption)
-                        if figure_idx:
-                            # 根据 caption 前缀判断是 Figure 还是 Table
-                            caption_upper = caption.upper()
-                            if caption_upper.startswith("TABLE"):
-                                figure_id = f"{page_num}-Table{figure_idx}-{variant}"
-                            else:
-                                figure_id = f"{page_num}-Figure{figure_idx}-{variant}"
-                        else:
-                            # 无法提取编号，使用 caption 哈希或默认名称
-                            figure_id = f"{page_num}-FigureUNK-{variant}"
-
-                        image_path = self._save_image_to_disk(
-                            pil_image, pdf_path, page_num, figure_id, paper_id
-                        )
-                        if image_path:
-                            # 每个图注只保存一次
-                            if caption not in image_paths:
-                                image_paths[caption] = image_path
-                                image_pages[caption] = page_num
-
-                except Exception as e:
-                    logger.debug(f"⚠️ 处理图片组 {caption} 失败: {e}")
-                    continue
-
-        finally:
-            doc.close()
+            if saved_path and Path(saved_path).exists():
+                # 使用 (caption, page_num, idx) 作为复合键，避免 caption 重复导致覆盖
+                key = (caption, page_num, idx)
+                if key not in image_paths:
+                    image_paths[key] = saved_path
+                    image_pages[key] = page_num
+                    logger.debug(f"🖼️ [docling] 图片路径: {saved_path}")
 
         if image_paths:
-            figures_dir = self._get_figures_dir(pdf_path, paper_id)
-            logger.info(f"🖼️ 提取并保存 {len(image_paths)} 张图片至 {figures_dir}")
-            for caption, path in image_paths.items():
-                logger.debug(f"   {caption} (页{image_pages[caption]}) → {Path(path).name}")
+            logger.info(f"🖼️ 使用 docling 图片 {len(image_paths)} 张")
 
         return image_paths, image_pages
+
+    def _extract_and_save_tables(
+        self,
+        pdf_path: str,
+        multimodal_data: Dict[str, Any],
+        paper_id: str = None
+    ) -> Tuple[Dict[Tuple[str, int, int], Tuple[str, str, str]], Dict[Tuple[str, int, int], int]]:
+        """
+        提取并保存表格（CSV/PNG），返回表格路径映射
+
+        策略（优先使用 docling 已保存的表格）：
+        1. docling 已保存（saved_csv_path/saved_png_path 存在）→ 复制到 paper_id 目录
+        2. 无 saved_path → 跳过（表格由 docling 原始保存）
+
+        Args:
+            pdf_path: PDF文件路径
+            multimodal_data: 多模态数据（包含 tables 列表）
+            paper_id: 论文ID（用于按论文分类存储）
+
+        Returns:
+            Tuple[Dict, Dict]: (表注->(csv_path, png_path, caption), 表注->页码) 的映射
+        """
+        table_paths: Dict[str, Tuple[str, str, str]] = {}  # caption -> (csv_path, png_path, caption)
+        table_pages: Dict[str, int] = {}
+
+        tables = multimodal_data.get("tables", [])
+        if not tables:
+            return table_paths, table_pages
+
+        # 直接使用 docling flat 路径（已包含页码，不会冲突）
+        # 表格路径: data/tables/{page}-Table{idx}.csv/.png
+        for idx, table_info in enumerate(tables):
+            saved_csv = table_info.get("saved_csv_path")
+            saved_png = table_info.get("saved_png_path")
+            caption = table_info.get("caption") or ""
+            page_num = table_info.get("page_number", 0)
+
+            # 使用 (caption, page_num, idx) 作为复合键，避免 caption 重复导致覆盖
+            key = (caption, page_num, idx)
+            if key not in table_paths:
+                table_paths[key] = (saved_csv or "", saved_png or "", caption)
+                table_pages[key] = page_num
+                if saved_csv:
+                    logger.debug(f"📊 [docling] 表格 CSV: {saved_csv}")
+                if saved_png:
+                    logger.debug(f"📊 [docling] 表格 PNG: {saved_png}")
+
+        if table_paths:
+            logger.info(f"📊 使用 docling 表格 {len(table_paths)} 个")
+
+        return table_paths, table_pages
 
     def _group_images_by_caption(self, images: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
         """
@@ -1072,8 +1068,9 @@ class HybridPDFParser:
         """
         将图片路径关联到包含对应引用的 chunk
 
-        关联逻辑：通过识别正文中的图片引用（Figure 1, Fig. 2, 图1等）
-        将图片关联到包含对应引用的文本块。
+        关联逻辑：
+        1. 通过识别正文中的图片引用（Figure 1, Fig. 2, 图1等）
+        2. 结合页码信息进行匹配（同一页或相邻页的图片更可能相关）
 
         Args:
             nodes: 分块后的节点列表
@@ -1086,22 +1083,30 @@ class HybridPDFParser:
         if not image_paths:
             return nodes
 
-        # 构建图片引用映射：figure编号 -> (图片路径, 图注)
-        figure_refs: Dict[str, Tuple[str, str]] = {}
-        for caption, path in image_paths.items():
-            figure_num = self._extract_figure_number(caption)
+        # 构建图片引用映射：figure编号 -> (图片路径, 图注, 页码)
+        figure_refs: Dict[str, Tuple[str, str, int]] = {}
+        for key, path in image_paths.items():
+            caption_str, page_num, idx = key  # key is (caption_str, page_num, idx)
+            figure_num = self._extract_figure_number(caption_str)
             if figure_num:
-                figure_refs[figure_num] = (path, caption)
+                figure_refs[figure_num] = (path, caption_str, page_num)
 
         if not figure_refs:
             logger.debug("⚠️ 未找到图片引用编号")
             return nodes
 
         # 预编译图片引用正则表达式
+        # 支持: Figure 1, Figure 1a, Figure A1, Figure S1, Figure 1-1, Figures 1 and 2, Fig.1 等
         import re
         figure_patterns = [
-            re.compile(r'(?:Figure|Fig\.?|图)\s*(\d+[a-zA-Z]?)', re.IGNORECASE),
-            re.compile(r'(?:Figure|Fig\.?|图)\s*(\d+[a-zA-Z]?)\s*[:.\)]', re.IGNORECASE),
+            # 基础模式: Figure 1, Fig. 1, 图 1
+            re.compile(r'(?:Figure|Fig\.?|图)\s*([A-Za-z]?\d+[A-Za-z]?(?:-?\d+)?)', re.IGNORECASE),
+            # 带标点的: Figure 1: 或 Figure 1)
+            re.compile(r'(?:Figure|Fig\.?|图)\s*([A-Za-z]?\d+[A-Za-z]?(?:-?\d+)?)\s*[:.\)]', re.IGNORECASE),
+            # 复数形式: Figures 1 and 2, Figs. 1-3
+            re.compile(r'(?:Figures|Figs\.?)\s*(\d+(?:\s*(?:,|and|and\s+)?\s*\d+)*)', re.IGNORECASE),
+            # 无空格形式: Fig.1
+            re.compile(r'(?:Fig\.?)\s*(\d+)', re.IGNORECASE),
         ]
 
         # 关联图片到 chunk
@@ -1109,16 +1114,24 @@ class HybridPDFParser:
         for node in nodes:
             node.metadata = dict(node.metadata)  # 复制避免修改原数据
 
+            # 从chunk文本中提取页码
+            chunk_page = self._extract_page_number_from_text(node.text)
+
             found_images = []  # 可能一个 chunk 引用多张图片
 
             for pattern in figure_patterns:
                 for match in pattern.finditer(node.text):
                     fig_num = match.group(1)
                     if fig_num in figure_refs:
-                        path, caption = figure_refs[fig_num]
+                        path, caption, fig_page = figure_refs[fig_num]
+                        # 检查页码相近（同一页或相邻2页内）
+                        page_match = (chunk_page > 0 and fig_page > 0 and abs(chunk_page - fig_page) <= 2)
                         # 去重
                         if path not in [img[0] for img in found_images]:
-                            found_images.append((path, caption, fig_num))
+                            found_images.append((path, caption, fig_num, page_match))
+
+            # 按匹配质量排序（页码匹配的优先）
+            found_images.sort(key=lambda x: x[3], reverse=True)
 
             if found_images:
                 # 关联第一张图片（主要图片）
@@ -1140,6 +1153,99 @@ class HybridPDFParser:
         logger.info(f"🔗 通过图片引用关联 {associated_count}/{len(nodes)} 个文本块到图片")
         return nodes
 
+    def _associate_tables_with_chunks(
+        self,
+        nodes: List[Node],
+        table_paths: Dict[str, Tuple[str, str, str]],
+        table_pages: Dict[str, int] = {}
+    ) -> List[Node]:
+        """
+        将表格路径关联到包含对应引用的 chunk
+
+        关联逻辑：
+        1. 通过识别正文中的表格引用（Table 1, 表 2 等）
+        2. 结合页码信息进行匹配（同一页或相邻页的表格更可能相关）
+
+        Args:
+            nodes: 分块后的节点列表
+            table_paths: 表注 -> (csv_path, png_path, caption) 的映射
+            table_pages: 表注 -> 页码 的映射
+
+        Returns:
+            添加了 table_path 信息的节点列表
+        """
+        if not table_paths:
+            return nodes
+
+        # 构建表格引用映射：table编号 -> (csv_path, png_path, caption, 页码)
+        table_refs: Dict[str, Tuple[str, str, str, int]] = {}
+        for key, paths in table_paths.items():
+            caption_str, page_num, idx = key  # key is (caption_str, page_num, idx)
+            table_num = self._extract_table_number(caption_str)
+            if table_num:
+                table_refs[table_num] = (paths[0], paths[1], caption_str, page_num)
+
+        if not table_refs:
+            logger.debug("⚠️ 未找到表格引用编号")
+            return nodes
+
+        # 预编译表格引用正则表达式
+        # 支持: Table 1, Table 1a, Table A1, Tables 1 and 2 等
+        import re
+        table_patterns = [
+            # 基础模式: Table 1, 表 1
+            re.compile(r'(?:Table|表)\s*([A-Za-z]?\d+[A-Za-z]?(?:-?\d+)?)', re.IGNORECASE),
+            # 带标点的: Table 1: 或 Table 1)
+            re.compile(r'(?:Table|表)\s*([A-Za-z]?\d+[A-Za-z]?(?:-?\d+)?)\s*[:.\)]', re.IGNORECASE),
+            # 复数形式: Tables 1 and 2
+            re.compile(r'(?:Tables)\s*(\d+(?:\s*(?:,|and|and\s+)?\s*\d+)*)', re.IGNORECASE),
+        ]
+
+        # 关联表格到 chunk
+        associated_count = 0
+        for node in nodes:
+            node.metadata = dict(node.metadata)  # 复制避免修改原数据
+
+            # 从chunk文本中提取页码
+            chunk_page = self._extract_page_number_from_text(node.text)
+
+            found_tables = []  # 可能一个 chunk 引用多个表格
+
+            for pattern in table_patterns:
+                for match in pattern.finditer(node.text):
+                    tbl_num = match.group(1)
+                    if tbl_num in table_refs:
+                        csv_path, png_path, caption, tbl_page = table_refs[tbl_num]
+                        # 检查页码相近（同一页或相邻2页内）
+                        page_match = (chunk_page > 0 and tbl_page > 0 and abs(chunk_page - tbl_page) <= 2)
+                        # 去重
+                        if csv_path not in [tbl[0] for tbl in found_tables]:
+                            found_tables.append((csv_path, png_path, caption, tbl_num, page_match))
+
+            # 按匹配质量排序（页码匹配的优先）
+            found_tables.sort(key=lambda x: x[4], reverse=True)
+
+            if found_tables:
+                # 关联第一个表格（主要表格）
+                node.metadata["table_csv_path"] = found_tables[0][0]
+                node.metadata["table_png_path"] = found_tables[0][1]
+                node.metadata["table_caption"] = found_tables[0][2]
+                node.metadata["table_num"] = found_tables[0][3]
+                node.metadata["has_table"] = True
+
+                # 如果有多个表格，保存所有表格
+                if len(found_tables) > 1:
+                    node.metadata["all_tables"] = [
+                        {"csv_path": tbl[0], "png_path": tbl[1], "caption": tbl[2], "table_num": tbl[3]}
+                        for tbl in found_tables
+                    ]
+                associated_count += 1
+            else:
+                node.metadata["has_table"] = False
+
+        logger.info(f"🔗 通过表格引用关联 {associated_count}/{len(nodes)} 个文本块到表格")
+        return nodes
+
     def _extract_figure_number(self, caption: str) -> Optional[str]:
         """
         从图注中提取图片编号
@@ -1151,16 +1257,131 @@ class HybridPDFParser:
             图片编号，如 "1" 或 "1a"，None 表示未找到
         """
         import re
-        # 匹配 Figure 1, Fig. 1, 图 1 等格式
+        # 匹配 Figure 1, Fig. 1, 图 1, Figure A1, Figure S1 等格式
         patterns = [
-            r'(?:Figure|Fig\.?)\s*(\d+[a-zA-Z]?)',
-            r'(?:图)\s*(\d+[a-zA-Z]?)',
+            r'(?:Figure|Fig\.?)\s*([A-Za-z]?\d+[A-Za-z]?(?:-?\d+)?)',
+            r'(?:图)\s*([A-Za-z]?\d+[A-Za-z]?(?:-?\d+)?)',
         ]
         for pattern in patterns:
             match = re.search(pattern, caption, re.IGNORECASE)
             if match:
                 return match.group(1)
         return None
+
+    def _extract_table_number(self, caption: str) -> Optional[str]:
+        """
+        从表注中提取表格编号
+
+        Args:
+            caption: 表注文本，如 "Table 1: Performance Results..."
+
+        Returns:
+            表格编号，如 "1" 或 "1a"，None 表示未找到
+        """
+        import re
+        # 匹配 Table 1, Table 1a, Table A1 等格式
+        patterns = [
+            r'(?:Table|表)\s*([A-Za-z]?\d+[A-Za-z]?(?:-?\d+)?)',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, caption, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return None
+
+    def _extract_formula_refs(
+        self,
+        multimodal_data: Dict[str, Any]
+    ) -> Tuple[Dict[str, Tuple[str, int, str]], Dict[str, int]]:
+        """
+        提取公式引用信息
+
+        Args:
+            multimodal_data: 多模态数据（包含 formulas 列表）
+
+        Returns:
+            Tuple[Dict, Dict]: (公式编号 -> (formula_text, page_num, formula_id), 公式编号 -> 页码) 的映射
+        """
+        formula_refs: Dict[str, Tuple[str, int, str]] = {}  # formula_num -> (text, page, id)
+        formula_pages: Dict[str, int] = {}
+
+        formulas = multimodal_data.get("formulas", [])
+        for frm in formulas:
+            formula_text = frm.get("text", "")
+            formula_index = frm.get("formula_index", 0)
+            page_num = frm.get("page_number", 0)
+
+            # 使用 "Eq-{index}" 或 "Equation-{index}" 作为编号
+            formula_refs[f"Eq-{formula_index}"] = (formula_text, page_num, f"Eq-{formula_index}")
+            formula_refs[f"Equation-{formula_index}"] = (formula_text, page_num, f"Eq-{formula_index}")
+            # 也支持纯数字编号
+            formula_refs[str(formula_index)] = (formula_text, page_num, f"Eq-{formula_index}")
+
+        return formula_refs, formula_pages
+
+    def _associate_formulas_with_chunks(
+        self,
+        nodes: List[Node],
+        formula_refs: Dict[str, Tuple[str, int, str]],
+        formula_pages: Dict[str, int] = {}
+    ) -> List[Node]:
+        """
+        将公式关联到包含对应引用的 chunk
+
+        关联逻辑：通过识别正文中的公式引用（Equation (1), 式(1), Eq. 1, (1) 等）
+        将公式内容关联到包含对应引用的文本块。
+
+        Args:
+            nodes: 分块后的节点列表
+            formula_refs: 公式编号 -> (formula_text, page_num, formula_id) 的映射
+            formula_pages: 公式编号 -> 页码 的映射
+
+        Returns:
+            添加了 formula_info 信息的节点列表
+        """
+        if not formula_refs:
+            return nodes
+
+        # 预编译公式引用正则表达式
+        # 支持: Equation (1), Eq. 1, 式(1), (1) 等
+        import re
+        formula_patterns = [
+            re.compile(r'(?:Equation|式)\s*\((\d+)\)', re.IGNORECASE),
+            re.compile(r'(?:Eq\.?)\s*(\d+)', re.IGNORECASE),
+            re.compile(r'\((\d+)\)(?!\s*[,\.])', re.IGNORECASE),  # 孤立的 (1) 引用
+        ]
+
+        # 关联公式到 chunk
+        associated_count = 0
+        for node in nodes:
+            node.metadata = dict(node.metadata)  # 复制避免修改原数据
+
+            found_formulas = []  # 可能一个 chunk 引用多个公式
+
+            for pattern in formula_patterns:
+                for match in pattern.finditer(node.text):
+                    formula_num = match.group(1)
+                    if formula_num in formula_refs:
+                        formula_text, page_num, formula_id = formula_refs[formula_num]
+                        # 去重
+                        if not any(f[2] == formula_id for f in found_formulas):
+                            found_formulas.append((formula_text, page_num, formula_id))
+                            associated_count += 1
+
+            if found_formulas:
+                # 只关联第一个公式（通常是最相关的）
+                first_formula = found_formulas[0]
+                node.metadata["formula_text"] = first_formula[0]
+                node.metadata["formula_page"] = first_formula[1]
+                node.metadata["formula_id"] = first_formula[2]
+                # 如果有多个公式，也保存列表
+                if len(found_formulas) > 1:
+                    node.metadata["all_formulas"] = [
+                        {"text": f[0], "page": f[1], "id": f[2]} for f in found_formulas
+                    ]
+
+        logger.info(f"🔗 通过公式引用关联 {associated_count}/{len(nodes)} 个文本块到公式")
+        return nodes
 
     def _extract_page_number_from_text(self, text: str) -> int:
         """从文本中提取页码"""

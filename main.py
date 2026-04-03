@@ -1852,7 +1852,7 @@ class PaperRAGPlugin(Star):
             yield event.plain_result(f"❌ Directory does not exist: {papers_dir}")
             return
 
-        yield event.plain_result("🔄 Step 1/4: Clearing knowledge base...")
+        yield event.plain_result("🔄 Step 1/5: Clearing knowledge base...")
 
         try:
             # Clear database
@@ -1860,35 +1860,33 @@ class PaperRAGPlugin(Star):
             if result.get("status") != "success":
                 yield event.plain_result(f"❌ Failed to clear: {result.get('message', 'Unknown error')}")
                 return
-            yield event.plain_result("✅ Step 1/4: Knowledge base cleared")
+            yield event.plain_result("✅ Step 1/5: Knowledge base cleared")
 
         except Exception as e:
             logger.error(f"Failed to clear document library: {e}")
             yield event.plain_result(f"❌ Failed to clear: {e}")
             return
 
-        # Delete figures folder
-        yield event.plain_result("🔄 Step 2/4: Clearing figures...")
-        figures_dir = self.config.get("figures_dir", "")
-        if not figures_dir:
-            # Default figures directory
-            figures_dir = Path(__file__).parent / "data" / "figures"
-        else:
-            figures_dir = Path(figures_dir)
+        # Delete figures and tables folders
+        yield event.plain_result("🔄 Step 2/5: Clearing figures...")
+        plugin_dir = Path(__file__).parent
+        figures_dir = plugin_dir / "data" / "figures"
+        tables_dir = plugin_dir / "data" / "tables"
 
-        if figures_dir.exists() and figures_dir.is_dir():
-            try:
-                import shutil
-                shutil.rmtree(figures_dir)
-                logger.info(f"✅ Deleted figures folder: {figures_dir}")
-                yield event.plain_result(f"✅ Step 2/4: Figures folder cleared")
-            except Exception as e:
-                logger.warning(f"Failed to delete figures folder: {e}")
-                yield event.plain_result(f"⚠️ Failed to delete figures: {e}")
-        else:
-            yield event.plain_result("✅ Step 2/4: No figures folder found, skipping")
+        for target_dir, name in [(figures_dir, "figures"), (tables_dir, "tables")]:
+            if target_dir.exists() and target_dir.is_dir():
+                try:
+                    import shutil
+                    shutil.rmtree(target_dir)
+                    logger.info(f"✅ Deleted {name} folder: {target_dir}")
+                    yield event.plain_result(f"✅ Step 2/5: {name.capitalize()} folder cleared")
+                except Exception as e:
+                    logger.warning(f"Failed to delete {name} folder: {e}")
+                    yield event.plain_result(f"⚠️ Failed to delete {name}: {e}")
+            else:
+                yield event.plain_result(f"✅ Step 2/5: No {name} folder found, skipping")
 
-        yield event.plain_result("🔄 Step 3/4: Scanning documents...")
+        yield event.plain_result("🔄 Step 3/5: Scanning documents...")
 
         # Scan documents
         doc_files = self._scan_documents(papers_dir)
@@ -1897,7 +1895,7 @@ class PaperRAGPlugin(Star):
             yield event.plain_result("📭 No supported documents found")
             return
 
-        yield event.plain_result(f"📄 Step 3/4: Found {len(doc_files)} documents")
+        yield event.plain_result(f"📄 Step 3/5: Found {len(doc_files)} documents")
 
         # Re-add documents
         import time
@@ -1907,7 +1905,7 @@ class PaperRAGPlugin(Star):
         failed = 0
         total_chunks = 0
 
-        yield event.plain_result("🔄 Step 4/4: Rebuilding embeddings... (this may take a while)")
+        yield event.plain_result("🔄 Step 4/5: Rebuilding embeddings... (this may take a while)")
 
         for idx, doc_file in enumerate(doc_files, 1):
             try:
