@@ -1,7 +1,7 @@
 name: "paper_rag"
 author: "YourName"
 description: "本地论文库RAG检索插件，支持基于Ollama/Gemini Embedding + Milvus Lite的论文检索和问答，支持多模态（图片/表格/公式）提取和VLM问答"
-version: "1.9.1"
+version: "1.9.2"
 repository: "https://github.com/HUSTcyf/astrbot_plugin_paperrag.git"
 tags:
   - research

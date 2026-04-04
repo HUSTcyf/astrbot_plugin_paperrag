@@ -2153,6 +2153,94 @@ class PaperRAGPlugin(Star):
         # Clear cache
         self._response_cache.clear()
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @paper_commands.command("rebuildf")
+    async def cmd_rebuild_file(self, event: AstrMessageEvent, file_name: str = ''):
+        """Rebuild a single paper in knowledge base (Admin)
+
+        Args:
+            file_name: File name to rebuild (partial match supported)
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if not file_name:
+            yield event.plain_result("❌ Please provide file name\nUsage: /paper rebuildf <filename>\nExample: /paper rebuildf 2508.09977v2（survey）.pdf")
+            return
+
+        engine = self._get_engine()
+        if not engine:
+            yield event.plain_result("❌ RAG engine is not ready")
+            return
+
+        # Find the paper file
+        papers_dir = self.config.get("papers_dir", "./papers")
+        paper_path = None
+
+        # 安全验证：确保 papers_dir 是绝对路径且存在
+        papers_dir_resolved = Path(papers_dir).resolve()
+
+        for ext in ['', '.pdf', '.PDF', '.docx', '.txt', '.md']:
+            candidate = os.path.join(papers_dir, file_name + ext) if ext else os.path.join(papers_dir, file_name)
+            candidate_resolved = Path(candidate).resolve()
+
+            # 安全检查：确保路径在 papers_dir 内（防止路径遍历）
+            if not str(candidate_resolved).startswith(str(papers_dir_resolved)):
+                continue
+
+            if os.path.exists(candidate) and os.path.isfile(candidate):
+                paper_path = candidate
+                break
+
+        # Try partial match in papers_dir
+        if not paper_path:
+            for p in Path(papers_dir).glob("*"):
+                if file_name.lower() in p.name.lower():
+                    p_resolved = p.resolve()
+                    # 安全检查
+                    if not str(p_resolved).startswith(str(papers_dir_resolved)):
+                        continue
+                    if p.is_file():
+                        paper_path = str(p)
+                        break
+
+        if not paper_path:
+            yield event.plain_result(f"❌ File not found: {file_name}")
+            return
+
+        # 使用找到的实际文件名（避免用户输入部分名称导致误删其他文件）
+        actual_file_name = os.path.basename(paper_path)
+
+        yield event.plain_result(f"🔄 Rebuilding: {actual_file_name}")
+
+        try:
+            # Step 1: Delete existing data
+            yield event.plain_result("🔍 Step 1/2: Deleting existing data...")
+            delete_result = await engine.delete_paper(actual_file_name)
+            if delete_result.get("status") != "success":
+                logger.warning(f"⚠️ 删除旧数据失败: {delete_result.get('message', 'Unknown error')}")
+
+            # Step 2: Re-add the paper
+            yield event.plain_result("🔨 Step 2/2: Re-parsing and indexing...")
+            add_result = await engine.add_paper(paper_path)
+
+            if add_result.get("status") == "success":
+                chunks_added = add_result.get("chunks_added", 0)
+                yield event.plain_result(
+                    f"✅ Rebuild complete!\n"
+                    f"   📄 File: {os.path.basename(paper_path)}\n"
+                    f"   📊 Chunks: {chunks_added}"
+                )
+            else:
+                yield event.plain_result(f"❌ Rebuild failed: {add_result.get('message', 'Unknown error')}")
+
+        except Exception as e:
+            logger.error(f"Failed to rebuild paper: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            yield event.plain_result(f"❌ Failed to rebuild: {e}")
+
     @paper_commands.command("graph_build")
     async def cmd_graph_build(self, event: AstrMessageEvent, confirm: str = ''):
         """Build knowledge graph from indexed documents

@@ -2,6 +2,52 @@
 
 所有值得注意的插件变更都会记录在这个文件中。
 
+## [1.9.2] - 2026-04-04
+
+### Author-Year 引用格式增强
+
+**文件**: `reference_processor.py`
+
+**概述**: 增强作者+年份引用格式的匹配能力，支持更多变体格式。
+
+**新增功能**:
+- `_extract_first_author_surname()` - 智能提取第一作者姓氏
+  - 支持 "S. Karamcheti" 缩写格式
+  - 支持 "et al." 前缀的正确处理
+  - 支持 "and" 分隔的多作者格式
+  - 排除常见后缀词 (Jr, Sr, MD, PhD, Dr)
+
+- `_parse_single_author_year()` - 改进的正则解析
+  - 支持方括号格式: `[Barron et al. 2022; Duckworth et al. 2023]`
+  - 支持括号格式: `(Liu et al., 2023b; Alayrac et al., 2022)`
+  - 支持年份后缀: 2023a, 2023b
+
+- `_match_author_in_map()` - 增强匹配逻辑
+  - 添加 fallback 从 author 字符串提取姓氏
+  - 解决 "S. Karamcheti" 无法直接匹配的问题
+
+- `BRACKET_CITATION_PATTERN` - 新增方括号引用正则
+
+**修复问题**:
+- 移除未使用的 `base_position` 参数 (Code Review Issue #1)
+
+**测试结果**:
+- 成功匹配格式: `[Barron et al. 2022; Duckworth et al. 2023; Müller et al. 2022]`
+- 成功匹配格式: `(Liu et al., 2023b; Alayrac et al., 2022)`
+- 成功匹配格式: `(S. Karamcheti et al. 2024)`
+
+### 论文引用格式调查
+
+**文件**: `docs/CITATION_FORMATS.md` (新增)
+
+**概述**: 调查90篇论文的引用格式分布
+
+**调查结果**:
+- 20篇 (22%) 使用作者+年份格式
+- 70篇 (78%) 使用数字引用格式
+
+---
+
 ## [1.9.1] - 2026-04-04
 
 ### Docling PDF 多模态提取（默认方案）

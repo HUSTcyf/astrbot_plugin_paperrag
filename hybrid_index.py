@@ -181,15 +181,22 @@ class HybridIndexManager:
             if isinstance(metadata, dict):
                 file_name = metadata.get("file_name", "unknown")
                 added_time = metadata.get("added_time", "")
+                github_url = metadata.get("github_url")
 
                 if file_name in self._doc_stats:
                     self._doc_stats[file_name]["chunk_count"] += 1
+                    # 如果新节点有 github_url 但 doc_stats 没有，则更新
+                    if github_url and not self._doc_stats[file_name].get("github_url"):
+                        self._doc_stats[file_name]["github_url"] = github_url
                 else:
-                    self._doc_stats[file_name] = {
+                    doc_stat = {
                         "file_name": file_name,
                         "chunk_count": 1,
                         "added_time": added_time
                     }
+                    if github_url:
+                        doc_stat["github_url"] = github_url
+                    self._doc_stats[file_name] = doc_stat
 
         self._save_doc_stats()
 
@@ -839,15 +846,13 @@ class HybridIndexManager:
 
                     if chunks_with_refs > 0 or chunks_without_field > 0:
                         logger.debug(f"📝 {paper_name}: {chunks_with_refs}/{len(all_results)} chunks有引用, {chunks_without_field} chunks无字段, 共 {refs_found_count} 条")
-                    elif chunks_with_refs == 0 and chunks_without_field == 0:
-                        # 对问题论文详细记录
-                        logger.info(f"📝 {paper_name}: {len(all_results)} chunks, 有引用chunks: {chunks_with_refs}, 无字段: {chunks_without_field}")
 
                     if not has_any_ref:
                         zero_ref_papers.append({
                             "file_name": paper_name,
                             "chunk_count": len(all_results)
                         })
+                        logger.info(f"📝 {paper_name}: {len(all_results)} chunks, 有引用: {chunks_with_refs}, 无字段: {chunks_without_field}")
 
                     checked_count += 1
 
@@ -1008,7 +1013,9 @@ class HybridIndexManager:
 
             # 构建查询表达式：查找 metadata["file_name"] 中匹配的文件名
             # Milvus JSON 字段使用 metadata["field_name"] 语法访问
-            expr = f'metadata["file_name"] like "%{file_name}%"'
+            # 转义特殊字符防止表达式注入
+            file_name_escaped = file_name.replace('"', '\\"').replace('%', '\\%')
+            expr = f'metadata["file_name"] like "%{file_name_escaped}%"'
 
             # 提取所有匹配的实体 ID（分批处理，避免超过限制）
             all_ids_to_delete = []

@@ -264,7 +264,16 @@ class HybridPDFParser:
             # 增强文本会跳过表格等内容，可能导致参考文献部分不完整
             raw_text = documents[0].metadata.get("raw_text", documents[0].text)
             logger.info(f"📝 原始文本总长度: {len(raw_text)} 字符, {len(raw_text.split(chr(10)))} 行")
-            # 调试：查找 References 在原始文本中的位置
+
+            # 提取 GitHub 链接作为元数据
+            import re
+            github_pattern = re.compile(r'https?://github\.com/[a-zA-Z0-9_.\-]+/[a-zA-Z0-9_.\-]+')
+            github_links = github_pattern.findall(raw_text)
+            if github_links:
+                # 取第一个（最早出现）作为论文对应的 GitHub 仓库
+                documents[0].metadata['github_url'] = github_links[0]
+                logger.info(f"📝 提取到 GitHub 链接: {github_links[0]}")
+
             lines = raw_text.split('\n')
             for doc in documents:
                 nodes = self._semantic_chunk(doc.text, doc.metadata, chunk_index)

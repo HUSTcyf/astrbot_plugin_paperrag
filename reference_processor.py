@@ -73,22 +73,32 @@ def _is_reference_section_title(line_lower: str) -> bool:
 
     避免误匹配如 "Reference Point Feature", "Reference Frame" 等论文章节
     """
+    # 去掉首尾空格
+    line_lower = line_lower.strip()
+
+    # 处理章节编号前缀：如 "5. REFERENCES" -> "REFERENCES"
+    # 匹配模式: 数字 + 标点 + 空格 开头
+    line_clean = re.sub(r'^\d+[\.\)]\s+', '', line_lower)
+
     # 精确匹配（去掉首尾空格后完全相等）
-    if line_lower in [kw.lower() for kw in REFERENCE_SECTION_KEYWORDS]:
+    if line_clean in [kw.lower() for kw in REFERENCE_SECTION_KEYWORDS]:
         return True
 
     # 附录格式匹配: "Appendix A. References" 或 "References S1"
     for kw in APPENDIX_REFERENCE_KEYWORDS:
-        if line_lower == kw.lower() or line_lower.startswith(kw.lower() + ' '):
+        if line_clean == kw.lower() or line_clean.startswith(kw.lower() + ' '):
             return True
 
-    # 通用格式匹配: 参考文献 后面只接受结束符、空格、或换行
-    # 例如 "References." 结尾是可以接受的
+    # 通用格式匹配: 参考文献 后面只接受特定标点结尾
+    # 例如 "References." 或 "References:" 或 "References\n" 是可以接受的
+    # 但 "Reference Point Feature" 不应该匹配
     for kw in ['references', 'bibliography']:
-        if line_lower.startswith(kw.lower()) and len(line_lower) > len(kw):
-            suffix = line_lower[len(kw):]
-            # 后缀只能是: 空格、句号、换行、或只有空格
-            if suffix and not suffix[0].isalnum():
+        if line_clean.startswith(kw.lower()) and len(line_clean) > len(kw):
+            suffix = line_clean[len(kw):]
+            # 后缀只能是: 句号、冒号、或空（行尾）
+            if suffix and suffix[0] in '.:':
+                return True
+            if not suffix:  # 行尾直接结束
                 return True
 
     return False
@@ -96,8 +106,7 @@ def _is_reference_section_title(line_lower: str) -> bool:
 
 def _find_ref_section_end(
     lines_text: List[str],
-    ref_start: int,
-    has_line_numbers: bool = False
+    ref_start: int
 ) -> int:
     """
     从 ref_start 开始，找到参考文献部分的结束位置
@@ -105,42 +114,20 @@ def _find_ref_section_end(
     Args:
         lines_text: 文本行列表
         ref_start: 参考文献开始行索引
-        has_line_numbers: 是否需要清洗行号
 
     Returns:
         参考文献结束位置（不包含）
     """
-    def clean_line(line: str) -> str:
-        if has_line_numbers:
-            cleaned = re.sub(r'^\[[0-9]+\]\s*', '', line)
-            return cleaned
-        return line
-
     ref_end = len(lines_text)
 
     for i, line in enumerate(lines_text[ref_start:], start=ref_start):
-        stripped = clean_line(line).strip()
-
-        # 遇到 Markdown 表格分隔行 | --- | --- | 直接截断
-        if stripped.startswith('|') and stripped.count('|') >= 3:
-            ref_end = i
-            break
-
-        # 遇到数学公式行（如 $...$ 或纯公式行）直接截断
-        if stripped.startswith('$') or stripped.endswith('$'):
-            ref_end = i
-            break
+        stripped = line.strip()
 
         # 遇到附录/补充材料/Acknowledgment时截断
-        if re.search(r'\b(Acknowledgment|Appendix|Supplementary Material)\b', stripped, re.IGNORECASE):
+        # 匹配以这些关键词开头的行（更灵活，支持变体）
+        if re.match(r'^(acknowledgment|appendix|supplementary)', stripped, re.IGNORECASE):
             ref_end = i
             break
-
-        # 检查是否有新的参考文献编号（清洗后检查）
-        has_ref_number = bool(re.match(r'^\[[0-9]+\]', stripped)) or bool(re.match(r'^[0-9]+\.\s+[A-Z]', stripped))
-
-        if has_ref_number:
-            ref_end = i + 1
 
     return ref_end
 
@@ -198,7 +185,7 @@ def _find_all_reference_sections(text: str) -> Dict[str, str]:
             ref_end = ref_titles[idx + 1][0]
         else:
             # 最后一个 section，扫描到下一个可能的 section 标题或文本末尾
-            ref_end = _find_ref_section_end(lines_text, ref_start, has_line_numbers)
+            ref_end = _find_ref_section_end(lines_text, ref_start)
 
             # 如果结束位置太靠后，尝试查找下一个 section
             if ref_end >= len(lines_text) - 5:
@@ -288,7 +275,8 @@ def _find_reference_section(text: str) -> Optional[str]:
             break
 
         # 遇到附录/补充材料/Acknowledgment时截断
-        if re.search(r'\b(Acknowledgment|Appendix|Supplementary Material)\b', stripped, re.IGNORECASE):
+        # 匹配以这些关键词开头的行（更灵活，支持变体）
+        if re.match(r'^(acknowledgment|appendix|supplementary)', stripped, re.IGNORECASE):
             ref_end = i
             break
 
@@ -335,6 +323,9 @@ class CitationLinker:
 
     # 匹配括号内的多引用: (Smith et al. 2021; Chen et al. 2024; Zhang, Liu, and Han 2024)
     MULTI_CITATION_PATTERN = re.compile(r'\(([^)]+)\)')
+
+    # 匹配方括号内的多引用: [Barron et al. 2022; Duckworth et al. 2023]
+    BRACKET_CITATION_PATTERN = re.compile(r'\[([^\]]+)\]')
 
     def find_citations_in_text(self, text: str) -> List[CitationInText]:
         """
@@ -394,6 +385,69 @@ class CitationLinker:
 
         return ref_ids
 
+    def _extract_first_author_surname(self, authors: str) -> Optional[str]:
+        """
+        从作者字符串提取第一作者姓氏
+
+        Args:
+            authors: 作者字符串，如 "Steven J. Gortler, et al." 或 "S. Karamcheti, et al."
+
+        Returns:
+            姓氏或 None
+        """
+        if not authors:
+            return None
+
+        authors = authors.strip()
+
+        # 处理 "et al." 情况 - 取 "et al." 之前的词
+        # 使用正则匹配 " et al." 模式，避免匹配到名字中的 "et"（如 Karamcheti）
+        et_al_pattern = re.compile(r'\s+et\s+al', re.IGNORECASE)
+        match = et_al_pattern.search(authors)
+        if match:
+            before_et = authors[:match.start()].strip()
+            before_et = before_et.rstrip(',').rstrip()
+            parts = before_et.split()
+            if parts:
+                surname = parts[-1].rstrip('.,')
+                if surname.lower() not in ['jr', 'sr', 'md', 'phd', 'dr']:
+                    return surname
+                if len(parts) > 1:
+                    surname2 = parts[-2].rstrip('.,')
+                    if surname2.lower() not in ['jr', 'sr', 'md', 'phd', 'dr']:
+                        return surname2
+
+        # 处理 "and" 分隔 - 取第一个作者
+        if ' and ' in authors:
+            first_author = authors.split(' and ')[0].strip()
+        elif '&' in authors:
+            first_author = authors.split('&')[0].strip()
+        else:
+            first_author = authors
+
+        # 处理逗号分隔 - 取第一部分
+        if ',' in first_author:
+            first_author = first_author.split(',')[0].strip()
+
+        # 处理缩写格式: "S. Karamcheti" 或 "S Karamcheti"
+        parts = first_author.split()
+        if len(parts) >= 2:
+            first_part = parts[0]
+            # 检查第一部分是否是缩写格式: "S." 或 "S"
+            if len(first_part) <= 2 and first_part[0].isupper():
+                second_part = parts[1].rstrip('.,')
+                if second_part.lower() not in ['jr', 'sr', 'md', 'phd', 'dr']:
+                    return second_part
+
+        # 否则取最后一个词作为姓氏
+        if parts:
+            surname = parts[-1].rstrip('.,')
+            if surname.lower() in ['jr', 'sr', 'md', 'phd', 'dr']:
+                surname = parts[-2].rstrip('.,') if len(parts) > 1 else surname
+            return surname
+
+        return None
+
     def _build_author_year_map(self, references: List[Reference]) -> Dict[str, str]:
         """
         从参考文献构建 author-year -> ref_id 映射
@@ -409,19 +463,26 @@ class CitationLinker:
             authors = ref.ref_authors.strip()
             year = ref.ref_year
             if authors and year:
-                # 提取第一作者（处理 "Smith, A. & Jones, B." 格式）
-                first_author = re.split(r'\s*&\s*|,', authors)[0].strip()
-                # 移除末尾的点
-                first_author = first_author.rstrip('.')
-                key = f"{first_author}{year}"
-                author_year_map[key.lower()] = ref.ref_id
-                # 也存储 "Smith et al.YEAR" 格式以支持 "Smith et al." 变体
-                if 'et al' not in first_author.lower():
-                    key_et_al = f"{first_author} et al.{year}"
-                    author_year_map[key_et_al.lower()] = ref.ref_id
-                    # AAAI格式: "Smith et al. 2021" (无逗号)
-                    key_aaai = f"{first_author.lower()} et al.{year}"
-                    author_year_map[key_aaai] = ref.ref_id
+                # 提取第一作者姓氏
+                surname = self._extract_first_author_surname(authors)
+                if not surname:
+                    continue
+
+                year_str = str(year)
+                surname_lower = surname.lower()
+
+                # 基础格式: gortler1996
+                key = f"{surname_lower}{year_str}"
+                author_year_map[key] = ref.ref_id
+
+                # 带 et al. 格式: gortler et al.1996
+                key_et_al = f"{surname_lower} et al.{year_str}"
+                author_year_map[key_et_al] = ref.ref_id
+
+                # 处理年份后缀: 2023a, 2023b
+                for suffix in ['a', 'b']:
+                    author_year_map[f"{surname_lower}{year_str}{suffix}"] = ref.ref_id
+                    author_year_map[f"{surname_lower} et al.{year_str}{suffix}"] = ref.ref_id
         return author_year_map
 
     def _match_author_in_map(self, author: str, year: str, author_year_map: Dict[str, str]) -> Optional[str]:
@@ -436,20 +497,32 @@ class CitationLinker:
         Returns:
             ref_id 或 None
         """
-        author_lower = author.lower()
         year_str = str(year)
 
-        # 尝试多种作者名格式
+        # 首先尝试直接匹配（author 已经是姓氏）
+        author_lower = author.lower().strip()
         variants = [
-            author_lower,  # 直接匹配
-            f"{author_lower} et al.",  # 带 et al.
-            author_lower.split()[0] if ' ' in author_lower else author_lower,  # 仅姓氏
+            f"{author_lower}{year_str}",  # gortler1996
+            f"{author_lower} et al.{year_str}",  # gortler et al.1996
+            f"{author_lower}et al.{year_str}",  # gortleret al.1996 (无空格)
         ]
 
-        for variant in variants:
-            key = f"{variant}{year_str}"
+        for key in variants:
             if key in author_year_map:
                 return author_year_map[key]
+
+        # 如果直接匹配失败，尝试从 author 中提取姓氏（如 "S. Karamcheti" -> "Karamcheti"）
+        surname = self._extract_first_author_surname(author)
+        if surname and surname.lower() != author_lower:
+            surname_lower = surname.lower()
+            variants = [
+                f"{surname_lower}{year_str}",
+                f"{surname_lower} et al.{year_str}",
+                f"{surname_lower}et al.{year_str}",
+            ]
+            for key in variants:
+                if key in author_year_map:
+                    return author_year_map[key]
 
         return None
 
@@ -467,6 +540,44 @@ class CitationLinker:
         citations = []
         seen_positions = set()  # 避免重复
 
+        # 首先处理方括号内的多引用: [Barron et al. 2022; Duckworth et al. 2023]
+        for bracket_match in self.BRACKET_CITATION_PATTERN.finditer(text):
+            bracket_content = bracket_match.group(1).strip()
+
+            # 检查是否包含分号（多引用）
+            if ';' in bracket_content:
+                # 分割多个引用
+                parts = bracket_content.split(';')
+                bracket_start = bracket_match.start()
+
+                for part in parts:
+                    part = part.strip()
+                    if not part:
+                        continue
+
+                    # 尝试解析单个 author-year 引用
+                    ref_ids = self._parse_single_author_year(part, author_year_map)
+                    if ref_ids:
+                        for ref_id in ref_ids:
+                            citations.append(CitationInText(
+                                ref_ids=[ref_id],
+                                position=bracket_start,
+                                raw_text=bracket_match.group(),
+                                context=text[max(0, bracket_start - 50):min(len(text), bracket_start + len(bracket_match.group()) + 50)]
+                            ))
+            else:
+                # 单个引用，使用原有逻辑
+                ref_ids = self._parse_single_author_year(bracket_content, author_year_map)
+                if ref_ids:
+                    for ref_id in ref_ids:
+                        citations.append(CitationInText(
+                            ref_ids=[ref_id],
+                            position=bracket_match.start(),
+                            raw_text=bracket_match.group(),
+                            context=text[max(0, bracket_match.start() - 50):min(len(text), bracket_match.end() + 50)]
+                        ))
+
+        # 处理括号内的 author-year 引用（原有逻辑）
         for match in self.AUTHOR_YEAR_PATTERN.finditer(text):
             # 获取作者和年份
             if match.group(1) and match.group(2):
@@ -505,6 +616,64 @@ class CitationLinker:
                 ))
 
         return citations
+
+    def _parse_single_author_year(self, text: str, author_year_map: Dict[str, str]) -> List[str]:
+        """
+        解析单个 author-year 引用文本
+
+        Args:
+            text: 引用文本，如 "Barron et al. 2022"
+            author_year_map: author-year -> ref_id 的映射
+
+        Returns:
+            ref_id 列表
+        """
+        # 改进的正则：支持缩写格式如 "S. Karamcheti et al. 2024"
+        # 使用非贪婪匹配避免吃掉年份前的空格
+        pattern = re.compile(
+            r'([A-Z]\.\s*[A-Z][a-z]+'  # 缩写+全名如 "S. Karamcheti"
+            r'|[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*'  # 多单词作者名
+            r')(?:\s+(?:et\s+al\.?|and\s+[A-Z][a-z]+))?'  # 可选的 et al. 或 and
+            r'[\s,]*?'  # 可选逗号/空格（非贪婪）
+            r'(?:[\(\[]?\s*)?'  # 可选的括号
+            r'(\d{4}[a-z]?)'  # 年份，可选 a/b 后缀
+        )
+        match = pattern.search(text.strip())
+        if match:
+            author = match.group(1).strip()
+            year = match.group(2)
+            ref_id = self._match_author_in_map(author, year, author_year_map)
+            if ref_id:
+                return [ref_id]
+
+        # Fallback: 尝试通用格式 "Author[ et al.] YEAR"
+        # 支持: "Karamcheti 2024", "Karamcheti et al. 2024", "Karamcheti et al., 2024"
+        parts = text.strip().split()
+        for i in range(len(parts)):
+            # 跳过 "et" 和 "al." 词
+            if parts[i].lower() in ['et', 'al.', 'al']:
+                continue
+            # 尝试从第 i 个词开始匹配 Author YEAR
+            for j in range(i + 1, len(parts) + 1):
+                author_part = ' '.join(parts[i:j])
+                year_part = None
+
+                # 查找年份（四位数）
+                for k in range(j, len(parts)):
+                    if re.match(r'^\d{4}[a-z]?$', parts[k]):
+                        year_part = parts[k]
+                        break
+                    # 跳过 "et" 和 "al." 词
+                    if parts[k].lower() in ['et', 'al.', 'al', ',']:
+                        continue
+
+                if year_part:
+                    # 尝试匹配
+                    ref_id = self._match_author_in_map(author_part, year_part, author_year_map)
+                    if ref_id:
+                        return [ref_id]
+
+        return []
 
     def link_citations_to_references(
         self,
@@ -892,14 +1061,6 @@ class LLMReferenceParser:
             分割后的文本列表
         """
         import re
-
-        # 匹配参考文献序号的模式: [数字], 数字., [数字数字...], 数字数字... .
-        # 例如: [1], [12], 1., 2., 123., [123]
-        ref_pattern = re.compile(r'(?=\[\d+\]|\[\d+\s)|(?<=^\d+\.)|(?<=\[\d+\])\s*(?=[A-Z])|(?<=^\[\d+\])\s*(?=[A-Z])')
-
-        # 找到所有可能的分割点
-        # 序号模式: [数字] 或 数字.
-        number_pattern = re.compile(r'(?=\[?\d+\]?\s*[\.\:]|\[\d+\]\s*(?=[A-Z]))')
 
         lines = ref_section.split('\n')
         batches = []
