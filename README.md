@@ -96,7 +96,7 @@ cp ~/Downloads/*.pdf papers/
 | `/paper delete <文件名>` | 删除指定论文（需管理员） | `/paper delete attention.pdf` |
 | `/paper rebuild [目录] confirm` | 清空并重建知识库 | `/paper rebuild ./papers confirm` |
 | `/paper clear confirm` | 清空知识库（需管理员） | `/paper clear confirm` |
-| `/paper refstats [top_k]` | 查看参考文献引用统计（需管理员） | `/paper refstats 20` |
+| `/paper refstats [top_k] [dedup=0]` | 查看参考文献引用统计（需管理员） | `/paper refstats 20 dedup=1` |
 | `/paper refstats -1` | 列出无参考文献的论文 | `/paper refstats -1` |
 | `/paper reparse_zero_ref confirm` | 批量重新解析无参考文献的论文（需管理员） | `/paper reparse_zero_ref confirm` |
 | `/paper arxiv_add <关键词> [数量]` | 从arXiv搜索下载论文并添加（需管理员） | `/paper arxiv_add attention is all you need 3` |
@@ -227,7 +227,19 @@ Bot:    ✅ 已添加到数据库
 查看数据库中论文的引用频次统计：
 
 ```
-/paper refstats [top_k]
+/paper refstats [top_k] [dedup=0]
+```
+
+**参数说明**：
+- `top_k`: 返回前 N 条高频频引用（默认 20）
+- `dedup`: 去重模式
+  - `0`（默认）: 原始统计，每篇论文对同一参考文献的多次引用分别计数
+  - `1`: 去重模式，每篇论文对同一参考文献只计 1 次
+
+**示例**：
+```
+/paper refstats 20        # 原始统计
+/paper refstats 20 dedup=1  # 去重统计
 ```
 
 **示例输出**：
@@ -236,10 +248,10 @@ Bot:    ✅ 已添加到数据库
 
 📊 统计概览:
    • 涉及论文种类: 156
-   • 引用总条次: 892
+   • 引用总条次: 892（去重后: 234）
    • 处理文档块: 234
 
-🔝 **Top 20 高频引用论文**
+🔝 **Top 20 高频引用论文**（去重）
 
  1. [ 15次] **Attention Is All You Need**
     └─ Vaswani, A. et al. (2017)
@@ -616,7 +628,7 @@ Query
 **解决**：
 1. 确认PDF不是扫描版
 2. 安装依赖：`pip install -r requirements.txt`
-3. 运行测试：`python test_semantic_chunker.py paper.pdf`
+3. 运行测试：`python test/test_semantic_chunker.py paper.pdf`
 
 ### Q3: 搜索结果不准确
 
@@ -820,7 +832,17 @@ evaluation_output/
 - [x] 多跳推理增强
 - [x] 手动/自动图谱构建
 - [x] 新增命令：`/paper graph_build`、`/paper graph_stats`、`/paper graph_rebuild`、`/paper graph_clear`、`/paper graph_backup`、`/paper graph_restore`、`/paper graph_backup_list`、`/paper graph_link`
+- [x] Neo4j Browser 样式文件（`graph_style.grass`），支持节点颜色自定义
 
+**Neo4j Browser 样式文件使用**：
+
+在 Neo4j Browser 中加载 `graph_style.grass` 可以自定义图谱节点颜色：
+
+```
+:style graph_style.grass
+```
+
+支持的节点类型：Paper（蓝）、Reference（橙）、Author（红）、Concept（紫）、Institution（青）、Chunk（浅灰）、Figure（绿）、Table（深橙）、Section（深灰蓝）
 **技术方案**：基于 LlamaIndex PropertyGraphIndex 实现
 
 **版本**：v1.7.3
