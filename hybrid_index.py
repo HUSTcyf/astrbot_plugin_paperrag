@@ -672,9 +672,14 @@ class HybridIndexManager:
                 "error": str(e)
             }
 
-    async def get_all_references(self) -> Dict[str, Any]:
+    async def get_all_references(self, allow_duplicates: bool = True) -> Dict[str, Any]:
         """
         从数据库中提取所有参考文献，统计论文名称出现频次
+
+        Args:
+            allow_duplicates: 是否允许同一篇论文对同一参考文献重复统计。
+                              True = 原始行为，统计每条引用（默认）
+                              False = 每篇论文对每篇参考文献只算1次
 
         Returns:
             Dict containing:
@@ -695,39 +700,85 @@ class HybridIndexManager:
             title_counter: Dict[str, Dict[str, Any]] = {}
             total_refs = 0
 
-            for chunk in all_chunks:
-                metadata = chunk.get("metadata", {})
-                if not isinstance(metadata, dict):
-                    continue
-
-                references = metadata.get("cited_references", [])
-                if not references:
-                    continue
-
-                for ref in references:
-                    if not isinstance(ref, dict):
+            if allow_duplicates:
+                # 原始行为：统计每条引用（chunk 粒度）
+                for chunk in all_chunks:
+                    metadata = chunk.get("metadata", {})
+                    if not isinstance(metadata, dict):
                         continue
 
-                    # 提取论文标题
-                    title = ref.get("ref_title", "").strip()
-                    if not title or len(title) < 5:  # 跳过太短的标题
+                    references = metadata.get("cited_references", [])
+                    if not references:
                         continue
 
-                    # 标准化标题用于比较（转小写，去除多余空格）
-                    title_normalized = " ".join(title.lower().split())
+                    for ref in references:
+                        if not isinstance(ref, dict):
+                            continue
 
-                    if title_normalized in title_counter:
+                        title = ref.get("ref_title", "").strip()
+                        if not title or len(title) < 5:
+                            continue
+
+                        title_normalized = " ".join(title.lower().split())
+
+                        if title_normalized in title_counter:
+                            title_counter[title_normalized]["count"] += 1
+                            title_counter[title_normalized]["raw_title"] = title
+                        else:
+                            title_counter[title_normalized] = {
+                                "count": 1,
+                                "raw_title": title,
+                                "ref_authors": ref.get("ref_authors", ""),
+                                "ref_year": ref.get("ref_year"),
+                                "ref_doi": ref.get("ref_doi", "")
+                            }
+                        total_refs += 1
+            else:
+                # 去重模式：每篇来源论文对每篇参考文献只算1次
+                # 记录每个引用论文被哪些来源论文引用过
+                title_to_papers: Dict[str, set] = {}
+
+                for chunk in all_chunks:
+                    metadata = chunk.get("metadata", {})
+                    if not isinstance(metadata, dict):
+                        continue
+
+                    # 获取来源论文名称（用于去重）
+                    citing_paper = metadata.get("file_name", "") or metadata.get("paper_id", "")
+
+                    references = metadata.get("cited_references", [])
+                    if not references:
+                        continue
+
+                    for ref in references:
+                        if not isinstance(ref, dict):
+                            continue
+
+                        title = ref.get("ref_title", "").strip()
+                        if not title or len(title) < 5:
+                            continue
+
+                        title_normalized = " ".join(title.lower().split())
+
+                        # 初始化
+                        if title_normalized not in title_counter:
+                            title_counter[title_normalized] = {
+                                "count": 0,
+                                "raw_title": title,
+                                "ref_authors": ref.get("ref_authors", ""),
+                                "ref_year": ref.get("ref_year"),
+                                "ref_doi": ref.get("ref_doi", "")
+                            }
+                            title_to_papers[title_normalized] = set()
+
+                        # 去重逻辑
+                        if citing_paper and citing_paper in title_to_papers[title_normalized]:
+                            # 该来源论文已统计过这篇参考文献，跳过
+                            continue
+
                         title_counter[title_normalized]["count"] += 1
-                        title_counter[title_normalized]["raw_title"] = title  # 保留原始大小写
-                    else:
-                        title_counter[title_normalized] = {
-                            "count": 1,
-                            "raw_title": title,
-                            "ref_authors": ref.get("ref_authors", ""),
-                            "ref_year": ref.get("ref_year"),
-                            "ref_doi": ref.get("ref_doi", "")
-                        }
-                    total_refs += 1
+                        title_to_papers[title_normalized].add(citing_paper)
+                        total_refs += 1
 
             # 转换为列表并按频次排序
             refs_list = []

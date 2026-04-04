@@ -18,7 +18,7 @@ import argparse
 from pathlib import Path
 
 # 添加插件路径
-plugin_dir = Path(__file__).parent
+plugin_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(plugin_dir))
 
 # 抑制警告

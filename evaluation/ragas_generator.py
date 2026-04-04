@@ -93,7 +93,12 @@ class OpenAICompatibleLLM(BaseRagasLLM):
 
     # 全局并发限制信号量（类变量，所有实例共享）
     _semaphore: Optional[Any] = None
-    _max_concurrent: int = 4  # 全局最大并发数（默认4，最大8）  # 全局最大并发数
+    _max_concurrent: int = 4  # 全局最大并发数（默认4，最大8）
+
+    # RPM 限制：时间窗口内的请求时间戳列表（类变量，所有实例共享）
+    _rpm_timestamps: List[float] = []
+    _rpm_lock: Optional[Any] = None
+    _max_rpm: int = 96  # 默认 RPM 限制
 
     @classmethod
     def set_max_concurrent(cls, n: int):
@@ -102,6 +107,73 @@ class OpenAICompatibleLLM(BaseRagasLLM):
         if cls._semaphore is not None:
             cls._semaphore.release()
             cls._semaphore = None
+
+    @classmethod
+    def set_max_rpm(cls, rpm: int):
+        """设置 RPM 限制"""
+        import threading
+        cls._max_rpm = rpm
+        if cls._rpm_lock is None:
+            cls._rpm_lock = threading.Lock()
+
+    def _wait_for_rpm_slot(self):
+        """等待直到获取 RPM 槽位（同步版本）"""
+        import threading
+        import time
+
+        if OpenAICompatibleLLM._rpm_lock is None:
+            OpenAICompatibleLLM._rpm_lock = threading.Lock()
+
+        with OpenAICompatibleLLM._rpm_lock:
+            now = time.time()
+            window = 60.0  # 1分钟时间窗口
+
+            # 清理超过窗口的旧时间戳
+            OpenAICompatibleLLM._rpm_timestamps = [
+                ts for ts in OpenAICompatibleLLM._rpm_timestamps
+                if now - ts < window
+            ]
+
+            # 如果已达 RPM 限制，等待直到最旧的请求滑出窗口
+            if len(OpenAICompatibleLLM._rpm_timestamps) >= self._max_rpm:
+                oldest = OpenAICompatibleLLM._rpm_timestamps[0]
+                sleep_time = window - (now - oldest)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+            # 重新清理并添加当前时间戳
+            now = time.time()
+            OpenAICompatibleLLM._rpm_timestamps = [
+                ts for ts in OpenAICompatibleLLM._rpm_timestamps
+                if now - ts < window
+            ]
+            OpenAICompatibleLLM._rpm_timestamps.append(now)
+
+    async def _await_for_rpm_slot_async(self):
+        """等待直到获取 RPM 槽位（异步版本）"""
+        import asyncio
+
+        while True:
+            now = asyncio.get_event_loop().time()
+            window = 60.0
+
+            # 清理超过窗口的旧时间戳
+            OpenAICompatibleLLM._rpm_timestamps = [
+                ts for ts in OpenAICompatibleLLM._rpm_timestamps
+                if now - ts < window
+            ]
+
+            # 如果已达 RPM 限制，等待
+            if len(OpenAICompatibleLLM._rpm_timestamps) >= self._max_rpm:
+                oldest = OpenAICompatibleLLM._rpm_timestamps[0]
+                sleep_time = window - (now - oldest)
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
+                continue
+
+            # 添加当前时间戳
+            OpenAICompatibleLLM._rpm_timestamps.append(now)
+            break
 
     def __init__(
         self,
@@ -139,6 +211,9 @@ class OpenAICompatibleLLM(BaseRagasLLM):
         """同步调用 API（受全局 Semaphore 限制并发）"""
         import requests
         import threading
+
+        # RPM 限制
+        self._wait_for_rpm_slot()
 
         # 同步路径也必须限速：获取或创建信号量
         # 注意：同步路径无法直接使用 asyncio.Semaphore，改用 threading.Semaphore
@@ -220,6 +295,9 @@ class OpenAICompatibleLLM(BaseRagasLLM):
         """异步生成文本（实现 BaseRagasLLM 接口）"""
         import aiohttp
         import asyncio
+
+        # RPM 限制
+        await self._await_for_rpm_slot_async()
 
         # 获取或创建信号量
         if OpenAICompatibleLLM._semaphore is None:

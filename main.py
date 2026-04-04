@@ -831,7 +831,7 @@ class PaperRAGPlugin(Star):
         delete       - Delete a specific paper from knowledge base
         clear        - Clear knowledge base
         rebuild      - Clear and re-add all documents
-        refstats     - Show reference title frequency statistics (-1 for zero-ref papers)
+        refstats     - Show reference title frequency statistics (-1 for zero-ref papers, dedup=1 for deduplicated count)
         arxiv_add    - Search arxiv and download papers, then add to database (Admin)
         arxiv_refs   - Download highly-cited reference papers from arxiv (Admin)
         arxiv_sync   - Sync MCP downloaded papers to paperrag database (Admin)
@@ -1202,11 +1202,13 @@ class PaperRAGPlugin(Star):
             yield event.plain_result(f"❌ Failed to delete paper: {e}")
 
     @paper_commands.command("refstats")
-    async def cmd_refstats(self, event: AstrMessageEvent, top_k: int = 20):
+    async def cmd_refstats(self, event: AstrMessageEvent, top_k: int = 20, dedup: int = 0):
         """Show reference title frequency statistics
 
         Args:
             top_k: Number of top references to show (default: 20). Use -1 to list papers with zero references.
+            dedup: If 1, count each citation at most once per paper (removes in-paper duplicates).
+                   If 0 (default), count every citation occurrence.
         """
         if not self.enabled:
             yield event.plain_result("❌ Plugin is disabled")
@@ -1265,7 +1267,7 @@ class PaperRAGPlugin(Star):
             # 正常模式：显示高频引用论文统计
             yield event.plain_result("📊 正在统计参考文献...")
 
-            stats = await index_manager.get_all_references()
+            stats = await index_manager.get_all_references(allow_duplicates=(dedup == 0))
 
             if "error" in stats:
                 yield event.plain_result(f"❌ 获取统计失败: {stats['error']}")
@@ -1280,7 +1282,8 @@ class PaperRAGPlugin(Star):
                 return
 
             # 格式化输出
-            output = f"📚 **参考文献统计**\n\n"
+            dedup_note = "（去重）" if dedup == 1 else ""
+            output = f"📚 **参考文献统计** {dedup_note}\n\n"
             output += f"📊 统计概览:\n"
             output += f"   • 涉及论文种类: {len(references)}\n"
             output += f"   • 引用总条次: {total_refs}\n"

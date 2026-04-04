@@ -1,0 +1,176 @@
+# 🎨 Paperrag Knowledge Graph Style for Neo4j Browser
+#
+# 使用方法:
+#   1. 在 Neo4j Browser 执行 :style
+#   2. 点击 Load Style 或拖拽此文件到浏览器窗口
+#   3. 点击 Apply 应用样式
+#
+# 或者:
+#   :style graph_style.grass
+
+# ============================================================
+# 全局默认样式
+# ============================================================
+node {
+  diameter: 50px;
+  color: #95A5A6;
+  border-color: #7F8C8D;
+  border-width: 2px;
+  text-color: #2C3E50;
+  font-size: 12px;
+  caption: '{name}';
+}
+
+relationship {
+  color: #BDC3C7;
+  width: 1px;
+  text-color: #7F8C8D;
+  font-size: 10px;
+  caption: '{type}';
+}
+
+# ============================================================
+# Paper 节点 - 主论文节点
+# ============================================================
+node.Paper {
+  color: #3498DB;           /* 蓝色 - 主论文 */
+  border-color: #2980B9;
+  border-width: 3px;
+  diameter: 60px;
+  caption: '{title}';
+}
+
+# ============================================================
+# Reference 节点 - 参考文献节点
+# ============================================================
+node.Reference {
+  color: #F39C12;          /* 橙色 - 参考文献 */
+  border-color: #D68910;
+  border-width: 2px;
+  diameter: 45px;
+  caption: '{ref_title}';
+}
+
+# ============================================================
+# Author 节点 - 作者节点
+# ============================================================
+node.Author {
+  color: #E74C3C;          /* 红色 - 作者 */
+  border-color: #C0392B;
+  border-width: 2px;
+  diameter: 40px;
+  caption: '{name}';
+}
+
+# ============================================================
+# Concept 节点 - 概念/关键词节点
+# ============================================================
+node.Concept {
+  color: #9B59B6;          /* 紫色 - 概念 */
+  border-color: #8E44AD;
+  border-width: 2px;
+  diameter: 35px;
+  caption: '{name}';
+}
+
+# ============================================================
+# Institution 节点 - 机构节点
+# ============================================================
+node.Institution {
+  color: #1ABC9C;          /* 青色 - 机构 */
+  border-color: #16A085;
+  border-width: 2px;
+  diameter: 45px;
+  caption: '{name}';
+}
+
+# ============================================================
+# Chunk 节点 - 文本块节点
+# ============================================================
+node.Chunk {
+  color: #ECF0F1;          /* 浅灰 - 文本块 */
+  border-color: #BDC3C7;
+  border-width: 1px;
+  diameter: 30px;
+  font-size: 9px;
+  caption: '{chunk_id}';
+}
+
+# ============================================================
+# Figure 节点 - 图片节点
+# ============================================================
+node.Figure {
+  color: #2ECC71;          /* 绿色 - 图片 */
+  border-color: #27AE60;
+  border-width: 2px;
+  diameter: 40px;
+  caption: '{figure_id}';
+}
+
+# ============================================================
+# Table 节点 - 表格节点
+# ============================================================
+node.Table {
+  color: #E67E22;          /* 深橙 - 表格 */
+  border-color: #D35400;
+  border-width: 2px;
+  diameter: 40px;
+  caption: '{table_id}';
+}
+
+# ============================================================
+# Section 节点 - 章节节点
+# ============================================================
+node.Section {
+  color: #34495E;          /* 深灰蓝 - 章节 */
+  border-color: #2C3E50;
+  border-width: 2px;
+  diameter: 45px;
+  caption: '{name}';
+}
+
+# ============================================================
+# 关系类型样式
+# ============================================================
+
+/* 引用关系 */
+relationship.CITES {
+  color: #E74C3C;
+  width: 2px;
+  caption: 'CITES';
+}
+
+/* 作者-论文关系 */
+relationship.WROTE {
+  color: #3498DB;
+  width: 2px;
+  caption: 'WROTE';
+}
+
+/* 属于关系 */
+relationship.BELONGS_TO {
+  color: #95A5A6;
+  width: 1px;
+  caption: 'BELONGS_TO';
+}
+
+/* 包含关系 */
+relationship.CONTAINS {
+  color: #BDC3C7;
+  width: 1px;
+  caption: 'CONTAINS';
+}
+
+/* 相关概念关系 */
+relationship.HAS_CONCEPT {
+  color: #9B59B6;
+  width: 1.5px;
+  caption: 'HAS_CONCEPT';
+}
+
+/* 附属于关系 */
+relationship.AFFILIATED_WITH {
+  color: #1ABC9C;
+  width: 1.5px;
+  caption: 'AFFILIATED_WITH';
+}

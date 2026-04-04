@@ -2,6 +2,86 @@
 
 所有值得注意的插件变更都会记录在这个文件中。
 
+## [1.9.3] - 2026-04-04
+
+### `/paper refstats` 引用去重功能
+
+**文件**: `hybrid_index.py`, `main.py`
+
+**概述**: 为参考文献统计添加去重选项，每篇论文对同一参考文献的引用最多计1次。
+
+**变更**:
+- `get_all_references()` 新增 `allow_duplicates: bool = True` 参数
+  - `True` (默认): 原始行为，每个 chunk 独立计数
+  - `False`: 去重模式，同一论文对同一参考文献只计1次
+- `cmd_refstats()` 新增 `dedup: int = 0` 参数
+  - 使用方式: `/paper refstats 20 dedup=1` 启用去重
+  - 使用方式: `/paper refstats 20 dedup=0` 原始统计
+
+**注意**: AstrBot 命令处理器不支持 `bool` 类型参数，因此使用 `int` (0/1) 代替。
+
+---
+
+### 测试文件迁移至 `test/` 目录
+
+**文件**: `test/` 目录 (新建)
+
+**概述**: 将所有测试脚本迁移到 `test/` 文件夹，统一管理。
+
+**迁移的测试文件**:
+- `test_astrbot_env.py` - AstrBot 环境测试
+- `test_author_year_matching.py` - 作者年份匹配测试
+- `test_brightdata.py` - BrightData API 测试
+- `test_graph_build.py` - 图谱构建测试
+- `test_graph_interface.py` - 图谱接口测试
+- `test_hybrid.py` - 混合 RAG 测试
+- `test_semantic_chunker.py` - 语义分块测试
+- `test_torch_mps.py` - Torch MPS 测试
+
+**修复**: 所有测试文件的 `sys.path` 已修正为 `Path(__file__).parent.parent`，确保正确导入插件模块。
+
+---
+
+### Neo4j 知识图谱样式文件
+
+**文件**: `graph_style.grass` (新建)
+
+**概述**: 为 Neo4j Browser 创建 GRASS (Graph Style Sheet) 样式文件，支持知识图谱节点颜色自定义。
+
+**节点颜色定义**:
+| 节点类型 | 颜色 | 说明 |
+|---------|------|------|
+| Paper | #3498DB (蓝色) | 主论文节点 |
+| Reference | #F39C12 (橙色) | 参考文献节点 |
+| Author | #E74C3C (红色) | 作者节点 |
+| Concept | #9B59B6 (紫色) | 概念/关键词节点 |
+| Institution | #1ABC9C (青色) | 机构节点 |
+| Chunk | #ECF0F1 (浅灰) | 文本块节点 |
+| Figure | #2ECC71 (绿色) | 图片节点 |
+| Table | #E67E22 (深橙) | 表格节点 |
+| Section | #34495E (深灰蓝) | 章节节点 |
+
+**关系样式**: CITES, WROTE, BELONGS_TO, CONTAINS, HAS_CONCEPT, AFFILIATED_WITH
+
+**使用方法**: Neo4j Browser 中执行 `:style graph_style.grass` 或通过 Load Style 加载
+
+---
+
+### 多模态 JSON 解析失败日志说明
+
+**文件**: `graph_builder.py`
+
+**说明**: "多模态 JSON 解析失败" 不是程序 bug，是正常的错误恢复机制。
+
+**原因分析**:
+- LLM 响应时间较长 (约76秒) 时，JSON 可能不完整
+- `json.loads()` 首次解析失败后，代码会尝试截断恢复 (查找最后一个 `}` )
+- 截断恢复成功后，批量处理正常进行
+
+**相关日志**: `[Graph-LLM] 多模态 JSON 解析失败, 尝试截断处理...` 后出现 `[Graph-LLM] 截断恢复成功, 提取到 N 个实体` 属于正常行为。
+
+---
+
 ## [1.9.2] - 2026-04-04
 
 ### Author-Year 引用格式增强
