@@ -785,6 +785,54 @@ python run_evaluation_qasper.py --all
 | `--bert_score` | 使用BERTScore F1进行语义评估（更适合QASPER长文档自由形式答案） |
 | `--limit N` | 限制处理的问题数量（默认0不限制，用于快速测试） |
 
+### RAGAS 评测（基于本地 Milvus 数据库）
+
+RAGAS 评测直接从本地 Milvus 数据库加载已索引的论文，自动生成测试问答对并评估 RAG 系统性能。
+
+**注意**：Qasper 数据集评估和 RAGAS 评测是两种不同的评估方式：
+- **Qasper 数据集**：使用标准学术数据集，对比不同 RAG 系统性能
+- **RAGAS 评测**：基于本地已索引论文，评估当前系统的实际表现
+
+### RAGAS 快速开始
+
+```bash
+# 完整流程（提取文本 -> 生成测试集 -> 评估 -> 报告）
+python -m evaluation.run_evaluation_ragas --step all --test-size 100
+
+# 仅生成测试集（需要已有 chunks 文件）
+python -m evaluation.run_evaluation_ragas --step generate --test-size 100 --max-rpm 96
+
+# 使用已有 chunks 文件（避免重复从 Milvus 读取）
+python -m evaluation.run_evaluation_ragas --step all --use-existing-chunks --test-size 100
+```
+
+### RAGAS 命令行参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--step` | 执行步骤：`all`/`extract`/`generate`/`evaluate` | `all` |
+| `--test-size` | 生成测试问题数量 | 50 |
+| `--max-rpm` | RPM 限制（避免 API 限流） | 96 |
+| `--max-concurrent` | 最大并发数 | 5 |
+| `--embedding-mode` | Embedding 模式：`api`/`ollama` | `ollama` |
+| `--output-dir` | 输出目录 | `results` |
+| `--use-existing-chunks` | 使用已有 chunks 文件 | False |
+| `--existing-chunks-path` | 已有 chunks 文件路径 | `results/milvus_chunks.json` |
+
+**环境变量**：
+- `EVAL_LLM_API_KEY`：评估用 LLM API Key
+
+**注意**：`freeapi_key` 和 `freeapi_url` 需在插件配置中设置（`/Users/chenyifeng/AstrBot/data/config/astrbot_plugin_paperrag_config.json`）
+| 参数 | 说明 |
+|------|------|
+| `--generate` | 仅生成 predictions（支持断点续传） |
+| `--evaluate` | 仅运行评估 |
+| `--all` | 生成 + 评估 |
+| `--no_resume` | 禁用断点续传，重新生成所有预测 |
+| `--llm_only` | 纯LLM基线模式：不进行检索，直接使用LLM回答（用于基线对比） |
+| `--bert_score` | 使用BERTScore F1进行语义评估（更适合QASPER长文档自由形式答案） |
+| `--limit N` | 限制处理的问题数量（默认0不限制，用于快速测试） |
+
 ### 评估指标
 
 - **Answer F1**: 答案 F1 分数（基于词汇重叠）

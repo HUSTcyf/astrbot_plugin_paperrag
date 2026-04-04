@@ -531,7 +531,7 @@ def main():
     embed_api_key = args.embed_api_key or os.getenv("EVAL_LLM_API_KEY", "")
 
     # 尝试从插件配置读取 freeapi 设置（当 API Key 未显式提供时）
-    plugin_config_path = Path(__file__).parent.parent / "config" / "astrbot_plugin_paperrag_config.json"
+    plugin_config_path = Path(__file__).parent.parent.parent.parent / "config" / "astrbot_plugin_paperrag_config.json"
     if plugin_config_path.exists():
         with open(plugin_config_path, "r", encoding="utf-8-sig") as f:
             plugin_config = json.load(f)
