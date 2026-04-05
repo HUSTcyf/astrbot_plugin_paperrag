@@ -182,6 +182,10 @@ async def generate_testset_from_documents(
     embedding_model: str = "text-embedding-v3",
     embed_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
     embed_api_key: str = "",
+    embedding_mode: str = "api",
+    ollama_base_url: str = "http://localhost:11434",
+    ollama_embed_model: str = "bge-m3",
+    max_rpm: int = 96,
 ) -> List[Any]:
     """使用 Ragas 生成测试集"""
     print(f"\n{'='*60}")
@@ -197,6 +201,10 @@ async def generate_testset_from_documents(
         embedding_model=embedding_model,
         embed_base_url=embed_base_url,
         embed_api_key=embed_api_key,
+        embedding_mode=embedding_mode,
+        ollama_base_url=ollama_base_url,
+        ollama_embed_model=ollama_embed_model,
+        max_rpm=max_rpm,
     )
 
     samples = await generator.generate_testset(
@@ -302,6 +310,10 @@ async def run_full_pipeline(
     embedding_model: str = "text-embedding-v3",
     embed_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
     embed_api_key: str = "",
+    embedding_mode: str = "api",
+    ollama_base_url: str = "http://localhost:11434",
+    ollama_embed_model: str = "bge-m3",
+    max_rpm: int = 96,
     plugin_version: str = "1.0.0",
     eval_llm_model: str = "gpt-4o-mini",
     eval_llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
@@ -352,6 +364,10 @@ async def run_full_pipeline(
         embedding_model=embedding_model,
         embed_base_url=embed_base_url,
         embed_api_key=embed_api_key,
+        embedding_mode=embedding_mode,
+        ollama_base_url=ollama_base_url,
+        ollama_embed_model=ollama_embed_model,
+        max_rpm=max_rpm,
     )
 
     # ========== 步骤 3: 创建 RAG 查询引擎 ==========
@@ -532,6 +548,7 @@ def main():
 
     # 尝试从插件配置读取 freeapi 设置（当 API Key 未显式提供时）
     plugin_config_path = Path(__file__).parent.parent.parent.parent / "config" / "astrbot_plugin_paperrag_config.json"
+    embed_base_url = args.embed_base_url  # 默认使用命令行参数
     if plugin_config_path.exists():
         with open(plugin_config_path, "r", encoding="utf-8-sig") as f:
             plugin_config = json.load(f)
@@ -542,6 +559,8 @@ def main():
             print(f"✅ 已从插件配置加载 freeapi key")
         if config_freeapi_url and args.llm_base_url == "https://open.bigmodel.cn/api/paas/v4":
             llm_base_url = config_freeapi_url + "/v1/"
+            # freeapi 同时用于 LLM 和 Embedding
+            embed_base_url = config_freeapi_url + "/v1/"
             print(f"✅ 已从插件配置加载 freeapi: {llm_base_url}")
         else:
             llm_base_url = args.llm_base_url
@@ -551,6 +570,9 @@ def main():
     print(f"\n📊 配置信息:")
     print(f"   步骤: {args.step}")
     print(f"   LLM 模型: {args.llm_model}")
+    print(f"   LLM API URL: {llm_base_url}")
+    print(f"   Embedding 模型: {args.embedding_model}")
+    print(f"   Embedding API URL: {embed_base_url}")
     print(f"   Embedding 模式: {args.embedding_mode}")
     if args.embedding_mode == "ollama":
         print(f"   Ollama 地址: {args.ollama_base_url}")
@@ -575,8 +597,12 @@ def main():
             llm_base_url=llm_base_url,
             llm_api_key=llm_api_key,
             embedding_model=args.embedding_model,
-            embed_base_url=args.embed_base_url,
+            embed_base_url=embed_base_url,
             embed_api_key=embed_api_key,
+            embedding_mode=args.embedding_mode,
+            ollama_base_url=args.ollama_base_url,
+            ollama_embed_model=args.ollama_embed_model,
+            max_rpm=args.max_rpm,
             plugin_version=args.plugin_version,
             eval_llm_model=args.eval_llm_model,
             eval_llm_base_url=args.eval_llm_base_url,
@@ -609,8 +635,12 @@ def main():
             llm_base_url=llm_base_url,
             llm_api_key=llm_api_key,
             embedding_model=args.embedding_model,
-            embed_base_url=args.embed_base_url,
+            embed_base_url=embed_base_url,
             embed_api_key=embed_api_key,
+            embedding_mode=args.embedding_mode,
+            ollama_base_url=args.ollama_base_url,
+            ollama_embed_model=args.ollama_embed_model,
+            max_rpm=args.max_rpm,
         ))
 
     elif args.step == "evaluate":

@@ -932,6 +932,7 @@ class RagasTestsetGenerator:
         embed_dim: int = 1024,
         max_chunks: int = 200,
         max_concurrent: int = 4,
+        max_rpm: int = 96,
         paper_doc_stats_path: Optional[str] = None,
     ):
         """
@@ -953,6 +954,7 @@ class RagasTestsetGenerator:
             embed_dim: Embedding 维度
             max_chunks: 从数据库加载的最大 chunk 数量
             max_concurrent: LLM 最大并发数（默认 4，最大 8）
+            max_rpm: LLM 最大 RPM 限制（默认 96）
             paper_doc_stats_path: 论文统计 JSON 文件路径（默认取插件 data/paper_doc_stats.json）
         """
         if not RAGAS_AVAILABLE:
@@ -966,6 +968,10 @@ class RagasTestsetGenerator:
         self._embed_model = None
         self._max_chunks = max_chunks
         self._max_concurrent = max_concurrent
+
+        # 设置 RPM 限制
+        OpenAICompatibleLLM.set_max_rpm(max_rpm)
+        print(f"   [RagasTestsetGenerator] RPM 限制设置为: {max_rpm}")
 
         # 论文统计文件路径（默认为插件 data 目录）
         if paper_doc_stats_path is None:
@@ -999,6 +1005,14 @@ class RagasTestsetGenerator:
         self._knowledge_graph = None
         # 查询分布（延迟初始化）
         self._query_distribution = None
+
+    async def _close_embed_sessions(self):
+        """关闭 embedding 模型的 aiohttp session"""
+        if self._embed_model is not None and hasattr(self._embed_model, 'close'):
+            try:
+                await self._embed_model.close()
+            except Exception:
+                pass
 
     def load_documents_from_milvus(self) -> List[Any]:
         """
@@ -1142,38 +1156,58 @@ class RagasTestsetGenerator:
 
         # 生成测试集
         print("正在调用 LLM 生成问答对（可能需要几分钟）...")
-        testset = generator.generate_with_llamaindex_docs(
-            documents=documents,
-            testset_size=test_size,
-            query_distribution=self._query_distribution,
-            with_debugging_logs=with_debugging_logs,
-            raise_exceptions=raise_exceptions,
-        )
+        try:
+            testset = generator.generate_with_llamaindex_docs(
+                documents=documents,
+                testset_size=test_size,
+                query_distribution=self._query_distribution,
+                with_debugging_logs=with_debugging_logs,
+                raise_exceptions=raise_exceptions,
+            )
+        except Exception as e:
+            print(f"⚠️ 测试集生成过程中出现错误: {e}")
+            print("   尝试继续处理已生成的样本...")
+            testset = None
 
         # 转换为标准格式
         from ragas.testset.synthesizers.testset_schema import Testset
-        assert isinstance(testset, Testset), f"Expected Testset, got {type(testset)}"
         samples = []
-        for sample in testset.samples:
-            eval_sample_obj = sample.eval_sample
-            # 兼容 SingleTurnSample 和 MultiTurnSample
-            if hasattr(eval_sample_obj, 'user_input'):
-                question = getattr(eval_sample_obj, 'user_input', "") or ""
-                answer = getattr(eval_sample_obj, 'reference', "") or getattr(eval_sample_obj, 'response', "") or ""
-                contexts = getattr(eval_sample_obj, 'reference_contexts', []) or []
-            else:
-                question = ""
-                answer = ""
-                contexts = []
-            eval_sample = EvalSample(
-                question=question,
-                answer=answer,
-                contexts=contexts,
-                evolution_type=sample.synthesizer_name,
-                metadata={},
-                episode_done=True,
-            )
-            samples.append(eval_sample)
+        if testset is not None:
+            assert isinstance(testset, Testset), f"Expected Testset, got {type(testset)}"
+            for sample in testset.samples:
+                try:
+                    eval_sample_obj = sample.eval_sample
+                    # 兼容 SingleTurnSample 和 MultiTurnSample
+                    if hasattr(eval_sample_obj, 'user_input'):
+                        question = getattr(eval_sample_obj, 'user_input', "") or ""
+                        answer = getattr(eval_sample_obj, 'reference', "") or getattr(eval_sample_obj, 'response', "") or ""
+                        contexts = getattr(eval_sample_obj, 'reference_contexts', []) or []
+                    else:
+                        question = ""
+                        answer = ""
+                        contexts = []
+
+                    # 过滤 nan/inf 值
+                    import math
+                    if isinstance(question, float) and (math.isnan(question) or math.isinf(question)):
+                        print(f"   ⚠️ 跳过包含 nan 的样本")
+                        continue
+                    if isinstance(answer, float) and (math.isnan(answer) or math.isinf(answer)):
+                        print(f"   ⚠️ 跳过包含 nan 的答案")
+                        continue
+
+                    eval_sample = EvalSample(
+                        question=question,
+                        answer=answer,
+                        contexts=contexts,
+                        evolution_type=sample.synthesizer_name,
+                        metadata={},
+                        episode_done=True,
+                    )
+                    samples.append(eval_sample)
+                except Exception as sample_err:
+                    print(f"   ⚠️ 跳过无效样本: {sample_err}")
+                    continue
 
         # ========== 策略4：后处理过滤低质量问题 ==========
         print(f"\n🔍 过滤低质量问题（作者、机构、发表信息等）...")
@@ -1192,6 +1226,9 @@ class RagasTestsetGenerator:
 
         print(f"\n✅ 测试集已保存到: {output_path}")
         print(f"📊 问题类型分布: {self._count_types(samples)}")
+
+        # 清理 aiohttp session
+        await self._close_embed_sessions()
 
         return samples
 

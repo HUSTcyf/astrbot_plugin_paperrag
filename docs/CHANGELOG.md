@@ -2,6 +2,39 @@
 
 所有值得注意的插件变更都会记录在这个文件中。
 
+## [1.9.4] - 2026-04-05
+
+### RAGAS 评测 Embedding 配置修复
+
+**文件**: `evaluation/run_evaluation_ragas.py`, `evaluation/ragas_generator.py`
+
+**概述**: 修复 RAGAS 评测流程中 Embedding 配置未正确传递的问题。
+
+**变更**:
+- `generate_testset_from_documents()` 和 `run_full_pipeline()` 新增 `embedding_mode`、`ollama_base_url`、`ollama_embed_model` 参数
+- 当使用 freeapi 时，`embed_base_url` 现在也会同步更新为 freeapi URL
+- 新增 `max_rpm` 参数至 `RagasTestsetGenerator`，在初始化时设置 RPM 限制
+
+### RAGAS 测试集生成稳定性增强
+
+**文件**: `evaluation/ragas_generator.py`
+
+**概述**: 增强测试集生成过程的异常处理和资源清理。
+
+**变更**:
+- `generate_with_llamaindex_docs()` 调用包裹 try-except，捕获错误后继续处理已生成的样本
+- 添加 nan/inf 值检测和过滤，跳过包含无效浮点数的样本
+- 添加样本转换循环的异常捕获，逐个跳过无效样本而非整体失败
+- 新增 `_close_embed_sessions()` 方法，生成结束后关闭 aiohttp session 避免资源泄漏
+
+### Ollama 配置指南文档
+
+**文件**: `docs/OLLAMA_GUIDE.md` (新建)
+
+**概述**: 创建 Ollama 本地 Embedding 配置指南，被 README.md 引用。
+
+---
+
 ## [1.9.3] - 2026-04-04
 
 ### `/paper refstats` 引用去重功能
