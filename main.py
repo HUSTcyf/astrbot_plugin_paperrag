@@ -2245,21 +2245,38 @@ class PaperRAGPlugin(Star):
             yield event.plain_result(f"❌ Failed to rebuild: {e}")
 
     @paper_commands.command("graph_build")
-    async def cmd_graph_build(self, event: AstrMessageEvent, confirm: str = ''):
+    async def cmd_graph_build(self, event: AstrMessageEvent, confirm: str = '', skip: str = ''):
         """Build knowledge graph from indexed documents
 
         Args:
             confirm: Must be 'confirm' to proceed
+            skip: Number of papers to skip (e.g., '30' to skip first 30 papers)
         """
         if not self.enabled:
             yield event.plain_result("❌ Plugin is disabled")
             return
 
+        # 检查点文件路径
+        plugin_dir = Path(__file__).parent
+        checkpoint_file = plugin_dir / "data" / "graph_build_checkpoint.json"
+
         if confirm != "confirm":
+            skip_hint = ""
+            if checkpoint_file.exists():
+                try:
+                    with open(checkpoint_file, "r", encoding="utf-8") as f:
+                        ckpt = json.load(f)
+                        sc = ckpt.get("skip_count", 0)
+                        if sc > 0:
+                            skip_hint = f"\n⚠️ 检测到检查点（已处理 {sc} 篇），将自动从第 {sc} 篇后继续"
+                except Exception:
+                    pass
             yield event.plain_result(
                 "⚠️ 即将从已索引的文档构建知识图谱\n"
-                "注意：构建过程可能较慢（需要调用 LLM 抽取三元组）\n"
-                "使用 /paper graph_build confirm 确认执行"
+                "注意：构建过程在后台运行，可随时中断（检查点自动保存）\n"
+                "使用 /paper graph_build confirm [N] 确认执行\n"
+                "例如：/paper graph_build confirm 30 表示跳过前30篇，从第31篇开始"
+                + skip_hint
             )
             return
 
@@ -2273,27 +2290,55 @@ class PaperRAGPlugin(Star):
             yield event.plain_result("❌ RAG引擎未就绪")
             return
 
-        yield event.plain_result("🔨 正在构建知识图谱...\n⏳ 请稍候，这可能需要几分钟...")
+        # 解析 skip 参数
+        skip_count = 0
+        if skip:
+            skip_str = str(skip).strip()
+            # 移除 skip= 前缀（如果存在）
+            if '=' in skip_str:
+                skip_str = skip_str.split('=', 1)[1].strip()
+            # 移除非数字字符
+            skip_str = ''.join(c for c in skip_str if c.isdigit())
+            if skip_str:
+                skip_count = int(skip_str)
+            else:
+                yield event.plain_result(f"❌ skip 参数无效: {skip}，请使用数字")
+                return
+
+        # 立即返回，后台任务开始构建
+        yield event.plain_result(f"🔨 知识图谱构建已在后台启动...\n📋 查看进度：检查 AstrBot 控制台日志\n💾 每篇论文处理完自动保存检查点")
+
+        # 启动后台任务
+        asyncio.create_task(self._graph_build_background_task(event, engine, skip_count))
+
+    async def _graph_build_background_task(self, event: AstrMessageEvent, engine, skip_count: int = 0):
+        """后台运行图谱构建任务（支持检查点和进度日志）"""
+        from pathlib import Path
+
+        plugin_dir = Path(__file__).parent
+
+        def send_msg(text: str):
+            """发送消息到用户（仅通过日志）"""
+            logger.info(f"[GraphBuild] {text}")
 
         try:
             # 获取索引管理器
             index_manager = engine._ensure_index_manager_initialized()
 
-            # 获取所有论文列表（用于逐篇加载chunks）
-            yield event.plain_result("📖 正在从向量数据库读取论文列表...")
+            send_msg("📖 正在从向量数据库读取论文列表...")
 
             try:
                 papers = await index_manager.list_unique_documents()
             except Exception as e:
-                yield event.plain_result(f"❌ 无法获取论文列表: {e}\n请确保已使用 /paper add 添加文档")
+                send_msg(f"❌ 无法获取论文列表: {e}\n请确保已使用 /paper add 添加文档")
                 return
 
             if not papers:
-                yield event.plain_result("📭 向量数据库中未找到已索引的文档\n请先使用 /paper add 添加文档")
+                send_msg("📭 向量数据库中未找到已索引的文档\n请先使用 /paper add 添加文档")
                 return
 
             paper_names = [p.get("file_name", "") for p in papers if p.get("file_name")]
-            yield event.plain_result(f"📚 找到 {len(paper_names)} 篇论文\n🔨 正在逐篇加载所有文档块...")
+            send_msg(f"📚 找到 {len(paper_names)} 篇论文，开始逐篇构建...")
 
             # 导入必要的模块
             try:
@@ -2313,9 +2358,9 @@ class PaperRAGPlugin(Star):
                     self.text = chunk.get("text", "")
                     self.metadata = chunk.get("metadata", {})
 
-            import json
+            import json as _json_json
 
-            yield event.plain_result(f"📑 开始逐篇构建知识图谱 ({len(paper_names)} 篇论文)...")
+            send_msg(f"📑 开始逐篇构建知识图谱 ({len(paper_names)} 篇论文)...")
 
             # 创建 GraphRAGConfig（只创建一次）
             graph_config = self._create_graph_rag_config()
@@ -2354,11 +2399,30 @@ class PaperRAGPlugin(Star):
                 "chunks_empty": 0
             }
 
-            # 第二步：逐篇加载 chunks 并立即构建图谱
+            # 逐篇加载 chunks 并立即构建图谱
             await index_manager._ensure_collection()
             collection = index_manager._collection
 
+            # 检查点机制：优先使用传入的 skip_count，否则尝试读取检查点文件
+            import json as _json
+            checkpoint_file = plugin_dir / "data" / "graph_build_checkpoint.json"
+            if skip_count == 0 and checkpoint_file.exists():
+                try:
+                    with open(checkpoint_file, "r", encoding="utf-8") as f:
+                        ckpt = _json.load(f)
+                        skip_count = ckpt.get("skip_count", 0)
+                        if skip_count > 0:
+                            send_msg(f"🔄 检测到检查点，将跳过前 {skip_count} 篇已处理的论文")
+                except Exception:
+                    pass
+            elif skip_count > 0:
+                send_msg(f"⏭️ 使用 skip 参数，跳过前 {skip_count} 篇论文")
+
             for i, paper_name in enumerate(paper_names):
+                # 跳过已处理的论文
+                if i < skip_count:
+                    continue
+
                 paper_name_escaped = paper_name.replace('"', '\\"')
                 try:
                     # collection.query 是同步方法，需要用 run_in_executor 包装
@@ -2377,7 +2441,7 @@ class PaperRAGPlugin(Star):
                     if not raw_results:
                         continue
 
-                    yield event.plain_result(f"📄 [{i+1}/{len(paper_names)}] {paper_name} ({len(raw_results)} chunks)")
+                    send_msg(f"📄 [{i+1}/{len(paper_names)}] {paper_name} ({len(raw_results)} chunks)")
 
                     # 解析该论文的 chunks
                     paper_chunks = []
@@ -2389,7 +2453,7 @@ class PaperRAGPlugin(Star):
                         meta = row.get("metadata", "{}")
                         if isinstance(meta, str):
                             try:
-                                meta = json.loads(meta)
+                                meta = _json_json.loads(meta)
                             except Exception:
                                 meta = {"raw": meta}
                         chunk["metadata"] = meta
@@ -2414,22 +2478,58 @@ class PaperRAGPlugin(Star):
                     total_stats["chunks_empty"] += stats.get("chunks_empty", 0)
                     total_stats["chunks_processed"] += stats.get("chunks_processed", 0)
 
+                    # 每篇论文后保存检查点（保证最多丢失1篇）
+                    processed_count = i + 1
+                    try:
+                        checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+                        temp_file = checkpoint_file.with_suffix('.tmp')
+                        with open(temp_file, "w", encoding="utf-8") as f:
+                            _json.dump({
+                                "skip_count": processed_count,
+                                "saved_at": datetime.now().isoformat()
+                            }, f, ensure_ascii=False)
+                        temp_file.replace(checkpoint_file)
+                        logger.debug(f"💾 检查点已保存: {processed_count} 篇论文")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 保存检查点失败: {e}")
+
+                    # 每篇论文都更新进度
+                    send_msg(f"📥 进度: {i + 1}/{len(paper_names)} 篇论文...")
+
                 except Exception as e:
                     logger.warning(f"处理论文 {paper_name} 失败: {e}")
+                    # 发生异常时保存检查点
+                    try:
+                        checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+                        temp_file = checkpoint_file.with_suffix('.tmp')
+                        with open(temp_file, "w", encoding="utf-8") as f:
+                            _json.dump({
+                                "skip_count": i,  # 从当前论文重试
+                                "saved_at": datetime.now().isoformat(),
+                                "last_paper": paper_name
+                            }, f, ensure_ascii=False)
+                        temp_file.replace(checkpoint_file)
+                        send_msg(f"⚠️ 处理论文 {paper_name} 失败，已保存检查点")
+                    except Exception:
+                        pass
 
                 # 每隔20篇论文重新确保连接有效
                 if (i + 1) % 20 == 0:
                     await index_manager._ensure_collection()
                     collection = index_manager._collection
 
-                # 更新进度
-                if (i + 1) % 5 == 0 or (i + 1) == len(paper_names):
-                    yield event.plain_result(f"📥 构建进度: {i + 1}/{len(paper_names)} 篇论文...")
-
             # 保存图谱到磁盘
             graph_store.save(force=True)
 
-            # 输出结果
+            # 构建成功，删除检查点文件
+            if checkpoint_file.exists():
+                try:
+                    checkpoint_file.unlink()
+                    logger.debug("💾 检查点文件已清除")
+                except Exception:
+                    pass
+
+            # 输出最终结果
             text_triplets = total_stats.get('text_triplets_added', 0)
             cross_triplets = total_stats.get('cross_modal_triplets_added', 0)
             total_triplets_val = text_triplets + cross_triplets
@@ -2448,13 +2548,13 @@ class PaperRAGPlugin(Star):
 
 💾 图谱已自动保存到磁盘
 💡 使用 /paper graph_stats 查看图谱详情"""
-            yield event.plain_result(output)
+            send_msg(output)
 
         except Exception as e:
             logger.error(f"构建知识图谱失败: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            yield event.plain_result(f"❌ 构建失败: {e}")
+            send_msg(f"❌ 构建失败: {e}")
 
     @paper_commands.command("graph_stats")
     async def cmd_graph_stats(self, event: AstrMessageEvent):
@@ -3629,6 +3729,101 @@ class PaperRAGPlugin(Star):
         except Exception as e:
             logger.error(f"想法生成失败: {e}")
             yield event.plain_result(f"❌ 生成失败: {e}")
+
+    @idea_commands.command("tofeishu")
+    async def cmd_idea_tofeishu(self, event: AstrMessageEvent,
+                                  topic: str = "",
+                                  folder_token: str = ""):
+        """
+        将研究想法导出为飞书文档
+
+        使用方式:
+        /idea tofeishu <研究主题> [folder_token]
+        /idea tofeishu <研究主题> <folder_token>
+        Example: /idea tofeishu 大语言模型在医学诊断中的应用
+        Example: /idea tofeishu 大语言模型在医学诊断中的应用 <folder_token>
+        """
+        try:
+            # 解析参数
+            parts = event.plain_text.strip().split(maxsplit=2)
+            if len(parts) < 2:
+                yield event.plain_result("📚 Usage: /idea tofeishu <研究主题> [folder_token]\nExample: /idea tofeishu 大语言模型在医学诊断中的应用")
+                return
+
+            topic = parts[1] if len(parts) > 1 else ""
+            folder_token = parts[2] if len(parts) > 2 else ""
+
+            if not topic:
+                yield event.plain_result("📚 Usage: /idea tofeishu <研究主题> [folder_token]\nExample: /idea tofeishu 大语言模型在医学诊断中的应用")
+                return
+
+            yield event.plain_result(f"🔍 正在分析主题: {topic}")
+
+            # 获取 RAG 引擎
+            rag_engine = self._hybrid_rag_engine or self._get_hybrid_rag_engine()
+            if not rag_engine:
+                yield event.plain_result("❌ RAG引擎未初始化")
+                return
+
+            # 初始化 IdeaEngine
+            from .idea_engine import IdeaEngine
+            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
+
+            # 1. 分析主题
+            yield event.plain_result("📊 正在分析研究主题...")
+            analysis = await idea_engine.analyze_topic(topic, depth="standard")
+            if not analysis:
+                yield event.plain_result("❌ 主题分析失败")
+                return
+
+            # 2. 收集知识
+            yield event.plain_result("📚 正在检索知识...")
+            all_queries = (analysis.search_queries + analysis.local_rag_queries)[:5]
+            knowledge = await idea_engine.search_knowledge(all_queries, local_rag_top_k=3, web_top_k=5)
+
+            # 3. 生成研究想法
+            yield event.plain_result("💡 正在生成研究想法...")
+            ideas = await idea_engine.generate_ideas(
+                knowledge_context=knowledge.get("fused_context", ""),
+                research_domain=analysis.domain,
+                num_ideas=3,
+                idea_focus="all"
+            )
+
+            if not ideas:
+                yield event.plain_result("❌ 想法生成失败")
+                return
+
+            # 4. 创建飞书文档
+            yield event.plain_result("📄 正在创建飞书文档...")
+            result = await idea_engine.create_feishu_document(
+                ideas=ideas,
+                topic=topic,
+                folder_token=folder_token
+            )
+
+            if result.get("error"):
+                yield event.plain_result(f"❌ 创建飞书文档失败: {result.get('error')}")
+                return
+
+            # 成功
+            url = result.get("url", "")
+            blocks_created = result.get("blocks_created", 0)
+
+            output = f"""✅ **飞书文档创建成功！**
+
+📄 **文档标题**: {topic}
+📊 **生成想法数**: {len(ideas)}
+📝 **创建块数**: {blocks_created}
+
+🔗 **文档链接**: {url}
+
+💡 回复 /idea explore {topic} 可查看详细想法分析"""
+            yield event.plain_result(output)
+
+        except Exception as e:
+            logger.error(f"飞书文档创建失败: {e}")
+            yield event.plain_result(f"❌ 创建失败: {e}")
 
     def _format_retrieve_response(self, sources: list) -> str:
         """Format retrieval results"""

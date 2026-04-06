@@ -442,3 +442,334 @@ class IdeaEngine:
                 parts.append("")
 
         return "\n".join(parts)
+
+    async def to_feishu_markdown(
+        self,
+        ideas: List[ResearchIdea],
+        topic: str = "",
+        include_sources: bool = True
+    ) -> str:
+        """
+        将研究想法格式化为飞书文档兼容的Markdown格式
+
+        Args:
+            ideas: 研究想法列表
+            topic: 研究主题
+            include_sources: 是否包含灵感来源
+
+        Returns:
+            str: 飞书兼容的Markdown格式内容
+        """
+        if not ideas:
+            return ""
+
+        markdown_parts = [f"# {topic or '研究想法'}\n" if topic else "# 研究想法\n"]
+
+        for i, idea in enumerate(ideas, 1):
+            feasibility_bar = "★" * int(idea.feasibility * 5) + "☆" * (5 - int(idea.feasibility * 5))
+
+            markdown_parts.append(f"## {i}. {idea.title}\n")
+            markdown_parts.append(f"**可行性**: {feasibility_bar} ({idea.feasibility:.0%})\n")
+            markdown_parts.append(f"\n### 描述\n{idea.description}\n")
+            markdown_parts.append(f"\n### 创新点\n{idea.novelty}\n")
+            markdown_parts.append(f"\n### 方法论\n{idea.methodology}\n")
+
+            if idea.potential_challenges:
+                markdown_parts.append("\n### 潜在挑战\n")
+                for challenge in idea.potential_challenges:
+                    markdown_parts.append(f"- {challenge}\n")
+
+            if idea.related_work:
+                markdown_parts.append("\n### 相关工作\n")
+                for work in idea.related_work:
+                    markdown_parts.append(f"- {work}\n")
+
+            if include_sources and idea.inspiration_sources:
+                markdown_parts.append("\n### 灵感来源\n")
+                for source in idea.inspiration_sources:
+                    markdown_parts.append(f"- {source}\n")
+
+            markdown_parts.append("\n---\n")
+
+        return "".join(markdown_parts)
+
+    async def create_feishu_document(
+        self,
+        ideas: List[ResearchIdea],
+        topic: str = "",
+        folder_token: str = ""
+    ) -> Dict[str, Any]:
+        """
+        创建飞书文档并写入研究想法
+
+        Args:
+            ideas: 研究想法列表
+            topic: 研究主题
+            folder_token: 飞书文件夹Token（可选）
+
+        Returns:
+            Dict包含 document_id, url, error 等信息
+        """
+        try:
+            # 1. 格式化内容为飞书Markdown
+            markdown_content = await self.to_feishu_markdown(ideas, topic)
+            if not markdown_content:
+                return {"error": "内容为空"}
+
+            # 2. 生成飞书块格式
+            blocks = self._markdown_to_feishu_blocks(markdown_content)
+
+            # 3. 调用 feishu-mcp 创建文档
+            doc_result = await self._call_feishu_mcp_create_doc(topic or "研究想法", folder_token)
+            if doc_result.get("error"):
+                return doc_result
+
+            document_id = doc_result.get("document_id")
+            if not document_id:
+                return {"error": "文档创建失败，未返回文档ID"}
+
+            # 4. 添加内容块
+            block_result = await self._call_feishu_mcp_add_blocks(document_id, blocks)
+            if block_result.get("error"):
+                return {
+                    "document_id": document_id,
+                    "url": f"https://feishu.cn/document/{document_id}",
+                    "warning": f"文档已创建但内容添加失败: {block_result.get('error')}"
+                }
+
+            return {
+                "document_id": document_id,
+                "url": f"https://feishu.cn/document/{document_id}",
+                "title": topic or "研究想法",
+                "blocks_created": len(blocks)
+            }
+
+        except Exception as e:
+            logger.error(f"[IdeaEngine] 创建飞书文档失败: {e}")
+            return {"error": str(e)}
+
+    def _markdown_to_feishu_blocks(self, markdown_text: str) -> List[Dict]:
+        """将Markdown文本转换为飞书块格式"""
+        blocks = []
+        lines = markdown_text.split("\n")
+        i = 0
+
+        while i < len(lines):
+            line = lines[i]
+
+            if line.startswith("# ") and not line.startswith("## "):
+                # 一级标题
+                blocks.append({
+                    "blockType": "heading",
+                    "options": {
+                        "heading": {
+                            "level": 1,
+                            "content": line[2:].strip()
+                        }
+                    }
+                })
+            elif line.startswith("## "):
+                # 二级标题
+                blocks.append({
+                    "blockType": "heading",
+                    "options": {
+                        "heading": {
+                            "level": 2,
+                            "content": line[3:].strip()
+                        }
+                    }
+                })
+            elif line.startswith("### "):
+                # 三级标题
+                blocks.append({
+                    "blockType": "heading",
+                    "options": {
+                        "heading": {
+                            "level": 3,
+                            "content": line[4:].strip()
+                        }
+                    }
+                })
+            elif line.startswith("**") and line.endswith("**"):
+                # 加粗文本作为标题
+                blocks.append({
+                    "blockType": "text",
+                    "options": {
+                        "text": {
+                            "textStyles": [
+                                {
+                                    "text": line[2:-2].strip(),
+                                    "style": {"bold": True}
+                                }
+                            ]
+                        }
+                    }
+                })
+            elif line.startswith("- "):
+                # 无序列表
+                blocks.append({
+                    "blockType": "bullet",
+                    "options": {
+                        "bullet": {
+                            "content": line[2:].strip()
+                        }
+                    }
+                })
+            elif line.startswith("---"):
+                # 分割线
+                blocks.append({
+                    "blockType": "horizontal_line",
+                    "options": {}
+                })
+            elif line.strip() == "":
+                # 空行，跳过
+                pass
+            else:
+                # 普通文本
+                text_content = line.strip()
+                if text_content:
+                    blocks.append({
+                        "blockType": "text",
+                        "options": {
+                            "text": {
+                                "textStyles": [{"text": text_content}]
+                            }
+                        }
+                    })
+
+            i += 1
+
+        return blocks
+
+    async def _call_feishu_mcp_create_doc(
+        self,
+        title: str,
+        folder_token: str = ""
+    ) -> Dict[str, Any]:
+        """调用 feishu-mcp 创建文档"""
+        try:
+            # 从 mcp_server.json 读取配置
+            mcp_config_path = Path(__file__).parent.parent.parent / "mcp_server.json"
+            with open(mcp_config_path, "r", encoding="utf-8") as f:
+                mcp_config = json.load(f)
+
+            feishu_config = mcp_config.get("mcpServers", {}).get("feishu", {})
+            env_vars = feishu_config.get("env", {})
+
+            # 构建 MCP 请求
+            mcp_request = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_feishu_document",
+                    "arguments": {
+                        "title": title,
+                        "folderToken": folder_token
+                    }
+                }
+            }
+
+            # 调用 feishu-mcp
+            proc = await asyncio.create_subprocess_exec(
+                "npx", "feishu-mcp",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, **env_vars}
+            )
+
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=json.dumps(mcp_request).encode()),
+                timeout=30
+            )
+
+            if stderr:
+                logger.warning(f"[IdeaEngine] feishu-mcp stderr: {stderr.decode()}")
+
+            if stdout:
+                response = json.loads(stdout.decode())
+                result = response.get("result", {}).get("content", [{}])[0].get("text", "{}")
+                doc_info = json.loads(result)
+                document_id = doc_info.get("document_id") or doc_info.get("objToken") or doc_info.get("obj_token")
+                if document_id:
+                    return {"document_id": document_id}
+                return {"error": f"创建文档失败: {result}"}
+
+            return {"error": "feishu-mcp 无响应"}
+
+        except json.JSONDecodeError as e:
+            logger.error(f"[IdeaEngine] 解析 feishu-mcp 响应失败: {e}")
+            return {"error": f"解析响应失败: {e}"}
+        except asyncio.TimeoutError:
+            return {"error": "feishu-mcp 调用超时"}
+        except Exception as e:
+            logger.error(f"[IdeaEngine] 调用 feishu-mcp 失败: {e}")
+            return {"error": str(e)}
+
+    async def _call_feishu_mcp_add_blocks(
+        self,
+        document_id: str,
+        blocks: List[Dict]
+    ) -> Dict[str, Any]:
+        """调用 feishu-mcp 添加内容块"""
+        try:
+            # 从 mcp_server.json 读取配置
+            mcp_config_path = Path(__file__).parent.parent.parent / "mcp_server.json"
+            with open(mcp_config_path, "r", encoding="utf-8") as f:
+                mcp_config = json.load(f)
+
+            feishu_config = mcp_config.get("mcpServers", {}).get("feishu", {})
+            env_vars = feishu_config.get("env", {})
+
+            # 构建 MCP 请求
+            mcp_request = {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "batch_create_feishu_blocks",
+                    "arguments": {
+                        "documentId": document_id,
+                        "parentBlockId": "0",
+                        "index": 0,
+                        "blocks": blocks
+                    }
+                }
+            }
+
+            # 调用 feishu-mcp
+            proc = await asyncio.create_subprocess_exec(
+                "npx", "feishu-mcp",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, **env_vars}
+            )
+
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=json.dumps(mcp_request).encode()),
+                timeout=60
+            )
+
+            if stderr:
+                logger.warning(f"[IdeaEngine] feishu-mcp blocks stderr: {stderr.decode()}")
+
+            if stdout:
+                response = json.loads(stdout.decode())
+                result = response.get("result", {}).get("content", [{}])[0].get("text", "{}")
+                result_data = json.loads(result)
+                if result_data.get("totalBlocksCreated", 0) > 0:
+                    return {"success": True, "blocks_created": result_data.get("totalBlocksCreated")}
+                return {"error": result_data}
+
+            return {"error": "feishu-mcp 无响应"}
+
+        except json.JSONDecodeError as e:
+            logger.error(f"[IdeaEngine] 解析 feishu-mcp 响应失败: {e}")
+            return {"error": f"解析响应失败: {e}"}
+        except asyncio.TimeoutError:
+            return {"error": "feishu-mcp 调用超时"}
+        except Exception as e:
+            logger.error(f"[IdeaEngine] 调用 feishu-mcp 失败: {e}")
+            return {"error": str(e)}

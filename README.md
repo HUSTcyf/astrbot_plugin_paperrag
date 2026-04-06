@@ -1,8 +1,8 @@
-# 📚 Paper RAG Plugin v1.9.4 - 用户指南
+# 📚 Paper RAG Plugin v1.9.5 - 用户指南
 
 本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力（支持多模态VLM问答）。
 
-> **版本说明**：当前版本 v1.9.4，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
+> **版本说明**：当前版本 v1.9.5，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
 
 ## ✨ 核心功能
 
@@ -111,6 +111,7 @@ cp ~/Downloads/*.pdf papers/
 | `/paper graph_backup_list` | 列出可用备份 | `/paper graph_backup_list` |
 | `/paper graph_restore [文件名]` | 恢复图谱备份（需管理员） | `/paper graph_restore neo4j_backup_xxx.json.gz` |
 | `/paper graph_link [status\|create\|remove]` | 管理Neo4j符号链接 | `/paper graph_link status` |
+| `/idea tofeishu <研究主题> [folder_token]` | 将研究想法导出为飞书文档 | `/idea tofeishu 大语言模型研究` |
 
 ### 使用示例
 
@@ -929,6 +930,33 @@ evaluation_output/
 - [ ] 多源知识融合（本地论文 + 网络结果统一上下文）
 - [ ] 研究提案生成（基于结构化 prompt 的 idea 生成）
 - [ ] 引文追踪与格式化
+
+**新增功能**：
+
+#### 飞书文档导出
+
+**命令**: `/idea tofeishu <研究主题> [folder_token]`
+
+**功能**: 将研究想法导出为飞书文档，支持自动创建文档、格式化内容、添加标题和列表。
+
+**参数**:
+- `研究主题` (必填): 要导出为飞书文档的研究主题
+- `folder_token` (可选): 飞书文件夹 token，不提供则在根目录创建
+
+**使用示例**:
+```
+/idea tofeishu 大语言模型在代码生成中的应用
+/idea tofeishu 多模态大模型研究 OCks09kd293kd
+```
+
+**技术实现**:
+- `to_feishu_markdown()` - 格式化为飞书兼容的 Markdown
+- `create_feishu_document()` - 创建飞书文档并写入内容
+- `_markdown_to_feishu_blocks()` - 将 Markdown 转换为飞书块格式
+- `_call_feishu_mcp_create_doc()` - 调用 feishu-mcp 创建文档
+- `_call_feishu_mcp_add_blocks()` - 调用 feishu-mcp 添加内容块
+
+**前提条件**: 需要在 `mcp_server.json` 中配置 `feishu-mcp`。
 
 **技术方案**：基于 LangGraph 工作流编排
 
