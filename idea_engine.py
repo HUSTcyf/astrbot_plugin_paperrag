@@ -63,7 +63,19 @@ class IdeaEngine:
 
     def _get_llm_provider(self):
         """获取LLM provider"""
-        return self.context.provider if self.context else None
+        if not self.context:
+            return None
+        # 尝试获取当前正在使用的provider
+        provider = getattr(self.context, 'get_using_provider', None)
+        if provider:
+            return provider()
+        # fallback: 尝试通过provider_manager获取
+        provider_manager = getattr(self.context, 'provider_manager', None)
+        if provider_manager:
+            inst_map = getattr(provider_manager, 'inst_map', None)
+            if isinstance(inst_map, dict) and inst_map:
+                return list(inst_map.values())[0]
+        return None
 
     async def analyze_topic(self, topic: str, depth: str = "standard") -> TopicAnalysis:
         """
@@ -108,14 +120,33 @@ class IdeaEngine:
             return None
 
         try:
-            response = await provider.chat(
-                messages=[{"role": "user", "content": prompt}],
+            response = await provider.text_chat(
+                prompt=prompt,
+                contexts=[],
                 temperature=0.1,
                 max_tokens=2048
             )
 
-            text = response.text if hasattr(response, 'text') else str(response)
-            result = self._parse_json_response(text)
+            response_text = ""
+            # 方法1：检查 result_chain（AstrBot 格式）
+            if hasattr(response, 'result_chain'):
+                chain = getattr(response.result_chain, 'chain', None)
+                if chain and len(chain) > 0:
+                    first = chain[0]
+                    if hasattr(first, 'get_text'):
+                        response_text = first.get_text()
+                    elif hasattr(first, 'text'):
+                        response_text = first.text
+            # 方法2：检查 content 属性（LlamaCpp 格式）
+            elif hasattr(response, 'content'):
+                response_text = response.content
+            # 方法3：dict 格式
+            elif isinstance(response, dict):
+                response_text = response.get("content", "") or response.get("text", "")
+            # 方法4：字符串格式
+            else:
+                response_text = str(response)
+            result = self._parse_json_response(response_text)
 
             if result:
                 return TopicAnalysis(
@@ -345,14 +376,33 @@ class IdeaEngine:
             return []
 
         try:
-            response = await provider.chat(
-                messages=[{"role": "user", "content": prompt}],
+            response = await provider.text_chat(
+                prompt=prompt,
+                contexts=[],
                 temperature=0.7,
                 max_tokens=4096
             )
 
-            text = response.text if hasattr(response, 'text') else str(response)
-            result = self._parse_json_response(text)
+            response_text = ""
+            # 方法1：检查 result_chain（AstrBot 格式）
+            if hasattr(response, 'result_chain'):
+                chain = getattr(response.result_chain, 'chain', None)
+                if chain and len(chain) > 0:
+                    first = chain[0]
+                    if hasattr(first, 'get_text'):
+                        response_text = first.get_text()
+                    elif hasattr(first, 'text'):
+                        response_text = first.text
+            # 方法2：检查 content 属性（LlamaCpp 格式）
+            elif hasattr(response, 'content'):
+                response_text = response.content
+            # 方法3：dict 格式
+            elif isinstance(response, dict):
+                response_text = response.get("content", "") or response.get("text", "")
+            # 方法4：字符串格式
+            else:
+                response_text = str(response)
+            result = self._parse_json_response(response_text)
 
             if result and "ideas" in result:
                 ideas = []
@@ -650,11 +700,13 @@ class IdeaEngine:
         try:
             # 从 mcp_server.json 读取配置
             mcp_config_path = Path(__file__).parent.parent.parent / "mcp_server.json"
+            logger.info(f"[IdeaEngine] 读取 MCP 配置: {mcp_config_path}")
             with open(mcp_config_path, "r", encoding="utf-8") as f:
                 mcp_config = json.load(f)
 
             feishu_config = mcp_config.get("mcpServers", {}).get("feishu", {})
             env_vars = feishu_config.get("env", {})
+            logger.info(f"[IdeaEngine] feishu env keys: {list(env_vars.keys())}")
 
             # 构建 MCP 请求
             mcp_request = {
@@ -669,42 +721,63 @@ class IdeaEngine:
                     }
                 }
             }
+            logger.info(f"[IdeaEngine] MCP 请求: {json.dumps(mcp_request)[:200]}")
 
             # 调用 feishu-mcp
+            logger.info("[IdeaEngine] 启动 feishu-mcp 进程...")
             proc = await asyncio.create_subprocess_exec(
-                "npx", "feishu-mcp",
+                "npx", "-y", "feishu-mcp@latest", "--stdio",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env={**os.environ, **env_vars}
             )
+            logger.info(f"[IdeaEngine] feishu-mcp PID: {proc.pid}")
 
+            # 发送请求
+            request_data = json.dumps(mcp_request).encode()
+            logger.info(f"[IdeaEngine] 发送请求 ({len(request_data)} bytes)...")
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=json.dumps(mcp_request).encode()),
-                timeout=30
+                proc.communicate(input=request_data),
+                timeout=120
             )
 
+            logger.info(f"[IdeaEngine] feishu-mcp 返回: stdout={len(stdout)} bytes, stderr={len(stderr)} bytes")
+
             if stderr:
-                logger.warning(f"[IdeaEngine] feishu-mcp stderr: {stderr.decode()}")
+                stderr_text = stderr.decode(errors="replace")
+                logger.warning(f"[IdeaEngine] feishu-mcp stderr: {stderr_text[:500]}")
 
             if stdout:
-                response = json.loads(stdout.decode())
-                result = response.get("result", {}).get("content", [{}])[0].get("text", "{}")
-                doc_info = json.loads(result)
-                document_id = doc_info.get("document_id") or doc_info.get("objToken") or doc_info.get("obj_token")
-                if document_id:
-                    return {"document_id": document_id}
-                return {"error": f"创建文档失败: {result}"}
+                stdout_text = stdout.decode(errors="replace")
+                logger.info(f"[IdeaEngine] feishu-mcp stdout: {stdout_text[:1000]}")
+                try:
+                    response = json.loads(stdout_text)
+                    logger.info(f"[IdeaEngine] 解析响应成功: {str(response)[:200]}")
+                    result = response.get("result", {}).get("content", [{}])[0].get("text", "{}")
+                    logger.info(f"[IdeaEngine] feishu-mcp result: {result[:500]}")
+                    doc_info = json.loads(result)
+                    document_id = doc_info.get("document_id") or doc_info.get("objToken") or doc_info.get("obj_token")
+                    if document_id:
+                        logger.info(f"[IdeaEngine] 文档创建成功: {document_id}")
+                        return {"document_id": document_id}
+                    return {"error": f"创建文档失败: {result}"}
+                except json.JSONDecodeError as e:
+                    logger.error(f"[IdeaEngine] JSON解析失败: {e}, stdout: {stdout_text[:500]}")
+                    return {"error": f"JSON解析失败: {e}"}
 
-            return {"error": "feishu-mcp 无响应"}
+            # 无 stdout 时打印更多信息
+            logger.error(f"[IdeaEngine] feishu-mcp 无 stdout 输出, proc.returncode={proc.returncode}")
+            if stderr:
+                logger.error(f"[IdeaEngine] stderr: {stderr.decode(errors='replace')[:500]}")
+            return {"error": f"feishu-mcp 无响应 (returncode={proc.returncode})"}
 
-        except json.JSONDecodeError as e:
-            logger.error(f"[IdeaEngine] 解析 feishu-mcp 响应失败: {e}")
-            return {"error": f"解析响应失败: {e}"}
         except asyncio.TimeoutError:
+            logger.error("[IdeaEngine] feishu-mcp 调用超时")
             return {"error": "feishu-mcp 调用超时"}
         except Exception as e:
-            logger.error(f"[IdeaEngine] 调用 feishu-mcp 失败: {e}")
+            import traceback
+            logger.error(f"[IdeaEngine] 调用 feishu-mcp 失败: {e}\n{traceback.format_exc()}")
             return {"error": str(e)}
 
     async def _call_feishu_mcp_add_blocks(
@@ -740,7 +813,7 @@ class IdeaEngine:
 
             # 调用 feishu-mcp
             proc = await asyncio.create_subprocess_exec(
-                "npx", "feishu-mcp",
+                "npx", "-y", "feishu-mcp@latest", "--stdio",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -749,11 +822,12 @@ class IdeaEngine:
 
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(input=json.dumps(mcp_request).encode()),
-                timeout=60
+                timeout=120
             )
 
             if stderr:
-                logger.warning(f"[IdeaEngine] feishu-mcp blocks stderr: {stderr.decode()}")
+                stderr_text = stderr.decode()
+                logger.warning(f"[IdeaEngine] feishu-mcp blocks stderr: {stderr_text}")
 
             if stdout:
                 response = json.loads(stdout.decode())

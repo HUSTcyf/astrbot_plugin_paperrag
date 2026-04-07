@@ -4,6 +4,32 @@
 
 > **版本说明**：当前版本 v1.10.0，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
 
+## 🏗️ 系统架构
+
+![PaperRAG Architecture](docs/paper_rag.png)
+
+PaperRAG 是一个基于两阶段检索的学术论文问答系统，其架构如下：
+
+**两阶段检索流程：**
+
+1. **Stage 1 - 摘要索引**：`AbstractIndexManager` 通过 `LocalGGUFClient`（Qwen3.5-9B GGUF 模型）提取论文摘要，或回退到基于关键词的规则提取。摘要向量存储在独立的 Milvus collection (`paper_abstracts`)，查询时先通过摘要匹配快速过滤出相关论文。
+
+2. **Stage 2 - Chunk 检索**：`HybridRAGEngine` 在 Stage 1 筛选出的论文集内执行混合检索：
+   - **向量检索**：基于 cosine 相似度
+   - **BM25 检索**：基于关键词匹配
+   - **RRF 融合**：双路分数通过 Reciprocal Rank Fusion 融合 (k=60)
+   - **可选重排序**：通过 FlagEmbedding BAAI/bge-reranker-v2-m3 交叉注意力重排
+
+**知识图谱增强**：`GraphRAGEngine` 通过 `MultimodalGraphBuilder` 从 Chunk 中提取知识三元组（实体-关系-实体），支持 MemoryGraphStore（JSON 持久化）和 Neo4j 两种存储后端，支持局部遍历和全局遍历。
+
+**多模态支持**：`HybridPDFParser` 通过 Docling/PyMuPDF 提取 PDF 中的图片、表格、公式，`LlamaCppVLMProvider`（Qwen3.5 GGUF）支持图片问答。
+
+**生成层**：检索到的 Chunk 与查询结合，通过 AstrBot GLM Provider 或本地 VLM 生成带引用的答案。
+
+详细架构设计见 [paperrag_architecture_prompt.txt](docs/paperrag_architecture_prompt.txt)。
+
+---
+
 ## ✨ 核心功能
 
 - 🔍 **混合检索**：BM25 关键词 + 向量语义双路召回 + RRF 分数融合，兼顾精确术语匹配与语义理解

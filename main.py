@@ -4035,15 +4035,6 @@ class PaperRAGPlugin(Star):
         Example: /idea tofeishu 大语言模型在医学诊断中的应用 <folder_token>
         """
         try:
-            # 解析参数
-            parts = event.plain_text.strip().split(maxsplit=2)
-            if len(parts) < 2:
-                yield event.plain_result("📚 Usage: /idea tofeishu <研究主题> [folder_token]\nExample: /idea tofeishu 大语言模型在医学诊断中的应用")
-                return
-
-            topic = parts[1] if len(parts) > 1 else ""
-            folder_token = parts[2] if len(parts) > 2 else ""
-
             if not topic:
                 yield event.plain_result("📚 Usage: /idea tofeishu <研究主题> [folder_token]\nExample: /idea tofeishu 大语言模型在医学诊断中的应用")
                 return
@@ -4051,7 +4042,7 @@ class PaperRAGPlugin(Star):
             yield event.plain_result(f"🔍 正在分析主题: {topic}")
 
             # 获取 RAG 引擎
-            rag_engine = self._hybrid_rag_engine or self._get_hybrid_rag_engine()
+            rag_engine = self._get_engine()
             if not rag_engine:
                 yield event.plain_result("❌ RAG引擎未初始化")
                 return
