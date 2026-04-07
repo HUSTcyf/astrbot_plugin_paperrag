@@ -522,5 +522,20 @@
                 }
             }
         }
+    },
+    "enable_two_stage_retrieval": {
+        "description": "启用两阶段检索（先检索摘要匹配论文，再检索论文内chunks）",
+        "type": "bool",
+        "hint": "启用后，先在摘要索引中检索相关论文，再在匹配论文内检索具体chunks。可提高大规模论文库的检索精度。",
+        "obvious_hint": true,
+        "default": false
+    },
+    "two_stage_top_k": {
+        "description": "两阶段检索：摘要阶段返回的论文数量",
+        "type": "int",
+        "hint": "第一阶段从摘要索引中检索返回的论文数量",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 20
     }
 }

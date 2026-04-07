@@ -1,8 +1,8 @@
-# 📚 Paper RAG Plugin v1.10.0 - 用户指南
+# 📚 Paper RAG Plugin v1.10.1 - 用户指南
 
 本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力（支持多模态VLM问答）。
 
-> **版本说明**：当前版本 v1.10.0，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
+> **版本说明**：当前版本 v1.10.1，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
 
 ## 🏗️ 系统架构
 
@@ -945,7 +945,7 @@ evaluation_output/
 - 优先使用 Qwen3.5-9B 模型
 - 9B 不可用时自动降级到 Qwen3.5-4B 模型
 
-**版本**：v1.10.0
+**版本**：v1.10.1
 
 ---
 

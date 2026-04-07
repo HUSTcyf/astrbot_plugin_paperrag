@@ -97,6 +97,10 @@ class RAGConfig:
     graph_hybrid_alpha: float = 0.5  # 混合检索权重（0=纯图，1=纯向量）
     graph_auto_build: bool = False  # 是否自动构建图谱
     graph_auto_build_threshold: int = 10  # 自动构建阈值
+
+    # 两阶段检索配置
+    enable_two_stage_retrieval: bool = False  # 是否启用两阶段检索（先检索摘要匹配论文，再检索论文内chunks）
+    two_stage_top_k: int = 5  # 两阶段检索：摘要阶段返回的论文数量
     graph_multimodal_enabled: bool = True  # 是否启用多模态图谱抽取
     graph_max_images_per_chunk: int = 1  # 每个chunk最多处理图片数
     graph_extract_image_entities: bool = True  # 是否提取图片为实体

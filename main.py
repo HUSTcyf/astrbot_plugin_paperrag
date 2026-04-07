@@ -964,15 +964,20 @@ class PaperRAGPlugin(Star):
             # 安全获取响应类型，避免 KeyError
             response_type = response.get("type", "unknown")
 
+            # 预解析 arxiv 链接（优先从文件名模式检测，其次从CORE API获取）
+            sources = response.get("sources", [])
+            if sources:
+                sources = await self._resolve_sources_arxiv(sources)
+
             # Format output
             if response_type == "retrieve":
                 # Retrieve mode only
-                output = self._format_retrieve_response(response.get("sources", []))
+                output = self._format_retrieve_response(sources)
             elif response_type == "rag":
                 # RAG mode
                 output = self._format_rag_response(
                     response.get("answer", ""),
-                    response.get("sources", [])
+                    sources
                 )
             elif response_type == "error":
                 output = f"❌ {response.get('message', 'Unknown error')}"
@@ -2724,9 +2729,9 @@ class PaperRAGPlugin(Star):
 
             # 导入摘要索引模块
             try:
-                from .abstract_index import AbstractIndexManager, AbstractExtractor
+                from .abstract_index import AbstractIndexManager, AbstractExtractor, LocalGGUFClient
             except Exception:
-                from abstract_index import AbstractIndexManager, AbstractExtractor
+                from abstract_index import AbstractIndexManager, AbstractExtractor, LocalGGUFClient
 
             # 初始化摘要索引管理器
             embed_provider = await engine._ensure_embed_provider_initialized()
@@ -2741,6 +2746,20 @@ class PaperRAGPlugin(Star):
                 embed_dim=embed_dim,
             )
             abstract_index.set_embed_model(embed_provider)
+
+            # 初始化本地 GGUF LLM 客户端（用于同时提取标题和摘要）
+            llm_client = LocalGGUFClient()
+            if llm_client.is_model_loaded():
+                send_msg("✅ GGUF LLM 模型已加载，直接复用")
+            else:
+                send_msg("🔄 正在加载 GGUF LLM 模型...")
+                loaded = await llm_client.load()
+                if loaded:
+                    send_msg("✅ GGUF LLM 模型加载成功")
+                else:
+                    send_msg("⚠️ GGUF LLM 模型加载失败，将使用规则提取")
+            abstract_index.set_llm_client(llm_client)
+
             await abstract_index.initialize()
 
             send_msg(f"✅ 摘要索引管理器初始化完成 (dim={embed_dim})")
@@ -4076,29 +4095,65 @@ class PaperRAGPlugin(Star):
                 yield event.plain_result("❌ 想法生成失败")
                 return
 
-            # 4. 创建飞书文档
+            # 4. 创建飞书文档（传入知识检索结果以生成引用）
             yield event.plain_result("📄 正在创建飞书文档...")
             result = await idea_engine.create_feishu_document(
                 ideas=ideas,
                 topic=topic,
-                folder_token=folder_token
+                folder_token=folder_token,
+                knowledge=knowledge
             )
 
+            if not result:
+                yield event.plain_result("❌ 创建飞书文档失败: 未知错误")
+                return
+
             if result.get("error"):
-                yield event.plain_result(f"❌ 创建飞书文档失败: {result.get('error')}")
+                polished = result.get("polished_content", "")
+                if polished:
+                    # 即使创建失败，也返回润色内容供用户审阅
+                    output = f"""❌ 飞书文档创建失败，但以下是润色后的内容供审阅：
+
+---
+
+{polished}
+
+---
+
+❌ 错误信息: {result.get('error')}
+
+💡 你可以复制上方内容手动创建飞书文档"""
+                    yield event.plain_result(output)
+                else:
+                    yield event.plain_result(f"❌ 创建飞书文档失败: {result.get('error')}")
                 return
 
             # 成功
             url = result.get("url", "")
             blocks_created = result.get("blocks_created", 0)
+            polished = result.get("polished_content", "")
+            media_count = result.get("media_count", {})
+            images_count = media_count.get("images", 0)
+            tables_count = media_count.get("tables", 0)
+
+            media_info = ""
+            if images_count > 0 or tables_count > 0:
+                media_info = f"\n🖼️ **图片数**: {images_count}\n📊 **表格数**: {tables_count}"
 
             output = f"""✅ **飞书文档创建成功！**
 
 📄 **文档标题**: {topic}
 📊 **生成想法数**: {len(ideas)}
-📝 **创建块数**: {blocks_created}
-
+📝 **创建块数**: {blocks_created}{media_info}
 🔗 **文档链接**: {url}
+
+---
+
+**📋 文档内容预览（供审阅）：**
+
+{polished}
+
+---
 
 💡 回复 /idea explore {topic} 可查看详细想法分析"""
             yield event.plain_result(output)
@@ -4106,6 +4161,80 @@ class PaperRAGPlugin(Star):
         except Exception as e:
             logger.error(f"飞书文档创建失败: {e}")
             yield event.plain_result(f"❌ 创建失败: {e}")
+
+    async def _resolve_source_arxiv(self, source: dict) -> dict:
+        """解析单个 source 的引用名称"""
+        metadata = source.get("metadata", {})
+        filename = metadata.get("file_name", "unknown")
+
+        # 优先从 abstract index 的 doc_stats 中获取真实标题
+        paper_title = await self._get_paper_title_from_abstract_index(filename)
+
+        # 如果无法从 abstract index 获取标题，则使用文件名（去掉扩展名）
+        if not paper_title:
+            paper_title = filename
+            if paper_title.endswith(".pdf"):
+                paper_title = paper_title[:-4]
+            elif paper_title.endswith(".txt"):
+                paper_title = paper_title[:-4]
+
+        # 直接使用文章标题，不尝试获取 arxiv 链接
+        source = dict(source)
+        source["display_name"] = paper_title
+        source["arxiv_url"] = ""
+        source["github_url"] = ""
+        logger.debug(f"[PaperRAG] 引用名称: {filename} -> {paper_title}")
+        return source
+
+    async def _get_paper_title_from_abstract_index(self, filename: str) -> str:
+        """从 abstract index 的 doc_stats 中获取论文标题"""
+        try:
+            import json
+            from pathlib import Path
+
+            # 构建 abstract index 的 doc_stats 文件路径
+            plugin_dir = Path(__file__).parent
+            doc_stats_file = plugin_dir / "data" / "milvus_abstracts_doc_stats.json"
+
+            if not doc_stats_file.exists():
+                return ""
+
+            with open(doc_stats_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            # 从文件名提取 paper_id（去掉扩展名）
+            paper_id = filename
+            if paper_id.endswith(".pdf"):
+                paper_id = paper_id[:-4]
+
+            # 在 abstracts 中查找
+            abstracts = data.get("abstracts", {})
+            if paper_id in abstracts:
+                title = abstracts[paper_id].get("title", "")
+                if title:
+                    logger.debug(f"[PaperRAG] 从abstract index找到标题: {filename} -> {title}")
+                    return title
+
+            # 尝试使用 file_name 字段匹配
+            for abstract_data in abstracts.values():
+                if abstract_data.get("file_name", "") == filename:
+                    title = abstract_data.get("title", "")
+                    if title:
+                        logger.debug(f"[PaperRAG] 从abstract index找到标题: {filename} -> {title}")
+                        return title
+
+        except Exception as e:
+            logger.debug(f"[PaperRAG] 获取论文标题失败: {e}")
+
+        return ""
+
+    async def _resolve_sources_arxiv(self, sources: list) -> list:
+        """批量解析 sources 的 arxiv 链接"""
+        resolved = []
+        for source in sources:
+            resolved_source = await self._resolve_source_arxiv(source)
+            resolved.append(resolved_source)
+        return resolved
 
     def _format_retrieve_response(self, sources: list) -> str:
         """Format retrieval results"""
@@ -4116,8 +4245,9 @@ class PaperRAGPlugin(Star):
             filename = metadata.get("file_name", "unknown")
             score = source.get("score", 0.0)
             text = source.get("text", "")[:200]
+            display_name = source.get("display_name", filename)
 
-            output += f"[{i}] **{filename}** (similarity: {score:.3f})\n"
+            output += f"[{i}] **{display_name}** (similarity: {score:.3f})\n"
             output += f"{text}...\n\n"
 
         return output.strip()
@@ -4132,8 +4262,9 @@ class PaperRAGPlugin(Star):
             filename = metadata.get("file_name", "unknown")
             chunk_index = metadata.get("chunk_index", 0)
             text = source.get("text", "")[:150]
+            display_name = source.get("display_name", filename)
 
-            output += f"[{i}] **{filename}** (chunk #{chunk_index})\n"
+            output += f"[{i}] **{display_name}** (chunk #{chunk_index})\n"
             output += f"> {text}...\n\n"
 
         return output.strip()

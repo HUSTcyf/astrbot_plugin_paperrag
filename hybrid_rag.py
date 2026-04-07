@@ -970,6 +970,7 @@ class HybridRAGEngine:
         # 延迟初始化 - 使用 cast 避免类型错误
         self._parser: HybridPDFParser = cast(HybridPDFParser, None)
         self._index_manager: HybridIndexManager = cast(HybridIndexManager, None)
+        self._abstract_manager: Optional[Any] = None  # 摘要索引管理器（用于两阶段检索）
         self._embed_provider: Union[OllamaEmbeddingProvider, AstrBotEmbeddingProvider, None] = None
         self._llm_client: Any = cast(Any, None)
         self._retriever: Union[VectorRetriever, "HybridRetriever"] = cast(Any, None)
@@ -978,6 +979,7 @@ class HybridRAGEngine:
         # 初始化标志
         self._parser_initialized = False
         self._index_initialized = False
+        self._abstract_initialized = False
         self._embed_provider_initialized = False
         self._llm_initialized = False
         self._retriever_initialized = False
@@ -1067,6 +1069,39 @@ class HybridRAGEngine:
         except Exception as e:
             logger.error(f"❌ HybridIndexManager初始化失败: {e}")
             raise
+
+    async def _ensure_abstract_manager_initialized(self) -> Any:
+        """确保摘要索引管理器已初始化（用于两阶段检索）"""
+        if self._abstract_initialized and self._abstract_manager is not None:
+            return self._abstract_manager
+
+        try:
+            from .abstract_index import AbstractIndexManager
+
+            # 确定路径
+            plugin_dir = Path(__file__).parent
+            milvus_uri = str(plugin_dir / "data" / "milvus_abstracts.db")
+
+            self._abstract_manager = AbstractIndexManager(
+                milvus_uri=milvus_uri,
+                collection_name="paper_abstracts",
+                embed_dim=self.config.embed_dim,
+            )
+
+            # 设置 embedding 模型（复用 embed_provider）
+            embed_provider = await self._ensure_embed_provider_initialized()
+            self._abstract_manager.set_embed_model(embed_provider)
+
+            await self._abstract_manager.initialize()
+            self._abstract_initialized = True
+            logger.info("✅ AbstractIndexManager初始化完成（两阶段检索）")
+            return self._abstract_manager
+
+        except Exception as e:
+            logger.warning(f"⚠️ AbstractIndexManager初始化失败: {e}，两阶段检索将被禁用")
+            self._abstract_initialized = True  # 标记已尝试，避免重复尝试
+            self._abstract_manager = None
+            return None
 
     def _ensure_retriever_initialized(self) -> Union[VectorRetriever, HybridRetriever]:
         """确保检索器已初始化"""
@@ -1389,6 +1424,10 @@ class HybridRAGEngine:
         retriever = self._ensure_retriever_initialized()
         reranker = self._ensure_reranker_initialized()
 
+        # 两阶段检索：确保摘要管理器已初始化
+        if self.config.enable_two_stage_retrieval:
+            await self._ensure_abstract_manager_initialized()
+
         # ========== 确保 LLM 只加载一次 ==========
         # 后续所有操作（LLM融合、CRAG评估、CRAG修正）都复用同一个 LLM 实例
         llm_provider = None
@@ -1398,11 +1437,72 @@ class HybridRAGEngine:
                 retriever.set_llm_provider(llm_provider)
 
         try:
-            # 执行检索（根据类型选择参数）
-            if isinstance(retriever, HybridRetriever):
-                query_result = await retriever.retrieve(query, top_k, use_llm_fusion=use_llm_fusion)
-            else:
-                query_result = await retriever.retrieve(query, top_k)
+            # ========== 两阶段检索（可选） ==========
+            # 阶段1: 先检索摘要索引找到相关论文
+            # 阶段2: 在这些论文内检索具体chunks
+            abstract_top_k = self.config.two_stage_top_k if hasattr(self.config, 'two_stage_top_k') else 5
+            use_two_stage = (
+                self.config.enable_two_stage_retrieval and
+                self._abstract_initialized and
+                self._abstract_manager is not None
+            )
+
+            if use_two_stage:
+                try:
+                    # 阶段1: 从摘要索引检索相关论文
+                    abstract_results = await self._abstract_manager.search_by_abstract(query, top_k=abstract_top_k)
+                    if abstract_results:
+                        # 注意：abstract index 存储 paper_id（如 "2412.11752v2（DRKS）"）
+                        # 而 chunks 的 metadata["file_name"] 有 .pdf 后缀（如 "2412.11752v2（DRKS）.pdf"）
+                        # 需要转换 paper_id -> file_name 格式
+                        paper_ids = []
+                        for r in abstract_results:
+                            pid = r.get("paper_id", "")
+                            if pid:
+                                # 已经是 file_name 格式（有 .pdf 后缀）
+                                if pid.lower().endswith(".pdf"):
+                                    paper_ids.append(pid)
+                                else:
+                                    # 是 paper_id 格式，转换为 file_name
+                                    paper_ids.append(pid + ".pdf")
+                        logger.debug(f"[两阶段检索] 阶段1: 找到 {len(abstract_results)} 篇相关论文")
+
+                        # 阶段2: 在这些论文内检索chunks
+                        query_embedding = await self._embed_provider.get_text_embedding(query)
+                        chunk_results = await self._index_manager.search_with_paper_filter(
+                            query_embedding=query_embedding,
+                            paper_ids=paper_ids,
+                            top_k=top_k
+                        )
+                        logger.debug(f"[两阶段检索] 阶段2: 找到 {len(chunk_results)} 个相关chunks")
+
+                        # 将结果转换为 QueryResult 格式
+                        if chunk_results:
+                            nodes = []
+                            scores = []
+                            for r in chunk_results:
+                                node = Node(
+                                    text=r.get("text", ""),
+                                    metadata=r.get("metadata", {})
+                                )
+                                nodes.append(node)
+                                scores.append(r.get("score", 0.0))
+                            query_result = QueryResult(nodes=nodes, scores=scores)
+                        else:
+                            # fallback 到普通检索
+                            use_two_stage = False
+                    else:
+                        use_two_stage = False
+                except Exception as e:
+                    logger.warning(f"[两阶段检索] 执行失败，回退到普通检索: {e}")
+                    use_two_stage = False
+
+            # 如果没有使用两阶段检索，执行普通检索
+            if not use_two_stage:
+                if isinstance(retriever, HybridRetriever):
+                    query_result = await retriever.retrieve(query, top_k, use_llm_fusion=use_llm_fusion)
+                else:
+                    query_result = await retriever.retrieve(query, top_k)
 
             # ========== CRAG: 分层检索 + 质量评估 + 修正 ==========
             # 将检索结果转换为字典格式（用于评估和修正）
@@ -1931,16 +2031,24 @@ class HybridRAGEngine:
             force_english: 强制使用英文回答
         """
         try:
-            # 构建上下文
+            # 构建上下文 - 使用论文标题，不要 [来源 X] 标识
             context_parts = []
             for i, src in enumerate(sources):
-                file_name = src['metadata'].get('file_name', 'unknown')
+                metadata = src.get('metadata', {})
+                file_name = metadata.get('file_name', 'unknown')
+                # 尝试获取论文标题（从 display_name 或 title 字段）
+                display_name = metadata.get('display_name', '') or file_name
+                # 去掉 .pdf 扩展名
+                if display_name.endswith('.pdf'):
+                    display_name = display_name[:-4]
                 text = src['text']
-                context_parts.append(f"[来源{i+1}] {file_name}\n{text}")
+                # 使用论文标题作为引用标识
+                context_parts.append(f"【{display_name}】\n{text}")
 
             context = "\n\n".join(context_parts)
 
             # 构建提示（根据 force_english 选择语言）
+            # 不再让 LLM 使用 [来源 X] 格式，而是使用论文名称
             if force_english:
                 text_prompt = f"""Based on the following paper content, answer the question. Respond in English only.
 
@@ -1948,7 +2056,7 @@ class HybridRAGEngine:
 
 Question: {query}
 
-Please provide a detailed answer and cite the relevant sources."""
+Please provide a detailed answer. When citing a paper, use its title directly (e.g., "According to the paper 'Deformable Radial Kernel Splatting'...") instead of using numbered references like [来源 X]."""
             else:
                 text_prompt = f"""基于以下论文内容回答问题：
 
@@ -1956,7 +2064,7 @@ Please provide a detailed answer and cite the relevant sources."""
 
 问题：{query}
 
-请提供详细的回答，并引用相关文献。"""
+请提供详细的回答。引用论文时请直接使用论文标题（例如："根据论文《Deformable Radial Kernel Splatting》..."），不要使用 [来源 X] 这样的编号引用。"""
 
             # 判断使用哪个Provider
             # 多模态：优先使用配置的 multimodal_provider_id

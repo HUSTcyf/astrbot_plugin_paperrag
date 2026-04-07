@@ -2,6 +2,28 @@
 
 所有值得注意的插件变更都会记录在这个文件中。
 
+## [1.10.1] - 2026-04-08
+
+### 引用格式优化与 arXiv 链接解析
+
+**文件**: `hybrid_rag.py`, `idea_engine.py`, `main.py`
+
+**概述**: 优化论文引用格式，使用论文标题替代编号引用，并支持通过文件名直接提取 arXiv ID。
+
+**变更**:
+
+- `hybrid_rag.py`: `_generate_answer_with_llm()` 改为使用论文标题格式 `【论文标题】` 作为引用标识，Prompt 明确要求 LLM 使用论文名称而非 `[来源 X]` 编号格式
+- `main.py`: `_resolve_source_arxiv()` 删除 CORE API 调用逻辑，改为直接使用论文标题作为显示名称
+- `idea_engine.py`: `_polish_content_for_feishu()` Prompt 更新，要求 LLM 将论文名称替换为完整 arXiv 链接；`_build_citations_context()` 引用格式改为 `论文名称 (https://arxiv.org/abs/xxxxx)` 供 LLM 替换
+- `CoreAPIClient`: `_do_search_with_retry()` 新增重试机制，处理网络不稳定情况；修复 `httpx.TimeoutException` 异常类名错误
+
+### Bug 修复
+
+- 修复 `abstract_index.py` 中 `combined_text` 变量名拼写错误（应为 `{abstract_text}`）
+- 修复 `idea_engine.py` 中 CORE API 异常处理使用不存在的 `httpx.ConnectTimeout`（应为 `httpx.TimeoutException`）
+
+---
+
 ## [1.10.0] - 2026-04-07
 
 ### 两阶段检索与摘要索引

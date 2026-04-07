@@ -214,3 +214,4 @@ results/
 datasets/test_figures_and_tables
 evaluation/freeapi.json
 *.tgz
+.DS_Store

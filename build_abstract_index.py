@@ -445,33 +445,34 @@ class LocalGGUFClient:
             logger.error(f"❌ GGUF 模型加载失败: {e}")
             return False
 
-    async def extract_abstract(self, text: str) -> Optional[str]:
+    async def extract_title_and_abstract(self, text: str) -> tuple[Optional[str], Optional[str]]:
         """
-        使用 LLM 从论文开头提取摘要
+        使用 LLM 从论文开头提取标题和摘要
 
         Args:
             text: 论文开头的文本（直到 Introduction 之前）
 
         Returns:
-            提取的摘要文本，失败返回 None
+            (标题, 摘要) 元组，任一失败返回 (None, None)
         """
         if not self._is_loaded or self._llama is None:
             success = await self.load()
             if not success:
-                return None
+                return None, None
 
-        prompt = f"""从以下论文内容中提取摘要部分。
+        prompt = f"""从以下论文内容中提取标题和摘要。
 
 要求：
-1. 只返回摘要内容，不要其他解释
-2. 完全保持原文语言（英文就返回英文，中文就返回中文），不要翻译
-3. 不要进行任何润色、修改或概括，原文是怎样就怎样返回
-4. 如果内容明显不是摘要，返回空
+1. 标题：返回论文的完整标题（通常在页面顶部），保持原文语言
+2. 摘要：只返回摘要部分，完全保持原文语言（英文就返回英文，中文就返回中文），不要翻译，不要润色或修改
+3. 如果内容明显不是论文，返回空标题和空摘要
+4. 严格按照以下JSON格式返回，不要添加任何其他内容：
+{{"title": "论文标题", "abstract": "摘要内容"}}
 
 论文内容：
-{text[:3000]}
+{text[:4000]}
 
-摘要："""
+JSON："""
 
         try:
             llama = self._llama
@@ -488,17 +489,54 @@ class LocalGGUFClient:
                 )
             )
 
-            abstract = result["choices"][0]["message"]["content"].strip()
-            abstract = abstract.strip('"\n ')
+            content = result["choices"][0]["message"]["content"].strip()
 
+            # 解析 JSON
+            import json
+            # 尝试提取 JSON（可能包含在 markdown 代码块中）
+            json_match = re.search(r'\{[^{}]*"title"[^{}]*"abstract"[^{}]*\}', content, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+            else:
+                # 尝试直接解析整个响应
+                json_str = content
+
+            data = json.loads(json_str)
+            title = data.get("title", "").strip('"\n ')
+            abstract = data.get("abstract", "").strip('"\n ')
+
+            # 验证结果
             if len(abstract) < 30:
-                return None
+                logger.debug(f"摘要太短，可能是无效内容")
+                return title if title else None, None
 
-            return abstract
+            return title, abstract
 
+        except json.JSONDecodeError as e:
+            logger.debug(f"JSON 解析失败: {e}, 尝试备用提取")
+            # 备用：尝试用正则提取 LLM 响应中的 JSON
+            return self._extract_title_abstract_fallback(content)
         except Exception as e:
-            logger.warning(f"LLM 提取摘要失败: {e}")
-            return None
+            logger.warning(f"LLM 提取标题和摘要失败: {e}")
+            return None, None
+
+    def _extract_title_abstract_fallback(self, text: str) -> tuple[Optional[str], Optional[str]]:
+        """备用提取：当 JSON 解析失败时使用正则表达式提取"""
+        try:
+            import re
+            # 尝试匹配 JSON 中的 title 和 abstract
+            title_match = re.search(r'"title"\s*:\s*"([^"]+)"', text[:500])
+            abstract_match = re.search(r'"abstract"\s*:\s*"([^"]+)"', text)
+
+            title = title_match.group(1) if title_match else None
+            abstract = abstract_match.group(1) if abstract_match else None
+
+            if abstract and len(abstract) >= 30:
+                return title, abstract
+        except Exception:
+            pass
+
+        return None, None
 
     async def close(self):
         """关闭模型（如果是我们自己加载的）"""
@@ -662,20 +700,24 @@ class AbstractIndexManager:
     ) -> bool:
         """为单篇论文建立摘要索引
 
-        提取策略：默认使用 LLM 提取，失败时使用常规提取
+        提取策略：默认使用 LLM 同时提取标题和摘要，失败时使用常规提取
         """
         await self._ensure_collection()
 
         try:
             extractor = AbstractExtractor()
 
-            # LLM 提取（优先）
-            if not abstract_text and self._llm_client is not None:
+            # LLM 同时提取标题和摘要（优先）
+            if self._llm_client is not None and (not abstract_text or not title):
                 paper_beginning = self._extract_paper_beginning(pdf_path)
                 if paper_beginning:
-                    abstract_text = await self._llm_client.extract_abstract(paper_beginning)
+                    llm_title, llm_abstract = await self._llm_client.extract_title_and_abstract(paper_beginning)
+                    if llm_abstract and len(llm_abstract) >= 30:
+                        abstract_text = llm_abstract
+                    if llm_title:
+                        title = llm_title
 
-            # 常规提取（回退）
+            # 常规提取（回退）- 标题和摘要分别提取
             if not abstract_text or len(abstract_text) < 50:
                 abstract_text = extractor.extract_abstract_from_pdf(pdf_path)
 
