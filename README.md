@@ -1,8 +1,8 @@
-# 📚 Paper RAG Plugin v1.9.5 - 用户指南
+# 📚 Paper RAG Plugin v1.10.0 - 用户指南
 
 本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力（支持多模态VLM问答）。
 
-> **版本说明**：当前版本 v1.9.5，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
+> **版本说明**：当前版本 v1.10.0，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
 
 ## ✨ 核心功能
 
@@ -103,6 +103,7 @@ cp ~/Downloads/*.pdf papers/
 | `/paper arxiv_refs [top_k] [每篇数量]` | 下载高频引用论文（需管理员） | `/paper arxiv_refs 10 3` |
 | `/paper arxiv_sync confirm` | 同步MCP已下载论文到数据库（需管理员） | `/paper arxiv_sync confirm` |
 | `/paper arxiv_cleanup confirm` | 清理arXiv论文旧版本（需管理员） | `/paper arxiv_cleanup confirm` |
+| `/paper abstract_build confirm [N]` | 构建摘要索引（支持跳过前N篇，检查点恢复） | `/paper abstract_build confirm 30` |
 | `/paper graph_build` | 构建知识图谱（需管理员） | `/paper graph_build` |
 | `/paper graph_stats` | 查看图谱统计信息 | `/paper graph_stats` |
 | `/paper graph_rebuild confirm` | 重建知识图谱（清空+重建） | `/paper graph_rebuild confirm` |
@@ -917,6 +918,32 @@ evaluation_output/
 **模型自动降级**：
 - 优先使用 Qwen3.5-9B 模型
 - 9B 不可用时自动降级到 Qwen3.5-4B 模型
+
+**版本**：v1.10.0
+
+---
+
+### ✅ 两阶段检索（Two-Stage Retrieval）
+
+通过摘要索引实现先匹配论文再检索具体内容的分段检索模式。
+
+**已实现功能**：
+- [x] 摘要索引管理器 `AbstractIndexManager`（`abstract_index.py`）
+- [x] 摘要提取器 `AbstractExtractor`（从论文中提取摘要）
+- [x] 摘要向量索引构建（Milvus）
+- [x] `search_with_paper_filter()` 方法（在指定论文范围内搜索）
+- [x] 命令 `/paper abstract_build confirm [N]`（构建摘要索引，支持检查点恢复）
+
+**技术方案**：
+- 第一阶段：使用摘要向量匹配最相关的论文
+- 第二阶段：在匹配的论文范围内检索具体内容
+- 支持检查点机制，中断后可恢复
+
+**使用方式**：
+```bash
+/paper abstract_build confirm      # 开始构建摘要索引
+/paper abstract_build confirm 30   # 跳过前30篇，从第31篇开始
+```
 
 ---
 

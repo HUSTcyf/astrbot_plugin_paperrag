@@ -647,6 +647,88 @@ class HybridIndexManager:
             logger.error(f"搜索失败: {e}")
             raise
 
+    async def search_with_paper_filter(
+        self,
+        query_embedding: List[float],
+        paper_ids: List[str],
+        top_k: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        在指定论文范围内进行向量搜索（阶段2检索）
+
+        Args:
+            query_embedding: 查询向量
+            paper_ids: 论文 ID 列表（只在这范围内搜索）
+            top_k: 返回结果数量
+
+        Returns:
+            搜索结果列表
+        """
+        await self._ensure_collection()
+
+        try:
+            # 构建过滤表达式：匹配指定论文
+            if not paper_ids:
+                return []
+
+            # 构建 OR 表达式
+            paper_conditions = [f'metadata["file_name"] == "{pid}"' for pid in paper_ids]
+            if len(paper_conditions) == 1:
+                filter_expr = paper_conditions[0]
+            else:
+                filter_expr = " || ".join(paper_conditions)
+
+            # 搜索参数
+            search_params: Dict[str, Any] = {
+                "metric_type": "COSINE",
+                "params": {}
+            }
+
+            # 执行搜索
+            collection = cast(Collection, self._collection)
+            loop = asyncio.get_event_loop()
+
+            raw_results = await loop.run_in_executor(
+                None,
+                lambda: collection.search(
+                    data=[query_embedding],
+                    anns_field="vector",
+                    param=search_params,
+                    limit=top_k,
+                    expr=filter_expr,
+                    output_fields=["text", "metadata"]
+                )
+            )
+
+            results: Any = cast(Any, raw_results)
+            if results is None or len(results) == 0:
+                return []
+
+            # 转换结果
+            import json
+            documents = []
+            results_first: Any = cast(Any, results[0])
+            for hit in results_first:
+                metadata = hit.entity.get("metadata", {})
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except json.JSONDecodeError:
+                        metadata = {}
+
+                documents.append({
+                    "text": hit.entity.get("text"),
+                    "metadata": metadata or {},
+                    "score": float(hit.score),
+                    "paper_id": metadata.get("file_name", "")
+                })
+
+            return documents
+
+        except Exception as e:
+            logger.error(f"带论文过滤的搜索失败: {e}")
+            raise
+
     async def get_stats(self) -> Dict[str, Any]:
         """获取索引统计信息"""
         try:

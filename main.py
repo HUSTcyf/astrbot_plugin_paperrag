@@ -607,6 +607,60 @@ class PaperRAGPlugin(Star):
 
         return False
 
+    async def _index_abstract_for_paper(self, pdf_path: str, file_name: str, engine) -> bool:
+        """
+        为单篇论文构建摘要索引（使用 LLM 提取 + 向量存储）
+
+        Returns:
+            是否成功
+        """
+        try:
+            from .abstract_index import AbstractIndexManager
+        except Exception:
+            from abstract_index import AbstractIndexManager
+
+        try:
+            embed_provider = await engine._ensure_embed_provider_initialized()
+            embed_dim = self.config.get("embed_dim", 768)
+
+            plugin_dir = Path(__file__).parent
+            milvus_uri = str(plugin_dir / "data" / "milvus_abstracts.db")
+
+            abstract_index = AbstractIndexManager(
+                milvus_uri=milvus_uri,
+                collection_name="paper_abstracts",
+                embed_dim=embed_dim,
+            )
+            abstract_index.set_embed_model(embed_provider)
+
+            # 设置 LLM 客户端
+            try:
+                from .llama_cpp_vlm_provider import get_cached_llama_cpp_provider
+                llm_provider = get_cached_llama_cpp_provider()
+                if llm_provider is not None and llm_provider._initialized and llm_provider._llama is not None:
+                    from .abstract_index import LocalGGUFClient
+                    llm_client = LocalGGUFClient()
+                    llm_client._llama = llm_provider._llama
+                    llm_client._is_loaded = True
+                    abstract_index.set_llm_client(llm_client)
+                    logger.info("✅ 摘要索引使用已加载的 GGUF 模型")
+            except Exception as e:
+                logger.debug(f"未使用 LLM 提取摘要: {e}")
+
+            await abstract_index.initialize()
+
+            paper_id = os.path.splitext(file_name)[0]
+            success = await abstract_index.index_paper(
+                pdf_path=pdf_path,
+                paper_id=paper_id,
+                file_name=file_name,
+            )
+            return success
+
+        except Exception as e:
+            logger.warning(f"摘要索引失败 {file_name}: {e}")
+            return False
+
     async def _run_graph_build_in_background(self, engine):
         """后台运行图谱构建"""
         try:
@@ -824,22 +878,23 @@ class PaperRAGPlugin(Star):
     @filter.command_group("paper")
     def paper_commands(self):
         """Paper RAG command group
-        search       - Search documents and answer questions
-        list         - List indexed documents
-        add          - Add documents to knowledge base (PDF/Word/TXT supported)
-        addf         - Add a single document to knowledge base
-        delete       - Delete a specific paper from knowledge base
-        clear        - Clear knowledge base
-        rebuild      - Clear and re-add all documents
-        refstats     - Show reference title frequency statistics (-1 for zero-ref papers, dedup=1 for deduplicated count)
-        arxiv_add    - Search arxiv and download papers, then add to database (Admin)
-        arxiv_refs   - Download highly-cited reference papers from arxiv (Admin)
-        arxiv_sync   - Sync MCP downloaded papers to paperrag database (Admin)
-        arxiv_cleanup- Clean up old versions of arxiv papers (Admin)
-        graph_build  - Build knowledge graph from indexed documents
-        graph_rebuild- Rebuild knowledge graph from scratch (clear + rebuild)
-        graph_stats  - Show knowledge graph statistics
-        graph_clear  - Clear knowledge graph (Admin)
+        search         - Search documents and answer questions
+        list           - List indexed documents
+        add            - Add documents to knowledge base (PDF/Word/TXT supported)
+        addf           - Add a single document to knowledge base
+        delete         - Delete a specific paper from knowledge base
+        clear          - Clear knowledge base
+        rebuild        - Clear and re-add all documents
+        refstats       - Show reference title frequency statistics (-1 for zero-ref papers, dedup=1 for deduplicated count)
+        arxiv_add      - Search arxiv and download papers, then add to database (Admin)
+        arxiv_refs     - Download highly-cited reference papers from arxiv (Admin)
+        arxiv_sync     - Sync MCP downloaded papers to paperrag database (Admin)
+        arxiv_cleanup  - Clean up old versions of arxiv papers (Admin)
+        abstract_build - Build abstract index from indexed documents (two-stage retrieval)
+        graph_build    - Build knowledge graph from indexed documents
+        graph_rebuild  - Rebuild knowledge graph from scratch (clear + rebuild)
+        graph_stats    - Show knowledge graph statistics
+        graph_clear    - Clear knowledge graph (Admin)
         """
         pass
 
@@ -1035,6 +1090,12 @@ class PaperRAGPlugin(Star):
                             f"✅ [{idx}/{total_files}] {file_name} - {chunks_added} chunks"
                         )
 
+                        # 构建摘要索引（LLM 提取 + 向量存储）
+                        if file_name.lower().endswith('.pdf'):
+                            abstract_ok = await self._index_abstract_for_paper(file_path, file_name, engine)
+                            if abstract_ok:
+                                logger.info(f"✅ 摘要索引完成: {file_name}")
+
                         # 检查是否需要自动构建知识图谱
                         if successful == 1:  # 只在第一批成功时检查
                             auto_built = await self._maybe_trigger_graph_auto_build(successful)
@@ -1125,6 +1186,12 @@ class PaperRAGPlugin(Star):
             if result.get("status") == "success":
                 chunks_added = result.get("chunks_added", 0)
                 yield event.plain_result(f"✅ {file_name}\n   └─ {chunks_added} chunks added")
+
+                # 构建摘要索引（LLM 提取 + 向量存储）
+                if file_name.lower().endswith('.pdf'):
+                    abstract_ok = await self._index_abstract_for_paper(file_path, file_name, engine)
+                    if abstract_ok:
+                        yield event.plain_result(f"   └─ 摘要索引完成")
 
                 # 检查是否需要自动构建知识图谱
                 auto_built = await self._maybe_trigger_graph_auto_build(1)
@@ -2081,6 +2148,18 @@ class PaperRAGPlugin(Star):
                 return
             yield event.plain_result("✅ Step 1/5: Knowledge base cleared")
 
+            # 同时清除摘要索引
+            try:
+                from .abstract_index import AbstractIndexManager
+                embed_dim = self.config.get("embed_dim", 768)
+                milvus_uri = str(plugin_dir / "data" / "milvus_abstracts.db")
+                abstract_index = AbstractIndexManager(milvus_uri=milvus_uri, embed_dim=embed_dim)
+                await abstract_index.initialize()
+                abstract_index.clear()
+                yield event.plain_result("✅ Step 1/5b: Abstract index cleared")
+            except Exception as e:
+                logger.warning(f"清除摘要索引失败: {e}")
+
         except Exception as e:
             logger.error(f"Failed to clear document library: {e}")
             yield event.plain_result(f"❌ Failed to clear: {e}")
@@ -2552,6 +2631,218 @@ class PaperRAGPlugin(Star):
 
         except Exception as e:
             logger.error(f"构建知识图谱失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            send_msg(f"❌ 构建失败: {e}")
+
+    @paper_commands.command("abstract_build")
+    async def cmd_abstract_build(self, event: AstrMessageEvent, confirm: str = '', skip: str = ''):
+        """Build abstract index from indexed documents (two-stage retrieval)
+
+        Args:
+            confirm: Must be 'confirm' to proceed
+            skip: Number of papers to skip (e.g., '30' to skip first 30 papers)
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        plugin_dir = Path(__file__).parent
+        checkpoint_file = plugin_dir / "data" / "abstract_build_checkpoint.json"
+
+        if confirm != "confirm":
+            skip_hint = ""
+            if checkpoint_file.exists():
+                try:
+                    with open(checkpoint_file, "r", encoding="utf-8") as f:
+                        ckpt = json.load(f)
+                        sc = ckpt.get("skip_count", 0)
+                        if sc > 0:
+                            skip_hint = f"\n⚠️ 检测到检查点（已处理 {sc} 篇），将自动从第 {sc} 篇后继续"
+                except Exception:
+                    pass
+            yield event.plain_result(
+                "⚠️ 即将为已索引的文档建立摘要索引\n"
+                "摘要索引用于两阶段检索（先匹配论文，再检索详情）\n"
+                "注意：构建过程在后台运行，可随时中断（检查点自动保存）\n"
+                "使用 /paper abstract_build confirm [N] 确认执行\n"
+                "例如：/paper abstract_build confirm 30 表示跳过前30篇，从第31篇开始"
+                + skip_hint
+            )
+            return
+
+        engine = self._get_engine()
+        if not engine:
+            yield event.plain_result("❌ RAG引擎未就绪")
+            return
+
+        # 解析 skip 参数
+        skip_count = 0
+        if skip:
+            skip_str = str(skip).strip()
+            if '=' in skip_str:
+                skip_str = skip_str.split('=', 1)[1].strip()
+            skip_str = ''.join(c for c in skip_str if c.isdigit())
+            if skip_str:
+                skip_count = int(skip_str)
+            else:
+                yield event.plain_result(f"❌ skip 参数无效: {skip}，请使用数字")
+                return
+
+        yield event.plain_result(f"🔨 摘要索引构建已在后台启动...\n📋 查看进度：检查 AstrBot 控制台日志\n💾 每篇论文处理完自动保存检查点")
+
+        # 启动后台任务
+        asyncio.create_task(self._abstract_build_background_task(event, engine, skip_count))
+
+    async def _abstract_build_background_task(self, event: AstrMessageEvent, engine, skip_count: int = 0):
+        """后台运行摘要索引构建任务（支持检查点和进度日志）"""
+        from pathlib import Path
+
+        plugin_dir = Path(__file__).parent
+
+        def send_msg(text: str):
+            """发送消息到用户（仅通过日志）"""
+            logger.info(f"[AbstractBuild] {text}")
+
+        try:
+            # 获取索引管理器
+            index_manager = engine._ensure_index_manager_initialized()
+
+            send_msg("📖 正在从向量数据库读取论文列表...")
+
+            try:
+                papers = await index_manager.list_unique_documents()
+            except Exception as e:
+                send_msg(f"❌ 无法获取论文列表: {e}\n请确保已使用 /paper add 添加文档")
+                return
+
+            if not papers:
+                send_msg("📭 向量数据库中未找到已索引的文档\n请先使用 /paper add 添加文档")
+                return
+
+            send_msg(f"📚 找到 {len(papers)} 篇论文，开始逐篇提取摘要...")
+
+            # 导入摘要索引模块
+            try:
+                from .abstract_index import AbstractIndexManager, AbstractExtractor
+            except Exception:
+                from abstract_index import AbstractIndexManager, AbstractExtractor
+
+            # 初始化摘要索引管理器
+            embed_provider = await engine._ensure_embed_provider_initialized()
+            embed_dim = self.config.get("embed_dim", 768)
+
+            plugin_dir = Path(__file__).parent
+            milvus_uri = str(plugin_dir / "data" / "milvus_abstracts.db")
+
+            abstract_index = AbstractIndexManager(
+                milvus_uri=milvus_uri,
+                collection_name="paper_abstracts",
+                embed_dim=embed_dim,
+            )
+            abstract_index.set_embed_model(embed_provider)
+            await abstract_index.initialize()
+
+            send_msg(f"✅ 摘要索引管理器初始化完成 (dim={embed_dim})")
+
+            # 检查点机制
+            import json as _json
+            checkpoint_file = plugin_dir / "data" / "abstract_build_checkpoint.json"
+            if skip_count == 0 and checkpoint_file.exists():
+                try:
+                    with open(checkpoint_file, "r", encoding="utf-8") as f:
+                        ckpt = _json.load(f)
+                        skip_count = ckpt.get("skip_count", 0)
+                        if skip_count > 0:
+                            send_msg(f"🔄 检测到检查点，将跳过前 {skip_count} 篇已处理的论文")
+                except Exception:
+                    pass
+            elif skip_count > 0:
+                send_msg(f"⏭️ 使用 skip 参数，跳过前 {skip_count} 篇论文")
+
+            # 获取已处理的论文ID
+            existing_abstracts = await abstract_index.get_all_abstracts()
+            processed_ids = set(existing_abstracts.keys())
+
+            results = {"success": 0, "failed": 0, "skipped": 0}
+
+            for i, paper in enumerate(papers):
+                file_name = paper.get("file_name", "")
+                # 从 file_name 派生 paper_id（去掉扩展名）
+                paper_id = os.path.splitext(file_name)[0]
+
+                # 跳过已处理的
+                if i < skip_count:
+                    continue
+                if paper_id in processed_ids:
+                    send_msg(f"⏭️ [{i+1}/{len(papers)}] {file_name} 已存在摘要，跳过")
+                    results["skipped"] += 1
+                    continue
+
+                paper_id_escaped = paper_id.replace('"', '\\"')
+                try:
+                    # 获取PDF路径
+                    pdf_path = paper.get("file_path", "")
+                    if not pdf_path or not os.path.exists(pdf_path):
+                        # 尝试在papers_dir中查找
+                        papers_dir = self.config.get("papers_dir", "./papers")
+                        pdf_path = os.path.join(papers_dir, file_name)
+                        if not os.path.exists(pdf_path):
+                            # 尝试其他扩展名
+                            base_name = os.path.splitext(file_name)[0]
+                            for ext in ['.pdf', '.PDF', '.docx', '.txt']:
+                                alt_path = os.path.join(papers_dir, base_name + ext)
+                                if os.path.exists(alt_path):
+                                    pdf_path = alt_path
+                                    break
+
+                    send_msg(f"📄 [{i+1}/{len(papers)}] {file_name}")
+
+                    success = await abstract_index.index_paper(
+                        pdf_path=pdf_path,
+                        paper_id=paper_id,
+                        file_name=file_name,
+                    )
+
+                    if success:
+                        results["success"] += 1
+                    else:
+                        results["failed"] += 1
+
+                    # 保存检查点
+                    checkpoint = {
+                        "skip_count": i + 1,
+                        "last_paper": file_name,
+                        "results": results
+                    }
+                    with open(checkpoint_file, "w", encoding="utf-8") as f:
+                        _json.dump(checkpoint, f, ensure_ascii=False)
+
+                except Exception as e:
+                    logger.warning(f"⚠️ 索引失败 {file_name}: {e}")
+                    results["failed"] += 1
+
+            # 清理检查点文件
+            if checkpoint_file.exists():
+                try:
+                    os.remove(checkpoint_file)
+                    send_msg("🗑️ 检查点文件已清理")
+                except Exception:
+                    pass
+
+            output = f"""✅ **摘要索引构建完成**
+
+📊 统计结果：
+   • 总论文数：{len(papers)}
+   • 成功：{results['success']}
+   • 失败：{results['failed']}
+   • 跳过（已存在）：{results['skipped']}
+
+💡 使用 /paper abstract_search [query] 测试两阶段检索"""
+            send_msg(output)
+
+        except Exception as e:
+            logger.error(f"构建摘要索引失败: {e}")
             import traceback
             logger.error(traceback.format_exc())
             send_msg(f"❌ 构建失败: {e}")
