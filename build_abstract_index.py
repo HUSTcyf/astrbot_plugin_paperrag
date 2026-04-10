@@ -103,6 +103,7 @@ class OpenAlexAPIClient:
 
             results = []
             for w in works:
+                w = cast(dict, w)
                 pub_title = w.get("title", "")
                 if not pub_title:
                     continue
@@ -1364,18 +1365,19 @@ async def build_abstract_index(
                     arxiv_result = await arxiv_client._arxiv_library_fallback(abstract.title)
                     if arxiv_result:
                         arxiv_url, matched_title = arxiv_result
-                        from rapidfuzz import fuzz
-                        score = fuzz.token_set_ratio(
-                            arxiv_client._normalize(abstract.title),
-                            arxiv_client._normalize(matched_title)
-                        )
-                        if score >= 80:
-                            best_similarity = score / 100.0
-                            used_api = "arXiv Library"
-                            logger.success(f"  → arxiv (arXiv fallback, 相似度 {best_similarity:.1%}): {arxiv_url}")
-                        else:
-                            logger.warning(f"  → arXiv 结果验证失败: {score:.1%} < 80%")
-                            arxiv_url = ""  # 清除验证失败的 URL
+                        if matched_title:
+                            from rapidfuzz import fuzz
+                            score = fuzz.token_set_ratio(
+                                arxiv_client._normalize(abstract.title),
+                                arxiv_client._normalize(matched_title)
+                            )
+                            if score >= 80:
+                                best_similarity = score / 100.0
+                                used_api = "arXiv Library"
+                                logger.success(f"  → arxiv (arXiv fallback, 相似度 {best_similarity:.1%}): {arxiv_url}")
+                            else:
+                                logger.warning(f"  → arXiv 结果验证失败: {score:.1%} < 80%")
+                                arxiv_url = ""  # 清除验证失败的 URL
 
                 detail["similarity"] = best_similarity
                 detail["api"] = used_api
