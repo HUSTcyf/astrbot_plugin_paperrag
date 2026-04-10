@@ -286,7 +286,13 @@ BM25检索结果（Top 5）：
                     temperature=0.1,
                     max_tokens=100
                 )
-                response_text = self._extract_answer_from_response(response)
+                # 内联提取响应文本
+                if hasattr(response, 'choices') and response.choices:
+                    response_text = response.choices[0].message.content
+                elif hasattr(response, 'content'):
+                    response_text = response.content
+                else:
+                    response_text = str(response)
             else:
                 return self._alpha
 
@@ -1259,7 +1265,7 @@ class HybridRAGEngine:
             return self._reranker
 
         if not self.config.enable_reranking:
-            logger.debug("🔍 重排序未启用")
+            logger.debug(f"🔍 重排序未启用 (enable_reranking={self.config.enable_reranking})")
             return None
 
         try:
@@ -1449,60 +1455,67 @@ class HybridRAGEngine:
 
             if use_two_stage:
                 try:
-                    # 阶段1: 从摘要索引检索相关论文
-                    abstract_results = await self._abstract_manager.search_by_abstract(query, top_k=abstract_top_k)
-                    if abstract_results:
-                        # 注意：abstract index 存储 paper_id（如 "2412.11752v2（DRKS）"）
-                        # 而 chunks 的 metadata["file_name"] 有 .pdf 后缀（如 "2412.11752v2（DRKS）.pdf"）
-                        # 需要转换 paper_id -> file_name 格式
-                        paper_ids = []
-                        for r in abstract_results:
-                            pid = r.get("paper_id", "")
-                            if pid:
-                                # 已经是 file_name 格式（有 .pdf 后缀）
-                                if pid.lower().endswith(".pdf"):
-                                    paper_ids.append(pid)
-                                else:
-                                    # 是 paper_id 格式，转换为 file_name
-                                    paper_ids.append(pid + ".pdf")
-                        logger.debug(f"[两阶段检索] 阶段1: 找到 {len(abstract_results)} 篇相关论文")
-
-                        # 阶段2: 在这些论文内检索chunks
-                        query_embedding = await self._embed_provider.get_text_embedding(query)
-                        chunk_results = await self._index_manager.search_with_paper_filter(
-                            query_embedding=query_embedding,
-                            paper_ids=paper_ids,
-                            top_k=top_k
-                        )
-                        logger.debug(f"[两阶段检索] 阶段2: 找到 {len(chunk_results)} 个相关chunks")
-
-                        # 将结果转换为 QueryResult 格式
-                        if chunk_results:
-                            nodes = []
-                            scores = []
-                            for r in chunk_results:
-                                node = Node(
-                                    text=r.get("text", ""),
-                                    metadata=r.get("metadata", {})
-                                )
-                                nodes.append(node)
-                                scores.append(r.get("score", 0.0))
-                            query_result = QueryResult(nodes=nodes, scores=scores)
-                        else:
-                            # fallback 到普通检索
-                            use_two_stage = False
-                    else:
+                    abstract_mgr = self._abstract_manager
+                    embed_prov = self._embed_provider
+                    if embed_prov is None:
                         use_two_stage = False
+                    else:
+                        # 阶段1: 从摘要索引检索相关论文
+                        abstract_results = await cast(Any, abstract_mgr).search_by_abstract(query, top_k=abstract_top_k)
+                        if abstract_results:
+                            # 注意：abstract index 存储 paper_id（如 "2412.11752v2（DRKS）"）
+                            # 而 chunks 的 metadata["file_name"] 有 .pdf 后缀（如 "2412.11752v2（DRKS）.pdf"）
+                            # 需要转换 paper_id -> file_name 格式
+                            paper_ids = []
+                            for r in abstract_results:
+                                pid = r.get("paper_id", "")
+                                if pid:
+                                    # 已经是 file_name 格式（有 .pdf 后缀）
+                                    if pid.lower().endswith(".pdf"):
+                                        paper_ids.append(pid)
+                                    else:
+                                        # 是 paper_id 格式，转换为 file_name
+                                        paper_ids.append(pid + ".pdf")
+                            logger.debug(f"[两阶段检索] 阶段1: 找到 {len(abstract_results)} 篇相关论文")
+
+                            # 阶段2: 在这些论文内检索chunks
+                            query_embedding = await embed_prov.get_text_embedding(query)
+                            chunk_results = await self._index_manager.search_with_paper_filter(
+                                query_embedding=query_embedding,
+                                paper_ids=paper_ids,
+                                top_k=top_k
+                            )
+                            logger.debug(f"[两阶段检索] 阶段2: 找到 {len(chunk_results)} 个相关chunks")
+
+                            # 将结果转换为 QueryResult 格式
+                            if chunk_results:
+                                nodes = []
+                                scores = []
+                                for r in chunk_results:
+                                    node = Node(
+                                        text=r.get("text", ""),
+                                        metadata=r.get("metadata", {})
+                                    )
+                                    nodes.append(node)
+                                    scores.append(r.get("score", 0.0))
+                                query_result = QueryResult(nodes=nodes, scores=scores)
+                            else:
+                                # fallback 到普通检索
+                                use_two_stage = False
+                        else:
+                            use_two_stage = False
                 except Exception as e:
                     logger.warning(f"[两阶段检索] 执行失败，回退到普通检索: {e}")
                     use_two_stage = False
 
             # 如果没有使用两阶段检索，执行普通检索
+            query_result = QueryResult(nodes=[], scores=[])
             if not use_two_stage:
                 if isinstance(retriever, HybridRetriever):
                     query_result = await retriever.retrieve(query, top_k, use_llm_fusion=use_llm_fusion)
                 else:
                     query_result = await retriever.retrieve(query, top_k)
+            # type: ignore[has-type] - avoiding mypy duplicate variable warning; fallback result overwrites initial empty value
 
             # ========== CRAG: 分层检索 + 质量评估 + 修正 ==========
             # 将检索结果转换为字典格式（用于评估和修正）
@@ -1953,7 +1966,7 @@ class HybridRAGEngine:
 
             # 转换为 RGB（如果是 RGBA）
             if image.mode == 'RGBA':
-                image = image.convert('RGB')
+                image = cast(Image.Image, image.convert('RGB'))
 
             # 压缩为 JPEG 并返回 base64
             buffered = io.BytesIO()
@@ -2050,21 +2063,17 @@ class HybridRAGEngine:
             # 构建提示（根据 force_english 选择语言）
             # 不再让 LLM 使用 [来源 X] 格式，而是使用论文名称
             if force_english:
-                text_prompt = f"""Based on the following paper content, answer the question. Respond in English only.
+                text_prompt = f"""Based on the following paper content, answer the question in English. Keep the answer concise (2-4 sentences), factual, and in plain text without markdown formatting.
 
 {context}
 
-Question: {query}
-
-Please provide a detailed answer. When citing a paper, use its title directly (e.g., "According to the paper 'Deformable Radial Kernel Splatting'...") instead of using numbered references like [来源 X]."""
+Question: {query}"""
             else:
-                text_prompt = f"""基于以下论文内容回答问题：
+                text_prompt = f"""基于以下论文内容，用简洁的纯文本回答问题（2-4句话，不使用Markdown格式）：
 
 {context}
 
-问题：{query}
-
-请提供详细的回答。引用论文时请直接使用论文标题（例如："根据论文《Deformable Radial Kernel Splatting》..."），不要使用 [来源 X] 这样的编号引用。"""
+问题：{query}"""
 
             # 判断使用哪个Provider
             # 多模态：优先使用配置的 multimodal_provider_id
@@ -2450,7 +2459,7 @@ Answer requirements:
         # 合并关键词（答案关键词权重更高）
         all_keywords = query_keywords | answer_keywords
 
-        evidence_spans = []
+        evidence_spans: list[str] = []
 
         for src in sources:
             text = src.get("text", "")
@@ -2652,7 +2661,7 @@ Answer requirements:
 
         image_paths = []  # (path, priority) 元组列表
         seen = set()
-        paper_ids_with_visual_content = {}  # paper_id -> 提及的figure模式列表
+        paper_ids_with_visual_content: dict[str, set[str]] = {}  # paper_id -> 提及的figure集合
         source_texts_figures = []  # 各source中提到的figure引用
 
         # 获取插件目录（用于构建Qasper图片路径）
@@ -2993,7 +3002,7 @@ Output only JSON, no other text:"""
         """清空知识库（别名方法，向后兼容）"""
         return await self.clear_index()
 
-    async def delete_paper(self, file_name: str, file_path: str = None) -> Dict[str, Any]:
+    async def delete_paper(self, file_name: str, file_path: Optional[str] = None) -> Dict[str, Any]:
         """
         删除指定论文的向量数据和图表
 
@@ -3028,7 +3037,7 @@ Output only JSON, no other text:"""
                 "message": f"删除论文失败: {e}"
             }
 
-    async def _delete_figures_dir(self, file_name: str, file_path: str = None) -> bool:
+    async def _delete_figures_dir(self, file_name: str, file_path: Optional[str] = None) -> bool:
         """
         删除论文对应的图表目录
 

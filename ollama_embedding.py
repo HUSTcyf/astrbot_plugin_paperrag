@@ -108,6 +108,9 @@ class OllamaEmbeddingProvider:
                 else:
                     raise
 
+        # 不应该到达这里，但如果到达则抛出异常
+        raise RuntimeError(f"Failed to get embedding for text after {self.config.retry_attempts} attempts")
+
     async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
         """批量获取文本embeddings（并发处理）"""
         if not texts:
@@ -229,6 +232,7 @@ async def test_ollama_connection(
         >>> if await test_ollama_connection():
         ...     print("✅ Ollama服务正常")
     """
+    provider = None
     try:
         provider = create_ollama_provider(base_url=base_url, model=model)
         test_embedding = await provider._embed_single("test")
@@ -237,7 +241,7 @@ async def test_ollama_connection(
         logger.error(f"❌ Ollama连接测试失败: {e}")
         return False
     finally:
-        if 'provider' in locals():
+        if provider is not None:
             await provider._close()
 
 

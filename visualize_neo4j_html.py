@@ -39,7 +39,7 @@ def visualize_html():
         height="900px",
         width="100%",
         bgcolor="#1a1a2e",
-        font_color="white",
+        font_color="white",  # type: ignore[arg-type]
         notebook=False,
         cdn_resources="remote"
     )
@@ -67,13 +67,12 @@ def visualize_html():
     with driver.session() as session:
         # 查询节点
         print("查询节点...")
-        result = session.run(f"""
+        result = session.run("""
             MATCH (n)
             RETURN id(n) as nid,
                    labels(n)[0] as type,
                    coalesce(n.title, n.name, n.ref_title, 'unknown') as label
-            LIMIT {LIMIT_NODES}
-        """)
+            LIMIT """ + str(LIMIT_NODES))  # type: ignore[arg-type]
 
         node_map = {}
         for record in result:
@@ -98,11 +97,10 @@ def visualize_html():
 
         # 查询边
         print("查询关系...")
-        result = session.run(f"""
+        result = session.run("""
             MATCH (n)-[r]->(m)
             RETURN id(n) as source, id(m) as target, type(r) as rel
-            LIMIT {LIMIT_EDGES}
-        """)
+            LIMIT """ + str(LIMIT_EDGES))  # type: ignore[arg-type]
 
         edge_count = 0
         for record in result:

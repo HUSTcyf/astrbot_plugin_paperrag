@@ -15,7 +15,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Set
+from typing import Dict, Any, List, Optional, Set, cast
 from dataclasses import dataclass
 
 from astrbot.api import logger
@@ -36,7 +36,7 @@ class LocalGGUFClient:
     DEFAULT_MODEL_PATH = "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf"
     DEFAULT_MMproj_PATH = "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf"
 
-    def __init__(self, model_path: str = None, mmproj_path: str = None):
+    def __init__(self, model_path: Optional[str] = None, mmproj_path: Optional[str] = None):
         self._model_path = model_path or self.DEFAULT_MODEL_PATH
         self._mmproj_path = mmproj_path or self.DEFAULT_MMproj_PATH
         self._llama: Optional[Any] = None
@@ -115,10 +115,12 @@ class LocalGGUFClient:
 
 JSON："""
 
+        content: str = ""
         try:
             llama = self._llama
+            if llama is None:
+                return None, None
             loop = asyncio.get_event_loop()
-
             result = await loop.run_in_executor(
                 None,
                 lambda: llama.create_chat_completion(
@@ -131,8 +133,6 @@ JSON："""
             content = result["choices"][0]["message"]["content"].strip()
 
             # 解析 JSON
-            import json
-            import re
             # 尝试提取 JSON（可能包含在 markdown 代码块中）
             json_match = re.search(r'\{[^{}]*"title"[^{}]*"abstract"[^{}]*\}', content, re.DOTALL)
             if json_match:
@@ -279,7 +279,7 @@ class AbstractExtractor:
                 page = doc[page_num]
                 text = page.get_text()
                 if text:
-                    full_text += text + "\n"
+                    full_text += str(text) + "\n"
 
             doc.close()
             return full_text if full_text.strip() else None
@@ -419,8 +419,8 @@ class PaperAbstract:
     file_name: str           # 完整文件名
     title: str = ""          # 论文标题
     abstract_text: str = ""  # 摘要文本
-    vector: List[float] = None  # 摘要向量
-    metadata: Dict[str, Any] = None  # 其他元数据
+    vector: Optional[List[float]] = None  # 摘要向量
+    metadata: Optional[Dict[str, Any]] = None  # 其他元数据
 
     def __post_init__(self):
         if self.vector is None:
@@ -502,7 +502,7 @@ class AbstractIndexManager:
                 page = doc[page_num]
                 text = page.get_text()
                 if text:
-                    full_text += text + "\n"
+                    full_text += str(text) + "\n"
                 if len(full_text) >= max_chars:
                     break
 
@@ -562,7 +562,7 @@ class AbstractIndexManager:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
                 None,
-                lambda: self._collection.create_index(
+                lambda: self._collection.create_index(  # type: ignore[union-attr]
                     field_name="vector",
                     index_params={"index_type": "AUTOINDEX", "metric_type": "COSINE"}
                 )
@@ -632,8 +632,8 @@ class AbstractIndexManager:
         paper_id: str,
         file_name: str,
         title: str = "",
-        abstract_text: str = None,
-        metadata: Dict[str, Any] = None
+        abstract_text: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
     ) -> bool:
         """
         为单篇论文建立摘要索引
@@ -669,7 +669,9 @@ class AbstractIndexManager:
                 abstract_text = await extractor.extract_abstract_from_pdf(pdf_path)
 
             if not title:
-                title = extractor.extract_title_from_pdf(pdf_path)
+                extracted_title = extractor.extract_title_from_pdf(pdf_path)
+                if extracted_title:
+                    title = extracted_title
 
             if not abstract_text or len(abstract_text) < 50:
                 logger.warning(f"未找到有效摘要: {file_name}")
@@ -689,9 +691,13 @@ class AbstractIndexManager:
 
             # 存储到 Milvus（使用 Collection API）
             loop = asyncio.get_event_loop()
+            collection = self._collection
+            if collection is None:
+                logger.error("❌ Collection 未初始化")
+                return False
             await loop.run_in_executor(
                 None,
-                lambda: self._collection.insert(data=[{
+                lambda: collection.insert(data=[{
                     "paper_id": paper_id,
                     "file_name": file_name,
                     "title": title,
@@ -721,7 +727,7 @@ class AbstractIndexManager:
     async def index_papers_bulk(
         self,
         papers: List[Dict[str, str]],
-        extractor: AbstractExtractor = None,
+        extractor: Optional[AbstractExtractor] = None,
         progress_callback=None
     ) -> Dict[str, int]:
         """
@@ -747,7 +753,7 @@ class AbstractIndexManager:
                     pdf_path=paper['pdf_path'],
                     paper_id=paper['paper_id'],
                     file_name=paper['file_name'],
-                    metadata=paper.get('metadata')
+                    metadata=cast(Dict[str, Any], paper.get('metadata')) if paper.get('metadata') is not None else None
                 )
 
                 if success:
@@ -767,6 +773,7 @@ class AbstractIndexManager:
     async def _embed_text(self, text: str) -> List[float]:
         """生成文本的 embedding 向量"""
         try:
+            assert self._embed_model is not None
             if hasattr(self._embed_model, 'embed_text'):
                 # 自定义包装的 embed_text 方法（可能同步）
                 vector = self._embed_model.embed_text(text)
@@ -792,7 +799,7 @@ class AbstractIndexManager:
 
             # 确保是 list[float]
             if not isinstance(vector, list):
-                vector = list(vector)
+                vector = list(cast(Any, vector))
 
             return vector
 
@@ -823,6 +830,9 @@ class AbstractIndexManager:
 
             # 搜索
             client = self._collection
+            if client is None:
+                logger.error("❌ Collection 未初始化")
+                return []
             search_params = {
                 "metric_type": "COSINE",
                 "params": {}
@@ -839,6 +849,7 @@ class AbstractIndexManager:
 
             # 转换结果
             papers = []
+            results = cast(Any, results)
             for hit in results[0]:
                 papers.append({
                     "paper_id": hit.entity.get("paper_id"),
@@ -887,9 +898,13 @@ class AbstractIndexManager:
 
         try:
             loop = asyncio.get_event_loop()
+            collection = self._collection
+            if collection is None:
+                logger.error("❌ Collection 未初始化")
+                return False
             await loop.run_in_executor(
                 None,
-                lambda: self._collection.delete(f'paper_id == "{paper_id}"')
+                lambda: collection.delete(f'paper_id == "{paper_id}"')
             )
 
             if paper_id in self._abstract_cache:
@@ -908,7 +923,7 @@ class AbstractIndexManager:
         try:
             from pymilvus import utility
             if utility.has_collection(self._collection_name, using=self.alias):
-                utility.drop_collection(self._collection_name, using=self.alias)
+                utility.drop_collection(self._collection_name, using=self.alias)  # type: ignore[func-returns-value]
                 logger.info("✅ 摘要索引已清除")
             self._collection = None
             self._is_connected = False
@@ -921,7 +936,7 @@ class AbstractIndexManager:
     async def rebuild_index(
         self,
         papers: List[Dict[str, str]],
-        extractor: AbstractExtractor = None,
+        extractor: Optional[AbstractExtractor] = None,
         force: bool = False,
         progress_callback=None
     ) -> Dict[str, int]:
@@ -941,7 +956,10 @@ class AbstractIndexManager:
             await self._ensure_collection()
             try:
                 client = self._collection
-                client.drop_collection(self._collection_name)
+                if client is None:
+                    logger.warning("⚠️ Collection 未初始化")
+                    return {"success": 0, "failed": 0}
+                client.drop_collection(self._collection_name)  # type: ignore[attr-defined]
                 self._collection = None
                 self._abstract_cache = {}
                 logger.info("🗑️ 已清空摘要索引")
@@ -967,7 +985,7 @@ class TwoStageRetriever:
         self,
         abstract_index: AbstractIndexManager,
         chunk_index,  # HybridIndexManager
-        config: Dict[str, Any] = None
+        config: Optional[Dict[str, Any]] = None
     ):
         """
         Args:
@@ -987,8 +1005,8 @@ class TwoStageRetriever:
     async def retrieve(
         self,
         query: str,
-        abstract_top_k: int = None,
-        chunk_top_k: int = None,
+        abstract_top_k: Optional[int] = None,
+        chunk_top_k: Optional[int] = None,
         enable_two_stage: bool = True
     ) -> Dict[str, Any]:
         """
@@ -1008,8 +1026,10 @@ class TwoStageRetriever:
                 "query": query
             }
         """
-        abstract_top_k = abstract_top_k or self._abstract_top_k
-        chunk_top_k = chunk_top_k or self._chunk_top_k
+        abstract_top_k = abstract_top_k if abstract_top_k is not None else self._abstract_top_k
+        chunk_top_k = chunk_top_k if chunk_top_k is not None else self._chunk_top_k
+        abstract_top_k = cast(int, abstract_top_k)
+        chunk_top_k = cast(int, chunk_top_k)
 
         if not enable_two_stage:
             # 直接检索 chunks（原始策略）
@@ -1081,7 +1101,7 @@ class TwoStageRetriever:
 # 便捷函数
 # ============================================================================
 
-async def create_abstract_index(config: Dict[str, Any] = None) -> AbstractIndexManager:
+async def create_abstract_index(config: Optional[Dict[str, Any]] = None) -> AbstractIndexManager:
     """
     创建摘要索引管理器
 

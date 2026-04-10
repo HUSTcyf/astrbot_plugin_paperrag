@@ -25,6 +25,7 @@ from typing import Dict, Any, Optional, Union, TYPE_CHECKING, List, cast
 # 类型注解导入（仅在类型检查时导入，避免循环导入）
 if TYPE_CHECKING:
     from .hybrid_rag import HybridRAGEngine
+    from .graph_rag_engine import GraphRAGConfig
 
 # 抑制底层库的 gRPC/absl 警告（必须在导入深度学习库之前设置）
 os.environ['GRPC_VERBOSITY'] = 'ERROR'
@@ -106,81 +107,22 @@ class Neo4jServiceManager:
         except Exception:
             return False
 
-    def _is_homebrew_neo4j_installed(self) -> bool:
-        """检查是否通过 Homebrew 安装了 Neo4j"""
-        homebrew_paths = [
-            "/usr/local/bin/neo4j",
-            "/opt/homebrew/bin/neo4j",
-            "/usr/local/var/neo4j",
-            "/opt/homebrew/var/neo4j",
-        ]
-        for path in homebrew_paths:
-            if os.path.exists(path) or os.path.exists(os.path.dirname(path)):
-                return True
-        return False
-
-    def _get_neo4j_start_command(self) -> str:
-        """获取 Neo4j 启动命令"""
-        # Homebrew 安装
-        if os.path.exists("/usr/local/bin/neo4j") or os.path.exists("/opt/homebrew/bin/neo4j"):
-            return "neo4j start"
-        # 直接安装
-        return "sudo systemctl start neo4j"  # Linux systemd
-
     async def ensure_neo4j_running(self) -> bool:
         """
-        确保 Neo4j 正在运行
+        检测 Neo4j 是否可连接（不再自动启动）
 
         Returns:
-            Neo4j 是否就绪
+            Neo4j 是否可连接
         """
         if self._is_neo4j_available():
-            logger.info("[Neo4j] Neo4j 服务已运行")
+            logger.info("[Neo4j] Neo4j 服务已连接")
             return True
 
-        logger.info("[Neo4j] Neo4j 未运行，尝试启动...")
-
-        if not self._is_homebrew_neo4j_installed():
-            logger.warning("[Neo4j] 未检测到 Homebrew Neo4j 安装")
-            logger.info("[Neo4j] 请运行以下命令安装 Neo4j:")
-            logger.info("  brew install neo4j")
-            logger.info("  brew services start neo4j")
-            return False
-
-        try:
-            # 尝试启动 Neo4j
-            cmd = self._get_neo4j_start_command()
-            logger.info(f"[Neo4j] 执行: {cmd}")
-
-            result = subprocess.run(
-                cmd.split(),
-                capture_output=True,
-                text=True,
-                check=False
-            )
-
-            if result.returncode == 0:
-                # 等待 Neo4j 启动
-                await self._wait_for_neo4j_ready()
-                return True
-            else:
-                logger.error(f"[Neo4j] 启动失败: {result.stderr}")
-                return False
-
-        except Exception as e:
-            logger.error(f"[Neo4j] 启动异常: {e}")
-            return False
-
-    async def _wait_for_neo4j_ready(self, timeout: int = 60):
-        """等待 Neo4j 就绪"""
-        import time
-        start = time.time()
-        while time.time() - start < timeout:
-            if self._is_neo4j_available():
-                logger.info("[Neo4j] ✅ Neo4j 服务已就绪")
-                return
-            await asyncio.sleep(2)
-        logger.warning("[Neo4j] ⚠️ Neo4j 启动超时")
+        logger.warning("[Neo4j] Neo4j 不可连接，请确保 Neo4j 已启动")
+        logger.info("[Neo4j] 可用命令:")
+        logger.info("  neo4j start")
+        logger.info("  brew services start neo4j")
+        return False
 
     def get_connection_info(self) -> dict:
         """获取 Neo4j 连接信息"""
@@ -270,7 +212,7 @@ class PaperRAGPlugin(Star):
         self.cache_enabled = self.config.get("cache_enabled", True)
         self.cache_ttl = self.config.get("cache_ttl_seconds", 3600)
         self.cache_max_size = self.config.get("cache_max_entries", 100)
-        self._response_cache = {}
+        self._response_cache: Dict[str, Any] = {}
 
         # Graph RAG 自动构建追踪
         self._papers_since_graph_build = 0
@@ -297,46 +239,6 @@ class PaperRAGPlugin(Star):
 
         # 注册 LLM 可调用的论文搜索工具
         self._register_llm_tools()
-
-        # 自动启动 Neo4j 服务
-        if self.config.get("auto_start_neo4j", True):
-            self._start_neo4j_service_async()
-
-    def _start_neo4j_service_async(self):
-        """异步启动 Neo4j 服务（不阻塞插件初始化）"""
-        import threading
-
-        def _start():
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-
-                # 获取 Neo4j 配置
-                graph_config = self.config.get("graph_rag", {})
-                neo4j_config = {
-                    "host": "localhost",
-                    "port": 7687,
-                    "http_port": 7474,
-                    "user": graph_config.get("neo4j_user", "neo4j"),
-                    "password": graph_config.get("neo4j_password", "password"),
-                }
-
-                manager = Neo4jServiceManager(neo4j_config=neo4j_config)
-                success = loop.run_until_complete(manager.ensure_neo4j_running())
-
-                if success:
-                    conn_info = manager.get_connection_info()
-                    logger.info(f"[Neo4j] ✅ 服务已就绪: {conn_info['uri']}")
-                else:
-                    logger.warning("[Neo4j] ⚠️ 服务未运行，请手动启动 Neo4j")
-
-                loop.close()
-            except Exception as e:
-                logger.warning(f"[Neo4j] 自动检查服务失败: {e}")
-
-        self._neo4j_thread = threading.Thread(target=_start, daemon=True)
-        self._neo4j_thread.start()
-        logger.info("[Neo4j] Neo4j 服务检查线程已启动（后台运行）")
 
     def _register_llm_tools(self):
         """注册 LLM 可调用的论文搜索工具"""
@@ -430,7 +332,7 @@ class PaperRAGPlugin(Star):
         """扫描目录中的支持文档文件"""
         from pathlib import Path
         papers_dir = directory or self.config.get("papers_dir", "./papers")
-        doc_files = []
+        doc_files: List[Any] = []
         for ext in SUPPORTED_DOC_EXTENSIONS:
             doc_files.extend(Path(papers_dir).glob(f"*{ext}"))
         for ext in SUPPORTED_DOC_EXTENSIONS:
@@ -969,6 +871,9 @@ class PaperRAGPlugin(Star):
             if sources:
                 sources = await self._resolve_sources_arxiv(sources)
 
+            # 使用本地 VLM 重新排版 chunks 文本
+            sources = await self._compact_chunk_texts_with_vlm(sources)
+
             # Format output
             if response_type == "retrieve":
                 # Retrieve mode only
@@ -1031,6 +936,37 @@ class PaperRAGPlugin(Star):
         except Exception as e:
             logger.error(f"Failed to list papers: {e}")
             yield event.plain_result(f"❌ Failed to list papers: {e}")
+
+    @paper_commands.command("arxiv_list")
+    async def cmd_arxiv_list(self, event: AstrMessageEvent):
+        """List all papers with arxiv URLs in markdown format"""
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+        try:
+            import json
+            from pathlib import Path
+            doc_stats_path = Path(__file__).parent / "data" / "milvus_abstracts_doc_stats.json"
+            if not doc_stats_path.exists():
+                yield event.plain_result("❌ 未找到论文索引文件")
+                return
+            with open(doc_stats_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            abstracts = data.get('abstracts', {})
+            output = f"📚 **论文列表** ({len(abstracts)} 篇)\n\n"
+            count = 0
+            for v in abstracts.values():
+                title = v.get('title', '未知标题')
+                url = v.get('metadata', {}).get('arxiv_url', '')
+                if url:
+                    output += f"- [{title}]({url})\n"
+                    count += 1
+                else:
+                    output += f"- {title} (无链接)\n"
+            output += f"\n📊 总计: {len(abstracts)} 篇 | 有链接: {count} 篇"
+            yield event.plain_result(output)
+        except Exception as e:
+            yield event.plain_result(f"❌ 获取论文列表失败: {e}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @paper_commands.command("add")
@@ -2064,7 +2000,7 @@ class PaperRAGPlugin(Star):
 
             for base_id, versions in multi_version_papers.items():
                 # Sort by version descending
-                versions.sort(key=lambda x: x['version'], reverse=True)
+                cast(List[Dict[str, Any]], versions).sort(key=lambda x: x['version'], reverse=True)
 
                 # Mark latest as kept
                 versions[0]['is_latest'] = True
@@ -2072,8 +2008,8 @@ class PaperRAGPlugin(Star):
 
                 # Delete old versions
                 for v in versions[1:]:
-                    old_file = v['file']
-                    version = v['version']
+                    old_file = cast(Path, v['file'])
+                    version = cast(int, v['version'])
                     try:
                         file_size = old_file.stat().st_size / (1024 * 1024)
                         old_file.unlink()
@@ -2156,6 +2092,7 @@ class PaperRAGPlugin(Star):
             # 同时清除摘要索引
             try:
                 from .abstract_index import AbstractIndexManager
+                plugin_dir = Path(__file__).parent
                 embed_dim = self.config.get("embed_dim", 768)
                 milvus_uri = str(plugin_dir / "data" / "milvus_abstracts.db")
                 abstract_index = AbstractIndexManager(milvus_uri=milvus_uri, embed_dim=embed_dim)
@@ -2515,10 +2452,10 @@ class PaperRAGPlugin(Star):
                         List[Dict[str, Any]],
                         await asyncio.get_event_loop().run_in_executor(
                             None,
-                            lambda pn=paper_name_escaped: _collection.query(
+                            cast(Any, lambda pn=paper_name_escaped: _collection.query(
                                 expr=f'metadata["file_name"] == "{pn}"',
                                 output_fields=["id", "text", "metadata"],
-                            )
+                            ))
                         )
                     )
 
@@ -2549,7 +2486,7 @@ class PaperRAGPlugin(Star):
 
                     # 每篇论文处理完后保存并清理内存
                     if hasattr(graph_store, 'save'):
-                        graph_store.save(force=True)
+                        graph_store.save(force=True)  # type: ignore[attr-defined]
                     gc.collect()
 
                     # 累积统计
@@ -2603,7 +2540,7 @@ class PaperRAGPlugin(Star):
                     collection = index_manager._collection
 
             # 保存图谱到磁盘
-            graph_store.save(force=True)
+            graph_store.save(force=True)  # type: ignore[attr-defined]
 
             # 构建成功，删除检查点文件
             if checkpoint_file.exists():
@@ -2749,7 +2686,8 @@ class PaperRAGPlugin(Star):
 
             # 初始化本地 GGUF LLM 客户端（用于同时提取标题和摘要）
             llm_client = LocalGGUFClient()
-            if llm_client.is_model_loaded():
+            is_loaded = getattr(llm_client, 'is_model_loaded', None)
+            if is_loaded and is_loaded():
                 send_msg("✅ GGUF LLM 模型已加载，直接复用")
             else:
                 send_msg("🔄 正在加载 GGUF LLM 模型...")
@@ -2962,6 +2900,7 @@ class PaperRAGPlugin(Star):
         # 步骤1: 清空现有图谱
         yield event.plain_result("🗑️ 正在清空现有知识图谱...")
 
+        graph_engine = None
         try:
             graph_config = self._create_graph_rag_config()
 
@@ -3055,10 +2994,10 @@ class PaperRAGPlugin(Star):
                         List[Dict[str, Any]],
                         await asyncio.get_event_loop().run_in_executor(
                             None,
-                            lambda pn=paper_name_escaped: _collection.query(
+                            cast(Any, lambda pn=paper_name_escaped: _collection.query(
                                 expr=f'metadata["file_name"] == "{pn}"',
                                 output_fields=["id", "text", "metadata"],
-                            )
+                            ))
                         )
                     )
 
@@ -3096,14 +3035,13 @@ class PaperRAGPlugin(Star):
                     continue
 
             # 保存图谱
-            if graph_config.storage_type == "memory":
-                graph_engine._graph_store = graph_store
-            else:
-                await graph_engine._save_to_neo4j(graph_store)
+            if graph_engine is not None:
+                if graph_config.storage_type == "memory":
+                    graph_engine._graph_store = graph_store
 
-            # 更新内存图谱引用
-            if hasattr(graph_engine, '_graph_store'):
-                graph_engine._graph_store = graph_store
+                # 更新内存图谱引用
+                if hasattr(graph_engine, '_graph_store'):
+                    graph_engine._graph_store = graph_store
 
             output = f"""🎉 **知识图谱重建完成！**
 
@@ -3267,7 +3205,7 @@ class PaperRAGPlugin(Star):
                     RETURN labels(n) as labels,
                            properties(n) as props,
                            elementId(n) as id
-                """).data()
+                """).data()  # type: ignore[arg-type]
 
                 # 导出关系
                 rels_data = session.run("""
@@ -3276,7 +3214,7 @@ class PaperRAGPlugin(Star):
                            properties(r) as props,
                            elementId(startNode(r)) as start_id,
                            elementId(endNode(r)) as end_id
-                """).data()
+                """).data()  # type: ignore[arg-type]
 
             nodes_count = len(nodes_data)
             rels_count = len(rels_data)
@@ -3400,7 +3338,7 @@ class PaperRAGPlugin(Star):
                 pass
             return {"status": "error", "message": str(e)}
 
-    def _format_size(self, size: int) -> str:
+    def _format_size(self, size: float) -> str:
         """格式化文件大小"""
         for unit in ['B', 'KB', 'MB', 'GB']:
             if size < 1024:
@@ -3450,7 +3388,7 @@ class PaperRAGPlugin(Star):
         graph_config = self._create_graph_rag_config()
 
         if graph_config.storage_type != "neo4j":
-            yield event.plary_result("❌ 只有 Neo4j 存储模式支持恢复")
+            yield event.plain_result("❌ 只有 Neo4j 存储模式支持恢复")
             return
 
         yield event.plain_result(f"🔄 正在恢复备份: {backup_file}...")
@@ -3508,7 +3446,7 @@ class PaperRAGPlugin(Star):
 
             with driver.session() as session:
                 # 清空现有数据
-                session.run("MATCH (n) DETACH DELETE n")
+                session.run("MATCH (n) DETACH DELETE n")  # type: ignore[arg-type]
 
                 # 恢复节点
                 for node in nodes:
@@ -3524,11 +3462,11 @@ class PaperRAGPlugin(Star):
 
                     if clean_props:
                         props_str = "{" + ", ".join(
-                            f"k: {repr(v)}" for k, v in clean_props.items()
+                            "k: " + repr(v) for k, v in clean_props.items()
                         ) + "}"
-                        session.run(f"CREATE (n{label_str} {props_str})")
+                        session.run("CREATE (n" + label_str + " " + props_str + ")")  # type: ignore[arg-type]
                     else:
-                        session.run(f"CREATE (n{label_str})")
+                        session.run("CREATE (n" + label_str + ")")  # type: ignore[arg-type]
 
                 # 恢复关系
                 for rel in rels:
@@ -3545,19 +3483,17 @@ class PaperRAGPlugin(Star):
 
                         if clean_props:
                             props_str = "{" + ", ".join(
-                                f"k: {repr(v)}" for k, v in clean_props.items()
+                                "k: " + repr(v) for k, v in clean_props.items()
                             ) + "}"
-                            session.run(f"""
-                                MATCH (a), (b)
-                                WHERE elementId(a) = $start_id AND elementId(b) = $end_id
-                                CREATE (a)-[r:{rel_type} {props_str}]->(b)
-                            """, start_id=start_id, end_id=end_id)
+                            query = ("MATCH (a), (b) "
+                                     "WHERE elementId(a) = $start_id AND elementId(b) = $end_id "
+                                     "CREATE (a)-[r:" + rel_type + " " + props_str + "]->(b)")
+                            session.run(query, start_id=start_id, end_id=end_id)  # type: ignore[arg-type]
                         else:
-                            session.run(f"""
-                                MATCH (a), (b)
-                                WHERE elementId(a) = $start_id AND elementId(b) = $end_id
-                                CREATE (a)-[r:{rel_type}]->(b)
-                            """, start_id=start_id, end_id=end_id)
+                            query = ("MATCH (a), (b) "
+                                     "WHERE elementId(a) = $start_id AND elementId(b) = $end_id "
+                                     "CREATE (a)-[r:" + rel_type + "]->(b)")
+                            session.run(query, start_id=start_id, end_id=end_id)  # type: ignore[arg-type]
 
             logger.info(f"[GraphRAG] 备份恢复完成: {len(nodes)} 节点, {len(rels)} 关系")
 
@@ -3593,7 +3529,7 @@ class PaperRAGPlugin(Star):
         json_backups = list(backup_dir.glob("neo4j_backup_*.json.gz"))
         dir_backups = list(backup_dir.glob("neo4j_backup_*/"))
 
-        all_backups = []
+        all_backups: List[Dict[str, Any]] = []
         for b in json_backups:
             all_backups.append({
                 "name": b.name,
@@ -3617,14 +3553,14 @@ class PaperRAGPlugin(Star):
             return
 
         # 按时间排序
-        all_backups.sort(key=lambda x: x["mtime"], reverse=True)
+        cast(List[Dict[str, Any]], all_backups).sort(key=lambda x: x["mtime"], reverse=True)
 
         msg = "📦 **图谱备份列表**:\n\n"
-        for i, b in enumerate(all_backups[:10], 1):
-            size_str = self._format_size(b["size"])
-            mtime = datetime.fromtimestamp(b["mtime"]).strftime("%Y-%m-%d %H:%M:%S")
-            msg += f"{i}. `{b['name']}`\n"
-            msg += f"   类型: {b['type']}, 大小: {size_str}\n"
+        for i, b_item in enumerate(cast(List[Dict[str, Any]], all_backups)[:10], 1):
+            size_str = self._format_size(b_item["size"])
+            mtime = datetime.fromtimestamp(b_item["mtime"]).strftime("%Y-%m-%d %H:%M:%S")
+            msg += f"{i}. `{b_item['name']}`\n"
+            msg += f"   类型: {b_item['type']}, 大小: {size_str}\n"
             msg += f"   时间: {mtime}\n\n"
 
         msg += "💡 使用 `/paper graph_restore <文件名>` 恢复备份\n"
@@ -3748,10 +3684,13 @@ class PaperRAGPlugin(Star):
     @filter.command_group("idea")
     def idea_commands(self):
         """研究创意生成命令组
-        explore     - 探索研究想法（完整流程）
-        analyze     - 分析研究主题
-        search      - 多源知识检索
-        generate    - 基于知识上下文生成想法
+        explore              - 探索研究想法（完整流程）
+        analyze              - 分析研究主题
+        search               - 多源知识检索
+        generate             - 基于知识上下文生成想法
+        test_brightdata      - 测试 Bright Data MCP 学术搜索
+        test_media_db        - 测试图表提取流程（检查元数据）
+        test_feishu_markdown - 测试飞书 Markdown 解析（加粗/斜体/删除线/链接/图表引用/公式）
         """
         pass
 
@@ -4043,15 +3982,18 @@ class PaperRAGPlugin(Star):
     @idea_commands.command("tofeishu")
     async def cmd_idea_tofeishu(self, event: AstrMessageEvent,
                                   topic: str = "",
-                                  folder_token: str = ""):
+                                  folder_token: str = "",
+                                  table_format: str = "png"):
         """
         将研究想法导出为飞书文档
 
         使用方式:
-        /idea tofeishu <研究主题> [folder_token]
-        /idea tofeishu <研究主题> <folder_token>
+        /idea tofeishu <研究主题> [folder_token] [table_format]
+        /idea tofeishu <研究主题> <folder_token> <table_format>
         Example: /idea tofeishu 大语言模型在医学诊断中的应用
         Example: /idea tofeishu 大语言模型在医学诊断中的应用 <folder_token>
+        Example: /idea tofeishu 大语言模型在医学诊断中的应用 <folder_token> md
+        table_format 可选值: csv - 飞书原生表格, md - Markdown文本块, png(默认) - 图片
         """
         try:
             if not topic:
@@ -4082,6 +4024,10 @@ class PaperRAGPlugin(Star):
             all_queries = (analysis.search_queries + analysis.local_rag_queries)[:5]
             knowledge = await idea_engine.search_knowledge(all_queries, local_rag_top_k=3, web_top_k=5)
 
+            # 调试：输出媒体 caption 提取统计
+            debug_report = idea_engine.debug_media_captions(knowledge)
+            logger.info(f"[IdeaEngine] {debug_report}")
+
             # 3. 生成研究想法
             yield event.plain_result("💡 正在生成研究想法...")
             ideas = await idea_engine.generate_ideas(
@@ -4101,7 +4047,8 @@ class PaperRAGPlugin(Star):
                 ideas=ideas,
                 topic=topic,
                 folder_token=folder_token,
-                knowledge=knowledge
+                knowledge=knowledge,
+                table_format=table_format
             )
 
             if not result:
@@ -4162,8 +4109,424 @@ class PaperRAGPlugin(Star):
             logger.error(f"飞书文档创建失败: {e}")
             yield event.plain_result(f"❌ 创建失败: {e}")
 
+    @idea_commands.command("test_brightdata")
+    async def cmd_idea_test_brightdata(self, event: AstrMessageEvent,
+                                         query: str = "",
+                                         tool: str = "all"):
+        """
+        测试 Bright Data MCP 各种工具功能
+
+        使用方式:
+        /idea test_brightdata <搜索query> [工具类型]
+        示例:
+        /idea test_brightdata transformer architecture in computer vision
+        /idea test_brightdata transformer 扩散模型 discover
+        /idea test_brightdata https://arxiv.org/abs/2403.12345 scrape
+        /idea test_brightdata LLM reasoning chains discover
+
+        工具类型:
+        - search: 搜索引擎搜索（默认）
+        - discover: AI 智能搜索
+        - scrape: 抓取单个页面为 Markdown
+        - all: 测试所有工具（默认）
+        """
+        try:
+            if not query:
+                yield event.plain_result("""📚 Usage: /idea test_brightdata <搜索query> [工具类型]
+
+示例:
+  /idea test_brightdata transformer architecture in computer vision
+  /idea test_brightdata LLM reasoning chains discover
+  /idea test_brightdata https://arxiv.org/abs/2403.12345 scrape
+  /idea test_brightdata ["query1", "query2"] batch_search
+
+工具类型:
+  - search: 搜索引擎搜索（默认）
+  - discover: AI 智能搜索
+  - scrape: 抓取页面为 Markdown
+  - batch_search: 批量搜索
+  - all: 测试所有工具""")
+                return
+
+            # 获取 RAG 引擎
+            rag_engine = self._get_engine()
+            if not rag_engine:
+                yield event.plain_result("❌ RAG引擎未初始化")
+                return
+
+            # 初始化 IdeaEngine
+            from .idea_engine import IdeaEngine
+            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
+
+            # 检查 Bright Data 配置
+            is_configured = idea_engine._check_bright_data_config()
+            if not is_configured:
+                yield event.plain_result("⚠️ Bright Data MCP 未配置或 API_TOKEN 为空\n请检查 mcp_server.json 中的 BrightData 配置")
+                return
+
+            yield event.plain_result("✅ Bright Data MCP 已配置\n")
+
+            # 根据工具类型执行测试
+            if tool == "all" or tool == "search":
+                yield event.plain_result("🌐 [1/4] 测试 search_engine...")
+                result = await idea_engine.test_brightdata_mcp(query=query)
+                if result.get("success"):
+                    search_results = result.get("results", [])
+                    yield event.plain_result(f"   ✅ search_engine 成功！找到 {len(search_results)} 条结果")
+                    for i, r in enumerate(search_results[:3], 1):
+                        yield event.plain_result(f"   {i}. {r.get('title', 'N/A')[:60]}")
+                else:
+                    yield event.plain_result(f"   ❌ search_engine 失败: {result.get('error')}")
+
+            if tool == "all" or tool == "discover":
+                yield event.plain_result("\n🔍 [2/4] 测试 discover (AI智能搜索)...")
+                result = await idea_engine._discover_search(
+                    query=query,
+                    intent=f"Find academic papers and research about {query}",
+                    num_results=5
+                )
+                if result.get("success"):
+                    results_list = result.get("results", [])
+                    yield event.plain_result(f"   ✅ discover 成功！找到 {len(results_list)} 条结果")
+                    for i, r in enumerate(results_list[:3], 1):
+                        yield event.plain_result(f"   {i}. {r.get('title', 'N/A')[:60]}")
+                else:
+                    yield event.plain_result(f"   ❌ discover 失败: {result.get('error')}")
+
+            # 判断是否为 URL
+            is_url = query.startswith("http://") or query.startswith("https://")
+            is_url_list = False
+            try:
+                potential_list = json.loads(query)
+                is_url_list = isinstance(potential_list, list) and all(
+                    u.startswith("http") for u in potential_list
+                )
+            except json.JSONDecodeError:
+                pass
+
+            if tool == "all" or tool == "scrape":
+                if is_url:
+                    yield event.plain_result(f"\n📄 [3/4] 测试 scrape_as_markdown ({query[:50]}...)...")
+                    result = await idea_engine._scrape_as_markdown(query)
+                    if result.get("success"):
+                        markdown = result.get("markdown", "")
+                        yield event.plain_result(f"   ✅ scrape_as_markdown 成功！内容长度: {len(markdown)} 字符")
+                        yield event.plain_result(f"   内容预览: {markdown[:200]}...")
+                    else:
+                        yield event.plain_result(f"   ❌ scrape_as_markdown 失败: {result.get('error')}")
+                elif tool == "scrape":
+                    yield event.plain_result("⚠️ scrape 工具需要提供 URL，请使用完整 URL")
+
+            if tool == "all" or tool == "batch_search":
+                if is_url_list:
+                    urls = json.loads(query)
+                    yield event.plain_result(f"\n📦 [4/4] 测试 scrape_batch ({len(urls)} URLs)...")
+                    result = await idea_engine._scrape_batch_markdown(urls)
+                    if result.get("success"):
+                        yield event.plain_result(f"   ✅ scrape_batch 成功！")
+                    else:
+                        yield event.plain_result(f"   ❌ scrape_batch 失败: {result.get('error')}")
+                elif tool == "batch_search":
+                    # 尝试解析为 JSON 数组
+                    try:
+                        queries = json.loads(query)
+                        if isinstance(queries, list) and len(queries) <= 5:
+                            yield event.plain_result(f"\n📦 [4/4] 测试 search_engine_batch ({len(queries)} queries)...")
+                            result = await idea_engine._search_engine_batch([
+                                {"query": q, "engine": "google"} for q in queries
+                            ])
+                            if result.get("success"):
+                                yield event.plain_result(f"   ✅ batch_search 成功！")
+                            else:
+                                yield event.plain_result(f"   ❌ batch_search 失败: {result.get('error')}")
+                        else:
+                            yield event.plain_result("⚠️ batch_search 需要 JSON 数组格式的查询列表")
+                    except json.JSONDecodeError:
+                        yield event.plain_result("⚠️ batch_search 需要 JSON 数组格式的查询列表")
+
+            if tool == "all":
+                yield event.plain_result("\n✅ 所有 Bright Data 工具测试完成！")
+
+        except Exception as e:
+            logger.error(f"Bright Data MCP 测试失败: {e}")
+            yield event.plain_result(f"❌ 测试失败: {e}")
+
+    @idea_commands.command("test_feishu_markdown")
+    async def cmd_idea_test_feishu_markdown(self, event: AstrMessageEvent,
+                                           folder_token: str = ""):
+        """
+        测试飞书文档的 Markdown 格式渲染（使用 mistune v3 插件）
+
+        使用方式:
+        /idea test_feishu_markdown [folder_token]
+        示例:
+        /idea test_feishu_markdown FWK2fMleClICfodlHHWc4Mygnhb
+
+        测试内容：
+        - 一级/二级/三级标题
+        - 加粗、斜体、加粗斜体
+        - 行内代码
+        - 删除线 ~~text~~
+        - 链接 [文本](url)
+        - 无序列表、有序列表
+        - 分割线
+        - 图表引用 [图X]、[表X]
+        - LaTeX 公式 $公式$
+        - 混合内容
+        """
+        try:
+            if not folder_token:
+                yield event.plain_result("📚 Usage: /idea test_feishu_markdown [folder_token]\n示例: /idea test_feishu_markdown FWK2fMleClICfodlHHWc4Mygnhb")
+                return
+
+            yield event.plain_result("🧪 正在测试飞书文档 Markdown 格式...")
+
+            # 获取 RAG 引擎
+            rag_engine = self._get_engine()
+            if not rag_engine:
+                yield event.plain_result("❌ RAG引擎未初始化")
+                return
+
+            # 初始化 IdeaEngine
+            from .idea_engine import IdeaEngine
+            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
+
+            # 调用测试方法
+            result = await idea_engine.test_feishu_markdown_formats(folder_token=folder_token)
+
+            if not result.get("success"):
+                yield event.plain_result(f"❌ 测试失败: {result.get('error')}")
+                return
+
+            # 成功
+            url = result.get("url", "")
+            blocks_created = result.get("blocks_created", 0)
+            blocks_count = result.get("blocks_count", 0)
+
+            output = f"""✅ **Markdown 格式测试完成！**
+
+📊 **生成块数**: {blocks_created} / {blocks_count}
+🔗 **文档链接**: {url}
+
+请检查文档中以下格式是否正确渲染：
+- 标题（1-3级）
+- **加粗**、*斜体*、***加粗斜体***
+- `行内代码`
+- 列表（有序/无序）
+- 分割线"""
+
+            yield event.plain_result(output)
+
+        except Exception as e:
+            logger.error(f"Markdown 测试失败: {e}")
+            yield event.plain_result(f"❌ 测试失败: {e}")
+
+    @idea_commands.command("test_media_db")
+    async def cmd_idea_test_media_db(self, event: AstrMessageEvent,
+                                     limit: int = 20,
+                                     folder_token: str = "OedRflAATlKAmfduFvwcGMsPnRh",
+                                     table_format: str = "png"):
+        """
+        直接从 Milvus 数据库查找含有图表元数据的 chunk，并可选创建飞书文档测试图表插入
+
+        用法:
+          /idea test_media_db [最大数量] [folder_token] [table_format]
+        示例:
+          /idea test_media_db 50                           # 仅查询和统计
+          /idea test_media_db 50 FWK2fMleClICfodlHHWc4Mygnhb  # 查询并创建飞书文档测试
+          /idea test_media_db 50 FWK2fMleClICfodlHHWc4Mygnhb md  # 使用 MD 格式
+
+        参数:
+          limit: 最大处理的 chunk 数量（默认 20）
+          folder_token: 飞书文件夹 token（可选），提供则创建测试飞书文档
+          table_format: 表格插入格式，可选 csv、md、png(默认)
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        yield event.plain_result(f"🔍 直接查询 Milvus 数据库，查找含图表元数据的 chunk...\n(limit={limit})")
+
+        try:
+            rag_engine = self._get_engine()
+            if not rag_engine:
+                yield event.plain_result("❌ RAG 引擎未初始化")
+                return
+
+            index_manager = rag_engine._ensure_index_manager_initialized()
+
+            yield event.plain_result(f"🔍 通过 IndexManager 加载全量 chunks（按论文分组）...")
+
+            all_chunks = await index_manager.get_all_chunks()
+
+            yield event.plain_result(f"📊 共加载 {len(all_chunks)} 个 chunks，开始筛选含图表的...")
+
+            chunks_with_images = []
+            chunks_with_tables = []
+            chunks_with_both = []
+
+            for chunk in all_chunks:
+                raw_meta = chunk.get("metadata", {})
+                if not isinstance(raw_meta, dict):
+                    raw_meta = {}
+
+                ip = raw_meta.get("image_path")
+                tcp = raw_meta.get("table_csv_path")
+                tpp = raw_meta.get("table_png_path")
+
+                if ip or (tcp or tpp):
+                    chunk_info = {
+                        "text": chunk.get("text", "")[:200],
+                        "paper": chunk.get("file_name", "unknown"),
+                        "page": str(raw_meta.get("page", "")),
+                        "score": 1.0,
+                        "metadata": {
+                            "file_name": chunk.get("file_name", "unknown"),
+                            "page": str(raw_meta.get("page", "")),
+                            "image_path": ip,
+                            "image_caption": raw_meta.get("image_caption"),
+                            "table_csv_path": tcp,
+                            "table_png_path": tpp,
+                            "table_caption": raw_meta.get("table_caption"),
+                        }
+                    }
+                    if ip and (tcp or tpp):
+                        chunks_with_both.append(chunk_info)
+                    elif ip:
+                        chunks_with_images.append(chunk_info)
+                    else:
+                        chunks_with_tables.append(chunk_info)
+
+            yield event.plain_result(f"\n📋 统计结果：")
+            yield event.plain_result(f"  - 含图片的 chunk: {len(chunks_with_images)}")
+            yield event.plain_result(f"  - 含表格的 chunk: {len(chunks_with_tables)}")
+            yield event.plain_result(f"  - 含图片+表格的 chunk: {len(chunks_with_both)}")
+
+            # 优先选同时有图片和表格的
+            target_chunks = chunks_with_both[:3] if chunks_with_both else (chunks_with_images[:3] if chunks_with_images else chunks_with_tables[:3])
+
+            if not target_chunks:
+                yield event.plain_result(
+                    "\n❌ 数据库中没有找到含图表元数据的 chunk。\n"
+                    "请先运行 /paper build confirm 处理论文（确保 multimodal.enabled=true）"
+                )
+                return
+
+            yield event.plain_result(f"\n✅ 找到 {len(target_chunks)} 个含图表的 chunk，选择前 {len(target_chunks)} 个进行测试")
+
+            for i, c in enumerate(target_chunks):
+                meta = c["metadata"]
+                img = meta.get("image_path")
+                tbl = meta.get("table_csv_path") or meta.get("table_png_path")
+                yield event.plain_result(
+                    f"  [{i}] {c['paper'][:40]} (页{meta.get('page', '?')})\n"
+                    f"      图片: {img if img else '无'}\n"
+                    f"      表格: {tbl if tbl else '无'}"
+                )
+
+            # 组装 knowledge 格式
+            knowledge = {
+                "local_results": target_chunks,
+                "web_results": [],
+            }
+
+            from .idea_engine import IdeaEngine, ResearchIdea
+            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
+
+            # 验证 _build_citations_context 提取结果
+            citations_context, extracted_media = idea_engine._build_citations_context(knowledge)
+
+            # 增强媒体 caption（分析图片与 caption 是否匹配，标记不匹配的为跳过）
+            extracted_media = await idea_engine._enhance_media_captions(extracted_media, knowledge)
+
+            # 统计被跳过的图片
+            skipped_images = [img for img in extracted_media.get("images", []) if img.get("_skip")]
+            skipped_tables = [tbl for tbl in extracted_media.get("tables", []) if tbl.get("_skip")]
+            if skipped_images:
+                yield event.plain_result(f"\n⏭️ 跳过的图片（与 caption 不匹配）: {len(skipped_images)} 张")
+                for img in skipped_images:
+                    yield event.plain_result(f"  - [{img['index']}] {img.get('caption', '')}")
+            if skipped_tables:
+                yield event.plain_result(f"\n⏭️ 跳过的表格（描述无意义）: {len(skipped_tables)} 个")
+
+            yield event.plain_result(f"\n📦 _build_citations_context 提取结果：")
+            yield event.plain_result(f"  - extracted_media['images']: {len(extracted_media.get('images', []))} 张")
+            yield event.plain_result(f"  - extracted_media['tables']: {len(extracted_media.get('tables', []))} 个")
+
+            if extracted_media.get("images"):
+                yield event.plain_result("\n🖼️ 提取的图片：")
+                for img in extracted_media["images"]:
+                    skip标记 = " ⏭️已跳过" if img.get("_skip") else ""
+                    yield event.plain_result(f"  [{img['index']}] {img['caption']} | {img['path']}{skip标记}")
+
+            if extracted_media.get("tables"):
+                yield event.plain_result("\n📊 提取的表格：")
+                for tbl in extracted_media.get("tables", []):
+                    skip标记 = " ⏭️已跳过" if tbl.get("_skip") else ""
+                    yield event.plain_result(f"  [{tbl['index']}] {tbl['caption']} | CSV:{tbl.get('csv_path', '无')} PNG:{tbl.get('png_path', '无') or '无'}{skip标记}")
+
+            media_blocks, pending_images = idea_engine._create_media_blocks(extracted_media)
+            yield event.plain_result(f"\n🧱 _create_media_blocks: 创建 {len(media_blocks)} 个块，{len(pending_images)} 张待上传图片")
+
+            if not folder_token:
+                if media_blocks:
+                    yield event.plain_result("✅ 图表提取流程正常，可用于飞书文档插入")
+                    yield event.plain_result("\n💡 传入 folder_token 可创建飞书文档进行真实测试：")
+                    yield event.plain_result("  /idea test_media_db 50 <folder_token>")
+                else:
+                    yield event.plain_result("⚠️ 块创建返回空，文件可能不存在或路径无效")
+                return
+
+            # 有 folder_token，创建真实飞书文档测试
+            if not media_blocks:
+                yield event.plain_result("\n⚠️ 没有可插入的媒体块，跳过飞书文档创建")
+                return
+
+            yield event.plain_result(f"\n📄 开始创建飞书文档测试（folder_token={folder_token[:20]}...）")
+
+            # 构建简单的测试 ResearchIdea
+            test_ideas = [
+                ResearchIdea(
+                    title="图表插入测试",
+                    description="验证从数据库元数据提取的图片和表格能否正确插入飞书文档",
+                    novelty="测试多模态内容提取流程",
+                    methodology="直接读取 Milvus chunk 元数据，提取 image_path/table_csv_path",
+                    potential_challenges=["文件路径可能不存在", "图片格式可能不兼容"],
+                    related_work=["/idea test_media_db 命令"],
+                    feasibility=0.9,
+                    inspiration_sources=["paperrag 多模态提取"]
+                )
+            ]
+
+            # 调用 create_feishu_document（skip_arxiv_resolution 跳过文件名到 arxiv ID 的转换）
+            feishu_result = await idea_engine.create_feishu_document(
+                ideas=test_ideas,
+                topic="图表插入测试",
+                folder_token=folder_token,
+                knowledge=knowledge,
+                skip_arxiv_resolution=True,
+                table_format=table_format
+            )
+
+            if feishu_result.get("error"):
+                yield event.plain_result(f"\n❌ 飞书文档创建失败: {feishu_result['error']}")
+            else:
+                doc_url = feishu_result.get("url", "")
+                yield event.plain_result(f"\n✅ 飞书文档创建成功！")
+                yield event.plain_result(f"   文档链接: {doc_url}")
+                images_in_doc = feishu_result.get("images_uploaded", 0)
+                tables_in_doc = feishu_result.get("tables_created", 0)
+                media = feishu_result.get("media_count", {})
+                yield event.plain_result(f"   插入图片: {images_in_doc} 张（提取: {media.get('images', 0)} 张）")
+                yield event.plain_result(f"   插入表格: {tables_in_doc} 个（提取: {media.get('tables', 0)} 个）")
+
+        except Exception as e:
+            import traceback
+            logger.error(f"test_media_db 失败: {e}\n{traceback.format_exc()}")
+            yield event.plain_result(f"❌ 失败: {e}")
+
     async def _resolve_source_arxiv(self, source: dict) -> dict:
-        """解析单个 source 的引用名称"""
+        """解析单个 source 的引用名称和 arxiv 链接"""
         metadata = source.get("metadata", {})
         filename = metadata.get("file_name", "unknown")
 
@@ -4178,12 +4541,33 @@ class PaperRAGPlugin(Star):
             elif paper_title.endswith(".txt"):
                 paper_title = paper_title[:-4]
 
-        # 直接使用文章标题，不尝试获取 arxiv 链接
+        # 从 abstract index 的 metadata 中获取 arxiv/github 链接
+        arxiv_url = ""
+        github_url = ""
+        try:
+            import json
+            from pathlib import Path
+            plugin_dir = Path(__file__).parent
+            doc_stats_file = plugin_dir / "data" / "milvus_abstracts_doc_stats.json"
+            if doc_stats_file.exists():
+                with open(doc_stats_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                abstracts = data.get("abstracts", {})
+                paper_id = filename
+                if paper_id.endswith(".pdf"):
+                    paper_id = paper_id[:-4]
+                if paper_id in abstracts:
+                    meta = abstracts[paper_id].get("metadata", {})
+                    arxiv_url = meta.get("arxiv_url", "")
+                    github_url = meta.get("github_url", "")
+        except Exception:
+            pass
+
         source = dict(source)
         source["display_name"] = paper_title
-        source["arxiv_url"] = ""
-        source["github_url"] = ""
-        logger.debug(f"[PaperRAG] 引用名称: {filename} -> {paper_title}")
+        source["arxiv_url"] = arxiv_url
+        source["github_url"] = github_url
+        logger.debug(f"[PaperRAG] 引用: {filename} -> {paper_title} @ {arxiv_url}")
         return source
 
     async def _get_paper_title_from_abstract_index(self, filename: str) -> str:
@@ -4236,6 +4620,120 @@ class PaperRAGPlugin(Star):
             resolved.append(resolved_source)
         return resolved
 
+    async def _compact_chunk_texts_with_vlm(self, sources: list) -> list:
+        """
+        使用本地 VLM 重新排版 chunks 中的文本，使其更紧凑
+
+        Args:
+            sources: 来源列表，每个元素包含 "text" 字段
+
+        Returns:
+            处理后的 sources 列表，text 字段被重新排版
+        """
+        if not sources:
+            return sources
+
+        try:
+            # 导入 LlamaCppVLMProvider
+            try:
+                from .llama_cpp_vlm_provider import (
+                    get_cached_llama_cpp_provider,
+                    init_llama_cpp_vlm_provider,
+                )
+            except ImportError:
+                logger.warning("[PaperRAG] 无法导入 LlamaCppVLMProvider，跳过文本压缩")
+                return sources
+
+            # 优先复用已初始化的单例
+            vlm_provider = get_cached_llama_cpp_provider()
+            if vlm_provider is None:
+                logger.info("[PaperRAG] LlamaCppVLMProvider 未初始化，尝试初始化...")
+                import os
+                model_dir = os.path.join(os.path.dirname(__file__), "models", "Qwen3.5-9B-GGUF")
+                model_path = os.path.join(model_dir, "Qwen3.5-9B-UD-Q4_K_XL.gguf")
+                mmproj_path = os.path.join(model_dir, "mmproj-BF16.gguf")
+
+                vlm_provider = init_llama_cpp_vlm_provider(
+                    model_path=model_path,
+                    mmproj_path=mmproj_path,
+                    n_ctx=4096,
+                    n_gpu_layers=99,
+                    max_tokens=256,
+                    temperature=0.3
+                )
+                await vlm_provider.initialize()
+
+            # 使用固定的分隔符格式，与解析代码保持一致
+            CHUNK_MARKER = "[Chunk_"
+            SEPARATOR = "\n---CHUNK_SEPARATOR---\n"
+
+            # 构建批量处理的提示
+            chunks_parts = []
+            for i, s in enumerate(sources):
+                text = s.get('text', '')
+                chunks_parts.append(f"{CHUNK_MARKER}{i+1}]\n{text}")
+
+            chunks_text = SEPARATOR.join(chunks_parts)
+
+            prompt = f"""请将以下论文片段重新排版，使其更紧凑（去除多余空格和换行），同时保持核心信息不变。
+
+要求：
+1. 去除多余的空格、换行、制表符
+2. 合并断行的句子
+3. 保持原文的核心信息和格式
+4. 每个 chunk 之间用 {CHUNK_MARKER}N] 标记分隔（N 为数字）
+5. 直接输出重新排版后的内容，不要加任何前缀解释
+
+论文片段：
+{chunks_text}
+
+输出格式（严格遵循）：
+{CHUNK_MARKER}1] <紧凑后的文本>
+{CHUNK_MARKER}2] <紧凑后的文本>
+..."""
+
+            # 调用 VLM
+            response = await vlm_provider.text_chat(
+                prompt=prompt,
+                image_urls=[],  # 不需要图片
+                temperature=0.3,
+                max_tokens=4096
+            )
+
+            if not (response and hasattr(response, 'content')):
+                logger.warning("[PaperRAG] VLM 返回无效响应")
+                return sources
+
+            compacted_text = response.content.strip()
+
+            # 解析 VLM 返回的内容
+            # 使用正则匹配所有 [Chunk_N] 格式的标记
+            import re
+            # 匹配 [Chunk_数字] 格式，捕获数字和后续文本
+            pattern = r'\[Chunk_(\d+)\]\s*\n?(.*?)(?=\[Chunk_\d+\]|$)'
+            matches = re.findall(pattern, compacted_text, re.DOTALL)
+
+            if not matches:
+                logger.warning(f"[PaperRAG] VLM 返回格式不符合预期，跳过压缩")
+                return sources
+
+            # 更新 sources
+            updated_count = 0
+            for chunk_num_str, chunk_text in matches:
+                chunk_num = int(chunk_num_str)
+                if 1 <= chunk_num <= len(sources):
+                    # 清理文本：去除首尾空白和多余换行
+                    cleaned_text = ' '.join(chunk_text.split())
+                    sources[chunk_num - 1]["text"] = cleaned_text
+                    updated_count += 1
+
+            logger.info(f"[PaperRAG] VLM 文本压缩完成: {updated_count}/{len(sources)} 个 chunks")
+
+        except Exception as e:
+            logger.warning(f"[PaperRAG] VLM 文本压缩失败: {e}")
+
+        return sources
+
     def _format_retrieve_response(self, sources: list) -> str:
         """Format retrieval results"""
         output = "📚 **Document Search Results**\n\n"
@@ -4253,7 +4751,7 @@ class PaperRAGPlugin(Star):
         return output.strip()
 
     def _format_rag_response(self, answer: str, sources: list) -> str:
-        """Format RAG response"""
+        """Format RAG response with markdown link support"""
         output = f"💡 **Answer**\n\n{answer}\n\n"
         output += "📚 **References**\n\n"
 
@@ -4263,8 +4761,15 @@ class PaperRAGPlugin(Star):
             chunk_index = metadata.get("chunk_index", 0)
             text = source.get("text", "")[:150]
             display_name = source.get("display_name", filename)
+            arxiv_url = source.get("arxiv_url", "")
 
-            output += f"[{i}] **{display_name}** (chunk #{chunk_index})\n"
+            # 如果有 arxiv URL，输出为 markdown 链接格式
+            if arxiv_url:
+                ref_text = f"[{display_name}]({arxiv_url})"
+            else:
+                ref_text = f"**{display_name}**"
+
+            output += f"[{i}] {ref_text} (chunk #{chunk_index})\n"
             output += f"> {text}...\n\n"
 
         return output.strip()

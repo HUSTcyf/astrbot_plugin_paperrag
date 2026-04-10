@@ -20,11 +20,10 @@ import asyncio
 import json
 import os
 import re
-import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import httpx
 
@@ -58,6 +57,268 @@ class SimpleLogger:
             self._print("  ", msg)
 
 logger = SimpleLogger()
+
+
+# ============================================================================
+# arXiv API 客户端 - 使用 arxiv 库
+# ============================================================================
+
+class OpenAlexAPIClient:
+    """OpenAlex API 客户端 - 抗干扰标题模糊匹配"""
+
+    REQUEST_DELAY = 0.6  # OpenAlex 免费限流：100次/分钟
+    EMAIL = "astrbot@local"  # 附邮箱可提速至1000次/分钟
+
+    def __init__(self):
+        self._last_request_time = 0.0
+
+    def _normalize(self, title: str) -> str:
+        """基础清洗 + LaTeX 符号转换"""
+        import re as _re
+        # 转换常见 LaTeX 符号为 ASCII
+        title = title.replace('$π_0$', 'pi0').replace('$π_0.5$', 'pi05')
+        title = title.replace('$π$', 'pi').replace('π', 'pi')
+        # 去除 LaTeX 格式残留
+        title = _re.sub(r'\$([^$]+)\$', r'\1', title)
+        title = _re.sub(r'[^\w\s]', ' ', title).strip().lower()
+        return title
+
+    async def search_by_title(self, title: str, limit: int = 5) -> list:
+        """使用 OpenAlex 搜索论文（自动抗干扰）"""
+        elapsed = asyncio.get_event_loop().time() - self._last_request_time
+        if elapsed < self.REQUEST_DELAY:
+            await asyncio.sleep(self.REQUEST_DELAY - elapsed)
+
+        try:
+            import pyalex
+            from pyalex import Works
+
+            # 设置邮箱以提高限流（100->1000次/分钟）
+            pyalex.config.email = self.EMAIL
+
+            clean_q = self._normalize(title)
+
+            # OpenAlex 搜索默认按相关性排序，标题权重最高
+            works = Works().search(clean_q).get(per_page=limit)
+
+            results = []
+            for w in works:
+                pub_title = w.get("title", "")
+                if not pub_title:
+                    continue
+                arxiv_id = w.get("arxiv_id", "")
+                results.append({
+                    'title': pub_title,
+                    'arxiv_id': arxiv_id,
+                    'summary': w.get("abstract", "")[:200] if w.get("abstract") else "",
+                    'doi': w.get("doi", ""),
+                })
+
+            self._last_request_time = asyncio.get_event_loop().time()
+            return results
+
+        except Exception as e:
+            logger.debug(f"OpenAlex 搜索失败: {e}")
+            return []
+
+    def extract_arxiv_url(self, work: dict) -> Optional[str]:
+        """从搜索结果提取 arxiv URL（优先用 arxiv_id，否则从 DOI 解析）"""
+        arxiv_id = work.get('arxiv_id', '')
+        if arxiv_id:
+            return f"https://arxiv.org/abs/{arxiv_id}"
+        # 从 DOI 解析（如 https://doi.org/10.48550/arxiv.2105.05233）
+        doi = work.get('doi', '') or ''
+        if 'arxiv.' in doi:
+            arxiv_id = doi.split('arxiv.')[-1]
+            return f"https://arxiv.org/abs/{arxiv_id}"
+        return None
+
+    def extract_doi_url(self, work: dict) -> Optional[str]:
+        """从搜索结果提取 DOI 链接（会议/期刊版本）"""
+        doi = work.get('doi', '') or ''
+        if doi:
+            return doi
+        return None
+
+    async def _arxiv_library_fallback(self, title: str) -> Tuple[Optional[str], Optional[str]]:
+        """arXiv 库 fallback：直接用 arxiv 库搜索"""
+        try:
+            import arxiv
+
+            loop = asyncio.get_event_loop()
+            elapsed = loop.time() - self._last_request_time
+            if elapsed < self.REQUEST_DELAY:
+                await asyncio.sleep(self.REQUEST_DELAY - elapsed)
+
+            client = arxiv.Client()
+            # 使用标题搜索，在 executor 中执行避免阻塞
+            search = arxiv.Search(query=title, max_results=5)
+            results = await loop.run_in_executor(None, lambda: list(client.results(search)))
+
+            if results:
+                paper_id = results[0].entry_id.split('/')[-1]
+                paper_id = re.sub(r'v\d+$', '', paper_id)
+                self._last_request_time = loop.time()
+                return f"https://arxiv.org/abs/{paper_id}", results[0].title
+
+            return None, None
+
+        except Exception as e:
+            logger.debug(f"arXiv library fallback 失败: {e}")
+            return None, None
+
+    async def get_arxiv_by_title(self, title: str, threshold: float = 75) -> Tuple[Optional[str], Optional[str]]:
+        """根据标题获取 arxiv 链接，使用 rapidfuzz 二次验证"""
+        from rapidfuzz import fuzz
+
+        works = await self.search_by_title(title)
+        best_work = None
+        best_score = 0
+
+        for w in works:
+            pub_title = w.get('title', '')
+            score = fuzz.token_set_ratio(self._normalize(title), self._normalize(pub_title))
+            if score > best_score:
+                best_score = score
+                best_work = w
+
+        if best_work is None or best_score < threshold:
+            return None, None
+
+        arxiv_url = self.extract_arxiv_url(best_work)
+        if arxiv_url:
+            return arxiv_url, None
+        return None, None
+
+
+def find_best_title_match(query_title: str, works: list, threshold: int = 80) -> tuple:
+    """从候选结果中找到 rapidfuzz 相似度最高的（OpenAlex已做初步筛选）"""
+    from rapidfuzz import fuzz
+
+    best_work = None
+    best_score = 0
+
+    def norm(t: str) -> str:
+        """与 OpenAlexAPIClient._normalize 保持一致"""
+        t = t.replace('$π_0$', 'pi0').replace('$π_0.5$', 'pi05')
+        t = t.replace('$π$', 'pi').replace('π', 'pi')
+        t = re.sub(r'\$([^$]+)\$', r'\1', t)
+        t = re.sub(r'[^\w\s]', ' ', t).strip().lower()
+        return t
+
+    for work in works:
+        result_title = work.get('title', '')
+        score = fuzz.token_set_ratio(norm(query_title), norm(result_title))
+        if score > best_score:
+            best_score = score
+            best_work = work
+
+    if best_score < threshold:
+        return None, 0
+    return best_work, best_score / 100.0
+
+
+# ============================================================================
+# CORE API 客户端 - 查询论文的 arxiv 链接（作为 fallback）
+# ============================================================================
+
+class CoreAPIClient:
+    """CORE API v3 客户端 - 用于搜索学术论文的 arxiv 链接"""
+
+    BASE_URL = "https://api.core.ac.uk/v3"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+    async def search_by_title(self, title: str, limit: int = 3) -> list:
+        """根据论文标题搜索论文（宽松匹配，去除标点符号）"""
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # 预处理标题：去除多余标点，保留核心关键词
+                # 去除冒号、括号内的内容（容易导致匹配失败）
+                clean_title = re.sub(r'[:\(\[【【].*?[)\]】】]', '', title)
+                # 去除多余空格
+                clean_title = ' '.join(clean_title.split())
+                # 去掉末尾的标点符号
+                clean_title = clean_title.rstrip('.,;:')
+
+                response = await client.post(
+                    f"{self.BASE_URL}/search/works",
+                    headers=self.headers,
+                    json={"q": clean_title, "limit": limit}
+                )
+                response.raise_for_status()
+                results = response.json().get("results", [])
+                if results:
+                    return results
+        except Exception as e:
+            logger.warning(f"CORE API 搜索失败: {e}")
+        return []
+
+    def extract_arxiv_url(self, work: dict) -> Optional[str]:
+        """从 work 记录提取 arxiv URL"""
+        # 方法1：直接获取 arxivId 字段（CORE API 返回的驼峰字段名）
+        arxiv_id = work.get("arxivId", "")
+        if arxiv_id:
+            # 去除版本号（如 2301.12345v1 -> 2301.12345）
+            arxiv_id = re.sub(r'v\d+$', '', str(arxiv_id))
+            return f"https://arxiv.org/abs/{arxiv_id}"
+
+        # 方法2：扫描 sourceFulltextUrls
+        urls = work.get("sourceFulltextUrls", []) or []
+        for url in urls:
+            if "arxiv.org" in str(url):
+                match = re.search(r'arxiv\.org/(?:abs|pdf)/(\d+\.\d+)', str(url))
+                if match:
+                    return f"https://arxiv.org/abs/{match.group(1)}"
+
+        # 方法3：扫描 identifiers 数组
+        identifiers = work.get("identifiers", []) or []
+        for ident in identifiers:
+            if isinstance(ident, dict) and ident.get("type") == "ARXIV_ID":
+                arxiv_id = str(ident.get("identifier", ""))
+                if arxiv_id:
+                    arxiv_id = re.sub(r'v\d+$', '', arxiv_id)
+                    return f"https://arxiv.org/abs/{arxiv_id}"
+
+        return None
+
+    def extract_github_url(self, work: dict) -> Optional[str]:
+        """从 work 记录提取 GitHub URL"""
+        # 优先从 sourceFulltextUrls 查找
+        urls = work.get("sourceFulltextUrls", []) or []
+        for url in urls:
+            if url and "github.com" in str(url).lower():
+                match = re.search(r'github\.com/[\w\-]+/[\w\-]+', str(url), re.IGNORECASE)
+                if match:
+                    return f"https://{match.group()}"
+
+        # 降级：检查 downloadUrl
+        download = work.get("downloadUrl", "") or ""
+        if "github.com" in str(download).lower():
+            match = re.search(r'github\.com/[\w\-]+/[\w\-]+', str(download), re.IGNORECASE)
+            if match:
+                return f"https://{match.group()}"
+        return None
+
+    async def get_arxiv_by_title(self, title: str, threshold: float = 0.6) -> Tuple[Optional[str], Optional[str]]:
+        """根据标题获取 arxiv 和 GitHub 链接（选择相似度最高的结果，低于阈值则放弃）"""
+        works = await self.search_by_title(title)
+        best_work, best_score = find_best_title_match(title, works)
+
+        if best_work is None or best_score < threshold:
+            return None, None
+
+        arxiv_url = self.extract_arxiv_url(best_work)
+        if arxiv_url:
+            github_url = self.extract_github_url(best_work)
+            logger.debug(f"  → 标题匹配度: {best_score:.2%}")
+            return arxiv_url, github_url
+        return None, None
 
 
 # ============================================================================
@@ -100,7 +361,7 @@ class AbstractExtractor:
                 page = doc[page_num]
                 text = page.get_text()
                 if text:
-                    full_text += text + "\n"
+                    full_text += str(text) + "\n"
 
             doc.close()
             if full_text.strip():
@@ -354,6 +615,7 @@ class PaperAbstract:
     abstract_text: str = ""
     vector: List[float] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # arxiv_url 和 github_url 存储在 metadata 中
 
 
 # ============================================================================
@@ -367,7 +629,7 @@ class LocalGGUFClient:
     DEFAULT_MODEL_PATH = "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf"
     DEFAULT_MMproj_PATH = "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf"
 
-    def __init__(self, model_path: str = None, mmproj_path: str = None):
+    def __init__(self, model_path: Optional[str] = None, mmproj_path: Optional[str] = None):
         self._model_path = model_path or self.DEFAULT_MODEL_PATH
         self._mmproj_path = mmproj_path or self.DEFAULT_MMproj_PATH
         self._llama: Optional[Any] = None
@@ -474,13 +736,14 @@ class LocalGGUFClient:
 
 JSON："""
 
+        content: str = ""
         try:
             llama = self._llama
             loop = asyncio.get_event_loop()
 
             result = await loop.run_in_executor(
                 None,
-                lambda: llama.create_chat_completion(
+                lambda: llama.create_chat_completion(  # type: ignore[union-attr]
                     messages=[
                         {"role": "user", "content": prompt}
                     ],
@@ -492,7 +755,6 @@ JSON："""
             content = result["choices"][0]["message"]["content"].strip()
 
             # 解析 JSON
-            import json
             # 尝试提取 JSON（可能包含在 markdown 代码块中）
             json_match = re.search(r'\{[^{}]*"title"[^{}]*"abstract"[^{}]*\}', content, re.DOTALL)
             if json_match:
@@ -556,14 +818,20 @@ class AbstractIndexManager:
         milvus_uri: str = "./data/milvus_abstracts.db",
         collection_name: str = "paper_abstracts",
         embed_dim: int = 1024,
-        embed_client: OllamaEmbeddingClient = None,
-        llm_client: LocalGGUFClient = None,
+        embed_client: Optional[OllamaEmbeddingClient] = None,
+        llm_client: Optional[LocalGGUFClient] = None,
+        core_api_key: Optional[str] = None,
+        use_arxiv_api: bool = True,
     ):
         self._db_path = milvus_uri
         self._collection_name = collection_name
         self._dim = embed_dim
         self._embed_client = embed_client
         self._llm_client = llm_client
+        self._core_api_key = core_api_key
+        self._use_arxiv_api = use_arxiv_api
+        self._core_client: Optional[CoreAPIClient] = None
+        self._arxiv_client: Optional[OpenAlexAPIClient] = None
         self._is_connected = False
         self._collection = None
         self._abstract_cache: Dict[str, PaperAbstract] = {}
@@ -695,8 +963,8 @@ class AbstractIndexManager:
         paper_id: str,
         file_name: str,
         title: str = "",
-        abstract_text: str = None,
-        metadata: Dict[str, Any] = None
+        abstract_text: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
     ) -> bool:
         """为单篇论文建立摘要索引
 
@@ -722,7 +990,7 @@ class AbstractIndexManager:
                 abstract_text = extractor.extract_abstract_from_pdf(pdf_path)
 
             if not title:
-                title = extractor.extract_title_from_pdf(pdf_path)
+                title = extractor.extract_title_from_pdf(pdf_path) or ""
 
             if not abstract_text or len(abstract_text) < 50:
                 logger.warning(f"论文 {file_name} 未找到有效摘要，跳过")
@@ -743,7 +1011,7 @@ class AbstractIndexManager:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
                 None,
-                lambda: self._collection.insert(data=[{
+                lambda: self._collection.insert(data=[{  # type: ignore[union-attr]
                     "paper_id": paper_id,
                     "file_name": file_name,
                     "title": title,
@@ -752,7 +1020,41 @@ class AbstractIndexManager:
                 }])
             )
             # 刷新确保数据持久化
-            await loop.run_in_executor(None, lambda: self._collection.flush())
+            await loop.run_in_executor(None, lambda: self._collection.flush())  # type: ignore[union-attr]
+
+            # 获取 arxiv 链接（优先 CORE API，失败时用 arXiv API）
+            arxiv_url = ""
+            github_url = ""
+            existing_meta = self._abstract_cache.get(paper_id)
+            if not existing_meta or not existing_meta.metadata.get("arxiv_url"):
+                # 优先使用 CORE API（更稳定，不会被封禁）
+                if self._core_api_key:
+                    try:
+                        if self._core_client is None:
+                            self._core_client = CoreAPIClient(self._core_api_key)
+                        arxiv_url, github_url = await self._core_client.get_arxiv_by_title(title)
+                        if arxiv_url:
+                            logger.info(f"  → arxiv (CORE API): {arxiv_url}")
+                    except Exception as e:
+                        logger.debug(f"  → CORE API 查询失败: {e}")
+
+                # fallback: 使用 arXiv 官方 API（可通过 --no-arxiv-api 禁用）
+                if not arxiv_url and self._use_arxiv_api:
+                    try:
+                        if not hasattr(self, '_arxiv_client') or self._arxiv_client is None:
+                            self._arxiv_client = OpenAlexAPIClient()
+                        arxiv_url, _ = await self._arxiv_client.get_arxiv_by_title(title)
+                        if arxiv_url:
+                            logger.info(f"  → arxiv (arXiv API): {arxiv_url}")
+                    except Exception as e:
+                        logger.debug(f"  → arXiv API 查询失败: {e}")
+
+            # 将 arxiv/github 链接存入 metadata
+            paper_metadata = dict(metadata) if metadata else {}
+            if arxiv_url:
+                paper_metadata["arxiv_url"] = arxiv_url
+            if github_url:
+                paper_metadata["github_url"] = github_url
 
             # 更新缓存
             self._abstract_cache[paper_id] = PaperAbstract(
@@ -761,7 +1063,7 @@ class AbstractIndexManager:
                 title=title,
                 abstract_text=abstract_text,
                 vector=vector,
-                metadata=metadata or {}
+                metadata=paper_metadata,
             )
             self._save_doc_stats()
 
@@ -784,7 +1086,7 @@ class AbstractIndexManager:
                 page = doc[page_num]
                 text = page.get_text()
                 if text:
-                    full_text += text + "\n"
+                    full_text += str(text) + "\n"
                 if len(full_text) >= max_chars:
                     break
 
@@ -805,6 +1107,7 @@ class AbstractIndexManager:
         await self._ensure_collection()
 
         try:
+            assert self._embed_client is not None
             query_vector = await self._embed_client.get_text_embedding(query)
 
             search_params = {
@@ -816,7 +1119,7 @@ class AbstractIndexManager:
             loop = asyncio.get_event_loop()
             results = await loop.run_in_executor(
                 None,
-                lambda: self._collection.search(
+                lambda: self._collection.search(  # type: ignore[union-attr]
                     data=[query_vector],
                     anns_field="vector",
                     param=search_params,
@@ -826,6 +1129,7 @@ class AbstractIndexManager:
             )
 
             papers = []
+            results = cast(Any, results)
             for hit in results[0]:
                 papers.append({
                     "paper_id": hit.entity.get("paper_id"),
@@ -846,6 +1150,45 @@ class AbstractIndexManager:
 # 主程序
 # ============================================================================
 
+def _get_core_api_key_from_config() -> Optional[str]:
+    """从配置文件读取 CORE API Key"""
+    config_paths = [
+        Path(__file__).parent.parent.parent / "config" / "astrbot_plugin_paperrag_config.json",
+        Path.home() / "AstrBot" / "data" / "config" / "astrbot_plugin_paperrag_config.json",
+    ]
+    for config_path in config_paths:
+        if config_path.exists():
+            try:
+                with open(config_path, "r", encoding="utf-8-sig") as f:
+                    config = json.load(f)
+                key = config.get("core_api_key", "")
+                if key:
+                    return key
+            except Exception:
+                pass
+    return None
+
+
+def _get_freeapi_config() -> dict:
+    """从配置文件读取 freeapi 配置"""
+    config_paths = [
+        Path(__file__).parent.parent.parent / "config" / "astrbot_plugin_paperrag_config.json",
+        Path.home() / "AstrBot" / "data" / "config" / "astrbot_plugin_paperrag_config.json",
+    ]
+    for config_path in config_paths:
+        if config_path.exists():
+            try:
+                with open(config_path, "r", encoding="utf-8-sig") as f:
+                    config = json.load(f)
+                return {
+                    "freeapi_url": config.get("freeapi_url", ""),
+                    "freeapi_key": config.get("freeapi_key", ""),
+                }
+            except Exception:
+                pass
+    return {"freeapi_url": "", "freeapi_key": ""}
+
+
 async def build_abstract_index(
     papers_dir: str,
     ollama_url: str,
@@ -854,27 +1197,38 @@ async def build_abstract_index(
     skip: int = 0,
     force: bool = False,
     rebuild: bool = False,
+    core_api_key: Optional[str] = None,
+    update_links_only: bool = False,
+    use_arxiv_api: bool = True,
 ):
     """构建摘要索引"""
 
-    papers_path = Path(papers_dir)
-    if not papers_path.exists():
-        logger.error(f"论文目录不存在: {papers_dir}")
-        return
+    # 优先使用传入的 key，否则从配置文件读取
+    if not core_api_key:
+        core_api_key = _get_core_api_key_from_config()
 
-    # 查找所有 PDF 文件
+    # 初始化 pdf_files（可能为空列表）
     pdf_files = []
-    for ext in ['*.pdf', '*.PDF']:
-        pdf_files.extend(papers_path.glob(ext))
-    pdf_files = [f for f in pdf_files if not f.name.startswith('._')]
 
-    if not pdf_files:
-        logger.warning(f"在 {papers_dir} 中未找到 PDF 文件")
-        return
+    # 仅更新链接模式不需要 papers 目录
+    if not update_links_only:
+        papers_path = Path(papers_dir)
+        if not papers_path.exists():
+            logger.error(f"论文目录不存在: {papers_dir}")
+            return
 
-    logger.info(f"找到 {len(pdf_files)} 篇 PDF 论文")
-    logger.info(f"Ollama Embedding 地址: {ollama_url}")
-    logger.info(f"Embedding 模型: {ollama_model}")
+        # 查找所有 PDF 文件
+        for ext in ['*.pdf', '*.PDF']:
+            pdf_files.extend(papers_path.glob(ext))
+        pdf_files = [f for f in pdf_files if not f.name.startswith('._')]
+
+        if not pdf_files:
+            logger.warning(f"在 {papers_dir} 中未找到 PDF 文件")
+            return
+
+        logger.info(f"找到 {len(pdf_files)} 篇 PDF 论文")
+        logger.info(f"Ollama Embedding 地址: {ollama_url}")
+        logger.info(f"Embedding 模型: {ollama_model}")
 
     # 初始化 embedding 客户端
     embed_client = OllamaEmbeddingClient(base_url=ollama_url, model=ollama_model)
@@ -918,6 +1272,8 @@ async def build_abstract_index(
         milvus_uri=milvus_uri,
         collection_name="paper_abstracts",
         embed_dim=embed_dim,
+        core_api_key=core_api_key,
+        use_arxiv_api=use_arxiv_api,
     )
     abstract_index.set_embed_client(embed_client)
     abstract_index.set_llm_client(llm_client)
@@ -927,9 +1283,9 @@ async def build_abstract_index(
         logger.info("🔄 清除旧数据...")
         from pymilvus import connections, utility
         try:
-            connections.connect(alias="abstract_index", uri=milvus_uri)
+            connections.connect(alias="abstract_index", uri=milvus_uri)  # type: ignore[func-returns-value]
             if utility.has_collection("paper_abstracts", using="abstract_index"):
-                utility.drop_collection("paper_abstracts", using="abstract_index")
+                utility.drop_collection("paper_abstracts", using="abstract_index")  # type: ignore[func-returns-value]
         except Exception as e:
             logger.warning(f"清除旧数据出错: {e}")
         doc_stats_path = milvus_uri.replace('.db', '_doc_stats.json')
@@ -938,48 +1294,232 @@ async def build_abstract_index(
 
     await abstract_index.initialize()
 
-    existing = await abstract_index.get_all_abstracts()
-    processed_ids = set(existing.keys())
-    logger.info(f"已存在 {len(processed_ids)} 篇摘要" if not rebuild else "重新构建摘要索引")
+    # 两种模式分离处理
+    if update_links_only:
+        # 仅更新链接模式（不提取摘要，不覆盖原数据）
+        logger.info("🔗 仅更新论文链接模式")
+        await embed_client.close()  # 不需要 embedding 服务
+        await llm_client.close()
 
-    results = {"success": 0, "failed": 0, "skipped": 0}
-    start_time = time.time()
+        existing = await abstract_index.get_all_abstracts()
+        if not existing:
+            logger.warning("没有找到已索引的论文，请先运行普通索引构建")
+            return
 
-    for i, pdf_file in enumerate(pdf_files):
-        paper_id = pdf_file.stem
-        file_name = pdf_file.name
+        logger.info(f"找到 {len(existing)} 篇已索引的论文")
 
-        if i < skip:
-            continue
-        if not force and paper_id in processed_ids:
-            results["skipped"] += 1
-            continue
+        # 初始化 OpenAlex API + arXiv 库 fallback
+        arxiv_client = OpenAlexAPIClient()
 
-        logger.info(f"[{i+1}/{len(pdf_files)}] {file_name}")
+        results = {"updated": 0, "skipped": 0, "failed": 0}
+        # 详细记录每个论文的处理结果
+        details = []  # list of dict: {paper_id, title, old_url, new_url, similarity, reason, api}
+        start_time = time.time()
 
-        try:
-            success = await abstract_index.index_paper(
-                pdf_path=str(pdf_file),
-                paper_id=paper_id,
-                file_name=file_name,
-            )
-            if success:
-                results["success"] += 1
-            else:
+        for i, (paper_id, abstract) in enumerate(existing.items()):
+            old_url = abstract.metadata.get("arxiv_url", "")
+            detail = {
+                "paper_id": paper_id,
+                "title": abstract.title,
+                "old_url": old_url,
+                "new_url": "",
+                "similarity": 0.0,
+                "reason": "",
+                "api": "",
+            }
+
+            # 如果已有 arxiv_url 且非 force 模式，跳过
+            if abstract.metadata.get("arxiv_url") and not force:
+                detail["reason"] = "已有链接，未强制更新"
+                detail["new_url"] = old_url
+                results["skipped"] += 1
+                details.append(detail)
+                continue
+
+            logger.info(f"[{i+1}/{len(existing)}] 查询链接: {abstract.title[:50]}...")
+
+            arxiv_url = ""
+            github_url = ""
+            doi_url = ""
+            best_similarity = 0.0
+            used_api = ""
+
+            try:
+                # 1. OpenAlex API 搜索
+                if use_arxiv_api:
+                    works = await arxiv_client.search_by_title(abstract.title)
+                    best_work, best_score = find_best_title_match(abstract.title, works, threshold=80)
+                    if best_work and best_score >= 0.8:
+                        arxiv_url = arxiv_client.extract_arxiv_url(best_work)
+                        doi_url = arxiv_client.extract_doi_url(best_work) if not arxiv_url else None
+                        best_similarity = best_score
+                        used_api = "OpenAlex API"
+                        if arxiv_url:
+                            logger.success(f"  → arxiv (OpenAlex, 相似度 {best_score:.1%}): {arxiv_url}")
+                        elif doi_url:
+                            logger.success(f"  → DOI (OpenAlex, 相似度 {best_score:.1%}): {doi_url}")
+
+                # 2. arxiv 库 fallback
+                if not arxiv_url:
+                    arxiv_result = await arxiv_client._arxiv_library_fallback(abstract.title)
+                    if arxiv_result:
+                        arxiv_url, matched_title = arxiv_result
+                        from rapidfuzz import fuzz
+                        score = fuzz.token_set_ratio(
+                            arxiv_client._normalize(abstract.title),
+                            arxiv_client._normalize(matched_title)
+                        )
+                        if score >= 80:
+                            best_similarity = score / 100.0
+                            used_api = "arXiv Library"
+                            logger.success(f"  → arxiv (arXiv fallback, 相似度 {best_similarity:.1%}): {arxiv_url}")
+                        else:
+                            logger.warning(f"  → arXiv 结果验证失败: {score:.1%} < 80%")
+                            arxiv_url = ""  # 清除验证失败的 URL
+
+                detail["similarity"] = best_similarity
+                detail["api"] = used_api
+
+                if arxiv_url or github_url or doi_url:
+                    # 更新 metadata（保留原有数据）
+                    metadata = dict(abstract.metadata)
+                    if arxiv_url:
+                        metadata["arxiv_url"] = arxiv_url
+                    if doi_url:
+                        metadata["doi_url"] = doi_url
+                    if github_url:
+                        metadata["github_url"] = github_url
+
+                    abstract_index._abstract_cache[paper_id] = PaperAbstract(
+                        paper_id=abstract.paper_id,
+                        file_name=abstract.file_name,
+                        title=abstract.title,
+                        abstract_text=abstract.abstract_text,
+                        vector=abstract.vector,
+                        metadata=metadata,
+                    )
+                    abstract_index._save_doc_stats()
+                    results["updated"] += 1
+                    detail["new_url"] = arxiv_url or doi_url or github_url
+                    detail["reason"] = "更新成功"
+                elif best_similarity > 0:
+                    # 找到匹配但无链接（可能是 OpenAlex 有结果但没有 DOI）
+                    detail["reason"] = f"找到匹配但无链接 ({best_similarity:.1%})"
+                    detail["new_url"] = old_url
+                    results["skipped"] += 1
+                else:
+                    detail["reason"] = "未找到匹配结果"
+                    detail["new_url"] = old_url
+                    results["skipped"] += 1
+            except Exception as e:
+                logger.error(f"  → 查询失败: {e}")
+                detail["reason"] = f"查询异常: {e}"
                 results["failed"] += 1
-        except Exception as e:
-            logger.error(f"处理失败 {file_name}: {e}")
-            results["failed"] += 1
 
-    elapsed = time.time() - start_time
-    await embed_client.close()
+            details.append(detail)
 
-    print()
-    logger.success("=" * 40)
-    logger.success("摘要索引构建完成")
-    print(f"  成功: {results['success']} | 失败: {results['failed']} | 跳过: {results['skipped']}")
-    print(f"  耗时: {elapsed:.1f}s")
-    print(f"  位置: {milvus_uri}")
+        elapsed = time.time() - start_time
+        print()
+        logger.success("=" * 60)
+        logger.success("链接更新完成")
+        print(f"  更新: {results['updated']} | 跳过: {results['skipped']} | 失败: {results['failed']}")
+        print(f"  耗时: {elapsed:.1f}s")
+
+        # 打印详细汇总
+        print()
+        print("=" * 60)
+        print("📋 详细汇总")
+        print("=" * 60)
+
+        # 更新成功的
+        updated_list = [d for d in details if d["new_url"] and d["reason"] == "更新成功"]
+        if updated_list:
+            print(f"\n✅ 更新成功 ({len(updated_list)} 篇):")
+            for d in updated_list:
+                print(f"  - {d['title'][:50]}...")
+                print(f"    相似度: {d['similarity']:.1%} | API: {d['api']}")
+                print(f"    新链接: {d['new_url']}")
+
+        # 跳过的 - 进一步分类
+        skipped_list = [d for d in details if d["reason"] and d["reason"] != "更新成功"]
+        if skipped_list:
+            # 按原因分类
+            already_has_url_list = [d for d in skipped_list if "已有链接" in d["reason"]]
+            no_match_list = [d for d in skipped_list if "未找到匹配" in d["reason"]]
+            other_skipped = [d for d in skipped_list if d not in already_has_url_list and d not in no_match_list]
+
+            if already_has_url_list:
+                print(f"\n🔗 已有链接跳过 ({len(already_has_url_list)} 篇):")
+                for d in already_has_url_list:
+                    print(f"  - {d['title'][:50]}...")
+                    print(f"    相似度: {d['similarity']:.1%}")
+                    if d["old_url"]:
+                        print(f"    原链接: {d['old_url']}")
+
+            if no_match_list:
+                print(f"\n🔍 未找到匹配 ({len(no_match_list)} 篇):")
+                for d in no_match_list:
+                    print(f"  - {d['title'][:50]}...")
+                    print(f"    相似度: {d['similarity']:.1%}")
+
+            if other_skipped:
+                print(f"\n⏭️ 其他原因跳过 ({len(other_skipped)} 篇):")
+                for d in other_skipped:
+                    print(f"  - {d['title'][:50]}...")
+                    print(f"    原因: {d['reason']} | 相似度: {d['similarity']:.1%}")
+
+        # 失败的
+        failed_list = [d for d in details if "异常" in d["reason"] or "失败" in d["reason"]]
+        if failed_list:
+            print(f"\n❌ 查询失败 ({len(failed_list)} 篇):")
+            for d in failed_list:
+                print(f"  - {d['title'][:50]}...")
+                print(f"    原因: {d['reason']}")
+
+    else:
+        # 正常索引模式
+        existing = await abstract_index.get_all_abstracts()
+        processed_ids = set(existing.keys())
+        logger.info(f"已存在 {len(processed_ids)} 篇摘要" if not rebuild else "重新构建摘要索引")
+
+        results = {"success": 0, "failed": 0, "skipped": 0}
+        start_time = time.time()
+
+        for i, pdf_file in enumerate(pdf_files):
+            paper_id = pdf_file.stem
+            file_name = pdf_file.name
+
+            if i < skip:
+                continue
+            if not force and paper_id in processed_ids:
+                results["skipped"] += 1
+                continue
+
+            logger.info(f"[{i+1}/{len(pdf_files)}] {file_name}")
+
+            try:
+                success = await abstract_index.index_paper(
+                    pdf_path=str(pdf_file),
+                    paper_id=paper_id,
+                    file_name=file_name,
+                )
+                if success:
+                    results["success"] += 1
+                else:
+                    results["failed"] += 1
+            except Exception as e:
+                logger.error(f"处理失败 {file_name}: {e}")
+                results["failed"] += 1
+
+        elapsed = time.time() - start_time
+        await embed_client.close()
+
+        print()
+        logger.success("=" * 40)
+        logger.success("摘要索引构建完成")
+        print(f"  成功: {results['success']} | 失败: {results['failed']} | 跳过: {results['skipped']}")
+        print(f"  耗时: {elapsed:.1f}s")
+        print(f"  位置: {milvus_uri}")
 
 
 def main():
@@ -993,11 +1533,13 @@ def main():
   python build_abstract_index.py --papers ./papers --ollama http://localhost:11434 --model bge-m3
   python build_abstract_index.py --papers ./papers --force     # 强制重新处理已存在的论文
   python build_abstract_index.py --papers ./papers --rebuild    # 完全重建（删除旧数据库）
+  python build_abstract_index.py --papers ./papers --update-links-only  # 仅更新 arxiv/github 链接
 
 说明：
   - Embedding 使用 Ollama 服务（bge-m3 模型）
   - 摘要 LLM 提取使用本地 Qwen3.5-9B-GGUF 模型
   - 若 GGUF 模型已在 AstrBot 中加载，将直接复用
+  - --update-links-only 只更新 metadata（arxiv/github 链接），不覆盖原 title/abstract
         """
     )
 
@@ -1044,6 +1586,24 @@ def main():
         help='安静模式（减少输出）'
     )
 
+    parser.add_argument(
+        '--core-api-key',
+        default=os.environ.get('CORE_API_KEY', ''),
+        help='CORE API Key（用于查询 arxiv 链接）'
+    )
+
+    parser.add_argument(
+        '--update-links-only', '-u',
+        action='store_true',
+        help='仅更新链接（不提取摘要，不覆盖原数据）'
+    )
+
+    parser.add_argument(
+        '--no-arxiv-api',
+        action='store_true',
+        help='禁用 arXiv API 查询（当 arXiv 被限流时使用，仅依赖 CORE API）'
+    )
+
     args = parser.parse_args()
 
     global logger
@@ -1061,6 +1621,9 @@ def main():
         skip=args.skip,
         force=args.force,
         rebuild=args.rebuild,
+        core_api_key=args.core_api_key or None,
+        update_links_only=args.update_links_only,
+        use_arxiv_api=not args.no_arxiv_api,
     ))
 
 

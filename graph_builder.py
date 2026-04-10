@@ -31,7 +31,7 @@ from astrbot.api import logger
 
 # 延迟导入避免循环依赖
 if TYPE_CHECKING:
-    from .graph_rag_engine import MemoryGraphStore, Neo4jGraphStore, GraphRAGConfig
+    from .graph_rag_engine import MemoryGraphStore, GraphRAGConfig
 
 
 # ============================================================================
@@ -651,7 +651,7 @@ class MultimodalGraphBuilder:
     async def build_from_nodes(
         self,
         nodes: List[Any],
-        graph_store: "Union[MemoryGraphStore, Neo4jGraphStore]"
+        graph_store: Any
     ) -> Dict[str, int]:
         """
         从 Node 列表构建知识图谱
@@ -727,7 +727,7 @@ class MultimodalGraphBuilder:
     async def _process_batch(
         self,
         nodes: List[Any],
-        graph_store: "Union[MemoryGraphStore, Neo4jGraphStore]",
+        graph_store: Any,
         batch_idx: int = 0,
         total_batches: int = 1
     ) -> Dict[str, Any]:
@@ -895,7 +895,7 @@ class MultimodalGraphBuilder:
     async def _process_node(
         self,
         node: Any,
-        graph_store: "Union[MemoryGraphStore, Neo4jGraphStore]"
+        graph_store: Any
     ) -> Optional[Dict[str, Any]]:
         """处理单个节点"""
         try:
@@ -947,7 +947,7 @@ class MultimodalGraphBuilder:
         self,
         text: str,
         chunk_id: str,
-        graph_store: "Union[MemoryGraphStore, Neo4jGraphStore]"
+        graph_store: Any
     ) -> Dict[str, Any]:
         """纯文本三元组抽取"""
         result = {
@@ -1022,7 +1022,7 @@ class MultimodalGraphBuilder:
         image_path: str,
         image_caption: str,
         chunk_id: str,
-        graph_store: "Union[MemoryGraphStore, Neo4jGraphStore]"
+        graph_store: Any
     ) -> Dict[str, Any]:
         """多模态联合三元组抽取"""
         result = {
@@ -1369,7 +1369,7 @@ Extract triplets:"""
 
 async def build_graph_from_documents(
     documents: List[str],
-    graph_store: "Union[MemoryGraphStore, Neo4jGraphStore]",
+    graph_store: Any,
     config: Any,
     context: Any = None
 ) -> Dict[str, int]:

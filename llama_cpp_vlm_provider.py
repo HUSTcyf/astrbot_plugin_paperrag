@@ -306,8 +306,10 @@ class LlamaCppVLMProvider:
                 for img_url in image_urls:
                     img_path = Path(img_url)
                     if img_path.exists():
-                        image_paths.append(str(img_path.resolve()))
-                        logger.debug(f"[Llama.cpp-VLM] 添加图片: {img_path}")
+                        resolved = str(img_path.resolve())
+                        # 添加 file:// 前缀（urllib 需要 scheme 才能处理本地文件）
+                        image_paths.append(f"file://{resolved}")
+                        logger.debug(f"[Llama.cpp-VLM] 添加图片: file://{resolved}")
                     else:
                         logger.warning(f"[Llama.cpp-VLM] 图片不存在: {img_path}")
 

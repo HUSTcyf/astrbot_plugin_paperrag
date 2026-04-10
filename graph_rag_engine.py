@@ -19,14 +19,16 @@ Graph RAG Engine - 图谱增强检索引擎
 
 import asyncio
 import gc
-from typing import Dict, Any, Optional, List, TYPE_CHECKING
+from typing import Dict, Any, Optional, List, TYPE_CHECKING, cast
 from dataclasses import dataclass
 from pathlib import Path
 
 from astrbot.api import logger
 
+
 if TYPE_CHECKING:
     from .rag_engine import RAGConfig
+
 
 # Graph RAG 模块路径
 _PLUGIN_DIR = Path(__file__).parent.resolve()
@@ -583,7 +585,7 @@ class GraphRAGEngine:
         self._graph_store: Optional[Any] = None
         self._index: Optional[Any] = None
         self._query_engine: Optional[Any] = None
-        self._adapter: Optional[SimplePropertyGraphStoreAdapter] = None
+        self._adapter: Optional[Any] = None
         self._initialized = False
 
     def _get_llm(self):
@@ -648,8 +650,12 @@ class GraphRAGEngine:
                 logger.warning("[GraphRAG] 未找到 LLM，图谱检索将使用默认配置")
                 return
 
+            if self._graph_store is None:
+                logger.warning("[GraphRAG] 图谱存储未初始化，跳过索引创建")
+                return
+
             self._index = PropertyGraphIndex.from_existing(
-                graph_store=self._graph_store,
+                property_graph_store=self._graph_store,
                 llm=llm,
             )
 
@@ -659,7 +665,6 @@ class GraphRAGEngine:
             else:
                 retriever = PGRetriever(self._index)
                 self._query_engine = RetrieverQueryEngine.from_args(
-                    self._index,
                     retriever=retriever,
                     llm=llm,
                 )
@@ -770,22 +775,27 @@ class GraphRAGEngine:
         vector_task = self._vector_search(query, top_k)
         graph_task = self._graph_search(query, top_k)
 
-        vector_result, graph_result = await asyncio.gather(
+        results: tuple[Dict[str, Any] | BaseException, Dict[str, Any] | BaseException] = await asyncio.gather(
             vector_task,
             graph_task,
             return_exceptions=True
         )
 
+        vector_result = results[0]
+        graph_result = results[1]
+
         if isinstance(vector_result, Exception):
             logger.warning(f"向量检索失败，使用纯图谱检索: {vector_result}")
-            return graph_result
+            if isinstance(graph_result, Exception):
+                return {"type": "error", "message": "向量和图谱检索均失败"}
+            return cast(Dict[str, Any], graph_result)
 
         if isinstance(graph_result, Exception):
             logger.warning(f"图谱检索失败，使用纯向量检索: {graph_result}")
-            return vector_result
+            return cast(Dict[str, Any], vector_result)
 
-        vr: Dict[str, Any] = vector_result
-        gr: Dict[str, Any] = graph_result
+        vr = cast(Dict[str, Any], vector_result)
+        gr = cast(Dict[str, Any], graph_result)
 
         vector_sources = vr.get("sources", [])
         graph_entities = gr.get("entities", [])
@@ -873,7 +883,7 @@ class GraphRAGEngine:
 
         try:
             try:
-                from .graph_builder import MultimodalGraphBuilder
+                from .graph_builder import MultimodalGraphBuilder  # type: ignore[import]
             except ImportError:
                 from graph_builder import MultimodalGraphBuilder
 
@@ -888,8 +898,9 @@ class GraphRAGEngine:
             stats = await builder.build_from_nodes(nodes, self._adapter)
 
             # 处理完成后保存并清理内存
-            if hasattr(self._adapter, 'save'):
-                self._adapter.save(force=True)
+            adapter = self._adapter
+            if adapter is not None and hasattr(adapter, 'save'):
+                adapter.save(force=True)
             gc.collect()
 
             logger.info(f"✅ 知识图谱构建完成: {stats}")
@@ -972,6 +983,7 @@ async def build_graph_from_documents(
     context: Any = None
 ) -> Dict[str, int]:
     """便捷函数：从文档列表构建图谱"""
+    from .graph_builder import MultimodalGraphBuilder
     class SimpleNode:
         def __init__(self, text: str, metadata: Dict[str, Any]):
             self.text = text

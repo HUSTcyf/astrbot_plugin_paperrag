@@ -6,11 +6,12 @@
 
 import json
 import re
+import mistune
 import asyncio
 import os
 import base64
 import httpx
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, cast
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -93,6 +94,74 @@ class CoreAPIClient:
                     return match.group(1)
         return None
 
+    async def get_arxiv_link_by_filename(self, filename: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        根据本地文件名从 milvus_abstracts_doc_stats.json 获取 arxiv 链接
+
+        Args:
+            filename: 本地文件名（如 "2504.13204v1 (EDGS)"）
+
+        Returns:
+            Tuple[arxiv_url, github_url]
+        """
+        import json
+        from pathlib import Path
+
+        # 构建 doc_stats 文件路径
+        plugin_dir = Path(__file__).parent
+        doc_stats_file = plugin_dir / "data" / "milvus_abstracts_doc_stats.json"
+
+        if not doc_stats_file.exists():
+            logger.warning(f"[IdeaEngine] 未找到 {doc_stats_file}")
+            return None, None
+
+        try:
+            with open(doc_stats_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            abstracts = data.get("abstracts", {})
+            paper_id = filename
+            if paper_id.endswith(".pdf"):
+                paper_id = paper_id[:-4]
+
+            if paper_id in abstracts:
+                meta = abstracts[paper_id].get("metadata", {})
+                arxiv_url = meta.get("arxiv_url", "") or None
+                github_url = meta.get("github_url", "") or None
+                if arxiv_url:
+                    logger.info(f"[IdeaEngine] 从 doc_stats 获取 URL: {paper_id[:30]} -> {arxiv_url}")
+                return arxiv_url, github_url
+            else:
+                logger.info(f"[IdeaEngine] doc_stats 中未找到: {paper_id}")
+                return None, None
+
+        except Exception as e:
+            logger.warning(f"[IdeaEngine] 读取 doc_stats 失败: {e}")
+            return None, None
+
+    def _extract_arxiv_from_works(self, works: list) -> Tuple[Optional[str], Optional[str]]:
+        """从 CORE API 搜索结果中提取 arxiv 和 github 链接"""
+        for work in works:
+            arxiv_id = self.extract_arxiv_id(work)
+            if arxiv_id:
+                arxiv_url = f"https://arxiv.org/abs/{arxiv_id}"
+
+                # 尝试找 GitHub 链接
+                github_url = None
+                download_url = work.get("downloadUrl", "") or ""
+                if "github.com" in download_url.lower():
+                    github_url = download_url
+                else:
+                    desc = work.get("description", "") or ""
+                    if "github.com" in desc.lower():
+                        github_match = re.search(r'github\.com/[\w\-]+/[\w\-]+', desc, re.IGNORECASE)
+                        if github_match:
+                            github_url = f"https://{github_match.group()}"
+
+                return arxiv_url, github_url
+
+        return None, None
+
     async def get_arxiv_link(self, paper_title: str) -> Tuple[Optional[str], Optional[str]]:
         """
         根据论文标题获取 arxiv 链接和 GitHub 链接（异步）
@@ -125,28 +194,6 @@ class CoreAPIClient:
 
                 return arxiv_url, github_url
 
-        return None, None
-
-    def _extract_arxiv_from_works(self, works: list) -> Tuple[Optional[str], Optional[str]]:
-        """从 CORE API 搜索结果中提取 arxiv 和 github 链接"""
-        for work in works:
-            arxiv_id = self.extract_arxiv_id(work)
-            if arxiv_id:
-                arxiv_url = f"https://arxiv.org/abs/{arxiv_id}"
-
-                # 尝试找 GitHub 链接
-                github_url = None
-                download_url = work.get("downloadUrl", "") or ""
-                if "github.com" in download_url.lower():
-                    github_url = download_url
-                else:
-                    desc = work.get("description", "") or ""
-                    if "github.com" in desc.lower():
-                        github_match = re.search(r'github\.com/[\w\-]+/[\w\-]+', desc, re.IGNORECASE)
-                        if github_match:
-                            github_url = f"https://{github_match.group()}"
-
-                return arxiv_url, github_url
         return None, None
 
 
@@ -194,7 +241,26 @@ class IdeaEngine:
         """
         self.context = context
         self._rag_engine = rag_engine
-        self._bright_data_available = True
+        # 检查 Bright Data MCP 是否配置
+        self._bright_data_available = self._check_bright_data_config()
+
+    def _check_bright_data_config(self) -> bool:
+        """检查 Bright Data MCP 是否已配置"""
+        try:
+            mcp_config_path = Path(__file__).parent.parent.parent / "mcp_server.json"
+            if not mcp_config_path.exists():
+                logger.warning("[IdeaEngine] mcp_server.json 不存在，Bright Data 搜索将不可用")
+                return False
+            with open(mcp_config_path, "r", encoding="utf-8") as f:
+                mcp_config = json.load(f)
+            api_token = mcp_config.get("mcpServers", {}).get("BrightData", {}).get("env", {}).get("API_TOKEN", "")
+            if not api_token:
+                logger.warning("[IdeaEngine] Bright Data API Token 未配置，网络搜索将不可用")
+                return False
+            return True
+        except Exception as e:
+            logger.warning(f"[IdeaEngine] 检查 Bright Data 配置失败: {e}")
+            return False
 
     def _get_llm_provider(self):
         """获取LLM provider"""
@@ -303,7 +369,7 @@ class IdeaEngine:
             if not paper or paper in enriched["arxiv_links"]:
                 continue
 
-            arxiv_url, github_url = await core_client.get_arxiv_link(paper)
+            arxiv_url, github_url = await core_client.get_arxiv_link_by_filename(paper)
             if arxiv_url:
                 enriched["arxiv_links"][paper] = arxiv_url
                 enriched["github_links"][paper] = github_url
@@ -315,7 +381,7 @@ class IdeaEngine:
         self,
         ideas: List["ResearchIdea"],
         topic: str,
-        knowledge: Dict[str, Any] = None
+        knowledge: Optional[Dict[str, Any]] = None
     ) -> Tuple[str, Dict[str, Any], str]:
         """
         使用 LLM 将研究想法润色为组会周报学术风格
@@ -339,16 +405,23 @@ class IdeaEngine:
         # 构建引用上下文（包含媒体资源）
         citations_context, extracted_media = self._build_citations_context(knowledge)
 
-        # 构建媒体说明
+        # 增强媒体 caption（对简单编号的 caption 调用 Qwen + LLM 生成描述）
+        extracted_media = await self._enhance_media_captions(extracted_media, knowledge)
+
+        # 构建媒体说明（排除被标记跳过的图片）
         media_instructions = ""
-        if extracted_media["images"]:
+        valid_images = [img for img in extracted_media["images"] if not img.get("_skip")]
+        valid_tables = [tbl for tbl in extracted_media.get("tables", []) if not tbl.get("_skip")]
+        if valid_images:
             media_instructions += f"\n\n**可用的图片资源：**\n"
-            for img in extracted_media["images"]:
-                media_instructions += f"- {img['index']}: {img['caption']} (来源: {img['source_paper']}, 页码: {img['source_page']})\n"
-        if extracted_media["tables"]:
+            for img in valid_images:
+                page_str = f"，页码: {img['source_page']}" if img.get('source_page') else ""
+                media_instructions += f"- {img['index']}: {img['caption']} (来源: {img['source_paper']}{page_str})\n"
+        if valid_tables:
             media_instructions += f"\n**可用的表格资源：**\n"
-            for tbl in extracted_media["tables"]:
-                media_instructions += f"- {tbl['index']}: {tbl['caption']} (来源: {tbl['source_paper']}, 页码: {tbl['source_page']})\n"
+            for tbl in valid_tables:
+                page_str = f"，页码: {tbl['source_page']}" if tbl.get('source_page') else ""
+                media_instructions += f"- {tbl['index']}: {tbl['caption']} (来源: {tbl['source_paper']}{page_str})\n"
                 if tbl['csv_content'] and tbl['csv_content'] != "(无法读取)":
                     media_instructions += f"  表格内容预览:\n```\n{tbl['csv_content'][:200]}...\n```\n"
 
@@ -383,44 +456,46 @@ class IdeaEngine:
             logger.warning(f"[IdeaEngine] 生成标题失败: {e}，使用原始主题")
             generated_title = topic
 
-        # 第二步：润色文档内容
-        polish_prompt = f"""你是一个专业的学术助手，擅长撰写组会周报风格的技术文档。
+        # 第二步：基于参考资料整合并完善文档内容
+        # 精简版工具说明
+        tools_instruction = """## 主动搜索工具
+<discover>query|意图描述|country</discover>  # AI智能搜索学术资源（推荐）
+注意：必须将搜索结果整合到"相关工作"章节，使用[论文名](url)格式。"""
 
-请将以下研究想法整理成规范的组会周报格式，要求：
+        polish_prompt = f"""你是一个学术助手，根据参考资料撰写组会周报。
 
-## 文档结构（必须包含以下所有章节）
-
-1. **背景与动机**：阐述研究问题的背景和重要性
-2. **相关工作**：列出与本研究想法相关的已发表工作，直接使用论文标题作为引用
-3. **方法论**：详细描述 proposed 方法
-4. **创新点**：明确列出主要贡献
-5. **实验设置与 Benchmark**：列出该领域公认的 benchmark 数据集/任务
-6. **潜在挑战与解决方案**：列出可能遇到的挑战及应对方案
-7. **下一步研究计划**：拟定 3-5 个具体的后续研究步骤
-
-## 格式要求
-1. 语言简洁专业，学术性强
-2. 使用 Markdown 格式输出
-3. **引用格式**：直接使用论文标题作为引用（例如："...根据论文《Deformable Radial Kernel Splatting》的研究..."），在输出最终内容时，将论文名称替换为完整的 arxiv 链接（例如：`[Deformable Radial Kernel Splatting](https://arxiv.org/abs/2412.11752)`）
-4. **重要**：如果引用内容中包含图片或表格，可以使用以下标记在适当位置插入：
-   - 插入图片: `<!-- INSERT_IMAGE:本地图-1 -->`
-   - 插入表格: `<!-- INSERT_TABLE:本地表-1 -->`
-   例如: `如图 <!-- INSERT_IMAGE:本地图-1 --> 所示`，`见表 <!-- INSERT_TABLE:本地表-1 -->`
-5. 实验部分，列出该领域常用的 Benchmark，如 GLUE、SuperGLUE、SQuAD、COCO 等公认的评估基准
-
-## 参考资料
-
+参考资料：
 {citations_context}
 {media_instructions}
 
-## 原始研究想法
-
+原始想法：
 {ideas_summary}
 
-请直接输出润色后的完整内容（含引用和图片/表格标记），不要添加额外说明。"""
+{tools_instruction}
+
+格式要求：
+- 包含章节：背景动机、相关工作、方法论、创新点、实验benchmark、挑战与解决方案、下一步计划
+- **每个章节都要有详细的展开论述**，不能只是简短的要点列表。要求：
+  - "背景动机"：详细说明问题的背景、重要性、现有方法的不足（3-5句）
+  - "相关工作"：详细综述相关方法和论文，不能只列论文名（3-5句）
+  - "方法论"：详细描述方法细节、工作流程、技术路线（3-7句）
+  - "创新点"：明确列出2-3个具体创新点，并解释为什么这些创新有效
+  - "实验benchmark"：详细说明实验设置、数据集、对比方法、评价指标
+  - "挑战与解决方案"：每个挑战都要详细说明原因和对应的具体解决方案
+  - "下一步计划"：具体的下一步研究方向和可行的改进思路
+- 引用格式：[论文名](url)，不用加粗或代码块
+- **图表引用格式（重要）**：图片/表格引用必须嵌入在句子中间，**禁止单独成段**。
+  - ✅ 正确：`如图[图1]所示，该方法在基准测试中表现优异`
+  - ✅ 正确：`根据[表1]的实验数据，可以观察到明显的性能提升`
+  - ❌ 错误：`如图[图1]所示`（后面直接换行，引用单独成段）
+  - ❌ 错误：把 `<!-- INSERT_IMAGE:本地图-N -->` 放在单独一行
+  - **所有图表引用必须作为句子的一部分出现**，而不是句子的全部内容
+- **列表项格式**：列表序号（如"1."、"2."）和列表内容必须在同一行，**不要在列表项内部换行**。如果列表项内容较长，直接续写，不要按句号或逗号换行。
+
+请直接输出内容："""
 
         try:
-            logger.info("[IdeaEngine] 开始润色内容（含引用、相关工作、Benchmark 和研究计划）...")
+            logger.info("[IdeaEngine] 开始整合参考资料并完善内容（含主动搜索）...")
             response = await provider.text_chat(
                 prompt=polish_prompt,
                 contexts=[],
@@ -428,15 +503,44 @@ class IdeaEngine:
                 max_tokens=16384
             )
             polished = self._extract_text_from_response(response)
-            logger.info(f"[IdeaEngine] 内容润色完成，长度: {len(polished) if polished else 0}")
+
+            # 解析并执行 LLM 输出中的工具调用
+            logger.info("[IdeaEngine] 解析 LLM 输出中的工具调用标签...")
+            polished, tool_results = await self._parse_and_execute_brightdata_tools(polished, max_iterations=3)
+
+            if tool_results:
+                logger.info(f"[IdeaEngine] 执行了 {len(tool_results)} 个工具调用，整合结果...")
+                results_summary = "\n".join([
+                    f"[{r['type']}] {r.get('query') or r.get('url') or ''}: {str(r.get('result',''))[:100]}"
+                    for r in tool_results
+                ])
+                integration_prompt = f"""整合搜索结果到"相关工作"章节：
+
+搜索结果：
+{results_summary}
+
+当前内容：
+{polished}
+
+要求：[论文名](url)格式，勿重复。直接输出。"""
+
+                response2 = await provider.text_chat(
+                    prompt=integration_prompt,
+                    contexts=[],
+                    temperature=0.3,
+                    max_tokens=16384
+                )
+                polished = self._extract_text_from_response(response2)
+
+            logger.info(f"[IdeaEngine] 内容整合完成，长度: {len(polished) if polished else 0}")
             content = polished if polished and polished.strip() else ideas_summary
 
             return content, extracted_media, generated_title
         except Exception as e:
-            logger.error(f"[IdeaEngine] 润色失败: {e}，使用原始格式")
+            logger.error(f"[IdeaEngine] 内容整合失败: {e}，使用原始格式")
             return ideas_summary, {"images": [], "tables": []}, topic
 
-    def _build_citations_context(self, knowledge: Dict[str, Any] = None) -> Tuple[str, Dict[str, Any]]:
+    def _build_citations_context(self, knowledge: Optional[Dict[str, Any]] = None) -> Tuple[str, Dict[str, Any]]:
         """
         构建引用上下文，包含本地检索和网络搜索的结果
 
@@ -453,8 +557,8 @@ class IdeaEngine:
         if not knowledge:
             return "（无可用引用来源）", {"images": [], "tables": []}
 
-        parts = []
-        extracted_media = {"images": [], "tables": []}
+        parts: List[str] = []
+        extracted_media: Dict[str, Any] = {"images": [], "tables": []}
         local_results = knowledge.get("local_results", [])
         web_results = knowledge.get("web_results", [])
 
@@ -463,10 +567,10 @@ class IdeaEngine:
         local_table_idx = 0
         if local_results:
             parts.append("## 本地论文检索引用：\n")
-            for i, result in enumerate(local_results[:10], 1):  # 最多10条
+            for i, result in enumerate(local_results[:15], 1):  # 最多15条
                 paper = result.get("paper", "Unknown")
                 page = result.get("page", "N/A")
-                text = result.get("text", "")[:300]
+                text = result.get("text", "")[:500]
                 score = result.get("score", 0.0)
                 metadata = result.get("metadata", {})
                 file_name = metadata.get("file_name", "")
@@ -481,43 +585,42 @@ class IdeaEngine:
 
                 # 检查是否有图片
                 image_path = metadata.get("image_path")
-
-                # 检查是否有图片
-                image_path = metadata.get("image_path")
-                if image_path and os.path.exists(image_path):
-                    local_image_idx += 1
-                    img_index = f"本地图-{local_image_idx}"
-                    img_caption = metadata.get("image_caption", f"图 {local_image_idx}")
-                    # 读取图片并转为 base64
-                    try:
-                        with open(image_path, "rb") as f:
-                            img_base64 = base64.b64encode(f.read()).decode("utf-8")
-                        extracted_media["images"].append({
-                            "index": img_index,
-                            "path": image_path,
-                            "base64": img_base64,
-                            "caption": img_caption,
-                            "source_paper": paper,
-                            "source_page": page
-                        })
-                    except Exception as e:
-                        logger.warning(f"[IdeaEngine] 读取图片失败 {image_path}: {e}")
-                        img_base64 = None
-
-                    # 构建引用（包含论文名称和完整 arxiv 链接，供 LLM 替换）
-                    if arxiv_id:
-                        ref_str = f"{paper} (https://arxiv.org/abs/{arxiv_id})"
+                img_index = None
+                img_base64 = None
+                img_caption = None
+                if image_path:
+                    if os.path.exists(image_path):
+                        local_image_idx += 1
+                        img_index = f"本地图-{local_image_idx}"
+                        img_caption = metadata.get("image_caption", f"图 {local_image_idx}")
+                        # 读取图片并转为 base64
+                        try:
+                            with open(image_path, "rb") as f:
+                                img_base64 = base64.b64encode(f.read()).decode("utf-8")
+                            extracted_media["images"].append({
+                                "index": img_index,
+                                "path": image_path,
+                                "base64": img_base64,
+                                "caption": img_caption,
+                                "source_paper": paper,
+                                "source_page": page
+                            })
+                        except Exception as e:
+                            logger.warning(f"[IdeaEngine] 读取图片失败 {image_path}: {e}")
+                            img_base64 = None
                     else:
-                        ref_str = paper
+                        logger.warning(f"[IdeaEngine] 图片元数据存在但文件缺失: {image_path}")
+
+                # 构建引用（无论图片是否存在都添加引用）
+                if arxiv_id:
+                    ref_str = f"{paper} (https://arxiv.org/abs/{arxiv_id})"
+                else:
+                    ref_str = paper
+                if img_index:
                     parts.append(f"- {ref_str} (页码: {page}, 相关度: {score:.3f}, 图片: {img_index})\n")
                     if img_base64:
                         parts.append(f"  - 图片说明: {img_caption}\n")
                 else:
-                    # 构建引用（包含论文名称和完整 arxiv 链接，供 LLM 替换）
-                    if arxiv_id:
-                        ref_str = f"{paper} (https://arxiv.org/abs/{arxiv_id})"
-                    else:
-                        ref_str = paper
                     parts.append(f"- {ref_str} (页码: {page}, 相关度: {score:.3f})\n")
 
                 # 检查是否有表格
@@ -525,32 +628,49 @@ class IdeaEngine:
                 table_png_path = metadata.get("table_png_path")
                 table_caption = metadata.get("table_caption", "")
 
+                # 尝试推断 md_path 和 png_path（与 csv 同目录，同名文件）
+                table_md_path = ""
+                if table_csv_path:
+                    table_md_path = table_csv_path.replace(".csv", ".md")
+                # 如果 png_path 为空，尝试从 csv_path 推断
+                if not table_png_path and table_csv_path:
+                    table_png_path = table_csv_path.replace(".csv", ".png")
+                    if not os.path.exists(table_png_path):
+                        table_png_path = ""  # 推断的路径也不存在，则置空
+
                 if table_csv_path or table_png_path:
                     local_table_idx += 1
                     tbl_index = f"本地表-{local_table_idx}"
                     csv_content = ""
-                    if table_csv_path and os.path.exists(table_csv_path):
-                        try:
-                            with open(table_csv_path, "r", encoding="utf-8") as f:
-                                csv_content = f.read()[:500]  # 限制内容长度
-                            extracted_media["tables"].append({
-                                "index": tbl_index,
-                                "csv_path": table_csv_path,
-                                "png_path": table_png_path,
-                                "caption": table_caption,
-                                "csv_content": csv_content,
-                                "source_paper": paper,
-                                "source_page": page
-                            })
-                        except Exception as e:
-                            logger.warning(f"[IdeaEngine] 读取表格失败 {table_csv_path}: {e}")
-                            csv_content = "(无法读取)"
+                    if table_csv_path:
+                        if not os.path.exists(table_csv_path):
+                            logger.warning(f"[IdeaEngine] 表格CSV元数据存在但文件缺失: {table_csv_path}")
+                        else:
+                            try:
+                                with open(table_csv_path, "r", encoding="utf-8") as f:
+                                    csv_content = f.read()[:500]  # 限制内容长度
+                                extracted_media["tables"].append({
+                                    "index": tbl_index,
+                                    "csv_path": table_csv_path,
+                                    "png_path": table_png_path,
+                                    "md_path": table_md_path if os.path.exists(table_md_path) else "",
+                                    "caption": table_caption,
+                                    "csv_content": csv_content,
+                                    "source_paper": paper,
+                                    "source_page": page
+                                })
+                            except Exception as e:
+                                logger.warning(f"[IdeaEngine] 读取表格失败 {table_csv_path}: {e}")
+                                csv_content = "(无法读取)"
+                    if table_png_path and not os.path.exists(table_png_path):
+                        logger.warning(f"[IdeaEngine] 表格PNG元数据存在但文件缺失: {table_png_path}")
 
                     if not any(t["index"] == tbl_index for t in extracted_media["tables"]):
                         extracted_media["tables"].append({
                             "index": tbl_index,
                             "csv_path": table_csv_path or "",
                             "png_path": table_png_path or "",
+                            "md_path": table_md_path if os.path.exists(table_md_path) else "",
                             "caption": table_caption,
                             "csv_content": csv_content,
                             "source_paper": paper,
@@ -577,6 +697,773 @@ class IdeaEngine:
 
         return "\n".join(parts), extracted_media
 
+    def _is_simple_caption(self, caption: str) -> bool:
+        """检查 caption 是否只是简单的编号而没有实际描述"""
+        if not caption:
+            return True
+        # 匹配简单的 Figure/Table/图 编号格式
+        simple_pattern = re.match(
+            r'^(Figure|Fig\.|Fig|Table|表|图)\s*([A-Za-z0-9]+(?:-[A-Za-z0-9]+)?)$',
+            caption.strip(),
+            re.IGNORECASE
+        )
+        return simple_pattern is not None
+
+    async def _enhance_media_captions(
+        self,
+        extracted_media: Dict[str, Any],
+        knowledge: Optional[Dict[str, Any]] = None,
+        enable_qwen: bool = True
+    ) -> Dict[str, Any]:
+        """
+        增强媒体 caption：
+        1. 对于简单编号的 caption（如 "Figure 4"），调用本地 Qwen 模型根据图片生成描述
+        2. 调用 AstrBot LLM 根据上下文润色描述
+
+        Args:
+            extracted_media: 提取的媒体资源
+            knowledge: 知识检索结果（包含相关 chunks）
+            enable_qwen: 是否启用 Qwen 图像分析（需要本地部署 Qwen-VL）
+
+        Returns:
+            Dict: 增强后的媒体资源
+        """
+        if not extracted_media:
+            return extracted_media
+
+        local_results = knowledge.get("local_results", []) if knowledge else []
+
+        # 构建 chunk 上下文映射（paper -> chunks）
+        chunk_contexts: Dict[str, List[str]] = {}
+        for result in local_results:
+            paper = result.get("metadata", {}).get("file_name", "")
+            text = result.get("text", "")
+            if paper and text:
+                if paper not in chunk_contexts:
+                    chunk_contexts[paper] = []
+                chunk_contexts[paper].append(text[:500])  # 限制每个 chunk 长度
+
+        # 增强图片 captions
+        for img in extracted_media.get("images", []):
+            caption = img.get("caption", "")
+            if self._is_simple_caption(caption) and enable_qwen:
+                paper = img.get("source_paper", "")
+                image_path = img.get("path", "")
+
+                if image_path and os.path.exists(image_path):
+                    # 获取相关 chunks
+                    related_chunks = chunk_contexts.get(paper, [])[:5]  # 最多5个相关 chunk
+                    context_text = "\n".join(related_chunks)
+
+                    # 调用 Qwen 分析图片（生成摘要和相关性判断）
+                    qwen_result = await self._generate_image_summary_with_qwen(
+                        image_path, context_text
+                    )
+
+                    if qwen_result:
+                        # 将 VLM 的摘要和相关性判断发给云端 LLM 做最终决定
+                        final_decision = await self._final_image_decision(
+                            qwen_result=qwen_result,
+                            context_text=context_text,
+                            original_caption=caption,
+                            caption_type="图"
+                        )
+                        if final_decision and final_decision.strip() == "[SKIP]":
+                            logger.info(f"[IdeaEngine] 云端 LLM 认为图片无关，跳过: index={img.get('index')}")
+                            img["_skip"] = True  # 标记跳过
+                        elif final_decision and final_decision.strip():
+                            logger.info(f"[IdeaEngine] 图片 caption 增强: '{caption}' -> '{final_decision}'")
+                            img["caption"] = final_decision
+                    else:
+                        # VLM 失败时保留原 caption
+                        logger.info(f"[IdeaEngine] VLM 分析失败，保留原 caption: index={img.get('index')}")
+
+        # 增强表格 captions
+        for tbl in extracted_media.get("tables", []):
+            caption = tbl.get("caption", "")
+            if self._is_simple_caption(caption) and enable_qwen:
+                paper = tbl.get("source_paper", "")
+                csv_path = tbl.get("csv_path", "")
+                csv_content = tbl.get("csv_content", "")
+
+                if csv_content:
+                    # 1. 使用 CSV 内容 + chunks 作为上下文
+                    related_chunks = chunk_contexts.get(paper, [])[:3]
+                    context_text = f"表格内容:\n{csv_content[:300]}\n\n相关上下文:\n" + "\n".join(related_chunks)
+
+                    # 2. 调用 LLM 直接润色（表格不需要 Qwen 分析）
+                    polished = await self._polish_caption_with_llm(
+                        caption, context_text, caption_type="表"
+                    )
+
+                    if polished and polished.strip() == "[SKIP]":
+                        logger.info(f"[IdeaEngine] LLM 认为表格描述无意义，跳过: index={tbl.get('index')}")
+                        tbl["_skip"] = True
+                    elif polished:
+                        logger.info(f"[IdeaEngine] 表格 caption 增强: '{caption}' -> '{polished}'")
+                        tbl["caption"] = polished
+
+        return extracted_media
+
+    async def _generate_image_summary_with_qwen(
+        self,
+        image_path: str,
+        context_text: str
+    ) -> Optional[dict]:
+        """
+        调用本地 LlamaCppVLMProvider (Qwen3.5-9B-GGUF) 分析图片并生成摘要
+
+        策略：优先提取图片中的文字（OCR），若无文字则进行视觉分析
+
+        Args:
+            image_path: 图片路径
+            context_text: 相关上下文文本（chunk 片段）
+
+        Returns:
+            dict: {"summary": str, "is_relevant": bool}，失败返回 None
+        """
+        try:
+            # 导入 LlamaCppVLMProvider 相关函数
+            try:
+                from .llama_cpp_vlm_provider import (
+                    get_llama_cpp_vlm_provider,
+                    get_cached_llama_cpp_provider,
+                    init_llama_cpp_vlm_provider,
+                    LlamaCppVLMProvider
+                )
+            except ImportError as e:
+                logger.warning(f"[IdeaEngine] 无法导入 LlamaCppVLMProvider: {e}")
+                return None
+
+            # 优先复用已初始化的单例
+            vlm_provider = get_cached_llama_cpp_provider()
+            if vlm_provider is None:
+                logger.info("[IdeaEngine] LlamaCppVLMProvider 未初始化，尝试初始化...")
+                # 使用默认路径（llama_cpp_vlm_provider.py 内部会自动下载模型）
+                model_dir = os.path.join(os.path.dirname(__file__), "models", "Qwen3.5-9B-GGUF")
+                model_path = os.path.join(model_dir, "Qwen3.5-9B-UD-Q4_K_XL.gguf")
+                mmproj_path = os.path.join(model_dir, "mmproj-BF16.gguf")
+
+                vlm_provider = init_llama_cpp_vlm_provider(
+                    model_path=model_path,
+                    mmproj_path=mmproj_path,
+                    n_ctx=4096,
+                    n_gpu_layers=99,
+                    max_tokens=512,
+                    temperature=0.3
+                )
+                await vlm_provider.initialize()
+
+            # ========== 策略1：优先提取文字 ==========
+            text_extract_prompt = """请只提取这张图片中的所有文字内容，不要进行任何视觉描述。
+
+要求：
+1. 按原文顺序输出所有文字
+2. 保留原文的换行和段落结构
+3. 忽略图片中的图表、图像等非文字内容
+4. 如果没有文字，输出"（图片中无文字）"
+
+输出格式：
+TEXT: <提取的文字内容>"""
+
+            text_response = await vlm_provider.text_chat(
+                prompt=text_extract_prompt,
+                image_urls=[image_path],
+                temperature=0.3,
+                max_tokens=512
+            )
+
+            extracted_text = ""
+            if text_response and hasattr(text_response, 'content'):
+                content = text_response.content.strip()
+                # 解析 TEXT: 格式
+                for line in content.split('\n'):
+                    line = line.strip()
+                    if line.startswith('TEXT:'):
+                        extracted_text = line[5:].strip()
+                        break
+
+            # 判断提取的文字是否有意义（排除"无文字"提示）
+            has_meaningful_text = (
+                extracted_text
+                and extracted_text != "（图片中无文字）"
+                and len(extracted_text) >= 10
+            )
+
+            if has_meaningful_text:
+                logger.info(f"[IdeaEngine] Qwen 文字提取成功: {extracted_text[:60]}...")
+                return {
+                    "summary": extracted_text,
+                    "is_relevant": True  # 有文字的图片默认认为相关
+                }
+
+            # ========== 策略2：无文字时进行视觉分析 ==========
+            logger.info(f"[IdeaEngine] 图片无文字，进行视觉分析: {image_path}")
+
+            visual_prompt = f"""请分析这张图片。
+
+上下文内容（图片所在论文中的相关段落）：
+{context_text[:1000] if context_text else '无'}
+
+请仔细观察图片的视觉内容，判断：
+1. 图片的主题和类型（散点图、特征图、热力图、渲染图、流程图、实物照片等）
+2. 图片是否与上面的上下文内容相关
+
+然后按以下格式输出（只输出这两行，不要加任何前缀或解释）：
+SUMMARY: <图片内容的详细摘要>
+RELEVANT: <yes 或 no>
+
+判断标准：
+- 如果图片内容与上下文主题相关（例如上下文讨论3DGS，图片也是3DGS相关的图），RELEVANT: yes
+- 如果图片与上下文完全无关（例如上下文讨论某个方法的效果，图片却是完全不相关的特征图/渲染图），RELEVANT: no"""
+
+            visual_response = await vlm_provider.text_chat(
+                prompt=visual_prompt,
+                image_urls=[image_path],
+                temperature=0.3,
+                max_tokens=512
+            )
+
+            if visual_response and hasattr(visual_response, 'content'):
+                content = visual_response.content.strip()
+                if content:
+                    logger.info(f"[IdeaEngine] Qwen 视觉分析成功: {content[:80]}...")
+                    # 解析输出
+                    summary = ""
+                    is_relevant = None
+                    for line in content.split('\n'):
+                        line = line.strip()
+                        if line.startswith('SUMMARY:'):
+                            summary = line[8:].strip()
+                        elif line.startswith('RELEVANT:'):
+                            relevant_str = line[9:].strip().lower()
+                            is_relevant = relevant_str in ('yes', 'y', 'true')
+                    if summary:
+                        return {"summary": summary, "is_relevant": is_relevant}
+
+            return None
+
+        except Exception as e:
+            logger.warning(f"[IdeaEngine] Qwen 图像分析异常: {e}")
+            import traceback
+            logger.warning(f"[IdeaEngine] 详细错误: {traceback.format_exc()}")
+            return None
+
+    async def _final_image_decision(
+        self,
+        qwen_result: dict,
+        context_text: str,
+        original_caption: str,
+        caption_type: str = "图"
+    ) -> Optional[str]:
+        """
+        调用云端 LLM 综合本地 VLM 的摘要和判断，做最终决定
+
+        Args:
+            qwen_result: 本地 VLM 返回的结果 {"summary": str, "is_relevant": bool}
+            context_text: 上下文文本
+            original_caption: 原始 caption
+            caption_type: "图" 或 "表"
+
+        Returns:
+            str: 润色后的 caption 或 [SKIP]
+        """
+        provider = self._get_llm_provider()
+        if not provider:
+            return None
+
+        vlm_summary = qwen_result.get("summary", "")
+        vlm_is_relevant = qwen_result.get("is_relevant")
+
+        media_type = "图片" if caption_type == "图" else "表格"
+        prompt = f"""给定一个{media_type}的本地模型分析结果和上下文内容，请做最终决定。
+
+本地模型（VLM）分析：
+- 摘要：{vlm_summary}
+- VLM 判断相关性：{'相关' if vlm_is_relevant else '不相关' if vlm_is_relevant is False else '不确定'}
+
+原始 caption：{original_caption}
+
+上下文（图片所在论文中的相关段落）：
+{context_text[:1500] if context_text else '无'}
+
+要求：
+1. 综合 VLM 的分析、原始 caption 和上下文内容，做最终判断
+2. 如果{media_type}明显与上下文不相关、模糊无法理解、或明显无意义，输出 [SKIP]
+3. 如果{media_type}有价值，生成一个简洁的 caption（不超过 100 字符），突出核心信息
+4. 只需要输出 caption 或 [SKIP]，不要加任何前缀或解释
+"""
+
+        try:
+            response = await provider.text_chat(
+                prompt=prompt,
+                contexts=[],
+                temperature=0.3,
+                max_tokens=128
+            )
+            result = self._extract_text_from_response(response)
+            if result and result.strip():
+                return result.strip()
+        except Exception as e:
+            logger.warning(f"[IdeaEngine] 云端 LLM 决策失败: {e}")
+        return None
+
+    async def _polish_caption_with_llm(
+        self,
+        description: str,
+        context_text: str,
+        caption_type: str = "图"
+    ) -> Optional[str]:
+        """
+        调用 AstrBot LLM 润色 caption
+
+        Args:
+            description: 原始描述
+            context_text: 上下文文本
+            caption_type: "图" 或 "表"
+
+        Returns:
+            str: 润色后的 caption
+        """
+        provider = self._get_llm_provider()
+        if not provider:
+            return description
+
+        media_type = "图片" if caption_type == "图" else "表格"
+        prompt = f"""给定以下{media_type}描述和上下文内容，请生成一个简洁的 caption。
+
+描述：
+{description}
+
+上下文：
+{context_text[:1500] if context_text else '无'}
+
+要求：
+1. 首先判断描述是否与上下文内容相关、是否有意义
+2. 如果描述明显不相关、模糊、无法理解，或与上下文内容不符，直接输出 [SKIP]
+3. 如果描述有意义，则生成一个简洁的 caption，突出{media_type}的核心信息
+4. 只需要输出描述内容，不要包含"图X"、"表X"等编号前缀
+5. 不要超过 100 个字符
+6. 直接输出 caption 或 [SKIP]，不要加任何前缀或解释
+"""
+        try:
+            response = await provider.text_chat(
+                prompt=prompt,
+                contexts=[],
+                temperature=0.3,
+                max_tokens=64
+            )
+            result = self._extract_text_from_response(response)
+            if result:
+                return result.strip()
+        except Exception as e:
+            logger.warning(f"[IdeaEngine] LLM caption 润色失败: {e}")
+
+        return description
+
+    async def _audit_media_relevance(
+        self,
+        content: str,
+        extracted_media: Dict[str, Any],
+        knowledge: Optional[Dict[str, Any]] = None
+    ) -> Tuple[str, Dict[str, Any]]:
+        """
+        使用本地 VLM 按章节审阅文档中插入的图片是否与内容相关，不相关则删除。
+
+        流程：
+        1. 按 Markdown 章节（## xxx）分块，每章作为一个审阅单元
+        2. 每章收集所有 <!-- INSERT_IMAGE:本地图-N --> 标记，批量传给 VLM
+        3. VLM 判断哪些图片与该章节内容不相关/有事实错误
+        4. 根据 VLM 决策删除对应标记（不对文本进行任何润色或精简）
+        5. 返回修改后的内容和更新后的 extracted_media
+
+        Args:
+            content: 包含 INSERT_IMAGE 标记的文档内容
+            extracted_media: 提取的媒体资源
+            knowledge: 知识检索结果（用于获取图片路径等信息）
+
+        Returns:
+            Tuple[str, Dict]: (审阅后的内容, 更新后的 extracted_media)
+        """
+        # 检查是否有图片标记需要审阅
+        image_markers_in_content = re.findall(r'<!--\s*INSERT_IMAGE:本地图-(\d+)\s*-->', content)
+        if not image_markers_in_content:
+            return content, extracted_media
+
+        # 检查 VLM 是否可用
+        try:
+            from .llama_cpp_vlm_provider import get_cached_llama_cpp_provider
+            vlm_provider = get_cached_llama_cpp_provider()
+            if vlm_provider is None:
+                logger.info("[IdeaEngine] VLM Provider 未初始化，跳过图片审阅")
+                return content, extracted_media
+        except ImportError:
+            logger.warning("[IdeaEngine] 无法导入 LlamaCppVLMProvider，跳过图片审阅")
+            return content, extracted_media
+
+        images = extracted_media.get("images", [])
+        # 构建 index -> image 的映射
+        image_map: Dict[str, Dict] = {}
+        for img in images:
+            index = img.get("index", "")
+            if index:
+                image_map[index] = img
+
+        # 解析图片路径（带 fallback）
+        def resolve_image_path(img: Dict) -> str:
+            path = img.get("path", "")
+            if path and os.path.exists(path):
+                return path
+            # fallback: 从 knowledge 中查找
+            if knowledge:
+                source_paper = img.get("source_paper", "")
+                for result in knowledge.get("local_results", []):
+                    metadata = result.get("metadata", {})
+                    if (metadata.get("image_path") and
+                            source_paper == metadata.get("file_name")):
+                        fallback = metadata.get("image_path", "")
+                        if fallback and os.path.exists(fallback):
+                            return fallback
+            return path if path else ""
+
+        # ========== 第一步：按 ## 章节分块 ==========
+        # 保留原始标题行位置，用于重建
+        lines = content.split('\n')
+        sections: List[Dict[str, Any]] = []
+        current_section = {"title": "", "lines": [], "start_line": 0}
+
+        for line_idx, line in enumerate(lines):
+            stripped = line.strip()
+            # 检测章节标题（1-3 级标题：# xxx / ## xxx / ### xxx）
+            if re.match(r'^#{1,3}\s+\S', stripped):
+                # 保存上一个章节
+                if current_section["lines"] or current_section["title"]:
+                    sections.append(current_section)
+                # 开始新章节
+                current_section = {"title": stripped, "lines": [], "start_line": line_idx}
+            else:
+                current_section["lines"].append(line)
+
+        # 保存最后一个章节
+        if current_section["lines"] or current_section["title"]:
+            sections.append(current_section)
+
+        # 如果没有章节标题，整个内容作为一个章节
+        if len(sections) == 1 and not sections[0]["title"]:
+            sections[0]["title"] = "(正文)"
+
+        # ========== 第二步：每章节批量审阅图片 ==========
+        all_remove_markers: List[str] = []  # 所有需要删除的标记
+
+        for sec in sections:
+            sec_title = sec["title"]
+            sec_text = '\n'.join(sec["lines"])
+
+            # 提取本章所有图片标记
+            sec_image_markers = re.findall(r'<!--\s*INSERT_IMAGE:本地图-(\d+)\s*-->', sec_text)
+            if not sec_image_markers:
+                continue
+
+            # 准备本章所有图片的路径和 caption
+            sec_images: List[Tuple[str, str, str]] = []  # (index, path, caption)
+            for img_num in sec_image_markers:
+                index = f"本地图-{img_num}"
+                img = image_map.get(index)
+                if not img:
+                    logger.warning(f"[IdeaEngine] 找不到图片 {index}，将删除其标记")
+                    all_remove_markers.append(index)
+                    continue
+                path = resolve_image_path(img)
+                if not path or not os.path.exists(path):
+                    logger.warning(f"[IdeaEngine] 图片路径不存在: {path}，将删除 {index} 的标记")
+                    all_remove_markers.append(index)
+                    continue
+                caption = img.get("caption", "")
+                sec_images.append((index, path, caption))
+
+            if not sec_images:
+                continue
+
+            # 批量调用 VLM 审阅本章节所有图片
+            try:
+                remove_list = await self._vlm_audit_section(
+                    vlm_provider, sec_title, sec_text, sec_images
+                )
+                all_remove_markers.extend(remove_list)
+                logger.info(f"[IdeaEngine] 章节审阅完成 [{sec_title}]，删除 {len(remove_list)} 个标记: {remove_list}")
+            except Exception as e:
+                logger.warning(f"[IdeaEngine] 章节审阅失败 [{sec_title}]: {e}")
+
+        # ========== 第三步：根据决策删除标记 ==========
+        new_content = content
+        removed_indices: set = set()
+        for index in all_remove_markers:
+            # 去重
+            if index in removed_indices:
+                continue
+            # 删除标记
+            pattern = rf'<!--\s*INSERT_IMAGE:{re.escape(index)}\s*-->'
+            new_content = re.sub(pattern, '', new_content)
+            removed_indices.add(index)
+            # 标记图片为跳过
+            if index in image_map:
+                image_map[index]["_skip"] = True
+
+        # ========== 第四步：重建 extracted_media（更新 _skip 状态） ==========
+        updated_images = []
+        seen_indices = set()
+        for img in images:
+            idx = img.get("index", "")
+            if idx in seen_indices:
+                continue
+            seen_indices.add(idx)
+            if idx in image_map:
+                updated_images.append(image_map[idx])
+            else:
+                updated_images.append(img)
+
+        extracted_media["images"] = updated_images
+
+        # 清理由删除引起的孤立引导词（如 "如图" 后面紧跟删除的标记，导致变成 "如图 "）
+        new_content = re.sub(r'(\[如图\]|\[如图\s*\])', '', new_content)
+        new_content = re.sub(r'(\[表\]|\[表\s*\])', '', new_content)
+        new_content = re.sub(r' +', ' ', new_content)
+
+        logger.info(f"[IdeaEngine] 图片审阅完成，共删除 {len(removed_indices)} 个标记")
+        return new_content, extracted_media
+
+    async def _vlm_audit_section(
+        self,
+        vlm_provider,
+        section_title: str,
+        section_text: str,
+        images: List[Tuple[str, str, str]]
+    ) -> List[str]:
+        """
+        调用本地 VLM 审阅某个章节中的所有图片，返回需要删除的标记列表。
+
+        策略：不修改文本、不润色内容，只判断哪些图片与章节内容不相关/有事实错误。
+
+        Args:
+            vlm_provider: VLM 提供者
+            section_title: 章节标题（如 "## 背景动机"）
+            section_text: 章节正文内容（不包含标题行）
+            images: List[(index, image_path, caption)]，该章节所有图片
+
+        Returns:
+            List[str]: 需要删除的标记列表，如 ["本地图-1", "本地图-3"]
+        """
+        # 构建图片列表描述
+        image_descriptions = []
+        for idx, path, caption in images:
+            # 从路径中提取文件名作为简短描述
+            filename = os.path.basename(path)
+            image_descriptions.append(f"  - {idx}: 文件={filename}, caption={caption}")
+
+        images_list_str = '\n'.join(image_descriptions)
+
+        prompt = f"""你是一个学术图片审核助手。你的任务是根据正文内容判断哪些图片不应该出现在这个章节中。
+
+**重要原则：不要修改、润色或精简正文内容。只判断哪些图片应当被删除。**
+
+章节标题：{section_title}
+
+章节正文：
+{section_text}
+
+该章节中插入的图片：
+{images_list_str}
+
+判断标准：
+1. **相关性**：图片内容是否与该章节的主题相关。如果图片与章节讨论的内容完全无关（如：章节讲的是方法A，但图片展示的是方法B的结果），应删除。
+2. **事实一致性**：正文对图片的引用是否属实。如果正文说"如图X所示..."但图片内容与正文描述明显不符，应删除该图片。
+3. **上下文匹配**：图片是否是该章节论证的一部分。如果图片只是提供了无关的补充信息而非支撑该章节的核心论点，应删除。
+
+操作规则：
+- **只删除图片标记，不要修改正文任何内容**
+- 如果图片与章节内容高度相关且引用准确，保留
+- 如果无法确定，倾向于保留
+
+请按以下 JSON 格式输出（只输出 JSON，不要任何其他文字）：
+{{
+  "reasoning": "简要说明判断理由",
+  "remove": ["本地图-1", "本地图-3"]  // 需要删除的图片编号列表，空列表表示全部保留
+}}"""
+
+        try:
+            # 批量传入所有图片（VLM 可以同时看多张图）
+            image_paths = [path for _, path, _ in images]
+
+            response = await vlm_provider.text_chat(
+                prompt=prompt,
+                image_urls=image_paths,
+                temperature=0.1,
+                max_tokens=512
+            )
+
+            if not (response and hasattr(response, 'content')):
+                return []
+
+            result_text = response.content.strip()
+
+            # 解析 JSON
+            import json
+            # 去掉 markdown 代码块标记（如 ```json ... ``` 或 ``` ... ```）
+            cleaned_text = re.sub(r'```(?:json)?\s*', '', result_text.strip())
+            cleaned_text = re.sub(r'```\s*$', '', cleaned_text)
+            try:
+                # 尝试直接解析
+                decision = json.loads(cleaned_text)
+            except json.JSONDecodeError:
+                # 尝试从清洗后的文本中提取 JSON 部分
+                json_match = re.search(r'\{.+\}', cleaned_text, re.DOTALL)
+                if json_match:
+                    try:
+                        decision = json.loads(json_match.group(0))
+                    except json.JSONDecodeError:
+                        logger.warning(f"[IdeaEngine] VLM 审阅 JSON 解析失败: {result_text[:200]}")
+                        return []
+                else:
+                    logger.warning(f"[IdeaEngine] VLM 审阅结果无法解析: {result_text[:200]}")
+                    return []
+
+            remove_list = decision.get("remove", [])
+            reasoning = decision.get("reasoning", "")
+            logger.info(f"[IdeaEngine] VLM 审阅理由: {reasoning[:200]}")
+
+            # 验证返回的列表只包含有效索引
+            valid_indices = {idx for idx, _, _ in images}
+            validated = []
+            for item in remove_list:
+                if item in valid_indices:
+                    validated.append(item)
+                else:
+                    logger.warning(f"[IdeaEngine] VLM 返回了无效的图片编号: {item}")
+
+            return validated
+
+        except Exception as e:
+            logger.warning(f"[IdeaEngine] VLM 章节审阅异常: {e}")
+            return []
+
+    async def _cleanup_content_for_feishu(self, content: str) -> str:
+        """
+        使用 LLM 清理内容中因媒体引用被跳过而导致的断句问题
+
+        Args:
+            content: 原始内容（可能包含空引用如"如图 所示"）
+
+        Returns:
+            str: 清理后的内容
+        """
+        provider = self._get_llm_provider()
+        if not provider:
+            return content
+
+        cleanup_prompt = f"""请检查以下文本，修复因图片/表格引用被移除而导致的断句问题。
+
+问题示例：
+- "如图 所示"（图片被跳过，引用为空）
+- "表 可见"（表格被跳过，引用为空）
+- "如图 描述了..."（引用为空，只剩引导词）
+
+修复要求：
+1. 如果一句话中的图片/表格引用为空导致语句不通顺，重新组织该句或删除该引用
+2. **重要**：保持原文中的所有 markdown 格式和引用标记不变，特别是：
+   - `[图X]`、`[表X]` 格式的引用（如 `[表2]`）必须原样保留，不要修改
+   - `**加粗**`、`*斜体*`、`***加粗斜体***` 等格式必须原样保留
+   - `[论文标题](url)` 格式的链接必须原样保留，**不要用代码块包裹**
+   - 不要修改括号内的内容
+3. 只输出修复后的文本，不要添加任何说明
+
+待修复文本：
+---
+{content}
+---
+
+修复后的文本："""
+
+        # 检查是否需要清理（避免无谓的 LLM 调用改变内容）
+        needs_cleanup = any(pattern in content for pattern in ['如图', '表', '图'])
+        if not needs_cleanup:
+            return content
+
+        try:
+            response = await provider.text_chat(
+                prompt=cleanup_prompt,
+                contexts=[],
+                temperature=0.3,
+                max_tokens=4096
+            )
+            result = self._extract_text_from_response(response)
+            if result:
+                result = result.strip()
+                logger.info(f"[IdeaEngine] LLM 内容清理完成，长度: {len(result)}")
+                return result
+        except Exception as e:
+            logger.warning(f"[IdeaEngine] LLM 内容清理失败: {e}")
+
+        return content
+
+    def debug_media_captions(self, knowledge: Dict[str, Any]) -> str:
+        """
+        调试函数：统计图片/表格的 caption 提取情况
+
+        Args:
+            knowledge: 知识检索结果
+
+        Returns:
+            str: 统计报告
+        """
+        local_results = knowledge.get("local_results", [])
+
+        images_with_desc = 0
+        images_without_desc = 0
+        tables_with_desc = 0
+        tables_without_desc = 0
+
+        report_lines = ["\n📊 **媒体 Caption 提取统计**\n"]
+
+        for result in local_results:
+            metadata = result.get("metadata", {})
+            paper = metadata.get("file_name", "Unknown")
+
+            # 检查图片 caption
+            img_caption = metadata.get("image_caption", "")
+            img_path = metadata.get("image_path", "")
+            if img_path:
+                if img_caption and len(img_caption) > 15:  # 有实际描述（超过15字符）
+                    images_with_desc += 1
+                else:
+                    images_without_desc += 1
+                    caption_display = img_caption if img_caption else "(无caption)"
+                    report_lines.append(f"  ❌ 图片缺失描述: {paper} | caption: {caption_display}")
+
+            # 检查表格 caption
+            tbl_caption = metadata.get("table_caption", "")
+            tbl_path = metadata.get("table_csv_path", "") or metadata.get("table_png_path", "")
+            if tbl_path:
+                if tbl_caption and len(tbl_caption) > 10:  # 有实际描述
+                    tables_with_desc += 1
+                else:
+                    tables_without_desc += 1
+                    caption_display = tbl_caption if tbl_caption else "(无caption)"
+                    report_lines.append(f"  ❌ 表格缺失描述: {paper} | caption: {caption_display}")
+
+        total_images = images_with_desc + images_without_desc
+        total_tables = tables_with_desc + tables_without_desc
+
+        report_lines.insert(1, f"  📷 图片: {images_with_desc}/{total_images} 有详细描述")
+        report_lines.insert(2, f"  📋 表格: {tables_with_desc}/{total_tables} 有详细描述")
+
+        if images_without_desc == 0 and tables_without_desc == 0:
+            report_lines.append("  ✅ 所有媒体都有完整的 caption 描述！")
+        else:
+            missing = images_without_desc + tables_without_desc
+            report_lines.append(f"  ⚠️ 共有 {missing} 个媒体缺失详细描述")
+
+        return "\n".join(report_lines)
+
     def _create_media_blocks(self, extracted_media: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         从提取的媒体资源创建飞书块（图片/表格）
@@ -591,8 +1478,8 @@ class IdeaEngine:
             Tuple[List[Dict], List[Dict]]: (飞书文本/图片块列表, 待上传图片列表)
                 待上传图片格式: [{"block_index": int, "path": str, "base64": str, "caption": str}, ...]
         """
-        blocks = []
-        pending_images = []  # 待上传的图片列表
+        blocks: List[Dict[str, Any]] = []
+        pending_images: List[Dict[str, Any]] = []  # 待上传的图片列表
 
         images = extracted_media.get("images", [])
         tables = extracted_media.get("tables", [])
@@ -611,58 +1498,153 @@ class IdeaEngine:
             }
         })
 
-        # 添加图片说明文本块
+        # 添加图片说明文本块（图片块由 9.2 节的图片处理循环单独创建，避免重复）
         for img in images:
-            caption = f"图: {img.get('caption', '')} (来源: {img.get('source_paper', '')}, 页码: {img.get('source_page', '')})"
+            # 跳过被标记为不匹配的图片
+            if img.get("_skip"):
+                logger.info(f"[IdeaEngine] 跳过不匹配的图片: index={img.get('index')}")
+                continue
+
+            # 提取图片编号
+            img_index = img.get("index", "")
+            match = re.search(r'-(\d+)$', img_index)
+            num = match.group(1) if match else img_index
+            caption_text = img.get('caption', '')
+            source = img.get('source_paper', '')
+            page = img.get('source_page', '')
+
+            # 格式：图1: <caption> (来源: xxx, 页码: xx)
+            # 前缀"图1:"加粗，后面内容正常
             blocks.append({
                 "blockType": "text",
                 "options": {
                     "text": {
                         "textStyles": [
-                            {"text": caption, "style": {"italic": True}}
+                            {"text": f"图{num}: ", "style": {"bold": True}},
+                            {"text": f"{caption_text} (来源: {source}, 页码: {page})", "style": {}}
                         ]
                     }
                 }
             })
-            # 创建空图片块（后续需要通过 upload_and_bind_image_to_block 上传）
-            blocks.append({
-                "blockType": "image",
-                "options": {
-                    "image": {}
-                }
-            })
-            # 记录待上传图片
-            if img.get("base64"):
+            # 注意：不要在这里创建图片块！图片块由 9.2 节的图片处理循环通过 batch_create_feishu_blocks 单独创建
+            # 记录待上传图片信息（供 9.2 节使用）
+            if img.get("base64") or img.get("path"):
                 pending_images.append({
-                    "block_index": len(blocks) - 1,  # 图片块在 blocks 中的索引
                     "path": img.get("path", ""),
                     "base64": img.get("base64", ""),
                     "caption": img.get("caption", "")
                 })
-            logger.info(f"[IdeaEngine] 创建图片块占位符: {img.get('index')}")
+            logger.info(f"[IdeaEngine] 记录图片信息: {img.get('index')}, path={img.get('path', '')}")
 
-        # 表格暂不处理（需要使用 create_feishu_table 工具）
-        if tables:
-            blocks.append({
-                "blockType": "text",
-                "options": {
-                    "text": {
-                        "textStyles": [
-                            {"text": f"（包含 {len(tables)} 个表格，需手动查看原文档）", "style": {"italic": True}}
-                        ]
-                    }
-                }
-            })
-            for tbl in tables:
-                logger.info(f"[IdeaEngine] 表格暂不支持: {tbl.get('index')}")
+        # 表格在 create_feishu_document 中单独处理（根据 table_format 选择 csv/png/md）
+        # 这里只需记录表格信息即可（跳过标记为 _skip 的表格）
+        for tbl in tables:
+            if tbl.get("_skip"):
+                logger.info(f"[IdeaEngine] 跳过不匹配的表格: index={tbl.get('index')}")
+                continue
+            logger.info(f"[IdeaEngine] 记录表格信息: {tbl.get('index')}, caption={tbl.get('caption', '')}")
 
         return blocks, pending_images
 
-    def _remove_media_markers(self, content: str) -> str:
-        """移除内容中的媒体标记"""
-        content = re.sub(r'<!--\s*INSERT_IMAGE:[^>]+-->\s*', '', content)
-        content = re.sub(r'<!--\s*INSERT_TABLE:[^>]+-->\s*', '', content)
-        return content
+    def _replace_media_markers(
+        self,
+        content: str,
+        extracted_media: Dict[str, Any]
+    ) -> str:
+        """
+        将媒体标记替换为带 caption 的引用格式
+
+        Args:
+            content: 包含 <!-- INSERT_IMAGE:本地图-X --> 或 <!-- INSERT_TABLE:本地表-X --> 标记的内容
+            extracted_media: 提取的媒体资源，包含 images 和 tables 列表
+
+        Returns:
+            str: 标记被替换为引用格式，如 "图1: caption文本" 或 "表1: caption文本"
+        """
+        if not extracted_media:
+            return content
+
+        images = extracted_media.get("images", [])
+        tables = extracted_media.get("tables", [])
+
+        # 构建 index -> caption 的映射，同时收集被跳过的图片
+        image_refs: Dict[str, str] = {}
+        skipped_image_indices: set = set()  # 被跳过的图片 index 集合
+        for img in images:
+            # 跳过被标记为不匹配的图片
+            if img.get("_skip"):
+                index = img.get("index", "")
+                if index:
+                    skipped_image_indices.add(index)
+                continue
+            index = img.get("index", "")
+            caption = img.get("caption", "")
+            if index and caption:
+                # 提取序号（如 "本地图-1" -> "1"）
+                match = re.search(r'-(\d+)$', index)
+                if match:
+                    num = match.group(1)
+                    # 主 body 引用用 [图X] 格式（_parse_inline_styles 会转换为加粗）
+                    image_refs[index] = f"[图{num}]"
+
+        table_refs: Dict[str, str] = {}
+        skipped_table_indices: set = set()  # 被跳过的表格 index 集合
+        for tbl in tables:
+            # 跳过被标记为不匹配的表格
+            if tbl.get("_skip"):
+                index = tbl.get("index", "")
+                if index:
+                    skipped_table_indices.add(index)
+                continue
+            index = tbl.get("index", "")
+            caption = tbl.get("caption", "")
+            if index and caption:
+                match = re.search(r'-(\d+)$', index)
+                if match:
+                    num = match.group(1)
+                    # 主 body 引用用 [表X] 格式（_parse_inline_styles 会转换为加粗）
+                    table_refs[index] = f"[表{num}]"
+
+        def replace_image_marker(match):
+            marker = match.group(0)
+            # 提取标记中的 index（如 "本地图-1"）
+            idx_match = re.search(r'本地图-(\d+)', marker)
+            if idx_match:
+                full_key = f"本地图-{idx_match.group(1)}"
+                # 如果图片被标记为跳过，不显示引用
+                if full_key in skipped_image_indices:
+                    return ""
+                if full_key in image_refs:
+                    return image_refs[full_key]
+            # 回退：只保留标记内的序号
+            if idx_match:
+                return f"[图{idx_match.group(1)}]"
+            return ""
+
+        def replace_table_marker(match):
+            marker = match.group(0)
+            idx_match = re.search(r'本地表-(\d+)', marker)
+            if idx_match:
+                full_key = f"本地表-{idx_match.group(1)}"
+                # 如果表格被标记为跳过，不显示引用
+                if full_key in skipped_table_indices:
+                    return ""
+                if full_key in table_refs:
+                    return table_refs[full_key]
+            if idx_match:
+                return f"[表{idx_match.group(1)}]"
+            return ""
+
+        # 替换图片标记
+        content = re.sub(r'<!--\s*INSERT_IMAGE:[^>]+-->', replace_image_marker, content)
+        # 替换表格标记
+        content = re.sub(r'<!--\s*INSERT_TABLE:[^>]+-->', replace_table_marker, content)
+
+        # 清理冗余描述（如"见了"、"如图"等引导词后面只剩下标点的情况）
+        content = re.sub(r'[见了如图见下图见上表见表]\s*\[\]', '', content)  # 移除非预期的空引用
+        content = re.sub(r'\[\]\s*', '', content)  # 移除空引用
+        content = re.sub(r' +', ' ', content)  # 只替换多余空格，保留换行符
+        return content.strip()
 
     def _format_ideas_as_markdown(self, ideas: List["ResearchIdea"], topic: str) -> str:
         """将研究想法格式化为 Markdown（备用方案）"""
@@ -676,7 +1658,7 @@ class IdeaEngine:
             output += "---\n\n"
         return output
 
-    async def analyze_topic(self, topic: str, depth: str = "standard") -> TopicAnalysis:
+    async def analyze_topic(self, topic: str, depth: str = "standard") -> Optional[TopicAnalysis]:
         """
         分析研究主题，生成搜索策略
 
@@ -759,6 +1741,7 @@ class IdeaEngine:
 
         except Exception as e:
             logger.error(f"[IdeaEngine] 主题分析失败: {e}")
+            return None
 
         return None
 
@@ -791,11 +1774,22 @@ class IdeaEngine:
                     result = await self._rag_engine.search(query, mode="retrieve")
                     sources = result.get("sources", [])
                     for src in sources[:local_rag_top_k]:
+                        src_metadata = src.get("metadata", {})
                         local_results.append({
                             "text": src.get("text", "")[:500],
-                            "paper": src.get("metadata", {}).get("file_name", "Unknown"),
-                            "page": str(src.get("metadata", {}).get("page", "")),
-                            "score": src.get("score", 0.0)
+                            "paper": src_metadata.get("file_name", "Unknown"),
+                            "page": str(src_metadata.get("page", "")),
+                            "score": src.get("score", 0.0),
+                            "metadata": {
+                                "file_name": src_metadata.get("file_name", "Unknown"),
+                                "page": str(src_metadata.get("page", "")),
+                                # 媒体资源字段（供 _build_citations_context 提取图片/表格）
+                                "image_path": src_metadata.get("image_path"),
+                                "image_caption": src_metadata.get("image_caption"),
+                                "table_csv_path": src_metadata.get("table_csv_path"),
+                                "table_png_path": src_metadata.get("table_png_path"),
+                                "table_caption": src_metadata.get("table_caption"),
+                            }
                         })
             except Exception as e:
                 logger.error(f"[IdeaEngine] 本地RAG搜索失败: {e}")
@@ -820,10 +1814,30 @@ class IdeaEngine:
             }
         }
 
-    async def _search_web(self, queries: List[str], top_k: int) -> List[Dict]:
-        """通过网络搜索获取信息（通过Bright Data MCP）"""
-        results = []
+    async def _call_brightdata_mcp_tool(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        timeout: int = 120
+    ) -> Dict[str, Any]:
+        """
+        通用 Bright Data MCP 工具调用方法
 
+        支持的工具:
+        - search_engine: 搜索引擎搜索
+        - search_engine_batch: 批量搜索引擎搜索
+        - scrape_as_markdown: 抓取单个页面为 Markdown
+        - scrape_batch: 批量抓取页面为 Markdown
+        - discover: AI 驱动的智能搜索
+
+        Args:
+            tool_name: 工具名称
+            arguments: 工具参数
+            timeout: 超时时间（秒）
+
+        Returns:
+            Dict 包含工具执行结果
+        """
         try:
             # API Token - 从 mcp_server.json 读取
             mcp_config_path = Path(__file__).parent.parent.parent / "mcp_server.json"
@@ -832,14 +1846,13 @@ class IdeaEngine:
                     mcp_config = json.load(f)
                 api_token = mcp_config.get("mcpServers", {}).get("BrightData", {}).get("env", {}).get("API_TOKEN", "")
             except (FileNotFoundError, json.JSONDecodeError) as e:
-                raise ValueError(f"无法从 {mcp_config_path} 读取 BrightData API Token: {e}")
+                return {"success": False, "error": f"无法读取配置: {e}"}
 
             if not api_token:
-                raise ValueError("BrightData API Token 未配置")
+                return {"success": False, "error": "BrightData API Token 未配置"}
 
-            # 启动Bright Data MCP服务器
+            # 启动 Bright Data MCP 服务器
             env = {**os.environ, "API_TOKEN": api_token}
-
             proc = await asyncio.create_subprocess_exec(
                 "npx", "@brightdata/mcp",
                 stdin=asyncio.subprocess.PIPE,
@@ -848,68 +1861,540 @@ class IdeaEngine:
                 env=env
             )
 
-            for query in queries[:5]:
-                rpc_request = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "search_engine",
-                        "arguments": {
-                            "query": query,
-                            "num_results": top_k,
-                            "source": "web"
-                        }
-                    }
+            # 构建请求
+            rpc_request = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": tool_name,
+                    "arguments": arguments
                 }
+            }
 
-                # MCP协议要求每行一个JSON-RPC消息
-                request_str = json.dumps(rpc_request) + "\n"
+            request_str = json.dumps(rpc_request) + "\n"
+            logger.info(f"[IdeaEngine] Bright Data MCP 调用: {tool_name}, 参数: {json.dumps(arguments)[:200]}")
 
-                try:
-                    stdout, stderr = await asyncio.wait_for(
-                        proc.communicate(input=request_str.encode()),
-                        timeout=60
-                    )
-
-                    if stdout:
-                        response = json.loads(stdout.decode())
-                        content = response.get("result", {}).get("content", [])
-
-                        # 解析搜索结果
-                        if content and len(content) > 0:
-                            text = content[0].get("text", "")
-                            if text:
-                                try:
-                                    data = json.loads(text)
-                                    organic = data.get("organic", [])
-                                    for item in organic:
-                                        results.append({
-                                            "title": item.get("title", ""),
-                                            "url": item.get("link", ""),
-                                            "snippet": item.get("description", "")
-                                        })
-                                except json.JSONDecodeError:
-                                    pass
-
-                except asyncio.TimeoutError:
-                    logger.warning(f"[IdeaEngine] 查询超时: {query}")
-                    continue
-
-            # 关闭进程
             try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except (ProcessLookupError, asyncio.TimeoutError):
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(input=request_str.encode()),
+                    timeout=timeout
+                )
+
+                # 关闭进程
                 try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
+                    proc.terminate()
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except (ProcessLookupError, asyncio.TimeoutError):
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+
+                if stderr:
+                    stderr_text = stderr.decode()
+                    if stderr_text and "Error" in stderr_text:
+                        logger.warning(f"[IdeaEngine] Bright Data stderr: {stderr_text[:200]}")
+
+                if stdout:
+                    stdout_text = stdout.decode().strip()
+                    # 尝试解析第一行有效的 JSON（可能有日志等额外输出）
+                    response = None
+                    for line in stdout_text.split('\n'):
+                        line = line.strip()
+                        if line and line.startswith('{'):
+                            try:
+                                response = json.loads(line)
+                                break
+                            except json.JSONDecodeError:
+                                continue
+                    if response is None:
+                        # 尝试整体解析（某些情况下是单行）
+                        try:
+                            response = json.loads(stdout_text)
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"[IdeaEngine] JSON 解析失败: {e}, 内容: {stdout_text[:200]}")
+                            return {"success": False, "error": f"JSON 解析失败: {e}"}
+                    content = response.get("result", {}).get("content", [])
+
+                    if content and len(content) > 0:
+                        text = content[0].get("text", "")
+                        if text:
+                            # 尝试解析为 JSON
+                            try:
+                                data = json.loads(text)
+                                return {"success": True, "data": data}
+                            except json.JSONDecodeError:
+                                # 返回原始文本（如 Markdown）
+                                return {"success": True, "data": text}
+
+                    return {"success": True, "data": None}
+
+            except asyncio.TimeoutError:
+                logger.warning(f"[IdeaEngine] Bright Data MCP 调用超时: {tool_name}")
+                return {"success": False, "error": "调用超时"}
 
         except Exception as e:
-            logger.error(f"[IdeaEngine] Bright Data调用失败: {e}")
+            logger.error(f"[IdeaEngine] Bright Data MCP 调用失败: {e}")
+            return {"success": False, "error": str(e)}
+
+        return {"success": False, "error": "未知错误"}
+
+    async def _search_web(self, queries: List[str], top_k: int) -> List[Dict]:
+        """通过网络搜索获取信息（通过Bright Data MCP）"""
+        results = []
+
+        try:
+            for query in queries[:5]:
+                result = await self._call_brightdata_mcp_tool(
+                    tool_name="search_engine",
+                    arguments={
+                        "query": query,
+                        "num_results": top_k,
+                        "source": "web"
+                    }
+                )
+
+                if result.get("success"):
+                    data = result.get("data", {})
+                    if isinstance(data, dict):
+                        organic = data.get("organic", [])
+                        for item in organic:
+                            results.append({
+                                "title": item.get("title", ""),
+                                "url": item.get("link", ""),
+                                "snippet": item.get("description", "")
+                            })
+                else:
+                    logger.warning(f"[IdeaEngine] 搜索失败: {query}, 错误: {result.get('error')}")
+
+        except Exception as e:
+            logger.error(f"[IdeaEngine] Bright Data搜索失败: {e}")
 
         return results
+
+    async def _scrape_as_markdown(self, url: str) -> Dict[str, Any]:
+        """
+        抓取单个页面为 Markdown
+
+        Args:
+            url: 网页 URL
+
+        Returns:
+            Dict 包含 success, markdown 内容或 error
+        """
+        result = await self._call_brightdata_mcp_tool(
+            tool_name="scrape_as_markdown",
+            arguments={"url": url}
+        )
+
+        if result.get("success"):
+            return {
+                "success": True,
+                "markdown": result.get("data", ""),
+                "url": url
+            }
+        return {
+            "success": False,
+            "error": result.get("error", "抓取失败")
+        }
+
+    async def _scrape_batch_markdown(self, urls: List[str]) -> Dict[str, Any]:
+        """
+        批量抓取页面为 Markdown
+
+        Args:
+            urls: URL 列表（最多5个）
+
+        Returns:
+            Dict 包含 success, results 列表或 error
+        """
+        urls = urls[:5]  # 最多5个
+        result = await self._call_brightdata_mcp_tool(
+            tool_name="scrape_batch",
+            arguments={"urls": urls}
+        )
+
+        if result.get("success"):
+            data = result.get("data", "")
+            return {
+                "success": True,
+                "results": data,  # 可能是字符串或结构化数据
+                "urls": urls
+            }
+        return {
+            "success": False,
+            "error": result.get("error", "批量抓取失败")
+        }
+
+    async def _discover_search(
+        self,
+        query: str,
+        intent: str = "",
+        country: str = "US",
+        num_results: int = 10,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        AI 驱动的智能搜索
+
+        Args:
+            query: 搜索查询
+            intent: 搜索意图描述
+            country: 国家代码
+            num_results: 返回结果数量
+
+        Returns:
+            Dict 包含 success, results 列表或 error
+        """
+        arguments = {
+            "query": query,
+            "num_results": num_results,
+            "country": country
+        }
+        if intent:
+            arguments["intent"] = intent
+        if kwargs.get("language"):
+            arguments["language"] = kwargs["language"]
+        if kwargs.get("start_date"):
+            arguments["start_date"] = kwargs["start_date"]
+        if kwargs.get("end_date"):
+            arguments["end_date"] = kwargs["end_date"]
+
+        result = await self._call_brightdata_mcp_tool(
+            tool_name="discover",
+            arguments=arguments
+        )
+
+        if result.get("success"):
+            data = result.get("data", {})
+            # discover 返回的是 scored_results 格式
+            if isinstance(data, dict):
+                results = data.get("results", []) or data.get("scored_results", [])
+                return {
+                    "success": True,
+                    "results": results,
+                    "query": query
+                }
+            return {"success": True, "results": [], "query": query}
+        return {
+            "success": False,
+            "error": result.get("error", "智能搜索失败")
+        }
+
+    async def _search_engine_batch(self, queries: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        批量搜索引擎搜索
+
+        Args:
+            queries: 查询列表，每个包含 query, engine, geo_location 等
+
+        Returns:
+            Dict 包含 success, results 列表或 error
+        """
+        queries = queries[:5]  # 最多5个
+        result = await self._call_brightdata_mcp_tool(
+            tool_name="search_engine_batch",
+            arguments={"queries": queries}
+        )
+
+        if result.get("success"):
+            data = result.get("data", {})
+            return {
+                "success": True,
+                "results": data,
+                "queries": queries
+            }
+        return {
+            "success": False,
+            "error": result.get("error", "批量搜索失败")
+        }
+
+    async def _call_arxiv_mcp_tool(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        timeout: int = 60
+    ) -> Dict[str, Any]:
+        """
+        通过 func_list 调用 arxiv MCP 工具
+
+        Args:
+            tool_name: arxiv 工具名称（如 search_papers, read_paper）
+            arguments: 工具参数
+            timeout: 超时时间
+
+        Returns:
+            Dict 包含工具执行结果
+        """
+        try:
+            provider_manager = getattr(self.context, 'provider_manager', None)
+            if not provider_manager:
+                return {"success": False, "error": "provider_manager 不可用"}
+
+            llm_tools = getattr(provider_manager, 'llm_tools', None)
+            if not llm_tools:
+                return {"success": False, "error": "llm_tools 不可用"}
+
+            func_list = getattr(llm_tools, 'func_list', [])
+            target_tool = None
+
+            # 查找 arxiv 工具（支持别名映射）
+            alias_map = {
+                "search_arxiv": "search_papers",
+                "get_paper": "read_paper",
+                "get_abstract": "get_abstract",
+                "semantic_search": "semantic_search",
+                "download_paper": "download_paper",
+            }
+            actual_name = alias_map.get(tool_name, tool_name)
+
+            for tool in func_list:
+                if hasattr(tool, 'name') and tool.name == actual_name:
+                    target_tool = tool
+                    break
+
+            if not target_tool:
+                arxiv_tools = [t.name for t in func_list if hasattr(t, 'name')]
+                logger.warning(f"[IdeaEngine] 未找到 arxiv 工具 '{actual_name}'，可用: {arxiv_tools}")
+                return {"success": False, "error": f"未找到 arxiv 工具: {actual_name}"}
+
+            # 检查工具类型
+            is_mcp = hasattr(target_tool, 'mcp_server_name')
+            logger.info(f"[IdeaEngine] 工具类型: {'MCP' if is_mcp else 'Native'}, mcp_server: {getattr(target_tool, 'mcp_server_name', 'N/A')}")
+            logger.info(f"[IdeaEngine] 工具属性: {[a for a in dir(target_tool) if not a.startswith('_')]}")
+
+            logger.info(f"[IdeaEngine] 调用 arxiv 工具: {target_tool.name}, 参数: {arguments}")
+
+            # 创建 ctx_wrapper
+            ctx_wrapper = ContextWrapper(context=self.context)
+            is_mcp = hasattr(target_tool, 'mcp_server_name')
+
+            result = None
+            error_msg = None
+
+            # MCP 工具调用方式
+            if is_mcp:
+                try:
+                    result = await target_tool.call(ctx_wrapper, **arguments)
+                except Exception as e:
+                    error_msg = f"MCP调用失败: {e}"
+            else:
+                # Native 工具 - 使用 handler
+                handler = getattr(target_tool, 'handler', None)
+                if handler:
+                    try:
+                        # handler 签名是 handler(event, query, top_k)
+                        # event 需要作为第一个参数传入
+                        result = await handler(ctx_wrapper, **arguments)
+                    except Exception as e:
+                        error_msg = f"Native handler调用失败: {e}"
+                else:
+                    error_msg = "Native工具无handler"
+
+            if error_msg and result is None:
+                return {"success": False, "error": error_msg}
+
+            # 解析结果
+            if hasattr(result, 'content') and result.content:
+                text = result.content[0].text if hasattr(result.content[0], 'text') else str(result.content[0])
+                return {"success": True, "data": text}
+            elif hasattr(result, 'text'):
+                return {"success": True, "data": result.text}
+            else:
+                return {"success": True, "data": str(result)}
+
+        except Exception as e:
+            logger.error(f"[IdeaEngine] arxiv MCP 工具调用失败: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def _parse_and_execute_brightdata_tools(
+        self,
+        text: str,
+        max_iterations: int = 3
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """
+        解析 LLM 输出中的 Bright Data 工具调用标签并执行（优化版：单次遍历）
+
+        支持的标签格式:
+        - <search>query</search>
+        - <discover>query|intent|country</discover>
+        - <scrape>url</scrape>
+        - <batch_search>["q1","q2"]</batch_search>
+        - <scrape_batch>["url1","url2"]</scrape_batch>
+        """
+        import re
+
+        # 预编译 regex（避免每次迭代重新编译）
+        _PATTERNS = (
+            ("search", re.compile(r'<search>([^<]+)</search>')),
+            ("discover", re.compile(r'<discover>([^<]+)</discover>')),
+            ("scrape", re.compile(r'<scrape>([^<]+)</scrape>')),
+            ("batch_search", re.compile(r'<batch_search>(\[[^\]]+\])</batch_search>')),
+            ("scrape_batch", re.compile(r'<scrape_batch>(\[[^\]]+\])</scrape_batch>')),
+        )
+
+        all_results: List[Dict[str, Any]] = []
+        iteration = 0
+        current_text = text
+
+        while iteration < max_iterations:
+            iteration += 1
+            found_any = False
+
+            # 单次遍历处理所有标签类型
+            for tool_type, pattern in _PATTERNS:
+                for match in pattern.finditer(current_text):
+                    found_any = True
+                    content = match.group(1).strip()
+
+                    if tool_type == "search":
+                        logger.info(f"[IdeaEngine] 执行 search: {content}")
+                        result = await self._call_brightdata_mcp_tool(
+                            "search_engine", {"query": content, "num_results": 5, "source": "web"}
+                        )
+                        formatted = self._format_search_result(result)
+                        all_results.append({"type": "search", "query": content, "result": formatted})
+                        current_text = current_text.replace(match.group(0), f"\n[搜索:{content}]\n{formatted}\n", 1)
+
+                    elif tool_type == "discover":
+                        parts = content.split("|")
+                        query, intent, country = parts[0].strip(), (parts[1].strip() if len(parts) > 1 else ""), (parts[2].strip() if len(parts) > 2 else "US")
+                        logger.info(f"[IdeaEngine] 执行 discover: {query}")
+                        result = await self._discover_search(query=query, intent=intent, country=country[:2] if len(country) == 2 else "US", num_results=5)
+                        formatted = self._format_discover_result(result)
+                        all_results.append({"type": "discover", "query": query, "result": formatted})
+                        current_text = current_text.replace(match.group(0), f"\n[AI搜索:{query}]\n{formatted}\n", 1)
+
+                    elif tool_type == "scrape":
+                        logger.info(f"[IdeaEngine] 执行 scrape: {content}")
+                        result = await self._scrape_as_markdown(content)
+                        formatted = self._format_scrape_result(result)
+                        all_results.append({"type": "scrape", "url": content, "result": formatted})
+                        current_text = current_text.replace(match.group(0), f"\n[网页内容]\n{formatted[:1000]}\n", 1)
+
+                    elif tool_type == "batch_search":
+                        try:
+                            queries = json.loads(content)
+                            if isinstance(queries, list) and len(queries) <= 5:
+                                logger.info(f"[IdeaEngine] 执行 batch_search: {queries}")
+                                result = await self._search_engine_batch([{"query": q, "engine": "google"} for q in queries])
+                                all_results.append({"type": "batch_search", "queries": queries, "result": "批量搜索完成"})
+                                current_text = current_text.replace(match.group(0), "\n[批量搜索完成]\n", 1)
+                        except json.JSONDecodeError:
+                            pass
+
+                    elif tool_type == "scrape_batch":
+                        try:
+                            urls = json.loads(content)
+                            if isinstance(urls, list) and len(urls) <= 5:
+                                logger.info(f"[IdeaEngine] 执行 scrape_batch: {urls}")
+                                result = await self._scrape_batch_markdown(urls)
+                                all_results.append({"type": "scrape_batch", "urls": urls, "result": "批量抓取完成"})
+                                current_text = current_text.replace(match.group(0), "\n[批量抓取完成]\n", 1)
+                        except json.JSONDecodeError:
+                            pass
+
+                    elif tool_type == "arxiv_search":
+                        logger.info(f"[IdeaEngine] 执行 arxiv_search: {content}")
+                        result = await self._call_arxiv_mcp_tool("search_papers", {"query": content, "max_results": 5})
+                        formatted = self._format_arxiv_result(result)
+                        all_results.append({"type": "arxiv_search", "query": content, "result": formatted})
+                        current_text = current_text.replace(match.group(0), f"\n[arXiv搜索:{content}]\n{formatted}\n", 1)
+
+                    elif tool_type == "arxiv_paper":
+                        logger.info(f"[IdeaEngine] 执行 arxiv_paper: {content}")
+                        result = await self._call_arxiv_mcp_tool("read_paper", {"paper_id": content})
+                        formatted = self._format_arxiv_paper_result(result)
+                        all_results.append({"type": "arxiv_paper", "arxiv_id": content, "result": formatted})
+                        current_text = current_text.replace(match.group(0), f"\n[arXiv论文:{content}]\n{formatted}\n", 1)
+
+            if not found_any:
+                break
+
+        return current_text, all_results
+
+    def _format_search_result(self, result: Dict[str, Any]) -> str:
+        """格式化搜索结果"""
+        if not result.get("success"):
+            return f"搜索失败: {result.get('error', '未知错误')}"
+        data = result.get("data", {})
+        if isinstance(data, dict):
+            organic = data.get("organic", [])
+            if organic:
+                return "\n".join([f"- [{i.get('title','')}]({i.get('link','')})" for i in organic[:3]])
+        return "无结果"
+
+    def _format_discover_result(self, result: Dict[str, Any]) -> str:
+        """格式化 discover 结果"""
+        if not result.get("success"):
+            return f"AI搜索失败: {result.get('error', '未知错误')}"
+        results_list = result.get("results", [])
+        if results_list:
+            return "\n".join([f"- [{i.get('title','')}]({i.get('url', i.get('link',''))})" for i in results_list[:3]])
+        return "无结果"
+
+    def _format_scrape_result(self, result: Dict[str, Any]) -> str:
+        """格式化抓取结果"""
+        if not result.get("success"):
+            return f"抓取失败: {result.get('error', '未知错误')}"
+        # scrape_as_markdown 返回的是 data 字段（不是 markdown）
+        markdown = result.get("data") or ""
+        if isinstance(markdown, dict):
+            # 有时返回的是 JSON 对象
+            return str(markdown)
+        if not markdown:
+            return "空内容"
+        return (markdown[:500] + "...") if len(markdown) > 500 else markdown
+
+    def _format_arxiv_result(self, result: Dict[str, Any]) -> str:
+        """格式化 arxiv 搜索结果"""
+        if not result.get("success"):
+            return f"arXiv搜索失败: {result.get('error', '未知错误')}"
+        data = result.get("data", "")
+        if not data:
+            return "无结果"
+        # 尝试解析 JSON
+        try:
+            if isinstance(data, str):
+                parsed = json.loads(data)
+            else:
+                parsed = data
+            if isinstance(parsed, list):
+                return "\n".join([f"- [{p.get('title', p.get('name', 'N/A'))}]({p.get('url', p.get('arxiv_url', ''))})" for p in parsed[:3]])
+            elif isinstance(parsed, dict):
+                papers = parsed.get("papers", []) or parsed.get("results", [])
+                return "\n".join([f"- [{p.get('title', 'N/A')}]({p.get('url', p.get('arxiv_url', ''))})" for p in papers[:3]])
+        except (json.JSONDecodeError, TypeError):
+            pass
+        # 如果是原始文本
+        if isinstance(data, str) and len(data) > 10:
+            return data[:500] + "..." if len(data) > 500 else data
+        return "无结果"
+
+    def _format_arxiv_paper_result(self, result: Dict[str, Any]) -> str:
+        """格式化 arxiv 论文详情"""
+        if not result.get("success"):
+            return f"arXiv论文获取失败: {result.get('error', '未知错误')}"
+        data = result.get("data", "")
+        if not data:
+            return "无内容"
+        try:
+            if isinstance(data, str):
+                parsed = json.loads(data)
+            else:
+                parsed = data
+            if isinstance(parsed, dict):
+                title = parsed.get("title", "")
+                authors = parsed.get("authors", "")
+                abstract = parsed.get("abstract", "")[:300]
+                url = parsed.get("url", parsed.get("arxiv_url", ""))
+                return f"**{title}**\n作者: {authors}\n\n摘要: {abstract}...\n\n链接: {url}"
+        except (json.JSONDecodeError, TypeError):
+            pass
+        if isinstance(data, str):
+            return data[:500] + "..." if len(data) > 500 else data
+        return "无内容"
 
     async def generate_ideas(
         self,
@@ -1075,7 +2560,7 @@ class IdeaEngine:
         # 本地论文
         if local_results:
             parts.append("## 本地论文库\n")
-            papers = {}
+            papers: Dict[str, List[Dict[str, Any]]] = {}
             for r in local_results:
                 paper = r.get("paper", "Unknown")
                 if paper not in papers:
@@ -1142,12 +2627,247 @@ class IdeaEngine:
 
         return "".join(markdown_parts)
 
+    async def test_brightdata_mcp(self, query: str) -> Dict[str, Any]:
+        """
+        测试 Bright Data MCP 学术搜索功能
+
+        此方法直接调用 Bright Data MCP 进行搜索测试。
+
+        Args:
+            query: 搜索查询词
+
+        Returns:
+            Dict包含搜索结果或错误信息
+        """
+        try:
+            logger.info(f"[IdeaEngine] 测试 Bright Data MCP 搜索: {query}")
+
+            # 直接调用 Bright Data MCP 搜索
+            results = await self._search_web(queries=[query], top_k=10)
+            if results:
+                return {
+                    "success": True,
+                    "results": results
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": "未找到结果或搜索失败"
+                }
+
+        except Exception as e:
+            logger.error(f"[IdeaEngine] Bright Data MCP 测试失败: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+    async def test_feishu_markdown_formats(
+        self,
+        folder_token: str = ""
+    ) -> Dict[str, Any]:
+        """
+        测试飞书文档的 Markdown 格式渲染（使用 mistune v3 插件）
+
+        测试内容：
+        - 一级/二级/三级标题
+        - 加粗、斜体、加粗斜体
+        - 行内代码
+        - 删除线
+        - 链接 [文本](url)
+        - 无序列表、有序列表
+        - 分割线
+        - 图表引用 [图X]、[表X]
+        - LaTeX 公式 $公式$
+        - 混合内容
+
+        Args:
+            folder_token: 飞书文件夹 Token
+
+        Returns:
+            Dict包含测试结果
+        """
+        test_markdown = """# 一级标题测试
+
+## 二级标题测试
+
+### 三级标题测试
+
+这是一段普通文本。
+
+**这是加粗文本**
+
+*这是斜体文本*
+
+***这是加粗斜体文本***
+
+`行内代码文本`
+
+~~这是删除线文本~~
+
+[链接示例](https://example.com)
+
+- 无序列表项 1
+- 无序列表项 2
+- 无序列表项 3
+
+1. 有序列表项 1
+2. 有序列表项 2
+3. 有序列表项 3
+
+---
+
+混合测试：**加粗** 和 *斜体* 和 `代码` 和 ~~删除线~~ 在同一行。
+
+## 图表引用测试
+
+如图[图1]所示，这是图片引用测试。
+
+请参见[表3]的数据。
+
+[图2]和[表1]同时出现在同一行。
+
+## 公式测试
+
+这是$E=mc^2$公式测试。
+
+在$\\alpha$和$\\beta$之间的公式测试。
+
+## 组合测试
+
+如图[图1]所示，$E=mc^2$是重要的公式。根据[表1]的数据显示，$\\alpha$和$\\beta$的关系见[图5]。
+"""
+
+        # 1. 获取飞书工具并创建文档
+        feishu_tool = self._get_feishu_tool()
+        if not feishu_tool:
+            return {"success": False, "error": "未找到飞书 MCP 工具"}
+
+        if not folder_token:
+            return {"success": False, "error": "需要提供 folder_token"}
+
+        ctx_wrapper = ContextWrapper(context=self.context)
+
+        # 创建文档
+        create_result = await feishu_tool.call(
+            ctx_wrapper,
+            title="Markdown格式测试",
+            folderToken=folder_token
+        )
+
+        # 解析 document_id
+        document_id = None
+        if hasattr(create_result, 'content') and create_result.content:
+            result_text = getattr(create_result.content[0], 'text', None)
+            if result_text:
+                try:
+                    doc_info = json.loads(result_text)
+                    document_id = doc_info.get("document", {}).get("document_id") or doc_info.get("document_id")
+                except json.JSONDecodeError:
+                    pass
+
+        if not document_id:
+            return {"success": False, "error": f"创建文档失败: {repr(create_result)[:200]}"}
+
+        # 2. 转换 Markdown 为飞书块
+        blocks = self._markdown_to_feishu_blocks(test_markdown)
+        logger.info(f"[Test] 生成 {len(blocks)} 个飞书块")
+
+        # 3. 添加内容块（复用 create_feishu_document 的逻辑）
+        provider_manager = getattr(self.context, 'provider_manager', None)
+        add_blocks_tool = None
+        if provider_manager:
+            llm_tools = getattr(provider_manager, 'llm_tools', None)
+            if llm_tools:
+                for tool in getattr(llm_tools, 'func_list', []):
+                    if tool.name == 'batch_create_feishu_blocks':
+                        add_blocks_tool = tool
+                        break
+
+        if not add_blocks_tool:
+            return {"success": False, "error": "未找到 batch_create_feishu_blocks 工具"}
+
+        # 3.1 获取文档的根块 ID（复用 create_feishu_document 的逻辑）
+        root_block_id = "0"
+        try:
+            get_blocks_tool = None
+            if provider_manager:
+                llm_tools = getattr(provider_manager, 'llm_tools', None)
+                if llm_tools:
+                    for tool in getattr(llm_tools, 'func_list', []):
+                        if tool.name == 'get_feishu_document_blocks':
+                            get_blocks_tool = tool
+                            break
+
+            if get_blocks_tool:
+                blocks_info_result = await get_blocks_tool.call(
+                    ctx_wrapper,
+                    documentId=document_id
+                )
+                logger.info(f"[Test] 获取块信息结果: {repr(blocks_info_result)[:500]}")
+
+                if hasattr(blocks_info_result, 'content') and blocks_info_result.content:
+                    result_text = getattr(blocks_info_result.content[0], 'text', None)
+                    if result_text:
+                        try:
+                            blocks_data = json.loads(result_text)
+                            if isinstance(blocks_data, list):
+                                if len(blocks_data) > 0:
+                                    first_item = blocks_data[0]
+                                    root_block_id = first_item.get('block_id', '0') if isinstance(first_item, dict) else '0'
+                            elif isinstance(blocks_data, dict):
+                                items = blocks_data.get('data', {}).get('items', []) or blocks_data.get('items', [])
+                                if items and len(items) > 0:
+                                    root_block_id = items[0].get('block_id', '0')
+                        except json.JSONDecodeError:
+                            pass
+        except Exception as e:
+            logger.warning(f"[Test] 获取根块 ID 失败: {e}，使用默认值 0")
+
+        logger.info(f"[Test] 最终使用的根块 ID: {root_block_id}")
+
+        # 3.2 添加块
+        blocks_result = await add_blocks_tool.call(
+            ctx_wrapper,
+            documentId=document_id,
+            parentBlockId=root_block_id,
+            index=0,
+            blocks=blocks
+        )
+
+        # 4. 检查结果
+        blocks_created = 0
+        if hasattr(blocks_result, 'isError') and blocks_result.isError:
+            error_text = ""
+            if hasattr(blocks_result, 'content') and blocks_result.content:
+                error_text = getattr(blocks_result.content[0], 'text', str(blocks_result))
+            return {"success": False, "error": f"添加块失败: {error_text[:500]}"}
+        elif hasattr(blocks_result, 'content') and blocks_result.content:
+            result_text = getattr(blocks_result.content[0], 'text', None)
+            if result_text:
+                try:
+                    result_data = json.loads(result_text)
+                    blocks_created = result_data.get("totalBlocksCreated", 0)
+                except json.JSONDecodeError:
+                    return {"success": False, "error": f"解析结果失败: {result_text[:200]}"}
+
+        return {
+            "success": True,
+            "document_id": document_id,
+            "url": f"https://feishu.cn/docx/{document_id}",
+            "blocks_created": blocks_created,
+            "blocks_count": len(blocks),
+            "test_content": test_markdown
+        }
+
     async def create_feishu_document(
         self,
         ideas: List[ResearchIdea],
         topic: str = "",
         folder_token: str = "",
-        knowledge: Dict[str, Any] = None
+        knowledge: Optional[Dict[str, Any]] = None,
+        skip_arxiv_resolution: bool = False,
+        table_format: str = "png"
     ) -> Dict[str, Any]:
         """
         创建飞书文档并写入研究想法
@@ -1155,7 +2875,7 @@ class IdeaEngine:
         流程：
         1. LLM 生成文档标题（不使用原始问题作为标题）
         2. LLM 润色内容（组会周报学术风格，含引用、相关工作、Benchmark、研究计划）
-        3. 通过 CORE API 将本地引用解析为 arxiv 链接
+        3. 通过 CORE API 将本地引用解析为 arxiv 链接（可选）
         4. 直接调用 AstrBot 已连接的 feishu MCP 工具
         5. 返回润色内容和文档链接
 
@@ -1164,13 +2884,16 @@ class IdeaEngine:
             topic: 研究主题
             folder_token: 飞书文件夹Token（可选）
             knowledge: 知识检索结果（包含 web_results, local_results）
+            skip_arxiv_resolution: 跳过 arxiv 链接预解析（用于测试场景）
+            table_format: 表格插入格式，可选 "csv"、"md"、"png"(默认)、"auto"
 
         Returns:
             Dict包含 document_id, url, polished_content, error 等信息
         """
         try:
             # 0. 预解析本地论文的 arxiv 链接（避免在 prompt 中重复查询）
-            knowledge = await self._pre_resolve_arxiv_links(knowledge)
+            if not skip_arxiv_resolution and knowledge is not None:
+                knowledge = await self._pre_resolve_arxiv_links(knowledge)
 
             # 1. LLM 润色内容（组会周报学术风格，含引用、媒体标记、相关工作、Benchmark 和研究计划）
             # 返回值：polished_content, extracted_media, generated_title
@@ -1181,8 +2904,16 @@ class IdeaEngine:
             # 2. 备用解析（处理 LLM 偶尔使用错误格式的情况）
             polished_content = await self._resolve_references(polished_content, knowledge)
 
-            # 3. 移除媒体标记，保留纯文本内容用于飞书文档
-            cleaned_content = self._remove_media_markers(polished_content)
+            # 3. 使用本地 VLM 审阅图片与内容的相关性（在标记替换之前进行，依赖原始 INSERT_IMAGE 标记）
+            audited_content, extracted_media = await self._audit_media_relevance(
+                polished_content, extracted_media, knowledge
+            )
+
+            # 3.1 将媒体标记替换为带 caption 的引用格式
+            cleaned_content = self._replace_media_markers(audited_content, extracted_media)
+
+            # 3.2 使用 LLM 清理因媒体引用被跳过而导致的断句
+            cleaned_content = await self._cleanup_content_for_feishu(cleaned_content)
 
             # 4. 生成飞书块格式（不含媒体）
             blocks = self._markdown_to_feishu_blocks(cleaned_content)
@@ -1321,7 +3052,7 @@ class IdeaEngine:
 
                     # 解析获取块信息结果，找到根块 ID
                     if hasattr(blocks_info_result, 'content') and blocks_info_result.content:
-                        result_text = getattr(blocks_info_result.content[0], 'text', None)
+                        result_text = cast(Optional[str], getattr(blocks_info_result.content[0], 'text', None))
                         if result_text:
                             try:
                                 blocks_data = json.loads(result_text)
@@ -1330,7 +3061,7 @@ class IdeaEngine:
                                 if isinstance(blocks_data, list):
                                     if len(blocks_data) > 0:
                                         first_item = blocks_data[0]
-                                        root_block_id = first_item.get('block_id') if isinstance(first_item, dict) else None
+                                        root_block_id = first_item.get('block_id', '0') if isinstance(first_item, dict) else '0'
                                         logger.info(f"[IdeaEngine] 从列表获取根块 ID: {root_block_id}")
                                 elif isinstance(blocks_data, dict):
                                     items = blocks_data.get('data', {}).get('items', []) or blocks_data.get('items', [])
@@ -1396,7 +3127,7 @@ class IdeaEngine:
                     else:
                         # 解析成功添加的块数
                         if hasattr(blocks_result, 'content') and blocks_result.content:
-                            result_text = getattr(blocks_result.content[0], 'text', None)
+                            result_text = cast(Optional[str], getattr(blocks_result.content[0], 'text', None))
                             if result_text:
                                 try:
                                     result_data = json.loads(result_text)
@@ -1405,34 +3136,95 @@ class IdeaEngine:
                                 except json.JSONDecodeError:
                                     logger.warning(f"[IdeaEngine] 解析文本块结果失败")
 
-                # 9.2 处理图片（两阶段：创建空图片块 → 上传绑定实际图片）
+                # 9.2 处理图片（三阶段：创建空图片块 → 上传绑定 → 创建居中图表说明）
                 images = extracted_media.get("images", [])
                 if images and upload_image_tool:
                     logger.info(f"[IdeaEngine] 开始处理 {len(images)} 张图片")
                     current_index = len(blocks)  # 从文本块之后开始
 
                     for i, img in enumerate(images):
+                        # 跳过被标记为不匹配的图片
+                        if img.get("_skip"):
+                            logger.info(f"[IdeaEngine] 跳过图片: index={img.get('index')}")
+                            continue
+
                         img_path = img.get("path", "")
                         if not img_path or not os.path.exists(img_path):
                             logger.warning(f"[IdeaEngine] 图片不存在: {img_path}")
                             continue
 
-                        # 创建空图片块
-                        image_blocks = [
+                        caption = img.get("caption", "")
+                        # 构建图片序号（如 "本地图-1" -> "图1"）
+                        idx_match = re.search(r'-(\d+)$', img.get("index", ""))
+                        fig_num = idx_match.group(1) if idx_match else str(i + 1)
+                        # 如果 caption 只是简单编号，用 图1 格式；否则用 图1: caption 格式（加粗前缀）
+                        simple_pattern = re.match(
+                            r'^(Figure|Fig\.|Fig|Table|表|图)\s*([A-Za-z0-9]+(?:-[A-Za-z0-9]+)?)$',
+                            caption.strip() if caption else "",
+                            re.IGNORECASE
+                        )
+                        if simple_pattern:
+                            # 简单编号：加粗显示
+                            caption_block = {
+                                "blockType": "text",
+                                "options": {
+                                    "text": {
+                                        "textStyles": [
+                                            {"text": f"图{fig_num}", "style": {"bold": True}}
+                                        ],
+                                        "align": 2  # 2 = 居中
+                                    }
+                                }
+                            }
+                        elif caption:
+                            # 有描述：前缀加粗
+                            caption_block = {
+                                "blockType": "text",
+                                "options": {
+                                    "text": {
+                                        "textStyles": [
+                                            {"text": f"图{fig_num}: ", "style": {"bold": True}},
+                                            {"text": caption, "style": {}}
+                                        ],
+                                        "align": 2  # 2 = 居中
+                                    }
+                                }
+                            }
+                        else:
+                            caption_block = {
+                                "blockType": "text",
+                                "options": {
+                                    "text": {
+                                        "textStyles": [
+                                            {"text": f"图{fig_num}", "style": {"bold": True}}
+                                        ],
+                                        "align": 2  # 2 = 居中
+                                    }
+                                }
+                            }
+
+                        # 创建空图片块 + 居中图表说明文本块（一次性创建）
+                        image_and_caption_blocks = [
                             {
                                 "blockType": "image",
+                                "align": 2,  # 2 = 居中
                                 "options": {
                                     "image": {}
                                 }
-                            }
+                            },
+                            caption_block
                         ]
+
+                        if add_blocks_tool is None:
+                            logger.warning(f"[IdeaEngine] add_blocks_tool 不可用，跳过图片块[{i}]")
+                            continue
 
                         img_result = await add_blocks_tool.call(
                             ctx_wrapper,
                             documentId=document_id,
                             parentBlockId=root_block_id,
                             index=current_index,
-                            blocks=image_blocks
+                            blocks=image_and_caption_blocks
                         )
                         logger.info(f"[IdeaEngine] 创建图片块[{i}]结果: {repr(img_result)[:500]}")
 
@@ -1442,10 +3234,10 @@ class IdeaEngine:
                             continue
 
                         # 从结果中提取图片块 ID
-                        image_block_id = None
+                        image_block_id: Optional[str] = None
                         try:
                             if hasattr(img_result, 'content') and img_result.content:
-                                result_text = getattr(img_result.content[0], 'text', None)
+                                result_text = cast(Optional[str], getattr(img_result.content[0], 'text', None))
                                 if result_text:
                                     result_data = json.loads(result_text)
                                     image_info = result_data.get('imageBlocksInfo', {})
@@ -1478,26 +3270,41 @@ class IdeaEngine:
                                 images_uploaded += 1
                                 logger.info(f"[IdeaEngine] 图片[{i}]上传成功")
 
-                        current_index += 1
+                        current_index += 2  # 图片块 + 居中图表说明文本块
 
-                # 9.3 处理表格
+                # 9.3 处理表格（创建表格后添加居中图表说明）
                 tables = extracted_media.get("tables", [])
-                if tables and create_table_tool:
-                    logger.info(f"[IdeaEngine] 开始处理 {len(tables)} 个表格")
-                    current_index = len(blocks) + len(images)  # 从文本块和图片块之后开始
+                if tables:
+                    logger.info(f"[IdeaEngine] 开始处理 {len(tables)} 个表格 (格式: {table_format})")
+                    # 计算实际处理的图片数量（排除跳过的）
+                    processed_image_count = sum(1 for img in images if not img.get("_skip"))
+                    current_index = len(blocks) + processed_image_count * 2  # 从文本块和图片块之后开始
 
                     for i, tbl in enumerate(tables):
+                        # 跳过被标记为不匹配的表格
+                        if tbl.get("_skip"):
+                            logger.info(f"[IdeaEngine] 跳过表格: index={tbl.get('index')}")
+                            continue
+
                         csv_path = tbl.get("csv_path", "")
+                        png_path = tbl.get("png_path", "")
+                        md_path = tbl.get("md_path", "")
                         caption = tbl.get("caption", f"表格 {i+1}")
 
-                        # 读取 CSV 内容
-                        cells_data = []
-                        if csv_path and os.path.exists(csv_path):
+                        if table_format == "csv":
+                            # CSV 格式：使用 create_feishu_table 工具
+                            if not create_table_tool:
+                                logger.warning(f"[IdeaEngine] create_feishu_table 工具不可用，跳过表格 {i}")
+                                continue
+                            if not csv_path or not os.path.exists(csv_path):
+                                logger.warning(f"[IdeaEngine] 表格[{i}] CSV路径为空或文件不存在")
+                                continue
+
+                            cells_data: List[Dict[str, Any]] = []
                             try:
                                 with open(csv_path, 'r', encoding='utf-8') as f:
                                     lines = f.readlines()
 
-                                # 解析 CSV 构建表格
                                 for row_idx, line in enumerate(lines[:10]):  # 最多10行
                                     cols = line.strip().split(',')
                                     for col_idx, cell_text in enumerate(cols[:10]):  # 最多10列
@@ -1516,30 +3323,256 @@ class IdeaEngine:
                                         })
                             except Exception as e:
                                 logger.error(f"[IdeaEngine] 读取CSV失败: {e}")
+                                continue
 
-                        if cells_data:
-                            table_config = {
-                                "columnSize": max([c["coordinate"]["column"] for c in cells_data]) + 1,
-                                "rowSize": max([c["coordinate"]["row"] for c in cells_data]) + 1,
-                                "cells": cells_data
-                            }
+                            if cells_data:
+                                table_config = {
+                                    "columnSize": max([c["coordinate"]["column"] for c in cells_data]) + 1,
+                                    "rowSize": max([c["coordinate"]["row"] for c in cells_data]) + 1,
+                                    "cells": cells_data
+                                }
+                                table_result = await create_table_tool.call(
+                                    ctx_wrapper,
+                                    documentId=document_id,
+                                    parentBlockId=root_block_id,
+                                    index=current_index,
+                                    tableConfig=table_config
+                                )
+                                if hasattr(table_result, 'isError') and table_result.isError:
+                                    error_text = ""
+                                    if hasattr(table_result, 'content') and table_result.content:
+                                        error_text = getattr(table_result.content[0], 'text', str(table_result))
+                                    logger.error(f"[IdeaEngine] 创建表格[{i}]失败: {error_text[:300] if error_text else 'unknown error'}")
+                                else:
+                                    tables_created += 1
+                                    logger.info(f"[IdeaEngine] 表格[{i}] (CSV) 创建成功")
+                                    # 创建居中图表说明文本块
+                                    if add_blocks_tool:
+                                        idx_match = re.search(r'-(\d+)$', tbl.get("index", ""))
+                                        tbl_num = idx_match.group(1) if idx_match else str(i + 1)
+                                        # 如果 caption 只是简单编号，用 表1 格式；否则用 表1: caption 格式（表1加粗）
+                                        simple_pattern = re.match(
+                                            r'^(Figure|Fig\.|Fig|Table|表|图)\s*([A-Za-z0-9]+(?:-[A-Za-z0-9]+)?)$',
+                                            caption.strip() if caption else "",
+                                            re.IGNORECASE
+                                        )
+                                        if simple_pattern:
+                                            caption_text = f"表{tbl_num}"
+                                            caption_block = [{
+                                                "blockType": "text",
+                                                "options": {
+                                                    "text": {
+                                                        "textStyles": [
+                                                            {"text": caption_text, "style": {"bold": True}}
+                                                        ],
+                                                        "align": 2  # 居中
+                                                    }
+                                                }
+                                            }]
+                                        elif caption:
+                                            caption_block = [{
+                                                "blockType": "text",
+                                                "options": {
+                                                    "text": {
+                                                        "textStyles": [
+                                                            {"text": f"表{tbl_num}: ", "style": {"bold": True}},
+                                                            {"text": caption, "style": {}}
+                                                        ],
+                                                        "align": 2  # 居中
+                                                    }
+                                                }
+                                            }]
+                                        else:
+                                            caption_text = f"表{tbl_num}"
+                                            caption_block = [{
+                                                "blockType": "text",
+                                                "options": {
+                                                    "text": {
+                                                        "textStyles": [
+                                                            {"text": caption_text, "style": {"bold": True}}
+                                                        ],
+                                                        "align": 2  # 居中
+                                                    }
+                                                }
+                                            }]
+                                        await add_blocks_tool.call(
+                                            ctx_wrapper,
+                                            documentId=document_id,
+                                            parentBlockId=root_block_id,
+                                            index=current_index + 1,
+                                            blocks=caption_block
+                                        )
+                                current_index += 2  # 表格块 + 居中图表说明文本块
 
-                            table_result = await create_table_tool.call(
+                        elif table_format == "md":
+                            # MD 格式：作为文本块插入
+                            md_content = ""
+                            if md_path and os.path.exists(md_path):
+                                try:
+                                    with open(md_path, 'r', encoding='utf-8') as f:
+                                        md_content = f.read()
+                                except Exception as e:
+                                    logger.error(f"[IdeaEngine] 读取MD失败: {e}")
+                            elif csv_path and os.path.exists(csv_path):
+                                try:
+                                    with open(csv_path, 'r', encoding='utf-8') as f:
+                                        md_content = f"```csv\n{f.read()}\n```"
+                                except Exception as e:
+                                    logger.error(f"[IdeaEngine] 读取CSV失败: {e}")
+
+                            if md_content:
+                                blocks.append({
+                                    "blockType": "text",
+                                    "options": {
+                                        "text": {
+                                            "textStyles": [
+                                                {"text": f"{caption}\n{md_content}", "style": {"code": True}}
+                                            ]
+                                        }
+                                    }
+                                })
+                                tables_created += 1
+                                logger.info(f"[IdeaEngine] 表格[{i}] (MD) 添加为文本块")
+                                current_index += 1
+
+                        elif table_format == "png":
+                            # PNG 格式：作为图片插入
+                            if not png_path or not os.path.exists(png_path):
+                                # PNG 不存在时，尝试用 Markdown 格式代替
+                                logger.warning(f"[IdeaEngine] 表格[{i}] PNG不存在(png_path={png_path})，尝试使用Markdown格式")
+                                if md_path and os.path.exists(md_path):
+                                    try:
+                                        with open(md_path, 'r', encoding='utf-8') as f:
+                                            md_content = f.read()[:500]
+                                        md_block = [{
+                                            "blockType": "text",
+                                            "options": {
+                                                "text": {
+                                                    "textStyles": [{"text": f"📋 {caption}\n```\n{md_content}\n```", "style": {"inline_code": False}}],
+                                                    "align": 1  # 左对齐
+                                                }
+                                            }
+                                        }]
+                                        if add_blocks_tool:
+                                            await add_blocks_tool.call(
+                                                ctx_wrapper,
+                                                documentId=document_id,
+                                                parentBlockId=root_block_id,
+                                                index=current_index,
+                                                blocks=md_block
+                                            )
+                                            tables_created += 1
+                                            logger.info(f"[IdeaEngine] 表格[{i}] (MD替代) 添加成功")
+                                            current_index += 1
+                                            continue
+                                    except Exception as e:
+                                        logger.error(f"[IdeaEngine] 表格[{i}] Markdown替代失败: {e}")
+                                logger.warning(f"[IdeaEngine] 表格[{i}] PNG和Markdown都不存在，跳过")
+                                continue
+
+                            # 先创建空图片块（居中）
+                            image_blocks = [{
+                                "blockType": "image",
+                                "align": 2,  # 2 = 居中
+                                "options": {"image": {}}
+                            }]
+
+                            if add_blocks_tool is None:
+                                logger.warning(f"[IdeaEngine] add_blocks_tool 不可用，跳过表格图片[{i}]")
+                                continue
+
+                            img_result = await add_blocks_tool.call(
                                 ctx_wrapper,
                                 documentId=document_id,
                                 parentBlockId=root_block_id,
                                 index=current_index,
-                                tableConfig=table_config
+                                blocks=image_blocks
                             )
-                            logger.info(f"[IdeaEngine] 创建表格[{i}]结果: {repr(table_result)[:500]}")
+                            image_block_id: Optional[str] = None
+                            try:
+                                if hasattr(img_result, 'content') and img_result.content:
+                                    result_text = cast(Optional[str], getattr(img_result.content[0], 'text', None))
+                                    if result_text:
+                                        result_data = json.loads(result_text)
+                                        image_info = result_data.get('imageBlocksInfo', {})
+                                        if image_info:
+                                            block_ids = image_info.get('blockIds', [])
+                                            if block_ids:
+                                                image_block_id = block_ids[0]
+                            except Exception as e:
+                                logger.error(f"[IdeaEngine] 解析图片块ID失败: {e}")
 
-                            if hasattr(table_result, 'isError') and table_result.isError:
-                                logger.error(f"[IdeaEngine] 创建表格[{i}]失败")
-                            else:
-                                tables_created += 1
-                                logger.info(f"[IdeaEngine] 表格[{i}]创建成功")
-
-                            current_index += 1
+                            if image_block_id and upload_image_tool is not None:
+                                upload_result = await upload_image_tool.call(
+                                    ctx_wrapper,
+                                    documentId=document_id,
+                                    images=[{
+                                        "blockId": image_block_id,
+                                        "imagePathOrUrl": png_path
+                                    }]
+                                )
+                                if hasattr(upload_result, 'isError') and upload_result.isError:
+                                    logger.error(f"[IdeaEngine] 上传表格图片[{i}]失败")
+                                else:
+                                    tables_created += 1
+                                    logger.info(f"[IdeaEngine] 表格[{i}] (PNG) 创建成功")
+                                    # 创建居中图表说明文本块
+                                    if add_blocks_tool:
+                                        idx_match = re.search(r'-(\d+)$', tbl.get("index", ""))
+                                        tbl_num = idx_match.group(1) if idx_match else str(i + 1)
+                                        # 如果 caption 只是简单编号，用 表1 格式；否则用 表1: caption 格式（表1加粗）
+                                        simple_pattern = re.match(
+                                            r'^(Figure|Fig\.|Fig|Table|表|图)\s*([A-Za-z0-9]+(?:-[A-Za-z0-9]+)?)$',
+                                            caption.strip() if caption else "",
+                                            re.IGNORECASE
+                                        )
+                                        if simple_pattern:
+                                            caption_text = f"表{tbl_num}"
+                                            caption_block = [{
+                                                "blockType": "text",
+                                                "options": {
+                                                    "text": {
+                                                        "textStyles": [
+                                                            {"text": caption_text, "style": {"bold": True}}
+                                                        ],
+                                                        "align": 2  # 居中
+                                                    }
+                                                }
+                                            }]
+                                        elif caption:
+                                            caption_block = [{
+                                                "blockType": "text",
+                                                "options": {
+                                                    "text": {
+                                                        "textStyles": [
+                                                            {"text": f"表{tbl_num}: ", "style": {"bold": True}},
+                                                            {"text": caption, "style": {}}
+                                                        ],
+                                                        "align": 2  # 居中
+                                                    }
+                                                }
+                                            }]
+                                        else:
+                                            caption_text = f"表{tbl_num}"
+                                            caption_block = [{
+                                                "blockType": "text",
+                                                "options": {
+                                                    "text": {
+                                                        "textStyles": [
+                                                            {"text": caption_text, "style": {"bold": True}}
+                                                        ],
+                                                        "align": 2  # 居中
+                                                    }
+                                                }
+                                            }]
+                                        await add_blocks_tool.call(
+                                            ctx_wrapper,
+                                            documentId=document_id,
+                                            parentBlockId=root_block_id,
+                                            index=current_index + 1,
+                                            blocks=caption_block
+                                        )
+                            current_index += 2  # 图片块 + 居中图表说明文本块
 
                 logger.info(f"[IdeaEngine] 块添加完成: 文本块={blocks_created}, 图片={images_uploaded}, 表格={tables_created}")
 
@@ -1573,7 +3606,7 @@ class IdeaEngine:
     async def _resolve_references(
         self,
         content: str,
-        knowledge: Dict[str, Any] = None
+        knowledge: Optional[Dict[str, Any]] = None
     ) -> str:
         """
         将本地论文引用解析为 arxiv 链接，网络引用解析为带链接的格式
@@ -1607,7 +3640,7 @@ class IdeaEngine:
                     if not paper or paper in paper_to_arxiv:
                         continue
 
-                    arxiv_url, github_url = await core_client.get_arxiv_link(paper)
+                    arxiv_url, github_url = await core_client.get_arxiv_link_by_filename(paper)
                     if arxiv_url:
                         paper_to_arxiv[paper] = arxiv_url
                         paper_to_github[paper] = github_url
@@ -1718,11 +3751,22 @@ class IdeaEngine:
 
     def _get_core_api_key(self) -> Optional[str]:
         """从配置文件获取 CORE API Key"""
+        # 1. 优先从插件配置读取
+        try:
+            plugin_config_path = Path(__file__).parent.parent.parent / "config" / "astrbot_plugin_paperrag_config.json"
+            with open(plugin_config_path, "r", encoding="utf-8-sig") as f:
+                plugin_config = json.load(f)
+            key = plugin_config.get("core_api_key", "")
+            if key:
+                return key
+        except Exception:
+            pass
+
+        # 2. 回退到 mcp_server.json
         try:
             mcp_config_path = Path(__file__).parent.parent.parent / "mcp_server.json"
-            with open(mcp_config_path, "r", encoding="utf-8") as f:
+            with open(mcp_config_path, "r", encoding="utf-8-sig") as f:
                 mcp_config = json.load(f)
-            # 尝试从多个位置获取 CORE API key
             return (
                 mcp_config.get("mcpServers", {}).get("CORE", {}).get("env", {}).get("API_TOKEN") or
                 mcp_config.get("core_api_key")
@@ -1788,9 +3832,8 @@ class IdeaEngine:
                     }
                 })
             # 无序列表 - xxx 或 * xxx
-            # 飞书 API 支持 markdown 渲染，保留原始内容
             elif line.startswith("- ") or line.startswith("* "):
-                content = line[2:].strip()
+                content = self._strip_markdown_style(line[2:].strip())
                 blocks.append({
                     "blockType": "list",
                     "options": {
@@ -1801,11 +3844,10 @@ class IdeaEngine:
                     }
                 })
             # 有序列表 1. xxx 或 1) xxx
-            # 飞书 API 支持 markdown 渲染，保留原始内容
             elif re.match(r'^\d+[\.\)]\s', line):
                 match = re.match(r'^(\d+[\.\)])\s+(.*)$', line)
                 if match:
-                    content = match.group(2).strip()
+                    content = self._strip_markdown_style(match.group(2).strip())
                     blocks.append({
                         "blockType": "list",
                         "options": {
@@ -1818,7 +3860,7 @@ class IdeaEngine:
             # 空行
             elif line.strip() == "":
                 pass
-            # 普通文本（使用 textStyles 处理行内样式）
+            # 普通文本（直接使用 textStyles 处理行内样式，由 _parse_inline_styles 自动处理样式标记）
             else:
                 text_content = line.strip()
                 if text_content:
@@ -1837,63 +3879,240 @@ class IdeaEngine:
         """移除 Markdown 样式标记，保留纯文本"""
         # 按优先级匹配：先处理长标记，再处理短标记
         # 移除 ***加粗斜体*** → 加粗斜体
-        text = re.sub(r'\*\*\*([^*]+)\*\*\*', r'\1', text)
+        text = re.sub(r'\*\*\*(.+?)\*\*\*', r'\1', text)
         # 移除 **加粗** → 加粗
-        text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+        text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
         # 移除 *斜体* → 斜体
-        text = re.sub(r'\*([^*]+)\*', r'\1', text)
+        text = re.sub(r'\*(.+?)\*', r'\1', text)
+        # 移除 `行内代码` → 代码内容
+        text = re.sub(r'`(.+?)`', r'\1', text)
         return text
+
+    def _strip_outer_markdown_style(self, text: str) -> str:
+        """
+        移除整行文本的外层 Markdown 样式标记（当整行都是样式文本时）
+        例如：***加粗斜体文本*** → 加粗斜体文本
+              **加粗文本** → 加粗文本
+              *斜体文本* → 斜体文本
+              `代码文本` → 代码文本
+        但保留行内样式：混合测试：**加粗** 和 *斜体* → 混合测试：**加粗** 和 *斜体*
+        """
+        # 检查是否是整行样式（从头到尾都是样式标记包裹的内容）
+        # 使用非贪婪匹配 .+? 来避免 [^*] 无法匹配某些字符的问题
+        if re.match(r'^(\*\*\*(.+?)\*\*\*|\*\*(.+?)\*\*|\*(.+?)\*|`(.+?)`)$', text):
+            # 整行都是样式，移除外层标记
+            return self._strip_markdown_style(text)
+        return text
+
+    def _create_feishu_markdown(self) -> mistune.Markdown:
+        """
+        创建带自定义插件的 mistune Markdown：
+        - [图X]/[表X] 引用 → <strong>[图X]</strong> / <strong>[表X]</strong>
+        - $公式$ → <em class="latex">公式</em>
+
+        使用 mistune v3 插件 API：
+        - md.inline.register(name, pattern, func, before='...') 注册解析规则
+        - md.renderer.register(name, func) 注册渲染函数
+        """
+        # ====== 图/表引用解析函数 ======
+        def parse_fig_ref(md, m, state):
+            """解析 [图X] 或 [表X] 引用"""
+            text = m.group(0)  # e.g., '[图1]' or '[表3]'
+            state.append_token({'type': 'fig_ref', 'raw': text})
+            return m.end()
+
+        def render_fig_ref(renderer, text):
+            """渲染图/表引用为加粗格式"""
+            return f'<strong>{text}</strong>'
+
+        # ====== LaTeX 公式解析函数 ======
+        def parse_latex(md, m, state):
+            """解析 $公式$"""
+            latex_match = m.group('latex')
+            if latex_match:
+                # latex_match includes the $ signs, e.g., '$E=mc^2$'
+                formula = latex_match[1:-1]  # Strip $ signs
+                state.append_token({'type': 'latex', 'raw': formula})
+            return m.end()
+
+        def render_latex(renderer, text):
+            """渲染 LaTeX 公式为 <eq>formula</eq> 格式（飞书 equation 元素）"""
+            return f'<eq>{text}</eq>'
+
+        # 创建带自定义插件的 Markdown
+        md = mistune.create_markdown(plugins=['strikethrough'])
+
+        # 注册 [图X]/[表X] 规则（在 link 之前，避免 [text](url) 干扰）
+        md.inline.register('fig_ref', r'\[(图|表)(\d+)\]', parse_fig_ref, before='link')
+        md.renderer.register('fig_ref', render_fig_ref)
+
+        # 注册 $公式$ 规则（在 emphasis 之前）
+        md.inline.register('latex', r'\$([^$\n]+?)\$', parse_latex, before='emphasis')
+        md.renderer.register('latex', render_latex)
+
+        return md
 
     def _parse_inline_styles(self, text: str) -> List[Dict[str, Any]]:
         """
-        解析行内 Markdown 样式（加粗、斜体），返回飞书 textStyles 格式
+        使用 mistune + html.parser 解析 Markdown 文本，返回飞书 textStyles 格式
 
         支持：
         - **加粗** → bold: true
         - *斜体* → italic: true
         - ***加粗斜体*** → bold: true, italic: true
+        - `行内代码` → inline_code: true
+        - [文本](链接) → 链接文本 + (url)
+        - [图X]、[表X] → 加粗图表引用
+        - $公式$ / $$公式$$ → equation 元素
         """
         if not text:
             return [{"text": "", "style": {}}]
 
-        styles = []
-        # 匹配顺序：***加粗斜体*** > **加粗** > *斜体*
-        pattern = r'(\*\*\*[^*]+\*\*\*|\*\*[^*]+\*\*|\*[^*]+\*)'
+        # 使用带自定义插件的 mistune 解析 Markdown
+        md = self._create_feishu_markdown()
+        html = md(text)
 
-        last_end = 0
-        for match in re.finditer(pattern, text):
-            # 添加匹配之前的普通文本
-            if match.start() > last_end:
-                plain_text = text[last_end:match.start()]
-                if plain_text:
-                    styles.append({"text": plain_text, "style": {}})
+        # 使用 Python 内置 html.parser 解析 HTML
+        result = self._parse_html_with_html_parser(html)
 
-            matched_text = match.group(0)
-            inner_text = matched_text[2:-2]  # 去掉前后标记
+        return result if result else [{"text": text, "style": {}}]
 
-            if matched_text.startswith('***') and matched_text.endswith('***'):
-                # 加粗斜体
-                styles.append({"text": inner_text, "style": {"bold": True, "italic": True}})
-            elif matched_text.startswith('**') and matched_text.endswith('**'):
-                # 加粗
-                styles.append({"text": inner_text, "style": {"bold": True}})
-            elif matched_text.startswith('*') and matched_text.endswith('*'):
-                # 斜体
-                styles.append({"text": inner_text, "style": {"italic": True}})
+    def _parse_html_with_html_parser(self, html: str) -> List[Dict[str, Any]]:
+        """使用 Python 内置 html.parser 解析 HTML"""
+        from html.parser import HTMLParser
+        from html import unescape
 
-            last_end = match.end()
+        class FeishuHTMLParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.result = []
+                self.current_text = ""
+                self.styles = {}
+                self.link_url = None
+                self._in_eq = False  # 是否在 <eq> 标签内
+                self._eq_text = ""   # 公式内容
 
-        # 添加最后剩余的文本
-        if last_end < len(text):
-            remaining = text[last_end:]
-            if remaining:
-                styles.append({"text": remaining, "style": {}})
+            def handle_starttag(self, tag, attrs):
+                attrs_dict = dict(attrs) if attrs else {}
 
-        # 如果没有匹配到任何样式，返回原始文本
-        if not styles:
-            return [{"text": text, "style": {}}]
+                # 先输出当前累积的文本（如果有）
+                if self.current_text and tag not in ('br',):
+                    self.result.append({
+                        "text": unescape(self.current_text),
+                        "style": dict(self.styles)
+                    })
+                    self.current_text = ""
 
-        return styles
+                if tag == 'strong':
+                    self.styles['bold'] = True
+                elif tag == 'em':
+                    self.styles['italic'] = True
+                elif tag == 'code':
+                    self.styles['inline_code'] = True
+                elif tag in ('del', 's', 'strike'):
+                    self.styles['strikethrough'] = True
+                elif tag == 'a':
+                    self.link_url = attrs_dict.get('href')
+                    # 链接文本需要加粗
+                    self.styles['bold'] = True
+                elif tag == 'br':
+                    self.result.append({"text": "\n", "style": {}})
+                elif tag == 'eq':
+                    # 公式标签：开始收集公式内容
+                    self._in_eq = True
+                    self._eq_text = ""
+
+            def handle_endtag(self, tag):
+                # 如果是在公式标签内，输出公式元素
+                if tag == 'eq' and self._in_eq:
+                    self.result.append({"equation": self._eq_text, "style": {}})
+                    self._in_eq = False
+                    self._eq_text = ""
+                    return
+
+                # 先输出当前累积的文本
+                if self.current_text:
+                    self.result.append({
+                        "text": unescape(self.current_text),
+                        "style": dict(self.styles)
+                    })
+                    self.current_text = ""
+
+                if tag == 'a':
+                    if self.link_url:
+                        self.result.append({"text": f" ({self.link_url})", "style": {}})
+                        self.link_url = None
+                        # 移除链接添加的 bold 样式
+                        self.styles.pop('bold', None)
+                elif tag in ('strong', 'em', 'code', 'del', 's', 'strike'):
+                    key = {'strong': 'bold', 'em': 'italic', 'code': 'inline_code',
+                           'del': 'strikethrough', 's': 'strikethrough', 'strike': 'strikethrough'}.get(tag)
+                    if key:
+                        self.styles.pop(key, None)
+                elif tag == 'p':
+                    pass
+
+            def handle_data(self, data):
+                if self._in_eq:
+                    self._eq_text += data
+                else:
+                    self.current_text += data
+
+            def handle_entityref(self, name):
+                if self._in_eq:
+                    self._eq_text += unescape(f'&{name};')
+                else:
+                    self.current_text += unescape(f'&{name};')
+
+            def handle_charref(self, name):
+                if self._in_eq:
+                    self._eq_text += unescape(f'&#{name};')
+                else:
+                    self.current_text += unescape(f'&#{name};')
+
+        # 移除 <p> 标签和末尾空白
+        html = html.replace('<p>', '').replace('</p>', '').strip()
+
+        parser = FeishuHTMLParser()
+        parser.feed(html)
+
+        # 保存剩余文本
+        if parser.current_text:
+            parser.result.append({
+                "text": unescape(parser.current_text),
+                "style": dict(parser.styles)
+            })
+
+        # 合并相邻的相同 style 文本
+        merged = []
+        for item in parser.result:
+            if merged and merged[-1].get('text') and item.get('text') and merged[-1].get('style') == item.get('style'):
+                merged[-1]['text'] += item['text']
+            else:
+                merged.append(item)
+
+        return merged
+
+    def _strip_html_tags_simple(self, text: str) -> str:
+        """
+        移除 HTML 标签（不使用正则表达式）
+        简单处理：只移除 <p> 和 </p> 标签
+        """
+        result = []
+        i = 0
+        n = len(text)
+        while i < n:
+            if text[i] == '<':
+                # 检查是否是 <p 或 </p
+                if text[i:i+2] == '<p' or text[i:i+3] == '</p':
+                    # 找到对应的 >
+                    j = text.find('>', i)
+                    if j != -1:
+                        i = j + 1
+                        continue
+            result.append(text[i])
+            i += 1
+        return ''.join(result)
 
     async def _call_feishu_mcp_create_doc(
         self,
@@ -1993,7 +4212,7 @@ class IdeaEngine:
         try:
             # 从 mcp_server.json 读取配置
             mcp_config_path = Path(__file__).parent.parent.parent / "mcp_server.json"
-            with open(mcp_config_path, "r", encoding="utf-8") as f:
+            with open(mcp_config_path, "r", encoding="utf-8-sig") as f:
                 mcp_config = json.load(f)
 
             feishu_config = mcp_config.get("mcpServers", {}).get("feishu", {})

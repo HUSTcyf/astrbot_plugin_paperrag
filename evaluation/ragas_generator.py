@@ -93,6 +93,7 @@ class OpenAICompatibleLLM(BaseRagasLLM):
 
     # 全局并发限制信号量（类变量，所有实例共享）
     _semaphore: Optional[Any] = None
+    _async_lock: Optional[Any] = None  # 异步信号量初始化的锁
     _max_concurrent: int = 4  # 全局最大并发数（默认4，最大8）
 
     # RPM 限制：时间窗口内的请求时间戳列表（类变量，所有实例共享）
@@ -217,8 +218,11 @@ class OpenAICompatibleLLM(BaseRagasLLM):
 
         # 同步路径也必须限速：获取或创建信号量
         # 注意：同步路径无法直接使用 asyncio.Semaphore，改用 threading.Semaphore
+        # 使用线程锁防止竞争条件
         if not hasattr(OpenAICompatibleLLM, '_sync_semaphore'):
-            OpenAICompatibleLLM._sync_semaphore = threading.Semaphore(self._max_concurrent)
+            with threading.Lock():
+                if not hasattr(OpenAICompatibleLLM, '_sync_semaphore'):
+                    OpenAICompatibleLLM._sync_semaphore = threading.Semaphore(self._max_concurrent)
         sync_sem = OpenAICompatibleLLM._sync_semaphore
 
         url = f"{self.api_base}/chat/completions"
@@ -299,9 +303,13 @@ class OpenAICompatibleLLM(BaseRagasLLM):
         # RPM 限制
         await self._await_for_rpm_slot_async()
 
-        # 获取或创建信号量
+        # 获取或创建信号量（使用类变量锁防止竞争条件）
         if OpenAICompatibleLLM._semaphore is None:
-            OpenAICompatibleLLM._semaphore = asyncio.Semaphore(self._max_concurrent)
+            if OpenAICompatibleLLM._async_lock is None:
+                OpenAICompatibleLLM._async_lock = asyncio.Lock()
+            async with OpenAICompatibleLLM._async_lock:
+                if OpenAICompatibleLLM._semaphore is None:
+                    OpenAICompatibleLLM._semaphore = asyncio.Semaphore(self._max_concurrent)
 
         prompt_text = self._get_prompt_text(prompt)
         url = f"{self.api_base}/chat/completions"
@@ -445,6 +453,8 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings):
 
     # 全局并发限制信号量（类变量，所有实例共享）
     _semaphore: Optional[Any] = None
+    _async_lock: Optional[Any] = None  # 异步信号量初始化的锁
+    _sync_semaphore_lock: Optional[Any] = None  # 同步信号量初始化的锁
     _max_concurrent: int = 4  # 全局最大并发数（默认4，最大8）
 
     @classmethod
@@ -484,8 +494,12 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings):
     def _get_sync_semaphore(self):
         """获取同步信号量（threading.Semaphore，所有实例共享）"""
         import threading
-        if not hasattr(OpenAICompatibleEmbeddings, '_sync_semaphore'):
-            OpenAICompatibleEmbeddings._sync_semaphore = threading.Semaphore(self._max_concurrent)
+        if OpenAICompatibleEmbeddings._sync_semaphore is None:
+            if OpenAICompatibleEmbeddings._sync_semaphore_lock is None:
+                OpenAICompatibleEmbeddings._sync_semaphore_lock = threading.Lock()
+            with OpenAICompatibleEmbeddings._sync_semaphore_lock:
+                if OpenAICompatibleEmbeddings._sync_semaphore is None:
+                    OpenAICompatibleEmbeddings._sync_semaphore = threading.Semaphore(self._max_concurrent)
         return OpenAICompatibleEmbeddings._sync_semaphore
 
     def _post_embedding(self, texts: Union[str, List[str]]) -> List[List[float]]:
@@ -541,9 +555,13 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings):
         """异步批量获取文本 embeddings（受全局 Semaphore 限制并发）"""
         import aiohttp
 
-        # 获取或创建信号量
+        # 获取或创建信号量（使用类变量锁防止竞争条件）
         if OpenAICompatibleEmbeddings._semaphore is None:
-            OpenAICompatibleEmbeddings._semaphore = asyncio.Semaphore(self._max_concurrent)
+            if OpenAICompatibleEmbeddings._async_lock is None:
+                OpenAICompatibleEmbeddings._async_lock = asyncio.Lock()
+            async with OpenAICompatibleEmbeddings._async_lock:
+                if OpenAICompatibleEmbeddings._semaphore is None:
+                    OpenAICompatibleEmbeddings._semaphore = asyncio.Semaphore(self._max_concurrent)
 
         url = f"{self.api_base}/embeddings"
         headers = {
@@ -1219,10 +1237,13 @@ class RagasTestsetGenerator:
         else:
             print(f"   未发现低质量问题")
 
-        # 保存结果
+        # 保存结果（使用原子写入：先写临时文件，再 rename）
+        import os
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
+        temp_path = output_path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
             json.dump([s.to_dict() for s in samples], f, ensure_ascii=False, indent=2)
+        os.replace(temp_path, output_path)  # 原子操作
 
         print(f"\n✅ 测试集已保存到: {output_path}")
         print(f"📊 问题类型分布: {self._count_types(samples)}")

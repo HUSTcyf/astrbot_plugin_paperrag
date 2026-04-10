@@ -8,7 +8,7 @@ import io
 import re
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, cast
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ try:
     from docling.document_converter import DocumentConverter, PdfFormatOption
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions
-    from docling_core.types.doc import PictureItem, TableItem, FormulaItem
+    # from docling_core.types.doc import PictureItem, TableItem, FormulaItem
     _DOCLING_PREIMPORTED = True
 except ImportError:
     _DOCLING_PREIMPORTED = False
@@ -187,7 +187,7 @@ class MultimodalPDFExtractor:
 
         # 使用预编译的行号正则表达式
         # 使用 "dict" 模式获取带位置信息的文本块
-        page_dict = page.get_text("dict")
+        page_dict = cast(dict[str, Any], page.get_text("dict"))
 
         text_lines = []
         for block in page_dict.get("blocks", []):
@@ -880,8 +880,8 @@ def _configure_docling_globals() -> None:
 
     # 3. 设置 docling settings
     from docling.datamodel.settings import settings
-    settings.cache_dir = str(models_dir)
-    settings.artifacts_path = str(models_dir)
+    settings.cache_dir = models_dir
+    settings.artifacts_path = models_dir
 
     _GLOBAL_DOCLING_CONFIGURED = True
     logger.info(f"🔧 [DoclingExtractor] 全局配置完成: cache_dir={settings.cache_dir}")
@@ -999,8 +999,8 @@ class DoclingExtractor:
         import json
         import os
 
-        pdf_path = Path(pdf_path)
-        paper_id = pdf_path.stem
+        pdf_path_obj = Path(pdf_path)
+        paper_id: str = pdf_path_obj.stem
 
         figures_dir = self._figures_base / paper_id
         tables_dir = self._tables_base / paper_id
@@ -1027,42 +1027,93 @@ from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling_core.types.doc import PictureItem, TableItem, FormulaItem
 
 def _table_data_to_csv(data):
+    """将表格数据转换为 CSV 格式字符串
+
+    Args:
+        data: TableItem、TableData 对象或 List[List[str]] 原始数据
+    """
+    # TableItem 有 export_to_dataframe 方法（正确处理合并单元格）
+    # TableData 没有此方法
+    if hasattr(data, 'export_to_dataframe'):
+        try:
+            df = data.export_to_dataframe(doc=None)
+            import io
+            buf = io.StringIO()
+            df.to_csv(buf, index=False, header=True, encoding='utf-8')
+            return buf.getvalue()
+        except Exception:
+            pass
+
+    # 回退：使用 grid 遍历
+    if hasattr(data, 'grid'):
+        rows = data.grid
+    else:
+        rows = data
+
     lines = []
-    for row in data:
-        # 将每个元素转为字符串，处理嵌套列表
+    for row in rows:
         cells = []
         for cell in row:
-            if isinstance(cell, list):
-                cell = str(cell)
-            cells.append(str(cell) if cell is not None else "")
-        line = ",".join(cells)
+            if hasattr(cell, '_get_text'):
+                cell_text = cell._get_text(doc=None) or ""
+            elif isinstance(cell, list):
+                cell_text = str(cell)
+            else:
+                cell_text = str(cell) if cell is not None else ""
+            cell_text = cell_text.replace('"', '""')
+            cells.append(cell_text)
+        escaped_cells = ['"' + c + '"' if ',' in c or '"' in c else c for c in cells]
+        line = ",".join(escaped_cells)
         lines.append(line)
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 def _csv_to_markdown(data):
-    """将 CSV 数据转换为 Markdown 表格格式"""
-    if not data:
+    """将表格数据转换为 Markdown 表格格式"""
+    # 优先使用 TableItem 的内置方法（正确处理合并单元格）
+    if hasattr(data, 'export_to_markdown'):
+        try:
+            return data.export_to_markdown(doc=None)
+        except Exception:
+            pass
+
+    if hasattr(data, 'export_to_dataframe'):
+        try:
+            df = data.export_to_dataframe(doc=None)
+            cols = list(df.columns)
+            lines = []
+            lines.append("| " + " | ".join(str(c) for c in cols) + " |")
+            lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
+            for _, row in df.iterrows():
+                cells = [str(v).replace("|", "\\|").replace("\n", " ") for v in row]
+                lines.append("| " + " | ".join(cells) + " |")
+            return "\n".join(lines)
+        except Exception:
+            pass
+
+    if hasattr(data, 'grid'):
+        rows = data.grid
+    else:
+        rows = data
+
+    if not rows:
         return ""
     lines = []
-    row_count = 0
-    for i, row in enumerate(data):
-        row_count += 1
+    for i, row in enumerate(rows):
         cells = []
         for cell in row:
-            if isinstance(cell, list):
-                cell = str(cell)
-            cell_str = str(cell) if cell is not None else ""
-            # 转义管道符和换行符（f-string中需要双写反斜杠）
-            cell_str = cell_str.replace("|", "\\\\|").replace("\\n", " ")
+            if hasattr(cell, '_get_text'):
+                cell_str = cell._get_text(doc=None) or ""
+            elif isinstance(cell, list):
+                cell_str = str(cell)
+            else:
+                cell_str = str(cell) if cell is not None else ""
+            cell_str = cell_str.replace("|", "\\|").replace("\n", " ")
             cells.append(cell_str)
         lines.append("| " + " | ".join(cells) + " |")
-        # 添加表头分隔符
         if i == 0:
             separator = "| " + " | ".join(["---"] * len(cells)) + " |"
             lines.append(separator)
-    if row_count == 0:
-        return ""
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 pdf_path = Path("{pdf_path}")
 paper_id = "{paper_id}"
@@ -1116,7 +1167,7 @@ for element, _level in result.document.iterate_items():
         page_no = element.prov[0].page_no
         table_idx = table_counters.get(page_no, 0) + 1
         table_counters[page_no] = table_idx
-        table_csv = _table_data_to_csv(element.data)
+        table_csv = _table_data_to_csv(element)
         csv_filename = f"{{page_no}}-Table{{table_idx}}.csv"
         png_filename = f"{{page_no}}-Table{{table_idx}}.png"
         csv_path = tables_dir / csv_filename
@@ -1128,7 +1179,7 @@ for element, _level in result.document.iterate_items():
             pil_image = element.image.pil_image
             pil_image.save(png_path, format="PNG")
             saved_png_path = str(png_path)
-        table_markdown = _csv_to_markdown(element.data)
+        table_markdown = _csv_to_markdown(element)
         tables.append({{
             "page_number": page_no,
             "table_index": table_idx,
@@ -1243,11 +1294,34 @@ print(result_json)
         pil_image.save(buffered, format="PNG")
         return buffered.getvalue()
 
-    def _table_data_to_csv(self, data: List[List[str]]) -> str:
+    def _table_data_to_csv(self, data) -> str:
         """将表格数据转换为 CSV 格式"""
+        if hasattr(data, 'export_to_dataframe'):
+            try:
+                import io
+                df = data.export_to_dataframe(doc=None)
+                buf = io.StringIO()
+                df.to_csv(buf, index=False, header=True, encoding='utf-8')
+                return buf.getvalue()
+            except Exception:
+                pass
+        if hasattr(data, 'grid'):
+            rows = data.grid
+        else:
+            rows = data
         lines = []
-        for row in data:
-            line = ",".join(f'"{cell}"' if ',' in cell else cell for cell in row)
+        for row in rows:
+            cells = []
+            for cell in row:
+                if hasattr(cell, '_get_text'):
+                    cell_text = cell._get_text(doc=None) or ""
+                elif isinstance(cell, list):
+                    cell_text = str(cell)
+                else:
+                    cell_text = str(cell) if cell is not None else ""
+                cell_text = cell_text.replace('"', '""')
+                cells.append(cell_text)
+            line = ",".join('"' + c + '"' if ',' in c or '"' in c else c for c in cells)
             lines.append(line)
         return "\n".join(lines)
 
@@ -1371,14 +1445,15 @@ class PDFParserAdvanced:
 
         try:
             if self.enable_multimodal:
-                return self._parse_with_multimodal(pdf_path)
+                full_text, _, metadata = self._parse_with_multimodal(pdf_path)
+                return full_text, metadata
             else:
                 return self._parse_with_pymupdf(pdf_path)
 
         except Exception as e:
             raise Exception(f"PDF解析失败 {filename}: {e}")
 
-    def _parse_with_multimodal(self, pdf_path: str) -> tuple[str, Dict[str, Any]]:
+    def _parse_with_multimodal(self, pdf_path: str) -> tuple[str, str, Dict[str, Any]]:
         """使用 DoclingExtractor 提取图片/表格/公式 + PyMuPDF 提取完整文本"""
         # 1. DoclingExtractor 提取多模态内容（图片、表格、公式）
         extracted = self.docling_extractor.extract(pdf_path)
@@ -1462,7 +1537,7 @@ class PDFParserAdvanced:
             "parser": "PyMuPDF"
         }
 
-        for page_num, page in enumerate(doc, 1):
+        for page_num, page in enumerate(cast(Any, doc), 1):
             page_text = self._extract_text_without_line_numbers(page)
             if page_text.strip():
                 text_parts.append(f"\n[Page {page_num}]\n{page_text}")
@@ -1484,7 +1559,7 @@ class PDFParserAdvanced:
         left_margin_threshold = page_width * 0.08
         right_margin_threshold = page_width * 0.92
 
-        page_dict = page.get_text("dict")
+        page_dict = cast(dict[str, Any], page.get_text("dict"))
 
         text_lines = []
         for block in page_dict.get("blocks", []):

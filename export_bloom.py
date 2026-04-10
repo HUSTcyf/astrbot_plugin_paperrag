@@ -105,14 +105,13 @@ def export_for_bloom():
     with driver.session() as session:
         # 查询节点
         print("查询节点...")
-        result = session.run(f"""
+        result = session.run("""
             MATCH (n)
             RETURN id(n) as nid,
                    labels(n) as labels,
                    coalesce(n.title, n.name, n.ref_title, n.label, 'unknown') as label,
                    properties(n) as props
-            LIMIT {LIMIT_NODES}
-        """)
+            LIMIT """ + str(LIMIT_NODES))  # type: ignore[arg-type]
 
         for record in result:
             nid = record["nid"]
@@ -141,11 +140,10 @@ def export_for_bloom():
 
         # 查询边
         print("查询关系...")
-        result = session.run(f"""
+        result = session.run("""
             MATCH (n)-[r]->(m)
             RETURN id(n) as source, id(m) as target, type(r) as rel_type
-            LIMIT {LIMIT_EDGES}
-        """)
+            LIMIT """ + str(LIMIT_EDGES))  # type: ignore[arg-type]
 
         edges = []
         for record in result:

@@ -136,12 +136,9 @@ class HybridPDFParser:
             logger.debug(f"🔍 解析PDF: {filename}")
             result = self.pdf_parser.parse_pdf(pdf_path)
 
-            # 处理 Docling Multimodal 返回的 3-tuple
-            if len(result) == 3:
-                text, raw_text, metadata = result  # Docling Multimodal
-            else:
-                text, metadata = result  # 普通 PyMuPDF
-                raw_text = text
+            # parse_pdf 返回 2-tuple: (text, metadata)
+            text, metadata = result
+            raw_text = text
 
             # 构建增强的文本（包含多模态占位符）
             enhanced_text = self._build_enhanced_text(text, metadata)
@@ -241,18 +238,18 @@ class HybridPDFParser:
                 return []
 
             # 提取并保存图片（获取图片路径映射）
-            image_paths = {}
-            image_pages = {}
-            table_paths = {}
-            table_pages = {}
-            formula_refs = {}
-            formula_pages = {}
+            image_paths: Dict[str, Any] = {}
+            image_pages: Dict[str, Any] = {}
+            table_paths: Dict[str, Tuple[str, str, str]] = {}
+            table_pages: Dict[str, int] = {}
+            formula_refs: Dict[str, Any] = {}
+            formula_pages: Dict[str, Any] = {}
             if documents and self.enable_multimodal:
                 multimodal_data = documents[0].metadata.get("multimodal_data", {})
                 # 使用 PDF 文件名作为 paper_id（用于按论文分类存储）
                 paper_id = Path(pdf_path).stem
-                image_paths, image_pages = self._extract_and_save_images(pdf_path, multimodal_data, paper_id)
-                table_paths, table_pages = self._extract_and_save_tables(pdf_path, multimodal_data, paper_id)
+                image_paths, image_pages = self._extract_and_save_images(multimodal_data)
+                table_paths, table_pages = self._extract_and_save_tables(multimodal_data)
                 formula_refs, formula_pages = self._extract_formula_refs(multimodal_data)
 
             # 语义分块
@@ -813,7 +810,7 @@ class HybridPDFParser:
 
     # ==================== 图片存储与关联（VLM支持） ====================
 
-    def _get_figures_dir(self, pdf_path: str, paper_id: str = None) -> str:
+    def _get_figures_dir(self, pdf_path: str, paper_id: Optional[str] = None) -> str:
         """
         获取图片存储目录
 
@@ -845,7 +842,7 @@ class HybridPDFParser:
         pdf_path: str,
         page_num: int,
         figure_id: str,  # 格式: "3-Table1-1" 或 "5-Figure1-2"
-        paper_id: str = None  # 论文ID，用于按论文分类存储
+        paper_id: Optional[str] = None  # 论文ID，用于按论文分类存储
     ) -> Optional[str]:
         """
         保存图片到磁盘
@@ -892,7 +889,7 @@ class HybridPDFParser:
             logger.warning(f"⚠️ 保存图片失败: {e}")
             return None
 
-    def _extract_and_save_images(self, pdf_path: str, multimodal_data: Dict[str, Any], paper_id: str = None) -> Tuple[Dict[str, str], Dict[str, int]]:
+    def _extract_and_save_images(self, multimodal_data: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, int]]:
         """
         提取并保存图片，返回图片路径映射
 
@@ -923,8 +920,8 @@ class HybridPDFParser:
             page_num = img_info.get("page_number", 0)
 
             if saved_path and Path(saved_path).exists():
-                # 使用 (caption, page_num, idx) 作为复合键，避免 caption 重复导致覆盖
-                key = (caption, page_num, idx)
+                # 使用字符串键避免类型不匹配，格式 "caption|page_num|idx"
+                key = f"{caption}|{page_num}|{idx}"
                 if key not in image_paths:
                     image_paths[key] = saved_path
                     image_pages[key] = page_num
@@ -935,12 +932,7 @@ class HybridPDFParser:
 
         return image_paths, image_pages
 
-    def _extract_and_save_tables(
-        self,
-        pdf_path: str,
-        multimodal_data: Dict[str, Any],
-        paper_id: str = None
-    ) -> Tuple[Dict[Tuple[str, int, int], Tuple[str, str, str]], Dict[Tuple[str, int, int], int]]:
+    def _extract_and_save_tables(self, multimodal_data: Dict[str, Any]) -> Tuple[Dict[str, Tuple[str, str, str]], Dict[str, int]]:
         """
         提取并保存表格（CSV/PNG），返回表格路径映射
 
@@ -971,8 +963,8 @@ class HybridPDFParser:
             caption = table_info.get("caption") or ""
             page_num = table_info.get("page_number", 0)
 
-            # 使用 (caption, page_num, idx) 作为复合键，避免 caption 重复导致覆盖
-            key = (caption, page_num, idx)
+            # 使用字符串键避免类型不匹配，格式 "caption|page_num|idx"
+            key = f"{caption}|{page_num}|{idx}"
             if key not in table_paths:
                 table_paths[key] = (saved_csv or "", saved_png or "", caption)
                 table_pages[key] = page_num
@@ -1119,7 +1111,11 @@ class HybridPDFParser:
         # 构建图片引用映射：figure编号 -> (图片路径, 图注, 页码)
         figure_refs: Dict[str, Tuple[str, str, int]] = {}
         for key, path in image_paths.items():
-            caption_str, page_num, idx = key  # key is (caption_str, page_num, idx)
+            # key 格式: "caption|page_num|idx"
+            parts = key.split("|")
+            caption_str = parts[0]
+            page_num = int(parts[1]) if len(parts) > 1 else 0
+            idx = int(parts[2]) if len(parts) > 2 else 0
             figure_num = self._extract_figure_number(caption_str)
             if figure_num:
                 figure_refs[figure_num] = (path, caption_str, page_num)
@@ -1213,7 +1209,11 @@ class HybridPDFParser:
         # 构建表格引用映射：table编号 -> (csv_path, png_path, caption, 页码)
         table_refs: Dict[str, Tuple[str, str, str, int]] = {}
         for key, paths in table_paths.items():
-            caption_str, page_num, idx = key  # key is (caption_str, page_num, idx)
+            # key 格式: "caption|page_num|idx"
+            parts = key.split("|")
+            caption_str = parts[0]
+            page_num = int(parts[1]) if len(parts) > 1 else 0
+            idx = int(parts[2]) if len(parts) > 2 else 0
             table_num = self._extract_table_number(caption_str)
             if table_num:
                 table_refs[table_num] = (paths[0], paths[1], caption_str, page_num)
