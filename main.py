@@ -3849,12 +3849,14 @@ class PaperRAGPlugin(Star):
             from .idea_engine import IdeaEngine
             idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
 
-            # identifier 即为 folder hash，通过 index 反向查找真实 topic 名称
-            real_topic = idea_engine.find_topic_by_folder(identifier)
-            ideas_list, context_data = idea_engine.load_ideas_by_topic(identifier)
+            # identifier 可能是 folder hash 或 topic 名称，统一解析为 folder hash
+            ideas_dir = idea_engine._get_ideas_dir()
+            folder_hash = identifier if (ideas_dir / identifier).exists() else idea_engine._topic_hash(identifier)
+            real_topic = idea_engine.find_topic_by_folder(folder_hash)
+            ideas_list, context_data = idea_engine.load_ideas_by_topic(folder_hash)
 
             if not ideas_list:
-                yield event.plain_result(f"❌ 未找到 folder hash={identifier} 的想法")
+                yield event.plain_result(f"❌ 未找到 folder hash={folder_hash} 的想法")
                 return
 
             display_name = real_topic if real_topic else identifier
@@ -4305,6 +4307,20 @@ class PaperRAGPlugin(Star):
                 yield event.plain_result("📚 Usage: /idea tofeishu <topic> [folder_token]\n       /idea tofeishu <uuid1,uuid2,...> [folder_token]\nExample: /idea tofeishu 稀疏3DGS a1b2c3d4,e5f6g7h8")
                 return
 
+            if not folder_token:
+                yield event.plain_result("""❌ 创建飞书文档需要提供 folder_token
+
+获取方式：
+1. 打开飞书文档所在的文件夹
+2. 点击文件夹右上角的「···」
+3. 选择「复制链接」
+4. 链接格式: https://xxx.feishu.cn/drive/folder/xxxxx
+5. 链接最后一部分就是 folder_token（如 FWK2fMleClICfodlHHWc4Mygnhb）
+6. 使用方式: /idea tofeishu <主题> <folder_token>
+
+例如: /idea tofeishu 我的研究想法 FWK2fMleClICfodlHHWc4Mygnhb""")
+                return
+
             # 获取 RAG 引擎
             rag_engine = self._get_engine()
             if not rag_engine:
@@ -4331,10 +4347,11 @@ class PaperRAGPlugin(Star):
                 refresh = False
             else:
                 # 按 topic 加载（支持 folder hash 直接查找）
-                topic = ids
                 # 优先检查 ids 是否已是合法 folder hash
                 ideas_dir = idea_engine._get_ideas_dir()
-                folder_hash = ids if (ideas_dir / ids).exists() else idea_engine._topic_hash(topic)
+                folder_hash = ids if (ideas_dir / ids).exists() else idea_engine._topic_hash(ids)
+                # 如果 ids 是 folder hash，从 context 中读取真实 topic 名称
+                topic = idea_engine.find_topic_by_folder(folder_hash) or ids
                 if refresh:
                     yield event.plain_result(f"🔄 强制重新检索: {topic}")
                     analysis = await idea_engine.analyze_topic(topic, depth="standard")
@@ -4353,6 +4370,7 @@ class PaperRAGPlugin(Star):
                     if not ideas_list:
                         yield event.plain_result(f"❌ 未找到 folder hash={folder_hash} 的想法")
                         return
+                    topic = context_data.get("topic", topic) if context_data else topic
                     ideas = idea_engine.convert_to_research_ideas(ideas_list)
                     knowledge = context_data or {}
 
