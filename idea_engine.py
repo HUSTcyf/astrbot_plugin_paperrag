@@ -1685,9 +1685,9 @@ RELEVANT: <yes 或 no>
 
         images_list_str = '\n'.join(image_descriptions)
 
-        prompt = f"""你是一个学术图片审核助手。你的任务是根据正文内容判断哪些图片不应该出现在这个章节中。
+        prompt = f"""你是一个学术图片审核助手。你的任务是根据正文内容判断哪些图片不应该出现在这个章节中，并修正正文中的事实错误。
 
-**重要原则：不要修改、润色或精简正文内容。只判断哪些图片应当被删除。**
+**重要原则：只修改有事实错误的内容，其他部分保持原样不动：不要修改、删除或添加任何标题（##）、列表、代码块等结构标记，不要重新组织句子，不要删减内容。只判断哪些图片应当被删除。**
 
 章节标题：{section_title}
 
@@ -1710,7 +1710,8 @@ RELEVANT: <yes 或 no>
 请按以下 JSON 格式输出（只输出 JSON，不要任何其他文字）：
 {{
   "reasoning": "简要说明判断理由",
-  "remove": ["本地图-1", "本地图-3"]  // 需要删除的图片编号列表，空列表表示全部保留
+  "remove": ["本地图-1", "本地图-3"],
+  "modified": [{{"loc": "位置", "orig": "原句", "corr": "修正后", "reason": "原因"}}]
 }}"""
 
         try:
@@ -1752,6 +1753,10 @@ RELEVANT: <yes 或 no>
 
             remove_list = decision.get("remove", [])
             reasoning = decision.get("reasoning", "")
+            modified = decision.get("modified", [])
+            if modified:
+                for m in modified:
+                    logger.info(f"[IdeaEngine] 🔍 修正 [{m.get('loc','')}]: 「{m.get('orig','')}」→「{m.get('corr','')}」 原因: {m.get('reason','')}")
             logger.info(f"[IdeaEngine] VLM 审阅理由: {reasoning[:200]}")
 
             # 验证返回的列表只包含有效索引
@@ -1793,6 +1798,7 @@ RELEVANT: <yes 或 no>
 修复要求：
 1. 如果一句话中的图片/表格引用为空导致语句不通顺，重新组织该句或删除该引用
 2. **重要**：保持原文中的所有 markdown 格式和引用标记不变，特别是：
+   - `## xxx` 等标题标记必须原样保留，**不要删除或替换**
    - `[图X]`、`[表X]` 格式的引用（如 `[表2]`）必须原样保留，不要修改
    - `**加粗**`、`*斜体*`、`***加粗斜体***` 等格式必须原样保留
    - `[论文标题](url)` 格式的链接必须原样保留，**不要用代码块包裹**
