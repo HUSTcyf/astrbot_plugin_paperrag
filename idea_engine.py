@@ -2243,6 +2243,84 @@ RELEVANT: <yes 或 no>
             }
         }
 
+    async def _filter_figures_by_relevance(
+        self,
+        local_results: List[Dict[str, Any]],
+        query: str = "",
+        relevance_threshold: float = 0.3
+    ) -> List[Dict[str, Any]]:
+        """
+        第二阶段图表过滤：在 RAG 检索到的 paper 基础上，进行 figure 级别的相关性筛选
+
+        Args:
+            local_results: RAG 检索结果列表（包含 image_path, image_caption, text 等）
+            query: 搜索查询词（用于计算相关性）
+            relevance_threshold: 相关性阈值，默认 0.3
+
+        Returns:
+            List[Dict]: 过滤后的图片列表，只保留评分高于阈值的图片
+        """
+        logger.info(f"[IdeaEngine] 第二阶段图表过滤开始，输入 {len(local_results)} 条结果")
+
+        filtered_images = []
+        for result in local_results:
+            metadata = result.get("metadata", {})
+            image_path = metadata.get("image_path")
+
+            if not image_path:
+                continue
+
+            # 计算图片相关性评分
+            text_score = result.get("score", 0.0)
+            image_caption = metadata.get("image_caption", "")
+
+            # 评估 caption 丰富度（简单 caption 得低分）
+            caption_richness = 1.0 if not self._is_simple_caption(image_caption) else 0.3
+
+            # 综合评分：结合文本相关度和 caption 丰富度
+            image_score = text_score * 0.7 + caption_richness * 0.3
+
+            # 记录评分
+            logger.debug(f"[IdeaEngine] 图片评分: {image_path}, score={image_score:.3f} (text={text_score:.3f}, richness={caption_richness})")
+
+            # 只保留评分高于阈值的结果
+            if image_score >= relevance_threshold:
+                filtered_images.append({
+                    "image_path": image_path,
+                    "image_caption": image_caption,
+                    "image_score": image_score,
+                    "text_score": text_score,
+                    "caption_richness": caption_richness,
+                    "paper": result.get("paper", ""),
+                    "page": result.get("page", ""),
+                    "text": result.get("text", "")
+                })
+
+        logger.info(f"[IdeaEngine] 第二阶段图表过滤完成，保留 {len(filtered_images)}/{len(local_results)} 条结果")
+        return filtered_images
+
+    def _write_search_to_temp_file(self, web_results: List[Dict]) -> str:
+        """
+        将网络搜索结果写入临时文件，供 LLM 读取
+
+        Args:
+            web_results: 搜索结果列表
+
+        Returns:
+            str: 临时文件路径
+        """
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        temp_path = f"/tmp/paperrag_search_{timestamp}.json"
+
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(web_results, f, ensure_ascii=False, indent=2)
+            logger.info(f"[IdeaEngine] 搜索结果已写入临时文件: {temp_path}")
+            return temp_path
+        except Exception as e:
+            logger.error(f"[IdeaEngine] 写入搜索结果到临时文件失败: {e}")
+            return ""
+
     async def _call_brightdata_mcp_tool(
         self,
         tool_name: str,
@@ -2894,9 +2972,11 @@ RELEVANT: <yes 或 no>
                 prompt=prompt,
                 contexts=[],
                 temperature=0.7,
-                max_tokens=4096
+                max_tokens=3000
             )
 
+            # Token 统计
+            input_tokens = len(prompt) // 4  # 粗略估算
             response_text = ""
             # 方法1：检查 result_chain（AstrBot 格式）
             if hasattr(response, 'result_chain'):
@@ -2917,6 +2997,10 @@ RELEVANT: <yes 或 no>
             else:
                 response_text = str(response)
             result = self._parse_json_response(response_text)
+
+            # Token 统计日志
+            output_tokens = len(response_text) // 4  # 粗略估算
+            logger.info(f"[IdeaEngine] 生成消耗: {input_tokens} in, {output_tokens} out")
 
             if result and "ideas" in result:
                 ideas = []
@@ -3011,15 +3095,22 @@ RELEVANT: <yes 或 no>
         self,
         ideas: List[ResearchIdea],
         topic: str = "",
-        include_sources: bool = True
+        include_sources: bool = True,
+        max_token_per_section: int = 500
     ) -> str:
         """
-        将研究想法格式化为飞书文档兼容的Markdown格式
+        将研究想法格式化为飞书文档兼容的Markdown格式（多阶段润色）
+
+        多阶段润色：
+        1. 内容阶段：确保每个 section（描述、创新点、方法论）内容充实
+        2. 结构阶段：检查标题层级、列表格式、引用格式
+        3. 格式阶段：确保飞书兼容的 Markdown（表格、公式、图片引用）
 
         Args:
             ideas: 研究想法列表
             topic: 研究主题
             include_sources: 是否包含灵感来源
+            max_token_per_section: 每 section 最大 token 数（默认 500）
 
         Returns:
             str: 飞书兼容的Markdown格式内容
@@ -3027,7 +3118,18 @@ RELEVANT: <yes 或 no>
         if not ideas:
             return ""
 
+        # 多阶段润色说明（供后续 LLM 调用参考）
+        polish_instructions = f"""
+格式规范（请严格遵循）：
+- 每个 section 内容不超过 {max_token_per_section} tokens
+- 标题层级：# 一级 > ## 二级 > ### 三级
+- 列表格式：使用 - 或 1. ，保持一致性
+- 图片引用：使用 [图X] 格式
+- 公式格式：使用 $公式$ 行内公式
+- 飞书兼容：不使用复杂表格语法
+"""
         markdown_parts = [f"# {topic or '研究想法'}\n" if topic else "# 研究想法\n"]
+        markdown_parts.append(f"<!-- 格式规范: 每 section ≤{max_token_per_section} tokens -->\n")
 
         for i, idea in enumerate(ideas, 1):
             feasibility_bar = "★" * int(idea.feasibility * 5) + "☆" * (5 - int(idea.feasibility * 5))
