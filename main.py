@@ -3684,6 +3684,12 @@ class PaperRAGPlugin(Star):
     @filter.command_group("idea")
     def idea_commands(self):
         """研究创意生成命令组
+        gen                  - 生成研究想法并保存（第一阶段）
+        list                 - 列出所有已保存的 topic
+        show                 - 显示单个 topic 下所有想法
+        add                  - 为已有 topic 追加新想法
+        del                  - 删除指定 UUID 的想法
+        tofeishu             - 将想法创建为飞书文档（第二阶段）
         explore              - 探索研究想法（完整流程）
         analyze              - 分析研究主题
         search               - 多源知识检索
@@ -3693,6 +3699,296 @@ class PaperRAGPlugin(Star):
         test_feishu_markdown - 测试飞书 Markdown 解析（加粗/斜体/删除线/链接/图表引用/公式）
         """
         pass
+
+    @idea_commands.command("gen")
+    async def cmd_idea(self, event: AstrMessageEvent,
+                        topic: str = ""):
+        """
+        生成研究想法并保存到文件（第一阶段）
+
+        使用方式:
+        /idea gen <研究主题>
+        Example: /idea gen 稀疏3DGS开放词汇统一重建
+
+        流程：分析主题 → 检索知识 → 生成想法 → 保存到文件
+        保存后可手动编辑打磨，之后用 /idea tofeishu 创建飞书文档
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if not topic:
+            yield event.plain_result("📚 Usage: /idea gen <研究主题>\nExample: /idea gen 稀疏3DGS开放词汇统一重建")
+            return
+
+        yield event.plain_result(f"💡 正在分析研究主题...\n主题: {topic}")
+
+        try:
+            from .idea_engine import IdeaEngine
+
+            rag_engine = self._get_engine()
+            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
+
+            # 1. 分析主题
+            yield event.plain_result("📊 正在分析研究主题...")
+            analysis = await idea_engine.analyze_topic(topic, depth="standard")
+            if not analysis:
+                yield event.plain_result("❌ 主题分析失败")
+                return
+
+            # 2. 收集知识
+            yield event.plain_result("📚 正在检索知识...")
+            all_queries = (analysis.search_queries + analysis.local_rag_queries)[:5]
+            knowledge = await idea_engine.search_knowledge(all_queries, local_rag_top_k=3, web_top_k=5)
+
+            # 3. 生成研究想法
+            yield event.plain_result("💡 正在生成研究想法...")
+            ideas = await idea_engine.generate_ideas(
+                knowledge_context=knowledge.get("fused_context", ""),
+                research_domain=analysis.domain,
+                num_ideas=3,
+                idea_focus="all"
+            )
+
+            if not ideas:
+                yield event.plain_result("❌ 想法生成失败")
+                return
+
+            # 4. 保存到文件（每个 idea 独立文件）
+            saved = idea_engine.save_ideas_to_file(
+                ideas=ideas,
+                topic=topic,
+                knowledge=knowledge
+            )
+
+            # 5. 返回想法摘要
+            output = f"**💡 研究想法已生成并保存**\n\n"
+            output += f"📁 文件数: {len(saved)} 个\n\n"
+            output += f"**🔑 UUID 列表**\n"
+            for uid, path in saved:
+                output += f"`{uid}`\n"
+
+            output += f"\n**想法摘要 ({len(ideas)}个)**\n\n"
+
+            for i, idea in enumerate(ideas, 1):
+                output += f"""---
+**[{i}] {idea.title}**
+
+**✨ 创新点**: {idea.novelty[:150]}...
+**🔧 方法论**: {idea.methodology[:150]}...
+**⚠️ 挑战**: {', '.join(idea.potential_challenges[:2])}
+"""
+
+            output += "\n---\n\n"
+            output += "💡 如需调整想法，可编辑上述 JSON 文件中的 `ideas` 数组。\n"
+            output += "📄 确认后，使用 `/idea tofeishu <研究主题> <folder_token>` 创建飞书文档。"
+
+            yield event.plain_result(output)
+
+        except Exception as e:
+            logger.error(f"[IdeaEngine] 想法生成失败: {e}")
+            yield event.plain_result(f"❌ 生成失败: {e}")
+
+    @idea_commands.command("list")
+    async def cmd_idea_list(self, event: AstrMessageEvent):
+        """
+        列出所有已保存的 topic 及其想法数量
+
+        使用方式:
+        /idea list
+        """
+        try:
+            rag_engine = self._get_engine()
+            if not rag_engine:
+                yield event.plain_result("❌ RAG引擎未初始化")
+                return
+
+            from .idea_engine import IdeaEngine
+            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
+            topics = idea_engine.list_all_topics()
+
+            if not topics:
+                yield event.plain_result("📭 暂无已保存的 topic，运行 /idea <主题> 生成想法")
+                return
+
+            lines = ["**📚 已保存的 Topics：**\n"]
+            for i, t in enumerate(topics, 1):
+                lines.append(f"{i}. **{t['topic']}**")
+                lines.append(f"   📁 `{t['folder']}` · 💡 {t['idea_count']} 个想法 · {t['created_at']}")
+            lines.append("")
+            lines.append("使用 `/idea show <topic>` 查看详情")
+            lines.append("使用 `/idea tofeishu <topic>` 创建飞书文档")
+
+            yield event.plain_result("\n".join(lines))
+
+        except Exception as e:
+            logger.error(f"[IdeaEngine] 列出 topic 失败: {e}")
+            yield event.plain_result(f"❌ 列出失败: {e}")
+
+    @idea_commands.command("show")
+    async def cmd_idea_show(self, event: AstrMessageEvent, identifier: str = ""):
+        """
+        显示单个 topic 下的所有想法（支持 topic 名称或 folder hash）
+
+        使用方式:
+        /idea show <topic>
+        /idea show <folder_hash>
+        Example: /idea show 稀疏3DGS开放词汇统一重建
+        Example: /idea show -4500404867533322446
+        """
+        try:
+            if not identifier:
+                yield event.plain_result("📚 Usage: /idea show <topic>\nExample: /idea show 稀疏3DGS")
+                return
+
+            rag_engine = self._get_engine()
+            if not rag_engine:
+                yield event.plain_result("❌ RAG引擎未初始化")
+                return
+
+            from .idea_engine import IdeaEngine
+            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
+
+            # identifier 即为 folder hash，通过 index 反向查找真实 topic 名称
+            real_topic = idea_engine.find_topic_by_folder(identifier)
+            ideas_list, context_data = idea_engine.load_ideas_by_topic(identifier)
+
+            if not ideas_list:
+                yield event.plain_result(f"❌ 未找到 folder hash={identifier} 的想法")
+                return
+
+            display_name = real_topic if real_topic else identifier
+            lines = [f"**💡 Topic: {display_name}**（共 {len(ideas_list)} 个想法）\n"]
+            for i, idea_data in enumerate(ideas_list, 1):
+                idea = idea_data.get("idea", {})
+                title = idea.get("title", "无标题")
+                idea_id = idea_data.get("id", "?")
+                novelty = idea.get("novelty", "")
+                feasibility = idea.get("feasibility", "")
+                lines.append(f"**{i}. {title}** `[{idea_id}]`")
+                if isinstance(novelty, str) and novelty:
+                    lines.append(f"   🎯 创新点: {novelty[:80]}{'...' if len(novelty) > 80 else ''}")
+                if isinstance(feasibility, (int, float)) and feasibility:
+                    lines.append(f"   ✅ 可行性: {feasibility}")
+                lines.append("")
+
+            lines.append("使用 `/idea tofeishu <uuid1,uuid2>` 创建飞书文档")
+            lines.append("使用 `/idea tofeishu <topic>` 创建全部想法的飞书文档")
+
+            yield event.plain_result("\n".join(lines))
+
+        except Exception as e:
+            logger.error(f"[IdeaEngine] 显示想法失败: {e}")
+            yield event.plain_result(f"❌ 显示失败: {e}")
+
+    @idea_commands.command("add")
+    async def cmd_idea_add(self, event: AstrMessageEvent,
+                           topic: str = "",
+                           num_ideas: int = 3):
+        """
+        为已有 topic 追加新想法（复用现有知识上下文）
+
+        使用方式:
+        /idea add <topic> [数量]
+        Example: /idea add 稀疏3DGS 2
+        """
+        try:
+            if not topic:
+                yield event.plain_result("📚 Usage: /idea add <topic> [数量]\nExample: /idea add 稀疏3DGS 2")
+                return
+
+            rag_engine = self._get_engine()
+            if not rag_engine:
+                yield event.plain_result("❌ RAG引擎未初始化")
+                return
+
+            from .idea_engine import IdeaEngine
+            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
+
+            yield event.plain_result(f"💡 正在为 topic「{topic}」追加 {num_ideas} 个想法...\n⏳ 复用现有知识上下文生成新想法")
+
+            ideas, knowledge = await idea_engine.add_ideas_to_topic(
+                topic=topic,
+                num_ideas=num_ideas,
+                idea_focus="all"
+            )
+
+            if not ideas:
+                yield event.plain_result("❌ 想法生成失败")
+                return
+
+            # 获取刚保存的 UUID（最后 num_ideas 个）
+            all_ideas, _ = idea_engine.load_ideas_by_topic(idea_engine._topic_hash(topic))
+            new_uuids = [a.get("id") for a in all_ideas[-num_ideas:]]
+
+            output = f"**✅ 已为「{topic}」追加 {len(ideas)} 个新想法**\n\n"
+            output += f"**🔑 新增 UUID 列表**\n"
+            for uid in new_uuids:
+                output += f"`{uid}`\n"
+
+            output += f"\n**新想法摘要**\n\n"
+            for i, idea in enumerate(ideas, 1):
+                output += f"""---
+**[{i}] {idea.title}**
+
+**✨ 创新点**: {idea.novelty[:150]}...
+**🔧 方法论**: {idea.methodology[:150]}...
+"""
+
+            output += "\n---\n\n"
+            output += f"💡 当前 topic 共有 {len(all_ideas)} 个想法。\n"
+            output += f"📄 使用 `/idea tofeishu <topic>` 创建飞书文档。"
+
+            yield event.plain_result(output)
+
+        except ValueError as e:
+            yield event.plain_result(f"❌ {e}")
+        except Exception as e:
+            logger.error(f"[IdeaEngine] 追加想法失败: {e}")
+            yield event.plain_result(f"❌ 追加失败: {e}")
+
+    @idea_commands.command("del")
+    async def cmd_idea_del(self, event: AstrMessageEvent,
+                           ids: str = ""):
+        """
+        删除指定 UUID 的想法
+
+        使用方式:
+        /idea del <uuid1,uuid2,...>
+        Example: /idea del a1b2c3d4,e5f6g7h8
+        """
+        try:
+            if not ids:
+                yield event.plain_result("📚 Usage: /idea del <uuid1,uuid2,...>\nExample: /idea del a1b2c3d4,e5f6g7h8")
+                return
+
+            uuids = [u.strip() for u in ids.split(",")]
+            rag_engine = self._get_engine()
+            if not rag_engine:
+                yield event.plain_result("❌ RAG引擎未初始化")
+                return
+
+            from .idea_engine import IdeaEngine
+            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
+
+            deleted, topic = idea_engine.delete_ideas_by_uuids(uuids)
+
+            if not deleted:
+                yield event.plain_result(f"❌ 未找到匹配 UUID 的想法: {uuids}")
+                return
+
+            output = f"**🗑️ 已删除 {len(deleted)} 个想法**\n"
+            for uid in deleted:
+                output += f"  - `{uid}`\n"
+            if topic:
+                remaining, _ = idea_engine.load_ideas_by_topic(idea_engine._topic_hash(topic))
+                output += f"\n💡 topic「{topic}」剩余 {len(remaining)} 个想法"
+
+            yield event.plain_result(output)
+
+        except Exception as e:
+            logger.error(f"[IdeaEngine] 删除想法失败: {e}")
+            yield event.plain_result(f"❌ 删除失败: {e}")
 
     @idea_commands.command("explore")
     async def cmd_idea_explore(self, event: AstrMessageEvent,
@@ -3981,26 +4277,33 @@ class PaperRAGPlugin(Star):
 
     @idea_commands.command("tofeishu")
     async def cmd_idea_tofeishu(self, event: AstrMessageEvent,
-                                  topic: str = "",
+                                  ids: str = "",
                                   folder_token: str = "",
-                                  table_format: str = "png"):
+                                  table_format: str = "png",
+                                  refresh: bool = False):
         """
-        将研究想法导出为飞书文档
+        将研究想法导出为飞书文档（第二阶段）
 
         使用方式:
-        /idea tofeishu <研究主题> [folder_token] [table_format]
-        /idea tofeishu <研究主题> <folder_token> <table_format>
-        Example: /idea tofeishu 大语言模型在医学诊断中的应用
-        Example: /idea tofeishu 大语言模型在医学诊断中的应用 <folder_token>
-        Example: /idea tofeishu 大语言模型在医学诊断中的应用 <folder_token> md
-        table_format 可选值: csv - 飞书原生表格, md - Markdown文本块, png(默认) - 图片
+        /idea tofeishu <topic> [folder_token] [table_format]      # 按 topic 加载全部
+        /idea tofeishu <uuid1,uuid2,...> [folder_token] [table_format]  # 按 UUID 加载指定想法
+        /idea tofeishu <topic> [folder_token] refresh            # 强制重新检索
+
+        Examples:
+        /idea tofeishu 稀疏3DGS开放词汇统一重建
+        /idea tofeishu 稀疏3DGS开放词汇统一重建 <folder_token>
+        /idea tofeishu 稀疏3DGS开放词汇统一重建 <folder_token> md
+        /idea tofeishu a1b2c3d4,e5f6g7h8 <folder_token>           # 加载指定 UUID
+        /idea tofeishu 稀疏3DGS <folder_token> refresh           # 强制重新检索
+
+        加载优先级：ids 含逗号 → UUID 精确加载；否则 → topic 加载该 topic 下全部
+        refresh=True 时：强制重新检索知识，不使用缓存 context
+        table_format: csv(飞书原生表格) / md(Markdown文本块) / png(默认,图片)
         """
         try:
-            if not topic:
-                yield event.plain_result("📚 Usage: /idea tofeishu <研究主题> [folder_token]\nExample: /idea tofeishu 大语言模型在医学诊断中的应用")
+            if not ids:
+                yield event.plain_result("📚 Usage: /idea tofeishu <topic> [folder_token]\n       /idea tofeishu <uuid1,uuid2,...> [folder_token]\nExample: /idea tofeishu 稀疏3DGS a1b2c3d4,e5f6g7h8")
                 return
-
-            yield event.plain_result(f"🔍 正在分析主题: {topic}")
 
             # 获取 RAG 引擎
             rag_engine = self._get_engine()
@@ -4012,34 +4315,54 @@ class PaperRAGPlugin(Star):
             from .idea_engine import IdeaEngine
             idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
 
-            # 1. 分析主题
-            yield event.plain_result("📊 正在分析研究主题...")
-            analysis = await idea_engine.analyze_topic(topic, depth="standard")
-            if not analysis:
-                yield event.plain_result("❌ 主题分析失败")
-                return
+            # 判断是 UUID 列表还是 topic
+            if "," in ids:
+                # 按 UUID 精确加载
+                uuids = [u.strip() for u in ids.split(",")]
+                yield event.plain_result(f"📂 按 UUID 加载想法: {uuids}")
+                ideas_list, context_data = idea_engine.load_ideas_by_uuids(uuids)
+                if not ideas_list:
+                    yield event.plain_result(f"❌ 未找到指定 UUID 的想法: {uuids}")
+                    return
+                ideas = idea_engine.convert_to_research_ideas(ideas_list)
+                knowledge = context_data or {}
+                topic = context_data.get("topic", ids) if context_data else ids
+                # UUID 加载时忽略 refresh（无重新检索需求）
+                refresh = False
+            else:
+                # 按 topic 加载（支持 folder hash 直接查找）
+                topic = ids
+                # 优先检查 ids 是否已是合法 folder hash
+                ideas_dir = idea_engine._get_ideas_dir()
+                folder_hash = ids if (ideas_dir / ids).exists() else idea_engine._topic_hash(topic)
+                if refresh:
+                    yield event.plain_result(f"🔄 强制重新检索: {topic}")
+                    analysis = await idea_engine.analyze_topic(topic, depth="standard")
+                    if not analysis:
+                        yield event.plain_result("❌ 主题分析失败")
+                        return
+                    all_queries = (analysis.search_queries + analysis.local_rag_queries)[:5]
+                    knowledge = await idea_engine.search_knowledge(all_queries, local_rag_top_k=3, web_top_k=5)
+                    ideas_list, _ = idea_engine.load_ideas_by_topic(folder_hash)
+                    ideas = idea_engine.convert_to_research_ideas(ideas_list)
+                    # 重新保存 context
+                    idea_engine.save_ideas_to_file(ideas, topic, knowledge)
+                    yield event.plain_result(f"💾 已更新 context")
+                else:
+                    ideas_list, context_data = idea_engine.load_ideas_by_topic(folder_hash)
+                    if not ideas_list:
+                        yield event.plain_result(f"❌ 未找到 folder hash={folder_hash} 的想法")
+                        return
+                    ideas = idea_engine.convert_to_research_ideas(ideas_list)
+                    knowledge = context_data or {}
 
-            # 2. 收集知识
-            yield event.plain_result("📚 正在检索知识...")
-            all_queries = (analysis.search_queries + analysis.local_rag_queries)[:5]
-            knowledge = await idea_engine.search_knowledge(all_queries, local_rag_top_k=3, web_top_k=5)
+            if not ideas:
+                yield event.plain_result("❌ 想法为空")
+                return
 
             # 调试：输出媒体 caption 提取统计
             debug_report = idea_engine.debug_media_captions(knowledge)
             logger.info(f"[IdeaEngine] {debug_report}")
-
-            # 3. 生成研究想法
-            yield event.plain_result("💡 正在生成研究想法...")
-            ideas = await idea_engine.generate_ideas(
-                knowledge_context=knowledge.get("fused_context", ""),
-                research_domain=analysis.domain,
-                num_ideas=3,
-                idea_focus="all"
-            )
-
-            if not ideas:
-                yield event.plain_result("❌ 想法生成失败")
-                return
 
             # 4. 创建飞书文档（传入知识检索结果以生成引用）
             yield event.plain_result("📄 正在创建飞书文档...")

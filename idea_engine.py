@@ -4,6 +4,7 @@
 整合Bright Data网络搜索 + 本地Paper RAG + LLM生成
 """
 
+import hashlib
 import json
 import re
 import mistune
@@ -14,6 +15,7 @@ import httpx
 from typing import Dict, Any, List, Optional, Tuple, cast
 from dataclasses import dataclass
 from pathlib import Path
+from datetime import datetime
 
 from astrbot.api import logger
 from astrbot.core.agent.run_context import ContextWrapper
@@ -262,6 +264,427 @@ class IdeaEngine:
             logger.warning(f"[IdeaEngine] 检查 Bright Data 配置失败: {e}")
             return False
 
+    def _get_ideas_dir(self) -> Path:
+        """获取想法存储根目录，不存在则创建"""
+        ideas_dir = Path(__file__).parent.parent.parent / "plugin_data" / "astrbot_plugin_paperrag" / "ideas"
+        ideas_dir.mkdir(parents=True, exist_ok=True)
+        return ideas_dir
+
+    def _topic_folder(self, topic: str) -> Path:
+        """获取 topic 对应的文件夹路径（使用 MD5 哈希，跨进程稳定）"""
+        return self._get_ideas_dir() / self._topic_hash(topic)
+
+    def _topic_hash(self, topic: str) -> str:
+        """计算 topic 对应的 folder hash（MD5 hex 前16位）"""
+        return hashlib.md5(topic.encode()).hexdigest()[:16]
+
+    def _get_topic_index(self) -> Dict[str, str]:
+        """获取 folder_name → topic 的索引"""
+        index_file = self._get_ideas_dir() / "topic_index.json"
+        if index_file.exists():
+            try:
+                with open(index_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return data
+                    logger.warning("[IdeaEngine] topic_index.json 格式错误（非 dict）")
+            except (json.JSONDecodeError, IOError):
+                pass
+        return {}
+
+    def find_topic_by_folder(self, folder_name: str) -> Optional[str]:
+        """根据 folder_name 查找对应的 topic"""
+        return self._get_topic_index().get(folder_name)
+
+    def _save_topic_index(self, index: Dict[str, str]) -> None:
+        """保存 topic → folder_name 索引"""
+        index_file = self._get_ideas_dir() / "topic_index.json"
+        with open(index_file, "w", encoding="utf-8") as f:
+            json.dump(index, f, ensure_ascii=False, indent=2)
+
+    def list_all_topics(self) -> List[Dict[str, Any]]:
+        """
+        列出所有已保存的 topic 及其元信息
+
+        Returns:
+            List[Dict]: [{"topic": str, "folder": str, "idea_count": int, "created_at": str}, ...]
+        """
+        index = self._get_topic_index()
+        ideas_dir = self._get_ideas_dir()
+        result = []
+
+        for folder_name, topic in index.items():
+            folder = ideas_dir / folder_name
+            if not folder.exists():
+                continue
+
+            # 统计 idea 数量（排除 context.json）
+            idea_files = [f for f in folder.glob("*.json") if f.name != "context.json"]
+            created_at = ""
+            if (folder / "context.json").exists():
+                try:
+                    with open(folder / "context.json", "r", encoding="utf-8") as f:
+                        ctx = json.load(f)
+                        if isinstance(ctx, dict):
+                            created_at = ctx.get("created_at", "")
+                except (json.JSONDecodeError, IOError):
+                    pass
+
+            result.append({
+                "topic": topic,
+                "folder": folder_name,
+                "idea_count": len(idea_files),
+                "created_at": created_at
+            })
+
+        return result
+
+    def delete_ideas_by_uuids(self, uuids: List[str]) -> Tuple[List[str], Optional[str]]:
+        """
+        根据 UUID 列表删除想法文件
+
+        通过扫描 topic_index 定位 UUID 所在文件夹
+
+        Args:
+            uuids: UUID 列表
+
+        Returns:
+            Tuple[List[已删除的UUID], 所属topic]
+        """
+        ideas_dir = self._get_ideas_dir()
+        index = self._get_topic_index()
+        deleted = []
+        found_topic = None
+
+        for folder_name, topic in index.items():
+            folder = ideas_dir / folder_name
+            if not folder.exists():
+                continue
+            for uid in uuids:
+                file_path = folder / f"{uid}.json"
+                if file_path.exists():
+                    file_path.unlink()
+                    deleted.append(uid)
+                    if found_topic is None:
+                        found_topic = topic
+                    logger.info(f"[IdeaEngine] 已删除想法: {file_path}")
+
+        return deleted, found_topic
+
+    async def add_ideas_to_topic(
+        self,
+        topic: str,
+        num_ideas: int = 3,
+        idea_focus: str = "all"
+    ) -> Tuple[List["ResearchIdea"], Dict[str, Any]]:
+        """
+        为已有 topic 追加新想法（复用现有 context）
+
+        Args:
+            topic: 已有 topic
+            num_ideas: 追加想法数量
+            idea_focus: 想法聚焦方向
+
+        Returns:
+            Tuple[新生成的想法列表, 现有knowledge dict]
+        """
+        # 加载现有 context
+        context_data = self._load_context(topic)
+        if not context_data:
+            raise ValueError(f"Topic '{topic}' 不存在，请先运行 /idea {topic}")
+
+        # 重建 knowledge dict（格式需与 search_knowledge 一致）
+        knowledge = {
+            "local_results": context_data.get("local_results", []),
+            "web_results": context_data.get("web_results", []),
+            "fused_context": self._fuse_knowledge_context(
+                context_data.get("local_results", []),
+                context_data.get("web_results", [])
+            )
+        }
+
+        # 生成新想法
+        ideas = await self.generate_ideas(
+            knowledge_context=knowledge.get("fused_context", ""),
+            research_domain=context_data.get("domain", ""),
+            num_ideas=num_ideas,
+            idea_focus=idea_focus
+        )
+
+        # 保存新想法（追加到 topic 文件夹）
+        self._save_ideas_append(ideas, topic, knowledge)
+
+        return ideas, knowledge
+
+    def _save_ideas_append(
+        self,
+        ideas: List["ResearchIdea"],
+        topic: str,
+        knowledge: Dict[str, Any]
+    ) -> List[Tuple[str, Path]]:
+        """追加保存想法到已有 topic 文件夹（不覆盖已有想法）"""
+        import uuid as uuid_module
+
+        folder = self._topic_folder(topic)
+        folder.mkdir(parents=True, exist_ok=True)
+
+        # 更新 topic 索引（folder_name → topic）
+        index = self._get_topic_index()
+        index[folder.name] = topic
+        self._save_topic_index(index)
+
+        results = []
+        for idea in ideas:
+            idea_uuid = str(uuid_module.uuid4())[:8]
+            idea_data = {
+                "id": idea_uuid,
+                "topic": topic,
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "idea": {
+                    "title": idea.title,
+                    "description": idea.description,
+                    "novelty": idea.novelty,
+                    "methodology": idea.methodology,
+                    "potential_challenges": idea.potential_challenges,
+                    "related_work": idea.related_work,
+                    "feasibility": idea.feasibility,
+                    "inspiration_sources": idea.inspiration_sources
+                }
+            }
+            file_path = folder / f"{idea_uuid}.json"
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(idea_data, f, ensure_ascii=False, indent=2)
+            results.append((idea_uuid, file_path))
+            logger.info(f"[IdeaEngine] 追加想法已保存: {file_path}")
+
+        return results
+
+    def _fuse_knowledge_context(
+        self,
+        local_results: List[Dict],
+        web_results: List[Dict]
+    ) -> str:
+        """将 local 和 web 结果融合为文本上下文"""
+        parts = []
+        for r in local_results[:8]:
+            title = r.get("title", "")
+            content = r.get("content", "")[:500]
+            if title or content:
+                parts.append(f"[本地文档] {title}\n{content}")
+        for r in web_results[:5]:
+            title = r.get("title", "")
+            content = r.get("content", "")[:500]
+            url = r.get("url", "")
+            if title or content:
+                parts.append(f"[网页] {title}\n{content}\n{url}")
+        return "\n\n".join(parts)
+
+    def _get_context_path(self, topic: str) -> Path:
+        """获取 topic 文件夹下的 context.json 路径"""
+        return self._topic_folder(topic) / "context.json"
+
+    def _save_context(self, topic: str, knowledge: Dict[str, Any]) -> None:
+        """保存共享 context 到 topic 文件夹"""
+        folder = self._topic_folder(topic)
+        folder.mkdir(parents=True, exist_ok=True)
+        ctx_data = {
+            "topic": topic,
+            "local_results": knowledge.get("local_results", [])[:8],
+            "web_results": knowledge.get("web_results", [])[:5]
+        }
+        with open(self._get_context_path(topic), "w", encoding="utf-8") as f:
+            json.dump(ctx_data, f, ensure_ascii=False, indent=2)
+
+    def _load_context(self, topic: str) -> Optional[Dict[str, Any]]:
+        """加载共享 context（topic 可能是原始名称或 folder hash）"""
+        # 如果 topic 本身是合法的 folder 名，直接使用；否则计算 hash
+        folder = self._get_ideas_dir() / topic
+        if not folder.exists():
+            folder = self._topic_folder(topic)
+        ctx_path = folder / "context.json"
+        if not ctx_path.exists():
+            return None
+        try:
+            with open(ctx_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+                logger.warning(f"[IdeaEngine] context.json 格式错误（非 dict 类型）: {type(data)}")
+                return None
+        except (json.JSONDecodeError, IOError):
+            return None
+
+    def save_ideas_to_file(
+        self,
+        ideas: List["ResearchIdea"],
+        topic: str,
+        knowledge: Dict[str, Any]
+    ) -> List[Tuple[str, Path]]:
+        """
+        将多个想法及上下文保存到 topic 文件夹
+
+        目录结构:
+        ideas/
+          topic_index.json
+          <hash(topic)>/
+            context.json          # 共享 context
+            <uuid1>.json        # 单个 idea
+            <uuid2>.json
+
+        Args:
+            ideas: 研究想法列表
+            topic: 原始 topic
+            knowledge: 知识检索结果
+
+        Returns:
+            List[Tuple[str, Path]]: [(uuid, 文件路径), ...]
+        """
+        import uuid as uuid_module
+
+        folder = self._topic_folder(topic)
+        folder.mkdir(parents=True, exist_ok=True)
+
+        # 保存共享 context
+        self._save_context(topic, knowledge)
+
+        # 保存每个 idea 到 topic 文件夹
+        results = []
+        for idea in ideas:
+            idea_uuid = str(uuid_module.uuid4())[:8]
+            idea_data = {
+                "id": idea_uuid,
+                "topic": topic,
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "idea": {
+                    "title": idea.title,
+                    "description": idea.description,
+                    "novelty": idea.novelty,
+                    "methodology": idea.methodology,
+                    "potential_challenges": idea.potential_challenges,
+                    "related_work": idea.related_work,
+                    "feasibility": idea.feasibility,
+                    "inspiration_sources": idea.inspiration_sources
+                }
+            }
+            file_path = folder / f"{idea_uuid}.json"
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(idea_data, f, ensure_ascii=False, indent=2)
+            results.append((idea_uuid, file_path))
+            logger.info(f"[IdeaEngine] 想法已保存: {file_path}")
+
+        # 更新 topic 索引（folder_name → topic）
+        index = self._get_topic_index()
+        index[folder.name] = topic
+        self._save_topic_index(index)
+
+        return results
+
+    def load_ideas_by_uuids(
+        self,
+        uuids: List[str]
+    ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """
+        根据 UUID 列表加载想法，同时加载共享 context
+
+        通过扫描 topic_index.json 定位 UUID 所在的文件夹，无需 topic 参数
+
+        Args:
+            uuids: UUID 列表，如 ["a1b2c3d4", "e5f6g7h8"]
+
+        Returns:
+            Tuple[List[想法dict], context dict]
+        """
+        ideas_dir = self._get_ideas_dir()
+        index = self._get_topic_index()
+        loaded = []
+        found_topic = None
+
+        for folder_name, topic in index.items():
+            folder = ideas_dir / folder_name
+            if not folder.exists():
+                continue
+            for uid in uuids:
+                file_path = folder / f"{uid}.json"
+                if file_path.exists():
+                    try:
+                        with open(file_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        if isinstance(data, dict):
+                            loaded.append(data)
+                            if found_topic is None:
+                                found_topic = topic
+                        else:
+                            logger.warning(f"[IdeaEngine] 想法文件格式错误（非 dict）: {uid}")
+                    except (json.JSONDecodeError, IOError) as e:
+                        logger.error(f"[IdeaEngine] 读取想法文件失败 {uid}: {e}")
+
+        context = self._load_context(found_topic) if found_topic else None
+        return loaded, context
+
+    def load_ideas_by_topic(
+        self, folder_hash: str
+    ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """
+        根据 folder hash 加载该 topic 下所有想法
+
+        Args:
+            folder_hash: folder 名称（MD5 hash）
+
+        Returns:
+            Tuple[List[想法dict], context dict]
+        """
+        folder = self._get_ideas_dir() / folder_hash
+        if not folder.exists():
+            logger.warning(f"[IdeaEngine] 未找到 folder_hash={folder_hash} 的文件夹")
+            return [], None
+
+        loaded = []
+        for file_path in folder.glob("*.json"):
+            if file_path.name == "context.json":
+                continue
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    loaded.append(data)
+                else:
+                    logger.warning(f"[IdeaEngine] 想法文件格式错误（非 dict）: {file_path.name}")
+            except (json.JSONDecodeError, IOError):
+                logger.warning(f"[IdeaEngine] 跳过损坏的想法文件: {file_path.name}")
+
+        context = self._load_context(folder_hash)
+        return loaded, context
+
+    def convert_to_research_ideas(
+        self, ideas_list: List[Dict[str, Any]]
+    ) -> List["ResearchIdea"]:
+        """
+        将想法数据列表转换回 ResearchIdea 对象列表
+
+        Args:
+            ideas_list: load_ideas_by_uuids 返回的想法列表
+
+        Returns:
+            List[ResearchIdea]
+        """
+        research_ideas = []
+        for data in ideas_list:
+            if not isinstance(data, dict):
+                logger.warning(f"[IdeaEngine] 跳过无效想法数据: {type(data)}")
+                continue
+            item = data.get("idea", {})
+            research_ideas.append(ResearchIdea(
+                title=item.get("title", ""),
+                description=item.get("description", ""),
+                novelty=item.get("novelty", ""),
+                methodology=item.get("methodology", ""),
+                potential_challenges=item.get("potential_challenges", []),
+                related_work=item.get("related_work", []),
+                feasibility=item.get("feasibility", 0.5),
+                inspiration_sources=item.get("inspiration_sources", [])
+            ))
+        return research_ideas
+
     def _get_llm_provider(self):
         """获取LLM provider"""
         if not self.context:
@@ -500,7 +923,7 @@ class IdeaEngine:
                 prompt=polish_prompt,
                 contexts=[],
                 temperature=0.3,
-                max_tokens=16384
+                max_tokens=32768
             )
             polished = self._extract_text_from_response(response)
 
@@ -567,10 +990,10 @@ class IdeaEngine:
         local_table_idx = 0
         if local_results:
             parts.append("## 本地论文检索引用：\n")
-            for i, result in enumerate(local_results[:15], 1):  # 最多15条
+            for i, result in enumerate(local_results[:8], 1):  # 最多8条
                 paper = result.get("paper", "Unknown")
                 page = result.get("page", "N/A")
-                text = result.get("text", "")[:500]
+                text = result.get("text", "")[:300]
                 score = result.get("score", 0.0)
                 metadata = result.get("metadata", {})
                 file_name = metadata.get("file_name", "")
@@ -683,7 +1106,7 @@ class IdeaEngine:
         # 网络搜索引用（直接使用 Markdown 链接格式）
         if web_results:
             parts.append(f"## 网络搜索引用：\n")
-            for i, result in enumerate(web_results[:10], 1):  # 最多10条
+            for i, result in enumerate(web_results[:5], 1):  # 最多5条
                 title = result.get("title", "Untitled")
                 url = result.get("url", "")
                 snippet = result.get("snippet", "")[:300]
@@ -2196,6 +2619,7 @@ RELEVANT: <yes 或 no>
                 return {"success": False, "error": error_msg}
 
             # 解析结果
+            assert result is not None
             if hasattr(result, 'content') and result.content:
                 text = result.content[0].text if hasattr(result.content[0], 'text') else str(result.content[0])
                 return {"success": True, "data": text}
@@ -2444,7 +2868,7 @@ RELEVANT: <yes 或 no>
             "methodology": "方法论建议",
             "potential_challenges": ["挑战1", "挑战2"],
             "related_work": ["相关工作1", "相关工作2"],
-            "feasibility": 0.8,
+            "feasibility": 0.0到1.0之间的浮点数,
             "inspiration_sources": ["灵感来源1", "灵感来源2"]
         }},
         ...
@@ -3941,14 +4365,16 @@ RELEVANT: <yes 或 no>
 
         # 创建带自定义插件的 Markdown
         md = mistune.create_markdown(plugins=['strikethrough'])
+        if md is None:
+            raise RuntimeError("mistune.create_markdown() returned None")
 
         # 注册 [图X]/[表X] 规则（在 link 之前，避免 [text](url) 干扰）
-        md.inline.register('fig_ref', r'\[(图|表)(\d+)\]', parse_fig_ref, before='link')
-        md.renderer.register('fig_ref', render_fig_ref)
+        md.inline.register('fig_ref', r'\[(图|表)(\d+)\]', parse_fig_ref, before='link')  # type: ignore
+        md.renderer.register('fig_ref', render_fig_ref)  # type: ignore
 
         # 注册 $公式$ 规则（在 emphasis 之前）
-        md.inline.register('latex', r'\$([^$\n]+?)\$', parse_latex, before='emphasis')
-        md.renderer.register('latex', render_latex)
+        md.inline.register('latex', r'\$([^$\n]+?)\$', parse_latex, before='emphasis')  # type: ignore
+        md.renderer.register('latex', render_latex)  # type: ignore
 
         return md
 
@@ -3973,7 +4399,7 @@ RELEVANT: <yes 或 no>
         html = md(text)
 
         # 使用 Python 内置 html.parser 解析 HTML
-        result = self._parse_html_with_html_parser(html)
+        result = self._parse_html_with_html_parser(cast(str, html))
 
         return result if result else [{"text": text, "style": {}}]
 

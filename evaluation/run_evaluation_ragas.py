@@ -1325,7 +1325,6 @@ def main():
     if args.embedding_mode == "ollama":
         print(f"   Ollama 地址: {args.ollama_base_url}")
         print(f"   Ollama Embed 模型: {args.ollama_embed_model}")
-    print(f"   测试问题数量: {args.test_size}")
 
     if not llm_api_key:
         print("⚠️ 警告: 未提供 API Key（设置 EVAL_LLM_API_KEY 环境变量或使用 --llm-api-key）")
@@ -1403,8 +1402,13 @@ def main():
                 print(f"❌ raw_answers.json 不存在: {raw_answers_path}")
                 print("请先运行带 RAG 推理的评估命令，生成该文件")
                 return
+            # 读取实际问题数量
+            with open(raw_answers_path, "r", encoding="utf-8") as f:
+                raw_data = json.load(f)
+            actual_count = len(raw_data)
             print(f"✅ 跳过 RAG 推理，从已有结果评估")
             print(f"   raw_answers: {raw_answers_path}")
+            print(f"   测试问题数量: {actual_count} (来自 raw_answers.json)")
             asyncio.run(run_evaluation_from_raw_answers(
                 raw_answers_path=raw_answers_path,
                 output_path=results_path,
@@ -1429,6 +1433,7 @@ def main():
                 return
 
             print(f"✅ 使用已有测试集: {testset_path}")
+            print(f"   测试问题数量: {args.test_size}")
 
             # 创建 RAG 引擎
             from rag_engine import create_rag_engine, RAGConfig
@@ -1492,6 +1497,7 @@ def main():
                 embedding_model=args.embedding_model,
                 embed_base_url=embed_base_url,
                 embed_api_key=embed_api_key,
+                eval_embedding_mode=args.eval_embedding_mode,
             ))
 
         # 生成报告

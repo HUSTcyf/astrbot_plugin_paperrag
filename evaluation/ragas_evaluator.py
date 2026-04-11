@@ -581,10 +581,12 @@ class RagasEvaluator:
             result = await rag_wrapper.aquery(sample.question, force_english=True)
             latency = (time.time() - start) * 1000
 
+            # 使用测试集原始标记，而不是从检索结果推断
+            has_multimodal = sample.metadata.get("is_multimodal", False)
+
             # 提取上下文文本（包含多模态信息）
             contexts = []
             source_nodes = result.get("sources", [])
-            has_multimodal = False
 
             for node in source_nodes:
                 if hasattr(node, "text"):
@@ -597,12 +599,10 @@ class RagasEvaluator:
                     text = str(node)
                     node_metadata = {}
 
-                # 检查是否有多模态内容
+                # 从检索结果中提取多模态信息（不影响 has_multimodal 判定）
                 if isinstance(node_metadata, dict):
                     image_path = node_metadata.get("image_path", "")
                     table_path = node_metadata.get("table_path", "")
-                    if image_path or table_path:
-                        has_multimodal = True
 
                     # 如果 RAG 引擎没有自动添加图片信息，手动添加
                     if image_path and "[IMAGE" not in text:
@@ -618,9 +618,9 @@ class RagasEvaluator:
 
                 contexts.append(text)
 
-            # 获取使用的图片列表（如果有）
+            # 获取使用的图片列表（从检索结果中提取，与原始问题类型无关）
             used_images = result.get("images", [])
-            if not used_images and has_multimodal:
+            if not used_images:
                 # 从 sources 中提取图片路径
                 used_images = []
                 for node in source_nodes:
