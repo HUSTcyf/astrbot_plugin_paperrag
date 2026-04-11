@@ -2246,7 +2246,6 @@ RELEVANT: <yes 或 no>
     async def _filter_figures_by_relevance(
         self,
         local_results: List[Dict[str, Any]],
-        query: str = "",
         relevance_threshold: float = 0.3
     ) -> List[Dict[str, Any]]:
         """
@@ -2254,7 +2253,6 @@ RELEVANT: <yes 或 no>
 
         Args:
             local_results: RAG 检索结果列表（包含 image_path, image_caption, text 等）
-            query: 搜索查询词（用于计算相关性）
             relevance_threshold: 相关性阈值，默认 0.3
 
         Returns:
@@ -2971,12 +2969,9 @@ RELEVANT: <yes 或 no>
             response = await provider.text_chat(
                 prompt=prompt,
                 contexts=[],
-                temperature=0.7,
-                max_tokens=3000
+                temperature=0.7
             )
 
-            # Token 统计
-            input_tokens = len(prompt) // 4  # 粗略估算
             response_text = ""
             # 方法1：检查 result_chain（AstrBot 格式）
             if hasattr(response, 'result_chain'):
@@ -2997,10 +2992,6 @@ RELEVANT: <yes 或 no>
             else:
                 response_text = str(response)
             result = self._parse_json_response(response_text)
-
-            # Token 统计日志
-            output_tokens = len(response_text) // 4  # 粗略估算
-            logger.info(f"[IdeaEngine] 生成消耗: {input_tokens} in, {output_tokens} out")
 
             if result and "ideas" in result:
                 ideas = []
@@ -3095,22 +3086,22 @@ RELEVANT: <yes 或 no>
         self,
         ideas: List[ResearchIdea],
         topic: str = "",
-        include_sources: bool = True,
-        max_token_per_section: int = 500
+        include_sources: bool = True
     ) -> str:
         """
-        将研究想法格式化为飞书文档兼容的Markdown格式（多阶段润色）
+        将研究想法格式化为飞书文档兼容的Markdown格式
 
-        多阶段润色：
-        1. 内容阶段：确保每个 section（描述、创新点、方法论）内容充实
-        2. 结构阶段：检查标题层级、列表格式、引用格式
-        3. 格式阶段：确保飞书兼容的 Markdown（表格、公式、图片引用）
+        格式规范：
+        - 标题层级：# 一级 > ## 二级 > ### 三级
+        - 列表格式：使用 - 或 1. ，保持一致性
+        - 图片引用：使用 [图X] 格式
+        - 公式格式：使用 $公式$ 行内公式
+        - 飞书兼容：不使用复杂表格语法
 
         Args:
             ideas: 研究想法列表
             topic: 研究主题
             include_sources: 是否包含灵感来源
-            max_token_per_section: 每 section 最大 token 数（默认 500）
 
         Returns:
             str: 飞书兼容的Markdown格式内容
@@ -3118,18 +3109,7 @@ RELEVANT: <yes 或 no>
         if not ideas:
             return ""
 
-        # 多阶段润色说明（供后续 LLM 调用参考）
-        polish_instructions = f"""
-格式规范（请严格遵循）：
-- 每个 section 内容不超过 {max_token_per_section} tokens
-- 标题层级：# 一级 > ## 二级 > ### 三级
-- 列表格式：使用 - 或 1. ，保持一致性
-- 图片引用：使用 [图X] 格式
-- 公式格式：使用 $公式$ 行内公式
-- 飞书兼容：不使用复杂表格语法
-"""
         markdown_parts = [f"# {topic or '研究想法'}\n" if topic else "# 研究想法\n"]
-        markdown_parts.append(f"<!-- 格式规范: 每 section ≤{max_token_per_section} tokens -->\n")
 
         for i, idea in enumerate(ideas, 1):
             feasibility_bar = "★" * int(idea.feasibility * 5) + "☆" * (5 - int(idea.feasibility * 5))
