@@ -998,7 +998,7 @@ class TwoStageRetriever:
 
         # 配置项
         self._abstract_top_k = self._config.get('abstract_top_k', 5)
-        self._chunk_top_k = self._config.get('chunk_top_k', 10)
+        self._chunk_top_k = self._config.get('chunk_top_k', 5)
         self._hybrid_alpha = self._config.get('hybrid_alpha', 0.7)  # 向量权重
 
     async def retrieve(

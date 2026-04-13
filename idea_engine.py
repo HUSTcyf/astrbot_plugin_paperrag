@@ -19,6 +19,7 @@ import mistune
 import base64
 import concurrent.futures
 import tempfile
+from urllib.parse import unquote
 from typing import Dict, Any, List, Optional, Tuple, cast
 from dataclasses import dataclass
 from pathlib import Path
@@ -413,7 +414,7 @@ class IdeaEngine:
     def _extract_markdown_image_from_text(self, text: str) -> list[tuple[str, str]]:
         """
         使用平衡括号计数从文本中提取所有 markdown 图片格式的 (path, caption)。
-        支持路径中包含括号如 2502.12138v4(nopo)。
+        支持路径中包含括号如 2502.12138v4(nopo)，也支持中文括号 ） 结尾。
 
         Returns:
             [(path, caption), ...]
@@ -426,17 +427,19 @@ class IdeaEngine:
             logger.debug(f"[_extract_markdown_image_from_text] 文本内容: {text}")
 
         for ext in _EXTENSIONS:
-            end_marker = f'.{ext})'
+            end_markers = [f'.{ext})', f'.{ext}）']  # 英文和中文括号
             start = 0
             while True:
-                # 查找 .{ext}) 的位置
-                idx = text.find(end_marker, start)
+                idx = -1
+                found_marker = ''
+                for em in end_markers:
+                    t = text.find(em, start)
+                    if t >= 0 and (idx < 0 or t < idx):
+                        idx = t
+                        found_marker = em
                 if idx < 0:
                     break
 
-                logger.debug(f"[_extract_markdown_image_from_text] 找到扩展名 {ext} at idx={idx}, start={start}")
-
-                # 从 idx 位置向前，使用平衡括号计数找到匹配的 (
                 paren_count = 1
                 j = idx - 1
                 found_paren = False
@@ -450,33 +453,18 @@ class IdeaEngine:
                             break
                     j -= 1
 
-                logger.debug(f"[_extract_markdown_image_from_text] 括号计数完成: found_paren={found_paren}, j={j}")
-
                 if found_paren and j >= 2:
-                    # 检查前面是否是 `](` 格式（markdown 图片）
                     if text[j-1] == ']' and text[j-2] == '!':
-                        path = text[j+1:idx+len(ext)+1]  # includes the last . of extension
-                        path = path[:-1]  # remove trailing )
-                        # Extract caption: find !![...] or ![...]
+                        # slice includes .ext) so we strip last char
+                        path = text[j+1:idx+len(ext)+2]
+                        path = path[:-1]
+                        path = unquote(path)
                         caption_start = text.rfind('![', 0, j-2)
-                        if caption_start < 0:
-                            caption = ''
-                        else:
-                            caption_brackets = text.find(']', caption_start)
-                            if caption_brackets > caption_start:
-                                caption = text[caption_start+2:caption_brackets]
-                            else:
-                                caption = ''
-                        logger.debug(f"[_extract_markdown_image_from_text] 匹配到图片: path={path}, caption={caption}")
+                        caption = text[caption_start+2:text.find(']', caption_start)] if caption_start >= 0 else ''
                         if path.startswith('/') and len(path) > 5:
                             results.append((path, caption))
-                            start = idx + len(end_marker)
+                            start = idx + len(found_marker)
                             continue
-                    else:
-                        logger.debug(f"[_extract_markdown_image_from_text] 括号前不是 !]: text[j-2:j+1]={repr(text[j-2:j+1])}")
-                else:
-                    logger.debug(f"[_extract_markdown_image_from_text] 未找到匹配的括号或位置不对")
-
                 start = idx + 1
 
         logger.info(f"[_extract_markdown_image_from_text] 共提取到 {len(results)} 张图片: {results}")
@@ -519,6 +507,7 @@ class IdeaEngine:
         3. 如果没有论文图表章节，则在全文查找图片并移到末尾
         """
         logger.info(f"[IdeaEngine] normalize 输入长度: {len(markdown_text)}")
+        markdown_text = unquote(markdown_text)  # 全局URL解码
 
         # 打印前200字符用于调试
         logger.debug(f"[IdeaEngine] normalize 输入前200字符: {markdown_text[:200]}")
@@ -627,9 +616,11 @@ class IdeaEngine:
         用真实图片路径和 caption，不依赖LLM生成。
         """
         if not knowledge:
+            logger.warning("[IdeaEngine] [_append_figure_section] knowledge 为空，跳过")
             return text
 
         local_results = knowledge.get("local_results", [])
+        logger.info(f"[IdeaEngine] [_append_figure_section] local_results 数量: {len(local_results)}")
         if not local_results:
             return text
 
@@ -638,7 +629,9 @@ class IdeaEngine:
         figure_entries: List[tuple[str, str]] = []  # (caption, path)
 
         for r in local_results:
-            img_path = r.get('image_path', '')
+            metadata = r.get('metadata', {})
+            img_path = metadata.get('image_path', '')
+            img_caption = metadata.get('image_caption', '')
             if not img_path or not os.path.exists(img_path):
                 continue
             img_filename = Path(img_path).name
@@ -646,16 +639,17 @@ class IdeaEngine:
             if paper_folder not in caption_cache:
                 caption_cache[paper_folder] = self._load_figure_captions(img_path)
             fname_to_caption = caption_cache[paper_folder]
-            real_caption = fname_to_caption.get(img_filename, img_filename)
+            real_caption = fname_to_caption.get(img_filename) or img_caption or img_filename
             figure_entries.append((real_caption, img_path))
 
         if not figure_entries:
+            logger.warning(f"[IdeaEngine] [_append_figure_section] figure_entries 为空（可能被 os.path.exists 跳过），共检查 {len(local_results)} 条 local_results")
             return text
 
-        # 构建图表章节：caption 在上，路径在下
-        fig_section = "\n\n## 9. 论文图表\n"
+        logger.info(f"[IdeaEngine] [_append_figure_section] 成功构建 {len(figure_entries)} 个图表条目")
+        fig_section = "\n## 9. 论文图表\n"
         for i, (caption, path) in enumerate(figure_entries, 1):
-            fig_section += f"图 {i}：{caption}\n{path}\n\n"
+            fig_section += f"![图 {i}：{caption}]({path})\n\n"
 
         # 追加到参考文献之后
         ref_match = re.search(r'(##\s*参考文献.*?)(?=##\s|\Z)', text, re.DOTALL)
@@ -843,72 +837,39 @@ class IdeaEngine:
         )
 
         segments = []
-        remaining = text
-
-        # 两种图片格式的正则（用文件扩展名锚定，支持路径中含括号如 2502.12138v4(nopo)）
-        _EXT = r'(?:png|jpg|jpeg|webp|gif|PNG|JPG|JPEG|WEBP|GIF)'
-        patterns = [
-            r'(\[图片[：:][^\]]*\]\(.+?\.' + _EXT + r'\)(?=[^a-zA-Z0-9）]|$))',
-            r'(!\[[^\]]*\]\(.+?\.' + _EXT + r'\)(?=[^a-zA-Z0-9）]|$))',
-        ]
-
-        logger.debug(f"[_extract_inline_images] 开始提取图片块")
-
-        while remaining:
-            earliest = None
-            earliest_pattern_idx = -1
-
-            for pidx, pat in enumerate(patterns):
-                m = re.search(pat, remaining)
-                if m and (earliest is None or m.start() < earliest.start()):
-                    earliest = m
-                    earliest_pattern_idx = pidx
-
-            # 检查中文括号格式（详见：/path/to/file.png）
-            cn_m = re.search(r'（(([^）]+)[:：])?([/][^）]+\.(png|jpg|jpeg|webp|gif|PNG|JPG|JPEG|WEBP|GIF))）', remaining)
-
-            take_cn = False
-            if cn_m:
-                if earliest is None or cn_m.start() < earliest.start():
-                    take_cn = True
-
-            if take_cn and cn_m:
-                before = remaining[:cn_m.start()]
-                if before.strip():
-                    segments.append({"type": "text", "content": before})
-                label = cn_m.group(2)
-                path = cn_m.group(3)
-                caption = label.strip() if label else os.path.basename(path)
-                segments.append({"type": "image", "path": path, "caption": caption})
-                remaining = remaining[cn_m.end():]
-                continue
-
-            if earliest is None:
-                if remaining.strip():
-                    segments.append({"type": "text", "content": remaining})
-                break
-
-            # 文本部分（图片之前）
-            before = remaining[:earliest.start()]
-            if before.strip():
-                segments.append({"type": "text", "content": before})
-
-            # 解析图片（path 支持带括号的路径）
-            full_match = earliest.group(1)
-            if earliest_pattern_idx == 0:
-                cap_m = re.match(r'\[图片[：:] ?([^\]]*)\]', full_match)
-                caption = cap_m.group(1) if cap_m else ""
-            else:
-                cap_m = re.match(r'!\[([^\]]*)\]', full_match)
-                caption = cap_m.group(1) if cap_m else ""
-            path_m = re.search(r'\]\((.+?\.' + _EXT + r')\)', full_match)
-            path = path_m.group(1) if path_m else ""
-            if path:
-                segments.append({"type": "image", "path": path, "caption": caption.strip() or os.path.basename(path)})
-
-            remaining = remaining[earliest.end():]
-
+        stripped = text.strip()
+        # 简单直接：找最后一个 ) 和对应的 (
+        if stripped.startswith('![') and '.png' in stripped.lower():
+            last_paren = stripped.rfind(')')
+            open_bracket = stripped.rfind('](', 0, last_paren)
+            if open_bracket > 0:
+                caption = stripped[2:open_bracket]
+                path = stripped[open_bracket+2:last_paren]
+                path = unquote(path)
+                if os.path.exists(path):
+                    segments.append({"type": "image", "path": path, "caption": caption})
+                else:
+                    logger.warning(f"[_extract_inline_images] 图片不存在: {path}")
+        if not segments:
+            segments.append({"type": "text", "content": text})
         return segments
+
+    def _ensure_png(self, img_path: str) -> str:
+        """webp/其他非PNG格式转为PNG，返回可用图片路径"""
+        if not img_path:
+            return img_path
+        try:
+            from PIL import Image as PILImage
+            with PILImage.open(img_path) as pil_img:
+                if pil_img.format == 'PNG' and pil_img.mode in ('RGB', 'RGBA'):
+                    return img_path
+                png_path = img_path.rsplit('.', 1)[0] + '_converted.png'
+                pil_img.convert('RGBA' if pil_img.mode == 'RGBA' else 'RGB').save(png_path, 'PNG')
+                logger.info(f"[IdeaEngine] 图片已转为PNG: {png_path}")
+                return png_path
+        except Exception as e:
+            logger.warning(f"[IdeaEngine] 图片格式转换失败: {e}")
+        return img_path
 
     def _make_image_block(self, image_path: str, caption: str = "") -> Optional[Dict]:
         """根据本地图片路径构造飞书图片块。文件不存在或读取失败时返回 None。"""
@@ -1142,33 +1103,16 @@ class IdeaEngine:
         if not feishu_tool or not add_blocks_tool:
             return {"success": False, "error": "缺少必要工具"}
 
-        # 测试 markdown：列表样式 + 图片 + 引用
-        test_markdown = """# 综合格式测试
-
-## 1. 有序列表（含加粗、斜体、链接）
-
-1. **跨视角粒度一致性对齐**。不同于现有方法仅关注几何外观，本方法创新性地将"跨视角粒度不一致性"作为核心解决目标。
-2. **面向无姿态输入的语义增强型联合优化策略**。将语言模态深度融入稀疏视图重建的*几何与姿态估计*全流程。
-3. **基于关键帧采样的可扩展范式**。参考 [OpenGaussian](https://arxiv.org/abs/2412.12138) 和 [CAGS](https://arxiv.org/abs/2504.11893) 的工作。
-
-## 2. 无序列表
-
-- 创新点一：`跨视角语义一致性`损失函数
-- 创新点二：语言先验约束*高斯分布*的几何优化空间
-- 创新点三：关键帧采样策略平衡效率与完整性
-
-## 3. 图片插入测试
-
-方法论示意图如下：![方法流程图](/Users/chenyifeng/AstrBot/data/plugins/astrbot_plugin_paperrag/data/figures/2502.12138v4(nopo)/14-Figure1.png)
-
-## 4. 普通文本（含样式和引用）
-
-根据 [FLARE](https://arxiv.org/abs/2502.12138) 的研究，*前馈式架构*能够直接接收**未校准的稀疏 RGB 图像**，同时预测 `3DGS 参数`及相机位姿。
-
-## 5. 混合测试
-
-上述方法在 [ScanNet](https://github.com/ScanNet/ScanNet) 数据集上进行了验证，结果显示**语义一致性**提升了15%，*计算效率*提升了30%。
-"""
+        # 从 initial_draft.md 读取内容测试
+        draft_path = "/Users/chenyifeng/AstrBot/data/plugin_data/astrbot_plugin_paperrag/ideas/8a160941c48c813c/initial_draft.md"
+        try:
+            with open(draft_path, "r", encoding="utf-8") as f:
+                test_markdown = f.read()
+            test_markdown = unquote(test_markdown)  # URL解码
+            logger.info(f"[Test] 读取测试文档: {draft_path}, 长度={len(test_markdown)}")
+        except Exception as e:
+            logger.error(f"[Test] 读取文件失败: {e}")
+            return {"success": False, "error": f"读取文件失败: {e}"}
 
         # 转换为块
         all_blocks = self._markdown_to_feishu_blocks(test_markdown)
@@ -1237,10 +1181,21 @@ class IdeaEngine:
                     img_path = tmp.name
 
                 if img_path and os.path.exists(img_path):
+                    img_path = self._ensure_png(img_path)
+                    img_caption = opts.get("caption", "")
+                    logger.info(f"[Test] caption='{img_caption}'")
+                    try:
+                        from PIL import Image as PILImage
+                        with PILImage.open(img_path) as pil_img:
+                            orig_w, orig_h = pil_img.size
+                        img_width, img_height = orig_w, orig_h
+                        logger.info(f"[Test] 图片: {img_width}x{img_height}")
+                    except Exception as e:
+                        img_width, img_height = 768, 768
                     img_result = await add_blocks_tool.call(
                         ctx_wrapper, documentId=document_id,
                         parentBlockId=document_id, index=current_index,
-                        blocks=[{"blockType": "image", "align": 2, "options": {"image": {}}}]
+                        blocks=[{"blockType": "image", "options": {"image": {"width": img_width, "height": img_height}}}]
                     )
                     image_block_id = None
                     try:
@@ -1262,7 +1217,30 @@ class IdeaEngine:
                         )
                         if upload_res and not getattr(upload_res, 'isError', True):
                             images_uploaded += 1
-                            logger.info(f"[Test] 图片上传成功")
+                            logger.info(f"[Test] 图片上传成功，添加caption: '{img_caption}'")
+                            # 追加 caption 文本块（同级，不是子块）
+                            if img_caption and add_blocks_tool:
+                                caption_block = [{
+                                    "blockType": "text",
+                                    "options": {
+                                        "text": {
+                                            "textStyles": [{"text": img_caption, "style": {"bold": True, "text_color": 7}}],
+                                            "align": 2
+                                        }
+                                    }
+                                }]
+                                cap_res = await add_blocks_tool.call(
+                                    ctx_wrapper, documentId=document_id,
+                                    parentBlockId=document_id,
+                                    index=current_index + 1,
+                                    blocks=caption_block
+                                )
+                                if hasattr(cap_res, 'isError') and cap_res.isError:
+                                    err = getattr(cap_res.content[0], 'text', str(cap_res))[:200] if hasattr(cap_res, 'content') and cap_res.content else str(cap_res)
+                                    logger.error(f"[Test] caption块追加失败: {err}")
+                                else:
+                                    logger.info(f"[Test] caption块追加成功")
+                                    current_index += 1  # caption占一个block位置
 
                 current_index += 1
                 batch_start_index = current_index
@@ -1362,6 +1340,97 @@ class IdeaEngine:
             "image_count": images_uploaded,
             "list_styles_updated": updated_lists,
         }
+
+    async def test_paperbanana_image(self, folder_token: str = "") -> Dict[str, Any]:
+        """测试：插入 PaperBanana webp 图片到飞书文档，对比不同尺寸"""
+        import glob
+        from astrbot.core.agent.run_context import ContextWrapper
+
+        ctx_wrapper = ContextWrapper(self.context)
+        provider_manager = getattr(self.context, 'provider_manager', None)
+        if not provider_manager:
+            return {"success": False, "error": "provider_manager 不可用"}
+
+        llm_tools = getattr(provider_manager, 'llm_tools', None)
+        feishu_tool = add_blocks_tool = upload_image_tool = None
+        if llm_tools:
+            for tool in getattr(llm_tools, 'func_list', []):
+                if tool.name == 'create_feishu_document':
+                    feishu_tool = tool
+                elif tool.name == 'batch_create_feishu_blocks':
+                    add_blocks_tool = tool
+                elif tool.name == 'upload_and_bind_image_to_block':
+                    upload_image_tool = tool
+
+        if not feishu_tool or not add_blocks_tool:
+            return {"success": False, "error": "缺少必要工具"}
+
+        # 找最新的 PaperBanana webp 图片
+        webp_files = sorted(glob.glob("/var/folders/vh/z2w2jz1x4yb3rfvdzs0nlpjr0000gn/T/*.webp"), key=os.path.getmtime, reverse=True)
+        webp_files += sorted(glob.glob("/var/folders/vh/z2w2jz1x4yb3rfvdzs0nlpjr0000gn/T/*.png"), key=os.path.getmtime, reverse=True)
+        if not webp_files:
+            return {"success": False, "error": "未找到 PaperBanana 图片，请先生成一张"}
+        img_path = webp_files[0]
+
+        # webp → PNG 转换（飞书可能对 webp 支持不好）
+        from PIL import Image as PILImage
+        if img_path.lower().endswith('.webp') or PILImage.open(img_path).format == 'WEBP':
+            png_path = img_path.rsplit('.', 1)[0] + '_converted.png'
+            PILImage.open(img_path).convert('RGBA' if PILImage.open(img_path).mode == 'RGBA' else 'RGB').save(png_path, 'PNG')
+            img_path = png_path
+            logger.info(f"[TestPB] WebP 已转为 PNG: {img_path}")
+
+        orig_w, orig_h = PILImage.open(img_path).size
+        logger.info(f"[TestPB] 使用图片: {img_path}, 尺寸: {orig_w}x{orig_h}")
+
+        # 创建文档
+        create_result = await feishu_tool.call(ctx_wrapper, title="[TestPB] PaperBanana 图片尺寸测试", folderToken=folder_token or "")
+        document_id = None
+        try:
+            if hasattr(create_result, 'content') and create_result.content:
+                r_text = getattr(create_result.content[0], 'text', '') or str(create_result.content[0])
+                r_data = json.loads(r_text)
+                document_id = r_data.get('document', {}).get('document_id', '')
+        except Exception as e:
+            logger.error(f"[TestPB] 解析文档ID失败: {e}")
+        if not document_id:
+            return {"success": False, "error": "创建文档失败"}
+
+        # 插入 3 张：原始、5x、50x
+        sizes = [
+            ("原始", orig_w, orig_h),
+            ("5x", orig_w * 5, orig_h * 5),
+            ("50x", orig_w * 50, orig_h * 50),
+        ]
+
+        for idx, (label, w, h) in enumerate(sizes):
+            # 创建空图片块
+            img_result = await add_blocks_tool.call(
+                ctx_wrapper, documentId=document_id,
+                parentBlockId=document_id, index=idx,
+                blocks=[{"blockType": "image", "options": {"image": {"width": w, "height": h}}}]
+            )
+            image_block_id = None
+            try:
+                if hasattr(img_result, 'content') and img_result.content:
+                    r_text = getattr(img_result.content[0], 'text', None) or str(img_result.content[0])
+                    r_data = json.loads(r_text)
+                    block_ids = r_data.get('imageBlocksInfo', {}).get('blockIds', [])
+                    if block_ids:
+                        image_block_id = block_ids[0]
+            except Exception as e:
+                logger.error(f"[TestPB] 解析块ID失败: {e}")
+
+            if image_block_id and upload_image_tool:
+                await upload_image_tool.call(
+                    ctx_wrapper, documentId=document_id,
+                    images=[{"blockId": image_block_id, "imagePathOrUrl": img_path}]
+                )
+                logger.info(f"[TestPB] 已上传 {label}: {w}x{h}")
+
+        url = f"https://feishu.cn/docx/{document_id}"
+        info = f"原始尺寸: {orig_w}x{orig_h}\n对比: 原始 / 2倍 / 10倍\n图片: {os.path.basename(img_path)}"
+        return {"success": True, "document_id": document_id, "url": url, "info": info}
 
     async def create_feishu_document(
         self,
@@ -1813,35 +1882,27 @@ class IdeaEngine:
                                 img_path = tmp.name
 
                             if img_path and os.path.exists(img_path):
-                                # 优先使用 block 中已有的宽高（PaperBanana 图片已设置原始尺寸，不缩放）
+                                img_path = self._ensure_png(img_path)
                                 img_width = opts.get("width")
                                 img_height = opts.get("height")
                                 if not img_width or not img_height:
-                                    # 未设置则从文件读取，大图缩放至 MAX_WIDTH
                                     try:
                                         from PIL import Image as PILImage
                                         with PILImage.open(img_path) as pil_img:
                                             orig_w, orig_h = pil_img.size
-                                        MAX_WIDTH = 768
-                                        if orig_w > MAX_WIDTH:
-                                            scale = MAX_WIDTH / orig_w
-                                            img_width = MAX_WIDTH
-                                            img_height = int(orig_h * scale)
-                                        else:
-                                            img_width, img_height = orig_w, orig_h
-                                        logger.info(f"[IdeaEngine] 图片尺寸: {orig_w}x{orig_h} → 缩放后: {img_width}x{img_height}")
+                                        img_width, img_height = orig_w, orig_h
+                                        logger.info(f"[IdeaEngine] 图片尺寸: {img_path} → {img_width}x{img_height}")
                                     except Exception as e:
-                                        img_width, img_height = 100, 100
-                                        logger.warning(f"[IdeaEngine] 读取图片尺寸失败: {e}，使用默认值")
+                                        img_width, img_height = 768, 768
                                 else:
-                                    logger.info(f"[IdeaEngine] 使用原始尺寸: {img_width}x{img_height}")
+                                    logger.info(f"[IdeaEngine] 图片尺寸 [来自block]: {img_width}x{img_height}")
 
                                 img_result = await add_blocks_tool.call(
                                     ctx_wrapper,
                                     documentId=document_id,
                                     parentBlockId=root_block_id,
                                     index=current_index,
-                                    blocks=[{"blockType": "image", "align": 2, "options": {"image": {"width": img_width, "height": img_height}}}]
+                                    blocks=[{"blockType": "image", "options": {"image": {"width": img_width, "height": img_height}}}]
                                 )
                                 image_block_id = None
                                 try:
@@ -1864,6 +1925,24 @@ class IdeaEngine:
                                     )
                                     if upload_res and not getattr(upload_res, 'isError', True):
                                         images_uploaded += 1
+                                        # 给图片块追加 caption 子块
+                                        img_caption = opts.get("caption", "")
+                                        if img_caption and add_blocks_tool:
+                                            caption_block = [{
+                                                "blockType": "text",
+                                                "options": {
+                                                    "text": {
+                                                        "textStyles": [{"text": img_caption, "style": {"bold": True, "text_color": 7}}],
+                                                        "align": 2
+                                                    }
+                                                }
+                                            }]
+                                            await add_blocks_tool.call(
+                                                ctx_wrapper, documentId=document_id,
+                                                parentBlockId=document_id,
+                                                index=current_index + 1,
+                                                blocks=caption_block
+                                            )
                                     else:
                                         err_msg = ""
                                         if hasattr(upload_res, 'content') and upload_res.content:
@@ -4420,7 +4499,7 @@ Caption："""
         figure_caption: str = "",
         pipeline_mode: str = "demo_planner_critic",
         aspect_ratio: str = "16:9",
-        figure_size: str = "7-9cm",
+        figure_size: str = "14-17cm",
         max_critic_rounds: int = 1,
         model_name: str = "apiyi/gemini-3.1-pro-preview",
         image_gen_model: str = "apiyi/gemini-3.1-flash-image-preview",

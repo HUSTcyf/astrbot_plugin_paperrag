@@ -698,7 +698,7 @@ class CragCorrector:
                 all_results.extend(additional_results)
 
             # 使用RRF融合
-            return self._rrf_fusion(all_results, top_k=10)
+            return self._rrf_fusion(all_results, top_k=5)
         except Exception as e:
             logger.warning(f"[CRAG] 补充检索失败: {e}")
             return original_results
@@ -735,7 +735,7 @@ class CragCorrector:
             all_results.extend(original_results)
 
             # 使用RRF融合
-            return self._rrf_fusion(all_results, top_k=10)
+            return self._rrf_fusion(all_results, top_k=5)
         except Exception as e:
             logger.warning(f"[CRAG] 重新检索失败: {e}")
             return original_results
@@ -848,7 +848,7 @@ class CragCorrector:
         self,
         vector_results: List[Dict[str, Any]],
         bm25_results: List[Dict[str, Any]],
-        top_k: int = 10
+        top_k: int = 5
     ) -> List[Dict[str, Any]]:
         """简单的分数融合"""
         # 构建分数映射
@@ -897,7 +897,7 @@ class CragCorrector:
     def _rrf_fusion(
         self,
         results: List[Dict[str, Any]],
-        top_k: int = 10,
+        top_k: int = 5,
         k: int = 60
     ) -> List[Dict[str, Any]]:
         """

@@ -34,6 +34,7 @@ os.environ['GLOG_minloglevel'] = '2'
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Plain, Image
+from astrbot.core.message.message_event_result import MessageChain
 from astrbot.api.provider import LLMResponse
 from astrbot.api.star import Context, Star, register
 
@@ -359,6 +360,77 @@ class PaperRAGPlugin(Star):
             max_images_per_chunk=multimodal_config.get("max_images_per_chunk", 1),
             extract_image_entities=multimodal_config.get("extract_image_entities", True),
         )
+
+    async def _check_academic_intent(self, query: str) -> tuple[bool, str]:
+        """用本地VLM判断用户问题是否与学术论文相关"""
+        prompt = f"""你是一个严格的学术问题分类器。只判断用户问题是否明确涉及学术论文的阅读、检索、分析。
+
+以下情况回答"否"：
+- 日常对话、闲聊、新闻、娱乐
+- 常识问题（如"今天吃什么"、"天气怎么样"）
+- 与论文无关的技术问题
+- 任何不涉及论文内容的问题
+
+以下情况回答"是"：
+- 询问某篇论文的方法、创新点、实验结果
+- 要求检索论文、总结论文内容
+- 关于论文中的公式、原理、数据集的技术问题
+- 要求对比多篇论文的异同
+
+问题: {query}
+
+只需回答"是"或"否"，不要解释。"""
+        try:
+            # 先确保VLM加载完成
+            from .llama_cpp_vlm_provider import get_cached_llama_cpp_provider
+            vlm_provider = get_cached_llama_cpp_provider()
+            if vlm_provider and vlm_provider._initialized and vlm_provider._llama:
+                response = await vlm_provider.text_chat(prompt=prompt, image_urls=[], temperature=0.0)
+                text = response.content.strip().lower() if hasattr(response, 'content') else str(response).lower()
+                logger.info(f"[_check_academic_intent] VLM原始回答: '{text}'")
+                if text.startswith("否"):
+                    return False, "非学术问题"
+                return True, "学术问题"
+            # VLM未就绪，手动触发初始化
+            logger.info("[_check_academic_intent] VLM未就绪，触发初始化...")
+            from .llama_cpp_vlm_provider import init_llama_cpp_vlm_provider
+            model_dir = os.path.join(os.path.dirname(__file__), "models", "Qwen3.5-9B-GGUF")
+            model_path = os.path.join(model_dir, "Qwen3.5-9B-UD-Q4_K_XL.gguf")
+            mmproj_path = os.path.join(model_dir, "mmproj-BF16.gguf")
+            vlm_provider = init_llama_cpp_vlm_provider(
+                model_path=model_path,
+                mmproj_path=mmproj_path,
+                n_ctx=8192,
+                n_gpu_layers=99,
+                max_tokens=25600,
+                temperature=0.0
+            )
+            await vlm_provider.initialize()
+            if vlm_provider and vlm_provider._initialized:
+                response = await vlm_provider.text_chat(prompt=prompt, image_urls=[], temperature=0.0)
+                text = response.content.strip().lower() if hasattr(response, 'content') else str(response).lower()
+                logger.info(f"[_check_academic_intent] VLM原始回答: '{text}'")
+                if text.startswith("否"):
+                    return False, "非学术问题"
+                return True, "学术问题"
+            return True, "VLM不可用，默认进行检索"
+        except Exception as e:
+            logger.warning(f"[_check_academic_intent] 意图判断失败: {e}")
+            return True, f"意图判断失败，默认检索: {e}"
+
+    async def _llm_direct_answer(self, query: str) -> str:
+        """由LLM直接回答问题（不经过RAG）"""
+        try:
+            provider_manager = getattr(self.context, 'provider_manager', None)
+            if not provider_manager:
+                return ""
+            llm_provider = provider_manager.get_provider(None)  # 使用默认provider
+            if llm_provider:
+                response = await llm_provider.generate(query)
+                return response.text.strip() if hasattr(response, 'text') else str(response)
+        except Exception as e:
+            logger.warning(f"[_llm_direct_answer] LLM回答失败: {e}")
+        return ""
 
     def _get_engine(self) -> "Optional[HybridRAGEngine]":
         """获取RAG引擎（单例模式，带缓存）"""
@@ -837,6 +909,21 @@ class PaperRAGPlugin(Star):
         yield event.plain_result(f"🔍 Searching document library...\nQuestion: {query}")
 
         try:
+            # 学术论文意图检查 - 非论文问题直接由LLM回答
+            if mode in ("rag", "auto"):
+                is_academic, intent_reason = await self._check_academic_intent(query)
+                if not is_academic:
+                    logger.info(f"[PaperRAG] 非学术问题，跳过检索: {intent_reason}")
+                    yield event.plain_result(f"💬 这不是学术论文相关问题，直接由LLM回答...\n\n")
+                    # 由LLM直接回答（不经过RAG）
+                    llm_response = await self._llm_direct_answer(query)
+                    if llm_response:
+                        yield event.plain_result(llm_response)
+                    else:
+                        yield event.plain_result("抱歉，我无法回答这个问题。")
+                    return
+                yield event.plain_result(f"✅ 意图确认: {intent_reason}")
+
             # 意图识别与路由（当 mode="auto" 时）
             actual_mode = mode
             routing_info = ""
@@ -892,8 +979,23 @@ class PaperRAGPlugin(Star):
             # Cache response
             self._set_cached_response(cache_key, output)
 
+            # Extract associated images from sources
+            images = self._extract_images_from_sources(sources)
+
             # Send result
             yield event.plain_result(output)
+
+            # Send images with captions
+            if images:
+                for img in images:
+                    try:
+                        chain = MessageChain()
+                        chain.message(img['caption'])
+                        chain.file_image(img["path"])
+                        await event.send(chain)
+                    except Exception as e:
+                        logger.warning(f"[PaperRAG] 发送图片失败 {img['path']}: {e}")
+                        yield event.plain_result(f"[图片] {img['caption']}: {img['path']}")
 
         except Exception as e:
             logger.error(f"Search failed: {e}")
@@ -4607,6 +4709,34 @@ class PaperRAGPlugin(Star):
             logger.error(f"testblocks 失败: {e}\n{traceback.format_exc()}")
             yield event.plain_result(f"❌ 测试失败: {e}")
 
+    @idea_commands.command("testpb")
+    async def cmd_idea_testpb(self, event: AstrMessageEvent, folder_token: str = ""):
+        """
+        插入 PaperBanana 生成的 webp 图片到飞书文档，测试尺寸
+
+        使用方式:
+        /idea testpb <folder_token>
+        """
+        try:
+            from .idea_engine import IdeaEngine
+            rag_engine = self._get_engine()
+            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
+
+            yield event.plain_result("正在插入 PaperBanana 图片到飞书...")
+            result = await idea_engine.test_paperbanana_image(folder_token=folder_token)
+
+            if result.get("success"):
+                url = result.get("url", "")
+                info = result.get("info", "")
+                yield event.plain_result(f"✅ 插入成功\n链接: {url}\n{info}")
+            else:
+                yield event.plain_result(f"❌ 失败: {result.get('error', '未知错误')}")
+
+        except Exception as e:
+            import traceback
+            logger.error(f"testpb 失败: {e}\n{traceback.format_exc()}")
+            yield event.plain_result(f"❌ 测试失败: {e}")
+
     @idea_commands.command("regen")
     async def cmd_idea_regen(self, event: AstrMessageEvent,
                                folder_hash: str = "",
@@ -5017,6 +5147,25 @@ Examples:
             output += f"> {text}...\n\n"
 
         return output.strip()
+
+    def _extract_images_from_sources(self, sources: list, max_images: int = 5) -> List[Dict]:
+        """从检索结果中提取关联图片（去重），返回 [{"path": str, "caption": str, "paper": str}, ...]"""
+        seen = set()
+        images = []
+        for source in sources:
+            metadata = source.get("metadata", {}) or {}
+            image_path = metadata.get("image_path")
+            if not image_path or not os.path.exists(image_path):
+                continue
+            if image_path in seen:
+                continue
+            seen.add(image_path)
+            caption = metadata.get("image_caption") or os.path.basename(image_path)
+            paper = metadata.get("file_name", "unknown")
+            images.append({"path": image_path, "caption": caption, "paper": paper})
+            if len(images) >= max_images:
+                break
+        return images
 
     # ==================== Lifecycle Management ====================
 

@@ -333,7 +333,7 @@ if LLAMA_INDEX_AVAILABLE:
         )
 
         query_engine = index.as_query_engine(
-            similarity_top_k=10,
+            similarity_top_k=5,
             node_postprocessors=[reranker]
         )
         ```
