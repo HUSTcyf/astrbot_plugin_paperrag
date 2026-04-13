@@ -136,7 +136,7 @@ def build_neo4j_graph(
         # 直接使用 llama_cpp.Llama（不需要 mmproj，用于纯文本）
         llama_llm = llama_cpp.Llama(
             model_path=model_path,
-            n_ctx=4096,  # 上下文窗口
+            n_ctx=8192,  # 上下文窗口
             n_gpu_layers=99,  # GPU 加速层数
             n_batch=32,  # 批处理大小
             verbose=False,
@@ -158,7 +158,7 @@ def build_neo4j_graph(
                 result = self._llama.create_chat_completion(
                     messages=messages,
                     temperature=kwargs.get("temperature", 0.1),
-                    max_tokens=kwargs.get("max_tokens", 4096),
+                    max_tokens=kwargs.get("max_tokens", 16384),
                 )
                 return result["choices"][0]["message"]["content"]
 

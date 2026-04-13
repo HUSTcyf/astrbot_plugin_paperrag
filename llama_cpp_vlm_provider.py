@@ -41,9 +41,9 @@ class LlamaCppVLMProvider:
         self,
         model_path: str = "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf",
         mmproj_path: str = "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf",
-        n_ctx: int = 4096,
+        n_ctx: int = 8192,
         n_gpu_layers: int = 99,
-        max_tokens: int = 2560,
+        max_tokens: int = 25600,
         temperature: float = 0.7,
         n_parallel: int = 1,
     ):
@@ -411,9 +411,9 @@ _vlm_provider_instance: Optional[LlamaCppVLMProvider] = None
 def init_llama_cpp_vlm_provider(
     model_path: str,
     mmproj_path: str,
-    n_ctx: int = 4096,
+    n_ctx: int = 8192,
     n_gpu_layers: int = 99,
-    max_tokens: int = 2560,
+    max_tokens: int = 25600,
     temperature: float = 0.7,
     n_parallel: int = 1,
 ) -> LlamaCppVLMProvider:
@@ -468,9 +468,9 @@ def get_llama_cpp_vlm_provider() -> LlamaCppVLMProvider:
         _vlm_provider_instance = LlamaCppVLMProvider(
             model_path=model_path,
             mmproj_path=mmproj_path,
-            n_ctx=4096,
+            n_ctx=8192,
             n_gpu_layers=99,
-            max_tokens=2560,
+            max_tokens=25600,
             temperature=0.7,
             n_parallel=1,
         )

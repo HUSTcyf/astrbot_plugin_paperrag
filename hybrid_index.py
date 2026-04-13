@@ -1417,7 +1417,7 @@ class HybridIndexManager:
                             llm_provider = init_llama_cpp_vlm_provider(
                                 model_path=llama_model_path,
                                 mmproj_path=llama_mmproj_path,
-                                n_ctx=4096,
+                                n_ctx=8192,
                                 n_gpu_layers=99,
                                 max_tokens=512,
                                 temperature=0.3

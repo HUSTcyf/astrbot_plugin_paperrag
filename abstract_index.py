@@ -839,7 +839,6 @@ class AbstractIndexManager:
             }
 
             results = client.search(
-                collection_name=self._collection_name,
                 data=[query_vector],
                 anns_field="vector",
                 param=search_params,

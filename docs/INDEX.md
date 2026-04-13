@@ -6,6 +6,7 @@
 |------|------|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 架构设计、组件说明、配置参数 |
 | [CHANGELOG.md](CHANGELOG.md) | 变更记录 |
+| [FEISHU_BLOCK_STYLING.md](FEISHU_BLOCK_STYLING.md) | 飞书文档块样式更新技术方案 |
 
 ## 使用指南
 

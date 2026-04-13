@@ -43,7 +43,7 @@ class LocalLLMConfig:
     """本地 LLM 配置"""
     model_path: str = "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf"
     mmproj_path: str = "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf"
-    n_ctx: int = 4096
+    n_ctx: int = 8192
     n_gpu_layers: int = 99
     max_tokens: int = 1024
     temperature: float = 0.1
@@ -618,9 +618,9 @@ class MultimodalGraphBuilder:
         return MultimodalLLMConfig(
             model_path=model_path,
             mmproj_path=mmproj_path,
-            n_ctx=4096,
+            n_ctx=8192,
             n_gpu_layers=99,
-            max_tokens=32768,  # 最大输出限制（实际受 n_ctx=4096 限制，最多生成 ~3000 tokens）
+            max_tokens=32768,
             temperature=0.1,
             vision_enabled=self.config.multimodal_enabled
         )

@@ -1083,6 +1083,8 @@ class HybridRAGEngine:
 
         try:
             from .abstract_index import AbstractIndexManager
+        except ImportError:
+            from abstract_index import AbstractIndexManager
 
             # 确定路径
             plugin_dir = Path(__file__).parent

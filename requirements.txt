@@ -58,3 +58,6 @@ datasets>=2.14.0  # HuggingFace 数据集加载
 
 # Docling PDF 多模态提取
 docling==2.84.0  # PDF 多模态提取（图片、表格）
+
+# PaperBanana
+gradio>=6.0.0  # PaperBanana 本地服务调用（Client 在 gradio_client 包中）

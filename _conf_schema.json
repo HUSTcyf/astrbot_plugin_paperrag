@@ -63,8 +63,8 @@
     "llama_vlm_n_ctx": {
         "description": "Llama.cpp VLM 上下文窗口大小",
         "type": "int",
-        "hint": "上下文窗口大小。Qwen3.5 支持 262144，但较大的值会占用更多内存",
-        "default": 4096,
+        "hint": "上下文窗口大小。Qwen3.5 支持 262144，但较大的值会占用更多内存。建议设置为 8192 以支持更长上下文",
+        "default": 8192,
         "minimum": 512,
         "maximum": 262144
     },
@@ -530,5 +530,20 @@
         "default": 5,
         "minimum": 1,
         "maximum": 20
+    },
+    "feishu_table_format": {
+        "description": "飞书文档表格格式",
+        "type": "string",
+        "hint": "创建飞书文档时，表格使用的格式。png: 图片格式（默认）；csv: 飞书原生CSV表格；md: Markdown文本块",
+        "obvious_hint": true,
+        "default": "png",
+        "enum": ["png", "csv", "md"]
+    },
+    "enable_paper_banana": {
+        "description": "是否启用 PaperBanana 方法图生成",
+        "type": "bool",
+        "hint": "启用后，将根据方法论章节内容生成方法流程图。图片会插入到方法论章节末尾。Caption优先从 data/captions/ 目录读取，若无则由VLM生成",
+        "obvious_hint": true,
+        "default": false
     }
 }

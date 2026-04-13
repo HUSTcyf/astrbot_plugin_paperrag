@@ -373,9 +373,9 @@ class PaperRAGPlugin(Star):
                     multimodal_provider_id=self.config.get("multimodal_provider_id", ""),
                     llama_vlm_model_path=self.config.get("llama_vlm_model_path", "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf"),
                     llama_vlm_mmproj_path=self.config.get("llama_vlm_mmproj_path", "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf"),
-                    llama_vlm_max_tokens=self.config.get("llama_vlm_max_tokens", 25600),
+                    llama_vlm_max_tokens=self.config.get("llama_vlm_max_tokens", 2560),
                     llama_vlm_temperature=self.config.get("llama_vlm_temperature", 0.7),
-                    llama_vlm_n_ctx=self.config.get("llama_vlm_n_ctx", 8192),
+                    llama_vlm_n_ctx=self.config.get("llama_vlm_n_ctx", 4096),
                     llama_vlm_n_gpu_layers=self.config.get("llama_vlm_n_gpu_layers", 99),
                     ollama_config=self.config.get("ollama", {}),
                     milvus_lite_path=self.config.get("milvus_lite_path", ""),
@@ -3689,13 +3689,14 @@ class PaperRAGPlugin(Star):
         show                 - 显示单个 topic 下所有想法
         add                  - 为已有 topic 追加新想法
         del                  - 删除指定 UUID 的想法
-        clear                - 清空指定 topic 下所有想法（保留 folder）
-        delete               - 完全删除 topic（包括 folder）
         tofeishu             - 将想法创建为飞书文档（第二阶段）
         explore              - 探索研究想法（完整流程）
         analyze              - 分析研究主题
         search               - 多源知识检索
         generate             - 基于知识上下文生成想法
+        test_brightdata      - 测试 Bright Data MCP 学术搜索
+        test_media_db        - 测试图表提取流程（检查元数据）
+        test_feishu_markdown - 测试飞书 Markdown 解析（加粗/斜体/删除线/链接/图表引用/公式）
         """
         pass
 
@@ -3992,77 +3993,6 @@ class PaperRAGPlugin(Star):
             logger.error(f"[IdeaEngine] 删除想法失败: {e}")
             yield event.plain_result(f"❌ 删除失败: {e}")
 
-    @idea_commands.command("delete")
-    async def cmd_idea_delete(self, event: AstrMessageEvent,
-                              topic_or_hash: str = ""):
-        """
-        完全删除指定 topic（包括 folder 本身）
-
-        使用方式:
-        /idea delete <topic名称或folder_hash>
-        Example: /idea delete 稀疏3DGS开放词汇统一重建
-        Example: /idea delete 8a160941c48c813c
-        """
-        try:
-            if not topic_or_hash:
-                yield event.plain_result("📚 Usage: /idea delete <topic名称或folder_hash>\nExample: /idea delete 稀疏3DGS开放词汇\nExample: /idea delete 8a160941c48c813c")
-                return
-
-            rag_engine = self._get_engine()
-            if not rag_engine:
-                yield event.plain_result("❌ RAG引擎未初始化")
-                return
-
-            from .idea_engine import IdeaEngine
-            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
-
-            success, topic, folder_hash = idea_engine.delete_topic_by_hash(topic_or_hash)
-
-            if not success:
-                yield event.plain_result(f"❌ 未找到 topic「{topic_or_hash}」")
-                return
-
-            yield event.plain_result(f"**🗑️ 已完全删除 topic「{topic}」**\n\nfolder: `{folder_hash}`")
-
-        except Exception as e:
-            logger.error(f"[IdeaEngine] 删除 topic 失败: {e}")
-            yield event.plain_result(f"❌ 删除失败: {e}")
-
-    @idea_commands.command("clear")
-    async def cmd_idea_clear(self, event: AstrMessageEvent,
-                              topic: str = ""):
-        """
-        清空指定 topic 下所有想法（保留 folder）
-
-        使用方式:
-        /idea clear <topic>
-        Example: /idea clear 稀疏3DGS开放词汇统一重建
-        """
-        try:
-            if not topic:
-                yield event.plain_result("📚 Usage: /idea clear <topic>\nExample: /idea clear 稀疏3DGS开放词汇统一重建")
-                return
-
-            rag_engine = self._get_engine()
-            if not rag_engine:
-                yield event.plain_result("❌ RAG引擎未初始化")
-                return
-
-            from .idea_engine import IdeaEngine
-            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
-
-            deleted_count, actual_topic = idea_engine.clear_ideas_by_topic(topic)
-
-            if deleted_count == 0:
-                yield event.plain_result(f"❌ 未找到 topic「{topic}」下的想法")
-                return
-
-            yield event.plain_result(f"**🗑️ 已清空 topic「{actual_topic}」的所有想法**\n\n已删除 {deleted_count} 个想法文件")
-
-        except Exception as e:
-            logger.error(f"[IdeaEngine] 清空想法失败: {e}")
-            yield event.plain_result(f"❌ 清空失败: {e}")
-
     @idea_commands.command("explore")
     async def cmd_idea_explore(self, event: AstrMessageEvent,
                                 topic: str = '',
@@ -4318,7 +4248,7 @@ class PaperRAGPlugin(Star):
                 research_domain=domain,
                 num_ideas=num,
                 idea_focus=focus,
-                topic=""
+                topic=topic
             )
 
             if not ideas:
@@ -4354,32 +4284,28 @@ class PaperRAGPlugin(Star):
     async def cmd_idea_tofeishu(self, event: AstrMessageEvent,
                                   ids: str = "",
                                   folder_token: str = "",
-                                  refresh: str = "auto"):
+                                  table_format: str = "png",
+                                  refresh: bool = False):
         """
         将研究想法导出为飞书文档（第二阶段）
 
         使用方式:
-        /idea tofeishu <topic> [folder_token] [refresh]      # 按 topic 加载全部
-        /idea tofeishu <uuid1,uuid2,...> [folder_token] [refresh]  # 按 UUID 加载指定想法
-        /idea tofeishu <topic> [folder_token] refresh       # 强制重新检索
+        /idea tofeishu <topic> [folder_token] [table_format]      # 按 topic 加载全部
+        /idea tofeishu <uuid1,uuid2,...> [folder_token] [table_format]  # 按 UUID 加载指定想法
+        /idea tofeishu <topic> [folder_token] refresh            # 强制重新检索
 
         Examples:
         /idea tofeishu 稀疏3DGS开放词汇统一重建
         /idea tofeishu 稀疏3DGS开放词汇统一重建 <folder_token>
+        /idea tofeishu 稀疏3DGS开放词汇统一重建 <folder_token> md
         /idea tofeishu a1b2c3d4,e5f6g7h8 <folder_token>           # 加载指定 UUID
         /idea tofeishu 稀疏3DGS <folder_token> refresh           # 强制重新检索
 
         加载优先级：ids 含逗号 → UUID 精确加载；否则 → topic 加载该 topic 下全部
-        refresh: auto(默认)使用已有草稿 / refresh=refresh 强制重新检索
-        表格格式: 由插件配置 feishu_table_format 指定（png/csv/md）
+        refresh=True 时：强制重新检索知识，不使用缓存 context
+        table_format: csv(飞书原生表格) / md(Markdown文本块) / png(默认,图片)
         """
         try:
-            # 转换 refresh 字符串为布尔值
-            table_format = self.config.get("feishu_table_format", "png")
-            enable_paper_banana = self.config.get("enable_paper_banana", False)
-            refresh_flag = refresh.lower() == "refresh" if refresh else False
-            logger.info(f"[IdeaEngine] tofeishu refresh={repr(refresh)}, refresh_flag={refresh_flag}, table_format={repr(table_format)}, enable_paper_banana={enable_paper_banana}")
-
             if not ids:
                 yield event.plain_result("📚 Usage: /idea tofeishu <topic> [folder_token]\n       /idea tofeishu <uuid1,uuid2,...> [folder_token]\nExample: /idea tofeishu 稀疏3DGS a1b2c3d4,e5f6g7h8")
                 return
@@ -4420,9 +4346,8 @@ class PaperRAGPlugin(Star):
                 ideas = idea_engine.convert_to_research_ideas(ideas_list)
                 knowledge = context_data or {}
                 topic = context_data.get("topic", ids) if context_data else ids
-                folder_hash = context_data.get("_folder_hash") if context_data else None
                 # UUID 加载时忽略 refresh（无重新检索需求）
-                refresh_flag = False
+                refresh = False
             else:
                 # 按 topic 加载（支持 folder hash 直接查找）
                 # 优先检查 ids 是否已是合法 folder hash
@@ -4430,16 +4355,19 @@ class PaperRAGPlugin(Star):
                 folder_hash = ids if (ideas_dir / ids).exists() else idea_engine._topic_hash(ids)
                 # 如果 ids 是 folder hash，从 context 中读取真实 topic 名称
                 topic = idea_engine.find_topic_by_folder(folder_hash) or ids
-                if refresh_flag:
-                    # refresh 只重新生成草稿，不重新检索 ideas 和 knowledge
-                    yield event.plain_result(f"🔄 重新生成草稿: {topic}")
-                    ideas_list, context_data = idea_engine.load_ideas_by_topic(folder_hash)
-                    if not ideas_list:
-                        yield event.plain_result(f"❌ 未找到 folder hash={folder_hash} 的想法")
+                if refresh:
+                    yield event.plain_result(f"🔄 强制重新检索: {topic}")
+                    analysis = await idea_engine.analyze_topic(topic, depth="standard")
+                    if not analysis:
+                        yield event.plain_result("❌ 主题分析失败")
                         return
-                    topic = context_data.get("topic", topic) if context_data else topic
+                    all_queries = (analysis.search_queries + analysis.local_rag_queries)[:5]
+                    knowledge = await idea_engine.search_knowledge(all_queries, local_rag_top_k=25, web_top_k=25)
+                    ideas_list, _ = idea_engine.load_ideas_by_topic(folder_hash)
                     ideas = idea_engine.convert_to_research_ideas(ideas_list)
-                    knowledge = context_data or {}
+                    # 重新保存 context
+                    idea_engine.save_ideas_to_file(ideas, topic, knowledge)
+                    yield event.plain_result(f"💾 已更新 context")
                 else:
                     ideas_list, context_data = idea_engine.load_ideas_by_topic(folder_hash)
                     if not ideas_list:
@@ -4453,69 +4381,19 @@ class PaperRAGPlugin(Star):
                 yield event.plain_result("❌ 想法为空")
                 return
 
-            # 加载已有的 initial_draft.md（仅当 refresh_flag=False 且有 folder_hash 时）
-            initial_draft = ""
-            if not refresh_flag:
-                if folder_hash:
-                    draft_file = idea_engine._get_ideas_dir() / folder_hash / "initial_draft.md"
-                    if draft_file.exists():
-                        try:
-                            with open(draft_file, "r", encoding="utf-8") as f:
-                                initial_draft = f.read()
-                            logger.info(f"[IdeaEngine] 已加载已有草稿: {draft_file}, 长度: {len(initial_draft)}")
-                        except OSError as e:
-                            logger.warning(f"[IdeaEngine] 读取草稿失败 [OSError]: {e}")
-                            yield event.plain_result(f"⚠️ 读取已有草稿失败 [OSError]: {e}，将重新生成")
-                            initial_draft = ""
-                        except UnicodeDecodeError as e:
-                            logger.warning(f"[IdeaEngine] 读取草稿失败 [UnicodeDecodeError]: {e}")
-                            yield event.plain_result(f"⚠️ 读取已有草稿失败 [UnicodeDecodeError]: {e}，将重新生成")
-                            initial_draft = ""
-                        except Exception as e:
-                            logger.error(f"[IdeaEngine] 读取草稿失败 [Unexpected]: {type(e).__name__}: {e}")
-                            yield event.plain_result(f"⚠️ 读取已有草稿失败 [{type(e).__name__}]: {e}，将重新生成")
-                            initial_draft = ""
-                    # else: 草稿不存在，正常，会生成新的
-                else:
-                    logger.debug("[IdeaEngine] 无 folder_hash（UUID路径），跳过草稿加载，将生成新草稿")
+            # 调试：输出媒体 caption 提取统计
+            debug_report = idea_engine.debug_media_captions(knowledge)
+            logger.info(f"[IdeaEngine] {debug_report}")
 
             # 4. 创建飞书文档（传入知识检索结果以生成引用）
             yield event.plain_result("📄 正在创建飞书文档...")
-            try:
-                result = await idea_engine.create_feishu_document(
-                    ideas=ideas,
-                    topic=topic,
-                    folder_token=folder_token,
-                    knowledge=knowledge,
-                    table_format=table_format,
-                    initial_draft=initial_draft,
-                    enable_paper_banana=enable_paper_banana
-                )
-            except Exception as e:
-                logger.error(f"[IdeaEngine] create_feishu_document 异常 [{type(e).__name__}]: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-                yield event.plain_result(f"❌ 创建飞书文档异常 [{type(e).__name__}]: {e}")
-                return
-
-            # 如果生成了新草稿且refresh_flag=True，保存草稿
-            if refresh_flag and result.get("polished_content"):
-                if folder_hash:
-                    draft_file = idea_engine._get_ideas_dir() / folder_hash / "initial_draft.md"
-                    draft_file.parent.mkdir(parents=True, exist_ok=True)
-                    try:
-                        with open(draft_file, "w", encoding="utf-8") as f:
-                            f.write(result["polished_content"])
-                        logger.info(f"[IdeaEngine] 已保存新草稿: {draft_file}")
-                    except OSError as e:
-                        logger.warning(f"[IdeaEngine] 保存草稿失败 [OSError]: {e}")
-                        yield event.plain_result(f"⚠️ 保存草稿失败 [OSError]: {e}")
-                    except Exception as e:
-                        logger.error(f"[IdeaEngine] 保存草稿失败 [{type(e).__name__}]: {e}")
-                        yield event.plain_result(f"⚠️ 保存草稿失败 [{type(e).__name__}]: {e}")
-                else:
-                    logger.warning("[IdeaEngine] 无法保存草稿：UUID路径缺少 folder_hash")
-                    yield event.plain_result("⚠️ 草稿已生成但无法保存（缺少 folder_hash）")
+            result = await idea_engine.create_feishu_document(
+                ideas=ideas,
+                topic=topic,
+                folder_token=folder_token,
+                knowledge=knowledge,
+                table_format=table_format
+            )
 
             if not result:
                 yield event.plain_result("❌ 创建飞书文档失败: 未知错误")
@@ -4575,56 +4453,21 @@ class PaperRAGPlugin(Star):
             logger.error(f"飞书文档创建失败: {e}")
             yield event.plain_result(f"❌ 创建失败: {e}")
 
-    @idea_commands.command("testblocks")
-    async def cmd_idea_testblocks(self, event: AstrMessageEvent, folder_token: str = ""):
-        """
-        测试 Markdown 转飞书块的转换逻辑并实际创建飞书文档
-
-        使用方式:
-        /idea testblocks <folder_token>
-        Example: /idea testblocks <your_folder_token>
-        """
-        try:
-            from .idea_engine import IdeaEngine
-
-            rag_engine = self._get_engine()
-            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
-
-            yield event.plain_result("正在创建测试飞书文档（列表样式+图片+引用）...")
-            result = await idea_engine.test_feishu_markdown_formats(folder_token=folder_token)
-
-            if result.get("success"):
-                url = result.get("url", "")
-                blocks = result.get("blocks_created", 0)
-                images = result.get("image_count", 0)
-                lists = result.get("list_styles_updated", 0)
-                yield event.plain_result(f"测试文档创建成功\n链接: {url}\n块数: {blocks}\n图片: {images}\n列表样式更新: {lists}")
-            else:
-                yield event.plain_result(f"❌ 测试失败: {result.get('error', '未知错误')}")
-
-        except Exception as e:
-            import traceback
-            logger.error(f"testblocks 失败: {e}\n{traceback.format_exc()}")
-            yield event.plain_result(f"❌ 测试失败: {e}")
-
     @idea_commands.command("regen")
     async def cmd_idea_regen(self, event: AstrMessageEvent,
                                folder_hash: str = "",
-                               refresh: str = "auto",
                                num: int = 3,
                                focus: str = "all"):
         """
         根据 folder hash 重新生成所有 ideas 以及初始周报
 
         使用方式:
-        /idea regen <folder_hash> [refresh] [num] [focus]
+        /idea regen <folder_hash> [num] [focus]
         Example: /idea regen a1b2c3d4e5f6g7h8
         Example: /idea regen a1b2c3d4e5f6g7h8 5 novelty
-        Example: /idea regen a1b2c3d4e5f6g7h8 refresh  # 强制重新检索知识
 
         Args:
             folder_hash: topic 的 folder hash（16位 MD5）
-            refresh: auto(默认)使用缓存context / refresh=refresh 强制重新检索
             num: 生成想法数量（默认3）
             focus: 想法聚焦方向 (novelty/feasibility/impact/all)
         """
@@ -4633,27 +4476,20 @@ class PaperRAGPlugin(Star):
             return
 
         if not folder_hash:
-            yield event.plain_result("""📚 Usage: /idea regen <folder_hash> [refresh] [num] [focus]
+            yield event.plain_result("""📚 Usage: /idea regen <folder_hash> [num] [focus]
 
 根据 folder hash 重新生成所有 ideas 和初始周报草稿。
-refresh 参数强制重新检索本地RAG和网络搜索知识。
 
 Examples:
   /idea regen a1b2c3d4e5f6g7h8
   /idea regen a1b2c3d4e5f6g7h8 5
   /idea regen a1b2c3d4e5f6g7h8 3 novelty
-  /idea regen a1b2c3d4e5f6g7h8 refresh  # 强制重新检索
 
 使用 /idea list 查看所有 topic 及其 folder hash。
 """)
             return
 
         try:
-            # 转换 refresh 字符串为布尔值
-            logger.info(f"[IdeaEngine] regen refresh={repr(refresh)}, type={type(refresh).__name__}")
-            refresh_bool = refresh.lower() == "refresh" if refresh else False
-            logger.info(f"[IdeaEngine] refresh_bool={refresh_bool}")
-
             rag_engine = self._get_engine()
             if not rag_engine:
                 yield event.plain_result("❌ RAG引擎未初始化")
@@ -4662,61 +4498,14 @@ Examples:
             from .idea_engine import IdeaEngine
             idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
 
-            # 检查 folder 是否存在
-            ideas_dir = idea_engine._get_ideas_dir()
-            folder = ideas_dir / folder_hash
-            if not folder.exists():
-                yield event.plain_result(f"❌ Folder hash 不存在: {folder_hash}")
-                return
+            yield event.plain_result(f"🔄 正在重新生成 ideas 和初始周报...\nfolder_hash: {folder_hash}\nnum: {num}, focus: {focus}")
 
-            # 获取 topic 名称
-            topic = idea_engine.find_topic_by_folder(folder_hash) or folder_hash
-
-            if refresh_bool:
-                yield event.plain_result(f"🔄 强制重新检索知识并重新生成...\nfolder_hash: {folder_hash}\nnum: {num}, focus: {focus}")
-
-                # 重新检索知识
-                analysis = await idea_engine.analyze_topic(topic, depth="standard")
-                if not analysis:
-                    yield event.plain_result("❌ 主题分析失败")
-                    return
-
-                all_queries = (analysis.search_queries + analysis.local_rag_queries)[:5]
-                knowledge = await idea_engine.search_knowledge(all_queries, local_rag_top_k=25, web_top_k=25)
-                yield event.plain_result(f"📚 重新检索完成: {len(knowledge.get('local_results', []))} 条本地 + {len(knowledge.get('web_results', []))} 条网络")
-
-                # 加载现有 ideas
-                ideas_list, _ = idea_engine.load_ideas_by_topic(folder_hash)
-                ideas = idea_engine.convert_to_research_ideas(ideas_list)
-
-                # 重新生成所有 ideas（使用 VLM）
-                ideas = await idea_engine.generate_ideas(
-                    knowledge_context=knowledge.get("fused_context", ""),
-                    research_domain=analysis.domain,
-                    num_ideas=num,
-                    idea_focus=focus,
-                    topic=topic
-                )
-
-                if not ideas:
-                    yield event.plain_result("❌ 想法重新生成失败")
-                    return
-
-                # 生成初始周报草稿
-                initial_draft = await idea_engine._generate_initial_draft_vlm(ideas, topic, knowledge)
-
-                # 保存
-                idea_engine.save_ideas_to_file(ideas, topic, knowledge)
-
-            else:
-                yield event.plain_result(f"🔄 正在重新生成 ideas 和初始周报...\nfolder_hash: {folder_hash}\nnum: {num}, focus: {focus}")
-
-                # 调用 regenerate_all（使用缓存的 context）
-                ideas, initial_draft, knowledge = await idea_engine.regenerate_all(
-                    folder_hash=folder_hash,
-                    num_ideas=num,
-                    idea_focus=focus
-                )
+            # 调用 regenerate_all
+            ideas, initial_draft, knowledge = await idea_engine.regenerate_all(
+                folder_hash=folder_hash,
+                num_ideas=num,
+                idea_focus=focus
+            )
 
             if not ideas:
                 yield event.plain_result("❌ 重新生成失败")
@@ -4730,7 +4519,6 @@ Examples:
 📁 **Folder Hash**: `{folder_hash}`
 📊 **新生成想法数**: {len(ideas)}
 🔍 **聚焦方向**: {focus}
-{'🔄 **已强制重新检索知识**' if refresh_bool else ''}
 
 ---
 
@@ -4768,6 +4556,579 @@ Examples:
         except Exception as e:
             logger.error(f"Idea 重新生成失败: {e}")
             yield event.plain_result(f"❌ 重新生成失败: {e}")
+
+    @idea_commands.command("test_brightdata")
+    async def cmd_idea_test_brightdata(self, event: AstrMessageEvent,
+                                         query: str = "",
+                                         tool: str = "all"):
+        """
+        测试 Bright Data MCP 各种工具功能
+
+        使用方式:
+        /idea test_brightdata <搜索query> [工具类型]
+        示例:
+        /idea test_brightdata transformer architecture in computer vision
+        /idea test_brightdata transformer 扩散模型 discover
+        /idea test_brightdata https://arxiv.org/abs/2403.12345 scrape
+        /idea test_brightdata LLM reasoning chains discover
+
+        工具类型:
+        - search: 搜索引擎搜索（默认）
+        - discover: AI 智能搜索
+        - scrape: 抓取单个页面为 Markdown
+        - all: 测试所有工具（默认）
+        """
+        try:
+            if not query:
+                yield event.plain_result("""📚 Usage: /idea test_brightdata <搜索query> [工具类型]
+
+示例:
+  /idea test_brightdata transformer architecture in computer vision
+  /idea test_brightdata LLM reasoning chains discover
+  /idea test_brightdata https://arxiv.org/abs/2403.12345 scrape
+  /idea test_brightdata ["query1", "query2"] batch_search
+
+工具类型:
+  - search: 搜索引擎搜索（默认）
+  - discover: AI 智能搜索
+  - scrape: 抓取页面为 Markdown
+  - batch_search: 批量搜索
+  - all: 测试所有工具""")
+                return
+
+            # 获取 RAG 引擎
+            rag_engine = self._get_engine()
+            if not rag_engine:
+                yield event.plain_result("❌ RAG引擎未初始化")
+                return
+
+            # 初始化 IdeaEngine
+            from .idea_engine import IdeaEngine
+            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
+
+            # 检查 Bright Data 配置
+            is_configured = idea_engine._check_bright_data_config()
+            if not is_configured:
+                yield event.plain_result("⚠️ Bright Data MCP 未配置或 API_TOKEN 为空\n请检查 mcp_server.json 中的 BrightData 配置")
+                return
+
+            yield event.plain_result("✅ Bright Data MCP 已配置\n")
+
+            # 根据工具类型执行测试
+            if tool == "all" or tool == "search":
+                yield event.plain_result("🌐 [1/4] 测试 search_engine...")
+                result = await idea_engine.test_brightdata_mcp(query=query)
+                if result.get("success"):
+                    search_results = result.get("results", [])
+                    yield event.plain_result(f"   ✅ search_engine 成功！找到 {len(search_results)} 条结果")
+                    for i, r in enumerate(search_results[:3], 1):
+                        yield event.plain_result(f"   {i}. {r.get('title', 'N/A')[:60]}")
+                else:
+                    yield event.plain_result(f"   ❌ search_engine 失败: {result.get('error')}")
+
+            if tool == "all" or tool == "discover":
+                yield event.plain_result("\n🔍 [2/4] 测试 discover (AI智能搜索)...")
+                result = await idea_engine._discover_search(
+                    query=query,
+                    intent=f"Find academic papers and research about {query}",
+                    num_results=5
+                )
+                if result.get("success"):
+                    results_list = result.get("results", [])
+                    yield event.plain_result(f"   ✅ discover 成功！找到 {len(results_list)} 条结果")
+                    for i, r in enumerate(results_list[:3], 1):
+                        yield event.plain_result(f"   {i}. {r.get('title', 'N/A')[:60]}")
+                else:
+                    yield event.plain_result(f"   ❌ discover 失败: {result.get('error')}")
+
+            # 判断是否为 URL
+            is_url = query.startswith("http://") or query.startswith("https://")
+            is_url_list = False
+            try:
+                potential_list = json.loads(query)
+                is_url_list = isinstance(potential_list, list) and all(
+                    u.startswith("http") for u in potential_list
+                )
+            except json.JSONDecodeError:
+                pass
+
+            if tool == "all" or tool == "scrape":
+                if is_url:
+                    yield event.plain_result(f"\n📄 [3/4] 测试 scrape_as_markdown ({query[:50]}...)...")
+                    result = await idea_engine._scrape_as_markdown(query)
+                    if result.get("success"):
+                        markdown = result.get("markdown", "")
+                        yield event.plain_result(f"   ✅ scrape_as_markdown 成功！内容长度: {len(markdown)} 字符")
+                        yield event.plain_result(f"   内容预览: {markdown[:200]}...")
+                    else:
+                        yield event.plain_result(f"   ❌ scrape_as_markdown 失败: {result.get('error')}")
+                elif tool == "scrape":
+                    yield event.plain_result("⚠️ scrape 工具需要提供 URL，请使用完整 URL")
+
+            if tool == "all" or tool == "batch_search":
+                if is_url_list:
+                    urls = json.loads(query)
+                    yield event.plain_result(f"\n📦 [4/4] 测试 scrape_batch ({len(urls)} URLs)...")
+                    result = await idea_engine._scrape_batch_markdown(urls)
+                    if result.get("success"):
+                        yield event.plain_result(f"   ✅ scrape_batch 成功！")
+                    else:
+                        yield event.plain_result(f"   ❌ scrape_batch 失败: {result.get('error')}")
+                elif tool == "batch_search":
+                    # 尝试解析为 JSON 数组
+                    try:
+                        queries = json.loads(query)
+                        if isinstance(queries, list) and len(queries) <= 5:
+                            yield event.plain_result(f"\n📦 [4/4] 测试 search_engine_batch ({len(queries)} queries)...")
+                            result = await idea_engine._search_engine_batch([
+                                {"query": q, "engine": "google"} for q in queries
+                            ])
+                            if result.get("success"):
+                                yield event.plain_result(f"   ✅ batch_search 成功！")
+                            else:
+                                yield event.plain_result(f"   ❌ batch_search 失败: {result.get('error')}")
+                        else:
+                            yield event.plain_result("⚠️ batch_search 需要 JSON 数组格式的查询列表")
+                    except json.JSONDecodeError:
+                        yield event.plain_result("⚠️ batch_search 需要 JSON 数组格式的查询列表")
+
+            if tool == "all":
+                yield event.plain_result("\n✅ 所有 Bright Data 工具测试完成！")
+
+        except Exception as e:
+            logger.error(f"Bright Data MCP 测试失败: {e}")
+            yield event.plain_result(f"❌ 测试失败: {e}")
+
+    @idea_commands.command("test_feishu_markdown")
+    async def cmd_idea_test_feishu_markdown(self, event: AstrMessageEvent,
+                                           folder_token: str = ""):
+        """
+        测试飞书文档的 Markdown 格式渲染（使用 mistune v3 插件）
+
+        使用方式:
+        /idea test_feishu_markdown [folder_token]
+        示例:
+        /idea test_feishu_markdown FWK2fMleClICfodlHHWc4Mygnhb
+
+        测试内容：
+        - 一级/二级/三级标题
+        - 加粗、斜体、加粗斜体
+        - 行内代码
+        - 删除线 ~~text~~
+        - 链接 [文本](url)
+        - 无序列表、有序列表
+        - 分割线
+        - 图表引用 [图X]、[表X]
+        - LaTeX 公式 $公式$
+        - 混合内容
+        """
+        try:
+            if not folder_token:
+                yield event.plain_result("📚 Usage: /idea test_feishu_markdown [folder_token]\n示例: /idea test_feishu_markdown FWK2fMleClICfodlHHWc4Mygnhb")
+                return
+
+            yield event.plain_result("🧪 正在测试飞书文档 Markdown 格式...")
+
+            # 获取 RAG 引擎
+            rag_engine = self._get_engine()
+            if not rag_engine:
+                yield event.plain_result("❌ RAG引擎未初始化")
+                return
+
+            # 初始化 IdeaEngine
+            from .idea_engine import IdeaEngine
+            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
+
+            # 调用测试方法
+            result = await idea_engine.test_feishu_markdown_formats(folder_token=folder_token)
+
+            if not result.get("success"):
+                yield event.plain_result(f"❌ 测试失败: {result.get('error')}")
+                return
+
+            # 成功
+            url = result.get("url", "")
+            blocks_created = result.get("blocks_created", 0)
+            blocks_count = result.get("blocks_count", 0)
+
+            output = f"""✅ **Markdown 格式测试完成！**
+
+📊 **生成块数**: {blocks_created} / {blocks_count}
+🔗 **文档链接**: {url}
+
+请检查文档中以下格式是否正确渲染：
+- 标题（1-3级）
+- **加粗**、*斜体*、***加粗斜体***
+- `行内代码`
+- 列表（有序/无序）
+- 分割线"""
+
+            yield event.plain_result(output)
+
+        except Exception as e:
+            logger.error(f"Markdown 测试失败: {e}")
+            yield event.plain_result(f"❌ 测试失败: {e}")
+
+    @idea_commands.command("test_media_db")
+    async def cmd_idea_test_media_db(self, event: AstrMessageEvent,
+                                     limit: int = 20,
+                                     folder_token: str = "OedRflAATlKAmfduFvwcGMsPnRh",
+                                     table_format: str = "png"):
+        """
+        直接从 Milvus 数据库查找含有图表元数据的 chunk，并可选创建飞书文档测试图表插入
+
+        用法:
+          /idea test_media_db [最大数量] [folder_token] [table_format]
+        示例:
+          /idea test_media_db 50                           # 仅查询和统计
+          /idea test_media_db 50 FWK2fMleClICfodlHHWc4Mygnhb  # 查询并创建飞书文档测试
+          /idea test_media_db 50 FWK2fMleClICfodlHHWc4Mygnhb md  # 使用 MD 格式
+
+        参数:
+          limit: 最大处理的 chunk 数量（默认 20）
+          folder_token: 飞书文件夹 token（可选），提供则创建测试飞书文档
+          table_format: 表格插入格式，可选 csv、md、png(默认)
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        yield event.plain_result(f"🔍 直接查询 Milvus 数据库，查找含图表元数据的 chunk...\n(limit={limit})")
+
+        try:
+            rag_engine = self._get_engine()
+            if not rag_engine:
+                yield event.plain_result("❌ RAG 引擎未初始化")
+                return
+
+            index_manager = rag_engine._ensure_index_manager_initialized()
+
+            yield event.plain_result(f"🔍 通过 IndexManager 加载全量 chunks（按论文分组）...")
+
+            all_chunks = await index_manager.get_all_chunks()
+
+            yield event.plain_result(f"📊 共加载 {len(all_chunks)} 个 chunks，开始筛选含图表的...")
+
+            chunks_with_images = []
+            chunks_with_tables = []
+            chunks_with_both = []
+
+            for chunk in all_chunks:
+                raw_meta = chunk.get("metadata", {})
+                if not isinstance(raw_meta, dict):
+                    raw_meta = {}
+
+                ip = raw_meta.get("image_path")
+                tcp = raw_meta.get("table_csv_path")
+                tpp = raw_meta.get("table_png_path")
+
+                if ip or (tcp or tpp):
+                    chunk_info = {
+                        "text": chunk.get("text", "")[:200],
+                        "paper": chunk.get("file_name", "unknown"),
+                        "page": str(raw_meta.get("page", "")),
+                        "score": 1.0,
+                        "metadata": {
+                            "file_name": chunk.get("file_name", "unknown"),
+                            "page": str(raw_meta.get("page", "")),
+                            "image_path": ip,
+                            "image_caption": raw_meta.get("image_caption"),
+                            "table_csv_path": tcp,
+                            "table_png_path": tpp,
+                            "table_caption": raw_meta.get("table_caption"),
+                        }
+                    }
+                    if ip and (tcp or tpp):
+                        chunks_with_both.append(chunk_info)
+                    elif ip:
+                        chunks_with_images.append(chunk_info)
+                    else:
+                        chunks_with_tables.append(chunk_info)
+
+            yield event.plain_result(f"\n📋 统计结果：")
+            yield event.plain_result(f"  - 含图片的 chunk: {len(chunks_with_images)}")
+            yield event.plain_result(f"  - 含表格的 chunk: {len(chunks_with_tables)}")
+            yield event.plain_result(f"  - 含图片+表格的 chunk: {len(chunks_with_both)}")
+
+            # 优先选同时有图片和表格的
+            target_chunks = chunks_with_both[:3] if chunks_with_both else (chunks_with_images[:3] if chunks_with_images else chunks_with_tables[:3])
+
+            if not target_chunks:
+                yield event.plain_result(
+                    "\n❌ 数据库中没有找到含图表元数据的 chunk。\n"
+                    "请先运行 /paper build confirm 处理论文（确保 multimodal.enabled=true）"
+                )
+                return
+
+            yield event.plain_result(f"\n✅ 找到 {len(target_chunks)} 个含图表的 chunk，选择前 {len(target_chunks)} 个进行测试")
+
+            for i, c in enumerate(target_chunks):
+                meta = c["metadata"]
+                img = meta.get("image_path")
+                tbl = meta.get("table_csv_path") or meta.get("table_png_path")
+                yield event.plain_result(
+                    f"  [{i}] {c['paper'][:40]} (页{meta.get('page', '?')})\n"
+                    f"      图片: {img if img else '无'}\n"
+                    f"      表格: {tbl if tbl else '无'}"
+                )
+
+            # 组装 knowledge 格式
+            knowledge = {
+                "local_results": target_chunks,
+                "web_results": [],
+            }
+
+            from .idea_engine import IdeaEngine, ResearchIdea
+            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
+
+            # 验证 _build_citations_context 提取结果
+            citations_context, extracted_media = idea_engine._build_citations_context(knowledge)
+
+            # 增强媒体 caption（分析图片与 caption 是否匹配，标记不匹配的为跳过）
+            extracted_media = await idea_engine._enhance_media_captions(extracted_media, knowledge)
+
+            # 统计被跳过的图片
+            skipped_images = [img for img in extracted_media.get("images", []) if img.get("_skip")]
+            skipped_tables = [tbl for tbl in extracted_media.get("tables", []) if tbl.get("_skip")]
+            if skipped_images:
+                yield event.plain_result(f"\n⏭️ 跳过的图片（与 caption 不匹配）: {len(skipped_images)} 张")
+                for img in skipped_images:
+                    yield event.plain_result(f"  - [{img['index']}] {img.get('caption', '')}")
+            if skipped_tables:
+                yield event.plain_result(f"\n⏭️ 跳过的表格（描述无意义）: {len(skipped_tables)} 个")
+
+            yield event.plain_result(f"\n📦 _build_citations_context 提取结果：")
+            yield event.plain_result(f"  - extracted_media['images']: {len(extracted_media.get('images', []))} 张")
+            yield event.plain_result(f"  - extracted_media['tables']: {len(extracted_media.get('tables', []))} 个")
+
+            if extracted_media.get("images"):
+                yield event.plain_result("\n🖼️ 提取的图片：")
+                for img in extracted_media["images"]:
+                    skip标记 = " ⏭️已跳过" if img.get("_skip") else ""
+                    yield event.plain_result(f"  [{img['index']}] {img['caption']} | {img['path']}{skip标记}")
+
+            if extracted_media.get("tables"):
+                yield event.plain_result("\n📊 提取的表格：")
+                for tbl in extracted_media.get("tables", []):
+                    skip标记 = " ⏭️已跳过" if tbl.get("_skip") else ""
+                    yield event.plain_result(f"  [{tbl['index']}] {tbl['caption']} | CSV:{tbl.get('csv_path', '无')} PNG:{tbl.get('png_path', '无') or '无'}{skip标记}")
+
+            media_blocks, pending_images = idea_engine._create_media_blocks(extracted_media)
+            yield event.plain_result(f"\n🧱 _create_media_blocks: 创建 {len(media_blocks)} 个块，{len(pending_images)} 张待上传图片")
+
+            if not folder_token:
+                if media_blocks:
+                    yield event.plain_result("✅ 图表提取流程正常，可用于飞书文档插入")
+                    yield event.plain_result("\n💡 传入 folder_token 可创建飞书文档进行真实测试：")
+                    yield event.plain_result("  /idea test_media_db 50 <folder_token>")
+                else:
+                    yield event.plain_result("⚠️ 块创建返回空，文件可能不存在或路径无效")
+                return
+
+            # 有 folder_token，创建真实飞书文档测试
+            if not media_blocks:
+                yield event.plain_result("\n⚠️ 没有可插入的媒体块，跳过飞书文档创建")
+                return
+
+            yield event.plain_result(f"\n📄 开始创建飞书文档测试（folder_token={folder_token[:20]}...）")
+
+            # 构建简单的测试 ResearchIdea
+            test_ideas = [
+                ResearchIdea(
+                    title="图表插入测试",
+                    description="验证从数据库元数据提取的图片和表格能否正确插入飞书文档",
+                    novelty="测试多模态内容提取流程",
+                    methodology="直接读取 Milvus chunk 元数据，提取 image_path/table_csv_path",
+                    potential_challenges=["文件路径可能不存在", "图片格式可能不兼容"],
+                    related_work=["/idea test_media_db 命令"],
+                    feasibility=0.9,
+                    inspiration_sources=["paperrag 多模态提取"]
+                )
+            ]
+
+            feishu_result = await idea_engine.create_feishu_document(
+                ideas=test_ideas,
+                topic="图表插入测试",
+                folder_token=folder_token,
+                knowledge=knowledge,
+                table_format=table_format
+            )
+
+            if feishu_result.get("error"):
+                yield event.plain_result(f"\n❌ 飞书文档创建失败: {feishu_result['error']}")
+            else:
+                doc_url = feishu_result.get("url", "")
+                yield event.plain_result(f"\n✅ 飞书文档创建成功！")
+                yield event.plain_result(f"   文档链接: {doc_url}")
+                images_in_doc = feishu_result.get("images_uploaded", 0)
+                tables_in_doc = feishu_result.get("tables_created", 0)
+                media = feishu_result.get("media_count", {})
+                yield event.plain_result(f"   插入图片: {images_in_doc} 张（提取: {media.get('images', 0)} 张）")
+                yield event.plain_result(f"   插入表格: {tables_in_doc} 个（提取: {media.get('tables', 0)} 个）")
+
+        except Exception as e:
+            import traceback
+            logger.error(f"test_media_db 失败: {e}\n{traceback.format_exc()}")
+            yield event.plain_result(f"❌ 失败: {e}")
+
+    @idea_commands.command("test_list")
+    async def cmd_idea_test_list(self, event: AstrMessageEvent,
+                                  folder_token: str = "OedRflAATlKAmfduFvwcGMsPnRh"):
+        """
+        测试飞书文档中的列表格式
+
+        用法:
+          /idea test_list [folder_token]
+
+        测试不同列表格式在飞书中的显示效果
+        """
+        if not folder_token:
+            yield event.plain_result("📚 Usage: /idea test_list [folder_token]\nExample: /idea test_list OedRflAATlKAmfduFvwcGMsPnRh")
+            return
+
+        try:
+            from .idea_engine import IdeaEngine
+            from astrbot.core.agent.run_context import ContextWrapper
+
+            rag_engine = self._get_engine()
+            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
+
+            yield event.plain_result("🔍 测试飞书列表格式...")
+
+            # 测试内容：包含不同列表格式
+            test_content = """# 列表格式测试
+
+## 1. 无序列表（- xxx）
+- 这是第一个列表项
+- 这是第二个列表项
+- 这是第三个列表项
+
+## 2. 有序列表（1. xxx）
+1. 第一项
+2. 第二项
+3. 第三项
+
+## 3. 复杂列表项测试
+1. 挑战一：2D预训练先验的噪声问题。原因：直接利用2D模型。解决方案：采用分层策略。
+2. 挑战二：几何对齐困难。原因：缺乏准确的相机位姿。解决方案：引入自监督网络。
+
+## 4. 纯文本（对照组）
+这是普通段落，不是列表。
+
+## 5. 段落加列表混合
+首先介绍背景。然后：
+- 列表项A
+- 列表项B
+最后是结论。
+"""
+
+            # 转换为飞书块
+            blocks = idea_engine._markdown_to_feishu_blocks(test_content)
+
+            # 打印调试信息
+            logger.info(f"[IdeaEngine] 测试列表生成 {len(blocks)} 个块")
+            for i, block in enumerate(blocks):
+                block_type = block.get("blockType", "")
+                logger.info(f"[IdeaEngine] 块[{i}] blockType={block_type}: {json.dumps(block, ensure_ascii=False)[:500]}")
+
+            # 获取飞书工具并创建文档
+            feishu_tool = idea_engine._get_feishu_tool()
+            if not feishu_tool:
+                yield event.plain_result("❌ 未找到飞书 MCP 工具")
+                return
+
+            ctx_wrapper = ContextWrapper(context=self.context)
+
+            # 创建文档
+            create_result = await feishu_tool.call(
+                ctx_wrapper,
+                title="列表格式测试",
+                folderToken=folder_token
+            )
+
+            # 解析文档ID
+            doc_id = ""
+            if hasattr(create_result, 'content') and create_result.content:
+                result_text = create_result.content[0].text
+                logger.info(f"[IdeaEngine] 创建结果: {result_text}")
+                try:
+                    result_data = json.loads(result_text)
+                    doc_id = result_data.get("document", {}).get("document_id", "")
+                except json.JSONDecodeError:
+                    doc_id = ""
+
+            if not doc_id:
+                yield event.plain_result(f"❌ 文档创建失败: {create_result}")
+                return
+
+            doc_url = f"https://bytedance.feishu.cn/docx/{doc_id}"
+            logger.info(f"[IdeaEngine] 文档创建成功，document_id: {doc_id}, URL: {doc_url}")
+
+            # 获取 batch_create_feishu_blocks 和 get_feishu_document_blocks 工具
+            provider_manager = getattr(self.context, 'provider_manager', None)
+            add_blocks_tool = None
+            get_blocks_tool = None
+            if provider_manager:
+                llm_tools = getattr(provider_manager, 'llm_tools', None)
+                if llm_tools:
+                    func_list = getattr(llm_tools, 'func_list', [])
+                    for tool in func_list:
+                        if tool.name == 'batch_create_feishu_blocks':
+                            add_blocks_tool = tool
+                        elif tool.name == 'get_feishu_document_blocks':
+                            get_blocks_tool = tool
+
+            if not add_blocks_tool:
+                yield event.plain_result(f"❌ 未找到 batch_create_feishu_blocks 工具")
+                return
+
+            if not get_blocks_tool:
+                yield event.plain_result(f"❌ 未找到 get_feishu_document_blocks 工具")
+                return
+
+            # 获取文档根block ID
+            root_blocks_result = await get_blocks_tool.call(
+                ctx_wrapper,
+                documentId=doc_id
+            )
+
+            root_block_id = "0"  # 默认值
+            if hasattr(root_blocks_result, 'content') and root_blocks_result.content:
+                result_text = root_blocks_result.content[0].text
+                logger.info(f"[IdeaEngine] 获取根块结果: {result_text}")
+                try:
+                    blocks_data = json.loads(result_text)
+                    # 检查是否是列表格式
+                    if isinstance(blocks_data, list):
+                        if len(blocks_data) > 0:
+                            first_item = blocks_data[0]
+                            root_block_id = first_item.get('block_id', '0') if isinstance(first_item, dict) else '0'
+                    elif isinstance(blocks_data, dict):
+                        items = blocks_data.get('data', {}).get('items', []) or blocks_data.get('items', [])
+                        if items and len(items) > 0:
+                            root_block_id = items[0].get('block_id', '0')
+                except json.JSONDecodeError:
+                    pass
+
+            logger.info(f"[IdeaEngine] 使用 root_block_id: {root_block_id}")
+
+            # 添加内容块
+            blocks_result = await add_blocks_tool.call(
+                ctx_wrapper,
+                documentId=doc_id,
+                parentBlockId=root_block_id,
+                index=0,
+                blocks=blocks
+            )
+
+            logger.info(f"[IdeaEngine] 块插入结果: {repr(blocks_result)[:500]}")
+
+            yield event.plain_result(f"✅ 测试文档创建成功！\n📄 文档ID: {doc_id}\n📝 块数量: {len(blocks)}\n🔗 {doc_url}")
+
+        except Exception as e:
+            import traceback
+            logger.error(f"test_list 失败: {e}\n{traceback.format_exc()}")
+            yield event.plain_result(f"❌ 失败: {e}")
 
     async def _resolve_source_arxiv(self, source: dict) -> dict:
         """解析单个 source 的引用名称和 arxiv 链接"""
@@ -4900,9 +5261,9 @@ Examples:
                 vlm_provider = init_llama_cpp_vlm_provider(
                     model_path=model_path,
                     mmproj_path=mmproj_path,
-                    n_ctx=8192,
+                    n_ctx=4096,
                     n_gpu_layers=99,
-                    max_tokens=25600,
+                    max_tokens=256,
                     temperature=0.3
                 )
                 await vlm_provider.initialize()

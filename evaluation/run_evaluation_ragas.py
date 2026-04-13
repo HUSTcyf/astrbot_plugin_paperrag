@@ -1131,12 +1131,13 @@ async def run_full_pipeline(
         db_name=rag_cfg.get("milvus", {}).get("db_name", "default"),
         collection_name=rag_cfg.get("collection_name", "paper_embeddings"),
         embed_dim=rag_cfg.get("embed_dim", 1024),
-        top_k=rag_cfg.get("top_k", 5),
+        top_k=args.top_k if args.top_k is not None else rag_cfg.get("top_k", 5),
         similarity_cutoff=rag_cfg.get("similarity_cutoff", 0.3),
         chunk_size=rag_cfg.get("chunk_size", 512),
         min_chunk_size=rag_cfg.get("min_chunk_size", 100),
         use_semantic_chunking=rag_cfg.get("use_semantic_chunking", True),
         enable_reranking=rag_cfg.get("enable_reranking", False),
+        enable_two_stage_retrieval=rag_cfg.get("enable_two_stage_retrieval", False),
     )
 
     # context 需要从 AstrBot 传入，这里用 None（引擎会跳过LLM初始化用于检索模式）
@@ -1239,6 +1240,7 @@ def main():
 
     # 测试集配置
     parser.add_argument("--test-size", type=int, default=50, help="生成测试问题数量")
+    parser.add_argument("--top-k", type=int, default=None, help="检索时返回的 top_k（覆盖配置文件）")
     parser.add_argument("--multimodal-test-size", type=int, default=20, help="多模态测试问题数量")
     parser.add_argument("--multimodal-context-before", type=int, default=1, help="多模态 chunk 前面的上下文 chunks 数量")
     parser.add_argument("--multimodal-context-after", type=int, default=1, help="多模态 chunk 后面的上下文 chunks 数量")
@@ -1466,12 +1468,13 @@ def main():
                 db_name=rag_cfg.get("milvus", {}).get("db_name", "default"),
                 collection_name=rag_cfg.get("collection_name", "paper_embeddings"),
                 embed_dim=rag_cfg.get("embed_dim", 1024),
-                top_k=rag_cfg.get("top_k", 5),
+                top_k=args.top_k if args.top_k is not None else rag_cfg.get("top_k", 5),
                 similarity_cutoff=rag_cfg.get("similarity_cutoff", 0.3),
                 chunk_size=rag_cfg.get("chunk_size", 512),
                 min_chunk_size=rag_cfg.get("min_chunk_size", 100),
                 use_semantic_chunking=rag_cfg.get("use_semantic_chunking", True),
                 enable_reranking=rag_cfg.get("enable_reranking", False),
+                enable_two_stage_retrieval=rag_cfg.get("enable_two_stage_retrieval", False),
             )
 
             # Fake context for engine
