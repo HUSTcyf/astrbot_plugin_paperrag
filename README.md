@@ -493,6 +493,75 @@ print('✅ Llama.cpp VLM 安装成功')
 "
 ```
 
+### PaperBanana 方法图生成配置
+
+PaperBanana 是一个**本地部署的 AI 学术图表生成服务**，可以将方法论文本自动转化为精美的论文方法流程图。
+
+**应用场景**：研究想法生成后，自动将技术方案转化为 Pipeline 架构图，插入飞书文档周报。
+
+| 配置项 | 说明 | 默认值 |
+|-------|------|--------|
+| `enable_paper_banana` | 启用 PaperBanana 方法图生成 | `false` |
+
+> 💡 **功能说明**：
+> - 启用后，`/idea tofeishu` 导出飞书文档时，自动根据方法论章节内容生成方法流程图
+> - 图片插入到方法论章节末尾
+> - Caption 优先从 `data/captions/` 目录读取，若无则由本地 VLM 生成
+
+**安装 PaperBanana**：
+
+1. **克隆部署**：
+```bash
+git clone https://github.com/dwzhu-pku/PaperBanana.git
+cd PaperBanana
+```
+
+2. **安装依赖**：
+```bash
+pip install -r requirements.txt
+```
+
+3. **配置 API Key**：
+```bash
+# 启动时填入你的 apiyi key（支持 Gemini/GPT 等）
+python app.py
+# 访问 http://127.0.0.1:7860 配置 key
+```
+
+4. **安装 gradio_client**：
+```bash
+pip install gradio>=6.0.0
+```
+
+5. **验证安装**：
+```bash
+# 确认服务运行中（http://127.0.0.1:7860）
+python -c "
+from gradio_client import Client
+c = Client('http://127.0.0.1:7860')
+print('✅ PaperBanana 连接成功')
+"
+```
+
+**生成效果示例**：
+
+用户输入方法论文本（如"特征提取 → 跨模态对齐 → 开放词汇分割 → 3DGS 渲染"），PaperBanana 生成如下风格的方法图：
+
+- 清晰的 Pipeline 流程（输入 → 处理模块 → 输出）
+- 学术论文风格（适合直接插入投稿论文或周报）
+- 支持多种比例（16:9、4:3 等）
+
+**技术实现**：
+
+| 方法 | 说明 |
+|------|------|
+| `_call_paperbanana()` | 调用本地 Gradio 服务生成方法图 |
+| `_refactor_for_paperbanana()` | 用本地 VLM 将方法论文本转述为图表描述格式 |
+| `_generate_method_figures_with_paperbanana_from_text()` | 从完整方法论文本生成图表 |
+| `test_paperbanana_image()` | 测试 PaperBanana 图片插入飞书文档 |
+
+---
+
 ### 重排序配置
 
 | 配置项 | 说明 | 默认值 | 推荐值 |
@@ -977,12 +1046,13 @@ evaluation_output/
 
 融合本地知识库 + 网络搜索 + 创意生成，构建智能研究助手。
 
-**计划功能**：
-- [ ] 智能搜索规划（LLM 驱动的多源搜索查询生成）
-- [ ] 网络信息增强（Semantic Scholar / Tavily / GitHub API）
-- [ ] 多源知识融合（本地论文 + 网络结果统一上下文）
-- [ ] 研究提案生成（基于结构化 prompt 的 idea 生成）
-- [ ] 引文追踪与格式化
+**已实现功能**：
+- [x] 智能搜索规划（LLM 驱动的多源搜索查询生成）
+- [x] 网络信息增强（Bright Data MCP + arXiv 搜索）
+- [x] 多源知识融合（本地论文 + 网络结果统一上下文）
+- [x] 研究提案生成（基于结构化 prompt 的 idea 生成）
+- [x] PaperBanana 方法图生成（AI 学术图表）
+- [x] 引文追踪与格式化（arXiv 链接提取、OpenAlex API）
 
 **新增功能**：
 
@@ -990,7 +1060,7 @@ evaluation_output/
 
 **命令**: `/idea tofeishu <研究主题> [folder_token]`
 
-**功能**: 将研究想法导出为飞书文档，支持自动创建文档、格式化内容、添加标题和列表。
+**功能**: 将研究想法导出为飞书文档，支持自动创建文档、格式化内容、添加标题和列表，**并可根据方法论内容自动生成方法流程图（需启用 PaperBanana）**。
 
 **参数**:
 - `研究主题` (必填): 要导出为飞书文档的研究主题
@@ -1002,18 +1072,41 @@ evaluation_output/
 /idea tofeishu 多模态大模型研究 OCks09kd293kd
 ```
 
+**PaperBanana 方法图集成**：
+
+当 `enable_paper_banana: true` 时，导出流程额外包含：
+
+1. **提取方法论章节** — 从生成的想法中提取技术方案描述
+2. **格式转述** — 用本地 VLM 将方法论文本转述为适合图表生成的描述
+3. **生成方法图** — 调用 PaperBanana 生成 Pipeline 架构图
+4. **插入文档** — 将生成的图片插入方法论章节末尾，附带 Caption
+
+生成的文档结构：
+```
+## 1. 研究主题
+## 2. 研究现状分析
+## 3. 创新点与技术路线
+## 4. 方法论（核心内容）
+   └── [自动生成的方法流程图]
+## 5. 参考文献
+```
+
 **技术实现**:
 - `to_feishu_markdown()` - 格式化为飞书兼容的 Markdown
 - `create_feishu_document()` - 创建飞书文档并写入内容
 - `_markdown_to_feishu_blocks()` - 将 Markdown 转换为飞书块格式
 - `_call_feishu_mcp_create_doc()` - 调用 feishu-mcp 创建文档
 - `_call_feishu_mcp_add_blocks()` - 调用 feishu-mcp 添加内容块
+- `_call_paperbanana()` - 调用本地 PaperBanana 服务生成方法图
+- `_refactor_for_paperbanana()` - VLM 格式转述
 
-**前提条件**: 需要在 `mcp_server.json` 中配置 `feishu-mcp`。
+**前提条件**:
+- 基础功能：需要在 `mcp_server.json` 中配置 `feishu-mcp`
+- 方法图生成：需要本地部署 [PaperBanana](https://github.com/dwzhu-pku/PaperBanana) 服务并启用 `enable_paper_banana: true`
 
 **技术方案**：基于 LangGraph 工作流编排
 
-**预计版本**：v1.10
+**版本**：v1.11.1
 
 ---
 
@@ -1050,3 +1143,4 @@ MIT License
 - [AstrBot](https://github.com/AstrBotDevs/AstrBot) - 聊天机器人框架
 - [Milvus](https://milvus.io/) - 向量数据库
 - [PyMuPDF](https://pymupdf.readthedocs.io/) - PDF解析
+- [PaperBanana](https://github.com/dwzhu-pku/PaperBanana) - AI学术图表生成
