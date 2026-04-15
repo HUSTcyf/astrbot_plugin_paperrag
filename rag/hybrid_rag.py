@@ -29,13 +29,13 @@ _PLUGIN_DIR = Path(__file__).parent.resolve()
 try:
     from .hybrid_parser import HybridPDFParser, Node
     from .hybrid_index import HybridIndexManager
-    from .embedding_providers import (
+    from embedding.embedding_providers import (
         create_embedding_provider,
         OllamaEmbeddingProvider,
         AstrBotEmbeddingProvider
     )
     from .rag_engine import RAGConfig
-    from .reranker import (
+    from embedding.reranker import (
         AdaptiveReranker,
         RerankerConfig,
         create_reranker
@@ -43,13 +43,13 @@ try:
 except ImportError:
     from hybrid_parser import HybridPDFParser, Node
     from hybrid_index import HybridIndexManager
-    from embedding_providers import (
+    from ..embedding.embedding_providers import (
         create_embedding_provider,
         OllamaEmbeddingProvider,
         AstrBotEmbeddingProvider
     )
     from rag_engine import RAGConfig
-    from reranker import (
+    from ..embedding.reranker import (
         AdaptiveReranker,
         RerankerConfig,
         create_reranker
@@ -60,9 +60,9 @@ LLAMA_CPP_VLM_AVAILABLE = False
 LLAMA_CPP_VLM_IMPORT_ERROR = None
 try:
     try:
-        from .llama_cpp_vlm_provider import LlamaCppVLMProvider
+        from ..idea.llama_cpp_vlm_provider import LlamaCppVLMProvider
     except ImportError:
-        from llama_cpp_vlm_provider import LlamaCppVLMProvider
+        from ..idea.llama_cpp_vlm_provider import LlamaCppVLMProvider
     LLAMA_CPP_VLM_AVAILABLE = True
     logger.info("[Llama.cpp-VLM] Llama.cpp VLM Provider 已加载")
 except ImportError as e:
@@ -1185,13 +1185,13 @@ class HybridRAGEngine:
                     llama_config = self._get_llama_cpp_vlm_config()
 
                     try:
-                        from .llama_cpp_vlm_provider import (
+                        from ..idea.llama_cpp_vlm_provider import (
                             get_llama_cpp_vlm_provider,
                             get_cached_llama_cpp_provider,
                             init_llama_cpp_vlm_provider
                         )
                     except ImportError:
-                        from llama_cpp_vlm_provider import (
+                        from ..idea.llama_cpp_vlm_provider import (
                             get_llama_cpp_vlm_provider,
                             get_cached_llama_cpp_provider,
                             init_llama_cpp_vlm_provider
@@ -2109,9 +2109,9 @@ Question: {query}"""
                 else:
                     # 尝试使用缓存的 Provider
                     try:
-                        from .llama_cpp_vlm_provider import get_cached_llama_cpp_provider
+                        from ..idea.llama_cpp_vlm_provider import get_cached_llama_cpp_provider
                     except ImportError:
-                        from llama_cpp_vlm_provider import get_cached_llama_cpp_provider
+                        from ..idea.llama_cpp_vlm_provider import get_cached_llama_cpp_provider
 
                     cached = get_cached_llama_cpp_provider()
                     if cached is not None:
@@ -2123,9 +2123,9 @@ Question: {query}"""
                             # 获取 LlamaCpp 配置
                             llama_config = self._get_llama_cpp_vlm_config()
                             try:
-                                from .llama_cpp_vlm_provider import init_llama_cpp_vlm_provider
+                                from ..idea.llama_cpp_vlm_provider import init_llama_cpp_vlm_provider
                             except ImportError:
-                                from llama_cpp_vlm_provider import init_llama_cpp_vlm_provider
+                                from ..idea.llama_cpp_vlm_provider import init_llama_cpp_vlm_provider
                             provider_to_use = init_llama_cpp_vlm_provider(
                                 model_path=llama_config['model_path'],
                                 mmproj_path=llama_config['mmproj_path'],
@@ -2360,13 +2360,13 @@ Answer requirements:
                         # 获取 LlamaCpp 配置
                         llama_config = self._get_llama_cpp_vlm_config()
                         try:
-                            from .llama_cpp_vlm_provider import (
+                            from ..idea.llama_cpp_vlm_provider import (
                                 get_llama_cpp_vlm_provider,
                                 get_cached_llama_cpp_provider,
                                 init_llama_cpp_vlm_provider,
                             )
                         except ImportError:
-                            from llama_cpp_vlm_provider import (
+                            from ..idea.llama_cpp_vlm_provider import (
                                 get_llama_cpp_vlm_provider,
                                 get_cached_llama_cpp_provider,
                                 init_llama_cpp_vlm_provider,

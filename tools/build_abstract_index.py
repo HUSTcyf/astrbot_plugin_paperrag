@@ -649,7 +649,7 @@ class LocalGGUFClient:
         """检查模型是否已加载（通过 LlamaCppVLMProvider 单例）"""
         try:
             # 尝试获取已缓存的 Provider
-            from llama_cpp_vlm_provider import get_cached_llama_cpp_provider
+            from ..idea.llama_cpp_vlm_provider import get_cached_llama_cpp_provider
             provider = get_cached_llama_cpp_provider()
             if provider is not None and provider._initialized and provider._llama is not None:
                 logger.info(f"✅ 检测到已加载的 LlamaCppVLMProvider 模型: {provider.model_path}")

@@ -1391,12 +1391,12 @@ class HybridIndexManager:
                     # 尝试获取缓存的 Provider
                     try:
                         try:
-                            from .llama_cpp_vlm_provider import (
+                            from ..idea.llama_cpp_vlm_provider import (
                                 get_cached_llama_cpp_provider,
                                 check_llama_cpp_vlm_available
                             )
                         except ImportError:
-                            from llama_cpp_vlm_provider import (
+                            from ..idea.llama_cpp_vlm_provider import (
                                 get_cached_llama_cpp_provider,
                                 check_llama_cpp_vlm_available
                             )
@@ -1413,7 +1413,7 @@ class HybridIndexManager:
                             llama_model_path = str(plugin_dir / "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf")
                             llama_mmproj_path = str(plugin_dir / "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf")
 
-                            from .llama_cpp_vlm_provider import init_llama_cpp_vlm_provider
+                            from ..idea.llama_cpp_vlm_provider import init_llama_cpp_vlm_provider
                             llm_provider = init_llama_cpp_vlm_provider(
                                 model_path=llama_model_path,
                                 mmproj_path=llama_mmproj_path,

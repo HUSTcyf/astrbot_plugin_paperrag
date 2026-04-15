@@ -27,7 +27,7 @@ from astrbot.api import logger
 
 
 if TYPE_CHECKING:
-    from .rag_engine import RAGConfig
+    from ..rag.rag_engine import RAGConfig
 
 
 # Graph RAG 模块路径
@@ -885,7 +885,7 @@ class GraphRAGEngine:
             try:
                 from .graph_builder import MultimodalGraphBuilder  # type: ignore[import]
             except ImportError:
-                from graph_builder import MultimodalGraphBuilder
+                from .graph_builder import MultimodalGraphBuilder
 
             if self._adapter is None:
                 await self.initialize()

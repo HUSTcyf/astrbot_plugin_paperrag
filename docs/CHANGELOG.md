@@ -2,6 +2,62 @@
 
 所有值得注意的插件变更都会记录在这个文件中。
 
+## [1.12.0] - 2026-04-15
+
+### 代码重构 - 模块化目录结构
+
+**概述**: 将散落在根目录的多个 Python 模块重构为子包目录，提升代码组织性和可维护性。
+
+**变更**:
+
+| 原路径 | 新路径 |
+|--------|--------|
+| `abstract_index.py` | `rag/abstract_index.py` |
+| `hybrid_index.py` | `rag/hybrid_index.py` |
+| `hybrid_parser.py` | `rag/hybrid_parser.py` |
+| `hybrid_rag.py` | `rag/hybrid_rag.py` |
+| `multimodal_extractor.py` | `rag/multimodal_extractor.py` |
+| `reference_processor.py` | `rag/reference_processor.py` |
+| `rag_engine.py` | `rag/rag_engine.py` |
+| `embedding_providers.py` | `embedding/embedding_providers.py` |
+| `ollama_embedding.py` | `embedding/ollama_embedding.py` |
+| `reranker.py` | `embedding/reranker.py` |
+| `llama_index_reranker.py` | `embedding/llama_index_reranker.py` |
+| `graph_builder.py` | `graphrag/graph_builder.py` |
+| `graph_rag_engine.py` | `graphrag/graph_rag_engine.py` |
+| `graph_rag_router.py` | `graphrag/graph_rag_router.py` |
+| `idea_engine.py` | `idea/generation.py` (重构) |
+| `llama_cpp_vlm_provider.py` | `idea/llama_cpp_vlm_provider.py` |
+
+**新增目录**:
+
+| 目录 | 说明 |
+|------|------|
+| `embedding/` | Embedding 提供者封装 |
+| `graphrag/` | Graph RAG 引擎模块 |
+| `idea/` | 研究想法生成系统 |
+| `rag/` | 核心 RAG 模块 |
+| `tools/` | 工具脚本 |
+
+**删除文件**:
+
+- `build_abstract_index.py` - 合并到 `rag/abstract_index.py`
+- `build_graph_from_milvus.py` - 独立工具脚本
+- `download_models.py` - 合并到其他模块
+- `export_bloom.py` - 未使用的工具
+- `extract_figure_captions.py` - 合并到 `rag/multimodal_extractor.py`
+- `repair_table_csvs.py` - 未使用的工具
+- `visualize_neo4j_html.py` - 移动到 `graphrag/`
+- `test_core_api_links.py` - 移动到 `test/`
+
+**统计**:
+
+- 删除: ~25,000 行代码（主要是冗余和未使用代码）
+- 新增: 代码重组到子包结构
+- 净变化: 代码更加模块化，可维护性提升
+
+---
+
 ## [1.11.1] - 2026-04-13
 
 ### 学术意图识别与非学术问题处理

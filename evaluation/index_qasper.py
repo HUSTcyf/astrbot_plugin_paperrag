@@ -229,7 +229,7 @@ async def initialize_milvus(
     milvus_lite_path: Optional[str] = None
 ):
     """初始化 Milvus 数据库（清除旧数据）"""
-    from milvus_manager import PaperMilvusManager
+    from legacy.milvus_manager import PaperMilvusManager
 
     # 使用覆盖路径或配置中的路径
     effective_lite_path = milvus_lite_path if milvus_lite_path else config.get("milvus_lite_path", "")
@@ -290,8 +290,8 @@ async def index_papers(
         - total_indexed: 索引的段落数量
         - paper_stats: {paper_id: {"file_name": ..., "chunk_count": ..., "paper_title": ...}, ...}
     """
-    from embedding_providers import create_embedding_provider, OllamaEmbeddingProvider, OllamaEmbeddingConfig
-    from milvus_manager import PaperMilvusManager
+    from ..embedding.embedding_providers import create_embedding_provider, OllamaEmbeddingProvider, OllamaEmbeddingConfig
+    from legacy.milvus_manager import PaperMilvusManager
 
     # 使用覆盖路径或配置中的路径
     effective_lite_path = milvus_lite_path if milvus_lite_path else config.get("milvus_lite_path", "")

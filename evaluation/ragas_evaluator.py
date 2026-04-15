@@ -12,7 +12,7 @@ from dataclasses import dataclass, asdict
 
 import pandas as pd
 from ragas import evaluate, RunConfig, EvaluationDataset
-from ragas.llms.base import InstructorBaseRagasLLM, llm_factory
+from ragas.llms.base import BaseRagasLLM, llm_factory
 from ragas.embeddings.base import BaseRagasEmbedding, embedding_factory
 # 使用内部 `_` 模块的 metric 类，避免 collections 模块的 class identity 问题
 from ragas.metrics._faithfulness import Faithfulness
@@ -320,7 +320,7 @@ class RagasEvaluator:
 
     def _get_ragas_metrics(self):
         """获取 Ragas 指标列表"""
-        llm = cast(InstructorBaseRagasLLM, self._get_llm())
+        llm = cast(BaseRagasLLM, self._get_llm())
         # 使用带 legacy 兼容方法的包装器，避免 embed_query/aembed_query 缺失错误
         embeddings = cast(BaseRagasEmbedding, self._get_embed_model_with_legacy())
         return [
@@ -428,7 +428,7 @@ class RagasEvaluator:
         raw_data = []
         for i in range(len(questions)):
             # 获取当前样本的多模态信息
-            r = results[i] if i < len(results) and isinstance(results[i], dict) else {}
+            r = cast(Dict[str, Any], results[i]) if isinstance(results[i], dict) else {}
             raw_data.append({
                 "question": questions[i],
                 "answer": answers[i],
@@ -460,8 +460,8 @@ class RagasEvaluator:
         evaluation_result = evaluate(
             dataset=ragas_dataset,
             metrics=self._get_ragas_metrics(),
-            llm=self._get_llm(),
-            embeddings=self._get_embed_model_with_legacy(),
+            llm=cast(BaseRagasLLM, self._get_llm()),
+            embeddings=cast(BaseRagasEmbedding, self._get_embed_model_with_legacy()),
             run_config=run_config,
         )
 
@@ -546,8 +546,8 @@ class RagasEvaluator:
         evaluation_result = evaluate(
             dataset=ragas_dataset,
             metrics=self._get_ragas_metrics(),
-            llm=self._get_llm(),
-            embeddings=self._get_embed_model_with_legacy(),
+            llm=cast(BaseRagasLLM, self._get_llm()),
+            embeddings=cast(BaseRagasEmbedding, self._get_embed_model_with_legacy()),
             run_config=run_config,
         )
 

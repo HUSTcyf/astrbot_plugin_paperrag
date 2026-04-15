@@ -292,7 +292,7 @@ async def initialize_rag_engine(config: dict, milvus_lite_path: str = ''):
         config: 插件配置
         milvus_lite_path: 可选的 Milvus 数据库路径覆盖，用于 Qasper 评估
     """
-    from rag_engine import RAGConfig, create_rag_engine
+    from ..rag.rag_engine import RAGConfig, create_rag_engine
 
     # 使用 Qasper 专用数据库路径（如果提供）
     effective_milvus_path = milvus_lite_path or config.get("milvus_lite_path", "")

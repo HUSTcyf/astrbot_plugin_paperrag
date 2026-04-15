@@ -1215,8 +1215,8 @@ class RagasTestsetGenerator:
                         continue
 
                     eval_sample = EvalSample(
-                        question=question,
-                        answer=answer,
+                        question=str(question),
+                        answer=str(answer),
                         contexts=contexts,
                         evolution_type=sample.synthesizer_name,
                         metadata={},

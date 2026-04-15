@@ -37,7 +37,7 @@ async def extract_chunks_from_milvus(
     print("=" * 60)
 
     try:
-        from hybrid_index import HybridIndexManager
+        from ..rag.hybrid_index import HybridIndexManager
 
         manager = HybridIndexManager(
             milvus_uri=milvus_path,

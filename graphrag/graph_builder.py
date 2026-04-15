@@ -628,7 +628,7 @@ class MultimodalGraphBuilder:
     async def _ensure_llm_initialized(self):
         """确保 LLM 已初始化 - 使用 LlamaCppVLMProvider"""
         if self._llm is None:
-            from .llama_cpp_vlm_provider import (
+            from ..idea.llama_cpp_vlm_provider import (
                 get_llama_cpp_vlm_provider,
                 get_cached_llama_cpp_provider,
                 init_llama_cpp_vlm_provider,

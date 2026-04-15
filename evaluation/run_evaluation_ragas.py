@@ -62,7 +62,7 @@ def create_index_manager() -> Any:
     rag_config = config.get("rag_config", {})
     milvus_config = rag_config.get("milvus", {})
 
-    from hybrid_index import HybridIndexManager
+    from ..rag.hybrid_index import HybridIndexManager
 
     return HybridIndexManager(
         collection_name=rag_config.get("collection_name", "paper_embeddings"),
@@ -380,7 +380,7 @@ def extract_multimodal_chunks_with_context(
     context_before: int = 1,
     context_after: int = 1,
     max_context_chunks_per_paper: int = 10,
-) -> List[Dict[str, Any]]:
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     提取多模态 chunks 并附带同论文的上下文 chunks
 
@@ -1055,6 +1055,7 @@ async def run_full_pipeline(
     use_existing_chunks: bool = False,
     existing_chunks_path: str = "results/milvus_chunks.json",
     eval_embedding_mode: str = "api",
+    top_k: int | None = None,
 ) -> dict:
     """
     完整评测流程
@@ -1112,7 +1113,7 @@ async def run_full_pipeline(
     print("=" * 60)
 
     # 使用插件现有配置创建引擎
-    from rag_engine import create_rag_engine, RAGConfig
+    from ..rag.rag_engine import create_rag_engine, RAGConfig
 
     plugin_dir = Path(__file__).parent.parent
     config_path = plugin_dir.parent.parent / "config" / "astrbot_plugin_paperrag_config.json"
@@ -1131,7 +1132,7 @@ async def run_full_pipeline(
         db_name=rag_cfg.get("milvus", {}).get("db_name", "default"),
         collection_name=rag_cfg.get("collection_name", "paper_embeddings"),
         embed_dim=rag_cfg.get("embed_dim", 1024),
-        top_k=args.top_k if args.top_k is not None else rag_cfg.get("top_k", 5),
+        top_k=top_k if top_k is not None else rag_cfg.get("top_k", 5),
         similarity_cutoff=rag_cfg.get("similarity_cutoff", 0.3),
         chunk_size=rag_cfg.get("chunk_size", 512),
         min_chunk_size=rag_cfg.get("min_chunk_size", 100),
@@ -1358,6 +1359,7 @@ def main():
             use_existing_chunks=args.use_existing_chunks,
             existing_chunks_path=args.existing_chunks_path,
             eval_embedding_mode=args.eval_embedding_mode,
+            top_k=args.top_k,
         ))
 
     elif args.step == "extract":
@@ -1438,7 +1440,7 @@ def main():
             print(f"   测试问题数量: {args.test_size}")
 
             # 创建 RAG 引擎
-            from rag_engine import create_rag_engine, RAGConfig
+            from ..rag.rag_engine import create_rag_engine, RAGConfig
 
             plugin_dir = Path(__file__).parent.parent
             config_path = plugin_dir.parent.parent / "config" / "astrbot_plugin_paperrag_config.json"

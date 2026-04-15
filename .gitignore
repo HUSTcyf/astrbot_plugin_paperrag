@@ -214,5 +214,6 @@ results/
 datasets/test_figures_and_tables
 evaluation/freeapi.json
 *.tgz
+*.code-workspace
 .DS_Store
 .planning/

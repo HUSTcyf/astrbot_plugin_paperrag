@@ -24,8 +24,9 @@ from typing import Dict, Any, Optional, Union, TYPE_CHECKING, List, cast
 
 # 类型注解导入（仅在类型检查时导入，避免循环导入）
 if TYPE_CHECKING:
-    from .hybrid_rag import HybridRAGEngine
-    from .graph_rag_engine import GraphRAGConfig
+    from .idea import IdeaEngine
+    from .rag.hybrid_rag import HybridRAGEngine
+    from .graphrag.graph_rag_engine import GraphRAGConfig
 
 # 抑制底层库的 gRPC/absl 警告（必须在导入深度学习库之前设置）
 os.environ['GRPC_VERBOSITY'] = 'ERROR'
@@ -38,7 +39,7 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.api.provider import LLMResponse
 from astrbot.api.star import Context, Star, register
 
-from .rag_engine import (
+from .rag.rag_engine import (
     create_rag_engine,
     RAGConfig
 )
@@ -342,7 +343,7 @@ class PaperRAGPlugin(Star):
 
     def _create_graph_rag_config(self) -> "GraphRAGConfig":
         """创建 GraphRAGConfig（从配置中读取所有设置）"""
-        from .graph_rag_engine import GraphRAGConfig
+        from .graphrag.graph_rag_engine import GraphRAGConfig
         graph_rag_config = self.config.get("graph_rag", {})
         multimodal_config = graph_rag_config.get("multimodal_extraction", {})
         return GraphRAGConfig(
@@ -382,7 +383,7 @@ class PaperRAGPlugin(Star):
 只需回答"是"或"否"，不要解释。"""
         try:
             # 先确保VLM加载完成
-            from .llama_cpp_vlm_provider import get_cached_llama_cpp_provider
+            from .idea.llama_cpp_vlm_provider import get_cached_llama_cpp_provider
             vlm_provider = get_cached_llama_cpp_provider()
             if vlm_provider and vlm_provider._initialized and vlm_provider._llama:
                 response = await vlm_provider.text_chat(prompt=prompt, image_urls=[], temperature=0.0)
@@ -393,7 +394,7 @@ class PaperRAGPlugin(Star):
                 return True, "学术问题"
             # VLM未就绪，手动触发初始化
             logger.info("[_check_academic_intent] VLM未就绪，触发初始化...")
-            from .llama_cpp_vlm_provider import init_llama_cpp_vlm_provider
+            from .idea.llama_cpp_vlm_provider import init_llama_cpp_vlm_provider
             model_dir = os.path.join(os.path.dirname(__file__), "models", "Qwen3.5-9B-GGUF")
             model_path = os.path.join(model_dir, "Qwen3.5-9B-UD-Q4_K_XL.gguf")
             mmproj_path = os.path.join(model_dir, "mmproj-BF16.gguf")
@@ -589,9 +590,9 @@ class PaperRAGPlugin(Star):
             是否成功
         """
         try:
-            from .abstract_index import AbstractIndexManager
-        except Exception:
-            from abstract_index import AbstractIndexManager
+            from .rag.abstract_index import AbstractIndexManager
+        except Exception as e:
+            raise ImportError(f"模块导入失败: {e}") from e
 
         try:
             embed_provider = await engine._ensure_embed_provider_initialized()
@@ -609,10 +610,10 @@ class PaperRAGPlugin(Star):
 
             # 设置 LLM 客户端
             try:
-                from .llama_cpp_vlm_provider import get_cached_llama_cpp_provider
+                from .idea.llama_cpp_vlm_provider import get_cached_llama_cpp_provider
                 llm_provider = get_cached_llama_cpp_provider()
                 if llm_provider is not None and llm_provider._initialized and llm_provider._llama is not None:
-                    from .abstract_index import LocalGGUFClient
+                    from .rag.abstract_index import LocalGGUFClient
                     llm_client = LocalGGUFClient()
                     llm_client._llama = llm_provider._llama
                     llm_client._is_loaded = True
@@ -638,9 +639,9 @@ class PaperRAGPlugin(Star):
     async def _run_graph_build_in_background(self, engine):
         """后台运行图谱构建"""
         try:
-            from .graph_rag_engine import GraphRAGEngine, GraphRAGConfig
-        except Exception:
-            from graph_rag_engine import GraphRAGEngine, GraphRAGConfig
+            from .graphrag.graph_rag_engine import GraphRAGEngine, GraphRAGConfig
+        except Exception as e:
+            raise ImportError(f"模块导入失败: {e}") from e
 
         try:
             graph_config = self._create_graph_rag_config()
@@ -929,9 +930,9 @@ class PaperRAGPlugin(Star):
             routing_info = ""
             if mode == "auto" and self.config.get("enable_graph_rag", False):
                 try:
-                    from .graph_rag_router import create_router, RetrievalMode
-                except Exception:
-                    from graph_rag_router import create_router, RetrievalMode
+                    from .graphrag.graph_rag_router import create_router, RetrievalMode
+                except Exception as e:
+                    raise ImportError(f"模块导入失败: {e}") from e
 
                 router = create_router(context=self.context)
                 route_result = router.route(query)
@@ -2193,7 +2194,7 @@ class PaperRAGPlugin(Star):
 
             # 同时清除摘要索引
             try:
-                from .abstract_index import AbstractIndexManager
+                from .rag.abstract_index import AbstractIndexManager
                 plugin_dir = Path(__file__).parent
                 embed_dim = self.config.get("embed_dim", 768)
                 milvus_uri = str(plugin_dir / "data" / "milvus_abstracts.db")
@@ -2465,14 +2466,14 @@ class PaperRAGPlugin(Star):
 
             # 导入必要的模块
             try:
-                from .graph_rag_engine import GraphRAGEngine, GraphRAGConfig, MemoryGraphStore
-            except Exception:
-                from graph_rag_engine import GraphRAGEngine, GraphRAGConfig, MemoryGraphStore
+                from .graphrag.graph_rag_engine import GraphRAGEngine, GraphRAGConfig, MemoryGraphStore
+            except Exception as e:
+                raise ImportError(f"模块导入失败: {e}") from e
 
             try:
-                from .graph_builder import MultimodalGraphBuilder
-            except Exception:
-                from graph_builder import MultimodalGraphBuilder
+                from .graphrag.graph_builder import MultimodalGraphBuilder
+            except Exception as e:
+                raise ImportError(f"模块导入失败: {e}") from e
 
             # ChunkNode 类用于适配 GraphBuilder
             class ChunkNode:
@@ -2491,7 +2492,7 @@ class PaperRAGPlugin(Star):
             # 根据配置决定存储类型
             if graph_config.storage_type == "neo4j":
                 from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
-                from .graph_rag_engine import SimplePropertyGraphStoreAdapter
+                from .graphrag.graph_rag_engine import SimplePropertyGraphStoreAdapter
                 raw_store = Neo4jPropertyGraphStore(
                     url=graph_config.neo4j_uri,
                     username=graph_config.neo4j_user,
@@ -2768,9 +2769,9 @@ class PaperRAGPlugin(Star):
 
             # 导入摘要索引模块
             try:
-                from .abstract_index import AbstractIndexManager, AbstractExtractor, LocalGGUFClient
-            except Exception:
-                from abstract_index import AbstractIndexManager, AbstractExtractor, LocalGGUFClient
+                from .rag.abstract_index import AbstractIndexManager, AbstractExtractor, LocalGGUFClient
+            except Exception as e:
+                raise ImportError(f"模块导入失败: {e}") from e
 
             # 初始化摘要索引管理器
             embed_provider = await engine._ensure_embed_provider_initialized()
@@ -2923,9 +2924,9 @@ class PaperRAGPlugin(Star):
             return
 
         try:
-            from .graph_rag_engine import GraphRAGEngine, GraphRAGConfig
-        except Exception:
-            from graph_rag_engine import GraphRAGEngine, GraphRAGConfig
+            from .graphrag.graph_rag_engine import GraphRAGEngine, GraphRAGConfig
+        except Exception as e:
+            raise ImportError(f"模块导入失败: {e}") from e
 
         try:
             graph_config = self._create_graph_rag_config()
@@ -2995,9 +2996,9 @@ class PaperRAGPlugin(Star):
             return
 
         try:
-            from .graph_rag_engine import GraphRAGEngine, GraphRAGConfig, MemoryGraphStore
-        except Exception:
-            from graph_rag_engine import GraphRAGEngine, GraphRAGConfig, MemoryGraphStore
+            from .graphrag.graph_rag_engine import GraphRAGEngine, GraphRAGConfig, MemoryGraphStore
+        except Exception as e:
+            raise ImportError(f"模块导入失败: {e}") from e
 
         # 步骤1: 清空现有图谱
         yield event.plain_result("🗑️ 正在清空现有知识图谱...")
@@ -3040,9 +3041,9 @@ class PaperRAGPlugin(Star):
             yield event.plain_result(f"📚 找到 {len(paper_names)} 篇论文\n🔨 正在逐篇加载所有文档块...")
 
             try:
-                from .graph_builder import MultimodalGraphBuilder
-            except Exception:
-                from graph_builder import MultimodalGraphBuilder
+                from .graphrag.graph_builder import MultimodalGraphBuilder
+            except Exception as e:
+                raise ImportError(f"模块导入失败: {e}") from e
 
             class ChunkNode:
                 """适配 GraphBuilder 的 Node 结构"""
@@ -3057,7 +3058,7 @@ class PaperRAGPlugin(Star):
             # 根据配置决定存储类型
             if graph_config.storage_type == "neo4j":
                 from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
-                from .graph_rag_engine import SimplePropertyGraphStoreAdapter
+                from .graphrag.graph_rag_engine import SimplePropertyGraphStoreAdapter
                 raw_store = Neo4jPropertyGraphStore(
                     url=graph_config.neo4j_uri,
                     username=graph_config.neo4j_user,
@@ -3192,9 +3193,9 @@ class PaperRAGPlugin(Star):
             return
 
         try:
-            from .graph_rag_engine import GraphRAGEngine, GraphRAGConfig
-        except Exception:
-            from graph_rag_engine import GraphRAGEngine, GraphRAGConfig
+            from .graphrag.graph_rag_engine import GraphRAGEngine, GraphRAGConfig
+        except Exception as e:
+            raise ImportError(f"模块导入失败: {e}") from e
 
         try:
             graph_config = self._create_graph_rag_config()
@@ -3229,7 +3230,7 @@ class PaperRAGPlugin(Star):
             yield event.plain_result("❌ Graph RAG 功能未启用")
             return
 
-        from .graph_rag_engine import GraphRAGConfig
+        from .graphrag.graph_rag_engine import GraphRAGConfig
         graph_config = self._create_graph_rag_config()
 
         if graph_config.storage_type != "neo4j":
@@ -3486,7 +3487,7 @@ class PaperRAGPlugin(Star):
             yield event.plain_result(msg)
             return
 
-        from .graph_rag_engine import GraphRAGConfig
+        from .graphrag.graph_rag_engine import GraphRAGConfig
         graph_config = self._create_graph_rag_config()
 
         if graph_config.storage_type != "neo4j":
@@ -3825,8 +3826,6 @@ class PaperRAGPlugin(Star):
         yield event.plain_result(f"💡 正在分析研究主题...\n主题: {topic}")
 
         try:
-            from .idea_engine import IdeaEngine
-
             rag_engine = self._get_engine()
             idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
 
@@ -3905,7 +3904,6 @@ class PaperRAGPlugin(Star):
                 yield event.plain_result("❌ RAG引擎未初始化")
                 return
 
-            from .idea_engine import IdeaEngine
             idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
             topics = idea_engine.list_all_topics()
 
@@ -3948,7 +3946,6 @@ class PaperRAGPlugin(Star):
                 yield event.plain_result("❌ RAG引擎未初始化")
                 return
 
-            from .idea_engine import IdeaEngine
             idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
 
             # identifier 可能是 folder hash 或 topic 名称，统一解析为 folder hash
@@ -4006,7 +4003,6 @@ class PaperRAGPlugin(Star):
                 yield event.plain_result("❌ RAG引擎未初始化")
                 return
 
-            from .idea_engine import IdeaEngine
             idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
 
             yield event.plain_result(f"💡 正在为 topic「{topic}」追加 {num_ideas} 个想法...\n⏳ 复用现有知识上下文生成新想法")
@@ -4072,7 +4068,6 @@ class PaperRAGPlugin(Star):
                 yield event.plain_result("❌ RAG引擎未初始化")
                 return
 
-            from .idea_engine import IdeaEngine
             idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
 
             deleted, topic = idea_engine.delete_ideas_by_uuids(uuids)
@@ -4115,7 +4110,6 @@ class PaperRAGPlugin(Star):
                 yield event.plain_result("❌ RAG引擎未初始化")
                 return
 
-            from .idea_engine import IdeaEngine
             idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
 
             success, topic, folder_hash = idea_engine.delete_topic_by_hash(topic_or_hash)
@@ -4150,7 +4144,6 @@ class PaperRAGPlugin(Star):
                 yield event.plain_result("❌ RAG引擎未初始化")
                 return
 
-            from .idea_engine import IdeaEngine
             idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
 
             deleted_count, actual_topic = idea_engine.clear_ideas_by_topic(topic)
@@ -4189,9 +4182,6 @@ class PaperRAGPlugin(Star):
         yield event.plain_result(f"🔍 正在分析研究主题...\n主题: {topic}")
 
         try:
-            # 导入创意引擎
-            from .idea_engine import IdeaEngine
-
             # 获取RAG引擎
             rag_engine = self._get_engine()
 
@@ -4293,7 +4283,6 @@ class PaperRAGPlugin(Star):
         yield event.plain_result(f"🔍 分析主题: {topic}")
 
         try:
-            from .idea_engine import IdeaEngine
             rag_engine = self._get_engine()
             idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
 
@@ -4353,7 +4342,6 @@ class PaperRAGPlugin(Star):
         yield event.plain_result(f"🔍 执行多源检索: {query_list}")
 
         try:
-            from .idea_engine import IdeaEngine
             rag_engine = self._get_engine()
             idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
 
@@ -4411,7 +4399,6 @@ class PaperRAGPlugin(Star):
         yield event.plain_result(f"💡 正在生成 {num} 个研究想法...")
 
         try:
-            from .idea_engine import IdeaEngine
             rag_engine = self._get_engine()
             idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
 
@@ -4507,7 +4494,6 @@ class PaperRAGPlugin(Star):
                 return
 
             # 初始化 IdeaEngine
-            from .idea_engine import IdeaEngine
             idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
 
             # 判断是 UUID 列表还是 topic
@@ -4687,8 +4673,6 @@ class PaperRAGPlugin(Star):
         Example: /idea testblocks <your_folder_token>
         """
         try:
-            from .idea_engine import IdeaEngine
-
             rag_engine = self._get_engine()
             idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
 
@@ -4708,33 +4692,6 @@ class PaperRAGPlugin(Star):
             import traceback
             logger.error(f"testblocks 失败: {e}\n{traceback.format_exc()}")
             yield event.plain_result(f"❌ 测试失败: {e}")
-
-    @idea_commands.command("testpb")
-    async def cmd_idea_testpb(self, event: AstrMessageEvent, folder_token: str = ""):
-        """
-        插入 PaperBanana 生成的 webp 图片到飞书文档，测试尺寸
-
-        使用方式:
-        /idea testpb <folder_token>
-        """
-        try:
-            from .idea_engine import IdeaEngine
-            rag_engine = self._get_engine()
-            idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
-
-            yield event.plain_result("正在插入 PaperBanana 图片到飞书...")
-            result = await idea_engine.test_paperbanana_image(folder_token=folder_token)
-
-            if result.get("success"):
-                url = result.get("url", "")
-                info = result.get("info", "")
-                yield event.plain_result(f"✅ 插入成功\n链接: {url}\n{info}")
-            else:
-                yield event.plain_result(f"❌ 失败: {result.get('error', '未知错误')}")
-
-        except Exception as e:
-            import traceback
-            logger.error(f"testpb 失败: {e}\n{traceback.format_exc()}")
             yield event.plain_result(f"❌ 测试失败: {e}")
 
     @idea_commands.command("regen")
@@ -4789,7 +4746,6 @@ Examples:
                 yield event.plain_result("❌ RAG引擎未初始化")
                 return
 
-            from .idea_engine import IdeaEngine
             idea_engine = IdeaEngine(context=self.context, rag_engine=rag_engine)
 
             # 检查 folder 是否存在
@@ -5010,7 +4966,7 @@ Examples:
         try:
             # 导入 LlamaCppVLMProvider
             try:
-                from .llama_cpp_vlm_provider import (
+                from .idea.llama_cpp_vlm_provider import (
                     get_cached_llama_cpp_provider,
                     init_llama_cpp_vlm_provider,
                 )
@@ -5187,7 +5143,7 @@ Examples:
 
         # 清理 Llama.cpp VLM Provider
         try:
-            from .llama_cpp_vlm_provider import reset_llama_cpp_vlm_provider
+            from .idea.llama_cpp_vlm_provider import reset_llama_cpp_vlm_provider
             reset_llama_cpp_vlm_provider()
             logger.info("[Llama.cpp-VLM] Provider 已清理")
 
