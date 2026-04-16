@@ -105,9 +105,10 @@ class LlamaCppVLMProvider:
 
     def _get_plugin_models_dir(self) -> Path:
         """获取插件的 models 目录"""
-        # __file__ = .../astrbot_plugin_paperrag/llama_cpp_vlm_provider.py
-        # .parent = .../astrbot_plugin_paperrag/
-        return Path(__file__).parent.resolve() / "models"
+        # __file__ = .../astrbot_plugin_paperrag/idea/llama_cpp_vlm_provider.py
+        # .parent = .../astrbot_plugin_paperrag/idea/
+        # .parent.parent = .../astrbot_plugin_paperrag/
+        return Path(__file__).parent.parent.resolve() / "models"
 
     async def _ensure_models_downloaded(self) -> None:
         """检查模型文件是否存在，不存在则自动下载（9B优先，4B备用）"""

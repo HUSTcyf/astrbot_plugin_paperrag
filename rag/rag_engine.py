@@ -100,7 +100,8 @@ class RAGConfig:
 
     # 两阶段检索配置
     enable_two_stage_retrieval: bool = False  # 是否启用两阶段检索（先检索摘要匹配论文，再检索论文内chunks）
-    two_stage_top_k: int = 5  # 两阶段检索：摘要阶段返回的论文数量
+    two_stage_top_k: int = 10  # 两阶段检索：摘要阶段召回的论文数量（rerank后选择top_k）
+    two_stage_rerank_k: int = 5  # 两阶段检索：rerank后选择的论文数量
     graph_multimodal_enabled: bool = True  # 是否启用多模态图谱抽取
     graph_max_images_per_chunk: int = 1  # 每个chunk最多处理图片数
     graph_extract_image_entities: bool = True  # 是否提取图片为实体
@@ -170,11 +171,8 @@ def create_rag_engine(config: RAGConfig, context) -> "HybridRAGEngine":
         >>> engine = create_rag_engine(config, context)
         >>> result = await engine.search("attention机制")
     """
-    # 延迟导入避免循环依赖，兼容直接运行和包运行
-    try:
-        from .hybrid_rag import HybridRAGEngine
-    except ImportError:
-        from hybrid_rag import HybridRAGEngine
+    # 延迟导入避免循环依赖
+    from .hybrid_rag import HybridRAGEngine
 
     logger.info("✅ 使用混合架构 RAG引擎（HybridRAGEngine）")
     logger.info("   - 自定义PDF解析（多模态）")

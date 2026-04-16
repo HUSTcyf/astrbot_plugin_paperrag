@@ -8,10 +8,10 @@ Query Intent Routing (GraphRAGRouter): Classifies incoming queries via pattern m
 
 Knowledge Graph Augmentation (GraphRAGEngine): MultimodalGraphBuilder extracts knowledge triples (Entity1, Relation, Entity2) via LLM prompting with entity types: Model/Architecture (BERT, GPT, Transformer), Method/Technique (attention, pooling), Task (text classification, QA), Dataset (GLUE, ImageNet), Metric (accuracy, F1, BLEU), Optimizer/Algorithm (Adam, SGD), Framework/Library (PyTorch, TensorFlow), Author/Organization, Venue (NeurIPS, ACL), and Other. Storage backends: PersistentPropertyGraphStoreAdapter (LlamaIndex SimplePropertyGraphStore with JSON persistence) or Neo4jGraphStore (Bolt protocol + Cypher queries via LlamaIndex PropertyGraphIndex). Graph retrieval supports local traversal (entity → neighbors, depth=2) and global traversal (Louvain community detection).
 
-Multimodal VLM (LlamaCppVLMProvider): Loads Qwen3.5-9B GGUF model via llama-cpp-python with 9B→4B automatic fallback, n_ctx=4096, n_gpu_layers=99. Handles image QA queries and table understanding via rendered images.
+Multimodal VLM (LlamaCppVLMProvider): Loads Qwen3.5-9B GGUF model via llama-cpp-python with 9B→4B automatic fallback, n_ctx=8192, n_gpu_layers=99. Handles image QA queries and table understanding via rendered images.
 
 Generation Layer: Retrieved Node passages with scores are combined with the original query and optional graph context into an augmented prompt, fed to AstrBot's GLM provider or local LlamaCpp VLM. CitationLinker parses bibliography and links citations in the generated response.
 
 Storage Architecture: Two Milvus Lite collections on SQLite (milvus_papers.db, milvus_abstracts.db) in data/. File system stores extracted figures (data/figures/{paper_id}/) and tables (data/tables/{paper_id}/). JSON document statistics (paper_doc_stats.json) tracks file_name, added_time, chunk_count, vector_ids per paper.
 
-Technology Stack: AstrBot SDK (plugin framework), PyMuPDF/Docling (PDF parsing), Milvus Lite (vector DB), AstrBotEmbeddingProvider/Ollama (embeddings), BAAI/bge-reranker-v2-m3 (reranking), llama-cpp-python GGUF (local VLM), LlamaIndex PropertyGraphStore/SimplePropertyGraphStore (graph storage), rank_bm25 (keyword search), CORE API (arXiv download).
+Technology Stack: Python, LlamaIndex, Milvus Lite, Neo4j, Qwen3.5 (llama.cpp GGUF), BGE-Reranker-v2 (FlagReranker, MPS/GPU), BGE-M3 (Ollama), RAGAS, Docling + PyMuPDF.

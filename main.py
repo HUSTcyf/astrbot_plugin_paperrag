@@ -19,6 +19,7 @@ import re
 import subprocess
 import requests
 from datetime import timedelta, datetime
+from functools import partial
 from pathlib import Path
 from typing import Dict, Any, Optional, Union, TYPE_CHECKING, List, cast
 
@@ -239,8 +240,93 @@ class PaperRAGPlugin(Star):
         else:
             logger.info("📚 Document RAG Plugin initialized (支持PDF/Word/TXT/HTML, Grobid未启用)")
 
-        # 注册 LLM 可调用的论文搜索工具
-        self._register_llm_tools()
+        # 暂时禁用 LLM 工具注册（全局工具注册导致所有消息处理异常）
+        # 如需启用工具，需要改用 MCP 方式或其他非全局注册方式
+        # self._register_llm_tools()
+
+    async def _search_papers_tool_impl(self, query: str | None, top_k: int = 5) -> str:
+        """搜索本地论文库并返回结果（RAG模式）"""
+        # 处理 event 对象被错误绑定到 query 的情况（防止 RAG 引擎被错误初始化）
+        from astrbot.api.event import AstrMessageEvent
+        if isinstance(query, AstrMessageEvent):
+            logger.warning(f"[PaperRAG] search_papers_tool 收到 event 对象，跳过执行")
+            return "❌ 此工具不支持此调用方式"
+
+        # 类型检查：query 必须是有效的字符串
+        if not isinstance(query, str) or not query.strip():
+            logger.warning(f"[PaperRAG] search_papers_tool 收到无效 query: {type(query)}")
+            return "❌ 查询参数无效"
+
+        # 长度检查
+        if len(query.strip()) < 3:
+            return "❌ 查询内容太短"
+
+        # 只有通过所有检查后才初始化 engine
+        engine = self._get_engine()
+        if not engine:
+            return "❌ RAG引擎未就绪，请检查配置文件"
+
+        try:
+            result = await engine.search(query, mode="rag")
+            if result.get("type") == "error":
+                return f"❌ 搜索失败: {result.get('message', '未知错误')}"
+
+            answer = result.get("answer", "")
+            sources = result.get("sources", [])
+
+            output = f"💡 **搜索结果**\n\n{answer}\n\n" if answer else "📚 **检索结果**\n\n"
+            for i, src in enumerate(sources[:top_k], 1):
+                metadata = src.get("metadata", {})
+                filename = metadata.get("file_name", "unknown")
+                text = src.get("text", "")[:200]
+                output += f"[{i}] **{filename}**\n{text}...\n\n"
+
+            return output.strip() if output.strip() else "❌ 未找到相关文档"
+        except Exception as e:
+            logger.error(f"LLM工具搜索失败: {e}")
+            return f"❌ 搜索异常: {e}"
+
+    async def _retrieve_papers_tool_impl(self, query: str | None, top_k: int = 5) -> str:
+        """仅检索论文片段，不生成回答"""
+        # 处理 event 对象被错误绑定到 query 的情况
+        from astrbot.api.event import AstrMessageEvent
+        if isinstance(query, AstrMessageEvent):
+            logger.warning(f"[PaperRAG] retrieve_papers_tool 收到 event 对象，跳过执行")
+            return "❌ 此工具不支持此调用方式"
+
+        if not isinstance(query, str) or not query.strip():
+            logger.warning(f"[PaperRAG] retrieve_papers_tool 收到无效 query: {type(query)}")
+            return "❌ 查询参数无效"
+
+        if len(query.strip()) < 2:
+            return "❌ 查询内容太短"
+
+        # 只有通过所有检查后才初始化 engine
+        engine = self._get_engine()
+        if not engine:
+            return "❌ RAG引擎未就绪，请检查配置文件"
+
+        try:
+            result = await engine.search(query, mode="retrieve")
+            if result.get("type") == "error":
+                return f"❌ 检索失败: {result.get('message', '未知错误')}"
+
+            sources = result.get("sources", [])
+            if not sources:
+                return "📭 未找到相关文档"
+
+            output = "📚 **检索结果**\n\n"
+            for i, src in enumerate(sources[:top_k], 1):
+                metadata = src.get("metadata", {})
+                filename = metadata.get("file_name", "unknown")
+                score = src.get("score", 0.0)
+                text = src.get("text", "")[:300]
+                output += f"[{i}] **{filename}** (相似度: {score:.3f})\n{text}...\n\n"
+
+            return output.strip()
+        except Exception as e:
+            logger.error(f"LLM工具检索失败: {e}")
+            return f"❌ 检索异常: {e}"
 
     def _register_llm_tools(self):
         """注册 LLM 可调用的论文搜索工具"""
@@ -248,63 +334,13 @@ class PaperRAGPlugin(Star):
             logger.info("📚 Paper RAG LLM工具已禁用")
             return
 
-        async def search_papers_tool(event, query: str, top_k: int = 5) -> str:
-            """搜索本地论文库并返回结果（RAG模式）"""
-            engine = self._get_engine()
-            if not engine:
-                return "❌ RAG引擎未就绪，请检查配置文件"
+        # 使用 lambda 包装实例方法，接收 event 参数（AstrBot 会传递）
+        async def search_tool(event, query: str | None, top_k: int = 5):
+            return await self._search_papers_tool_impl(query, top_k)
 
-            try:
-                result = await engine.search(query, mode="rag")
-                if result.get("type") == "error":
-                    return f"❌ 搜索失败: {result.get('message', '未知错误')}"
+        async def retrieve_tool(event, query: str | None, top_k: int = 5):
+            return await self._retrieve_papers_tool_impl(query, top_k)
 
-                answer = result.get("answer", "")
-                sources = result.get("sources", [])
-
-                # 格式化输出
-                output = f"💡 **搜索结果**\n\n{answer}\n\n" if answer else "📚 **检索结果**\n\n"
-
-                for i, src in enumerate(sources[:top_k], 1):
-                    metadata = src.get("metadata", {})
-                    filename = metadata.get("file_name", "unknown")
-                    text = src.get("text", "")[:200]
-                    output += f"[{i}] **{filename}**\n{text}...\n\n"
-
-                return output.strip() if output.strip() else "❌ 未找到相关文档"
-            except Exception as e:
-                logger.error(f"LLM工具搜索失败: {e}")
-                return f"❌ 搜索异常: {e}"
-
-        async def retrieve_papers_tool(event, query: str, top_k: int = 5) -> str:
-            """仅检索论文片段，不生成回答"""
-            engine = self._get_engine()
-            if not engine:
-                return "❌ RAG引擎未就绪，请检查配置文件"
-
-            try:
-                result = await engine.search(query, mode="retrieve")
-                if result.get("type") == "error":
-                    return f"❌ 检索失败: {result.get('message', '未知错误')}"
-
-                sources = result.get("sources", [])
-                if not sources:
-                    return "📭 未找到相关文档"
-
-                output = "📚 **检索结果**\n\n"
-                for i, src in enumerate(sources[:top_k], 1):
-                    metadata = src.get("metadata", {})
-                    filename = metadata.get("file_name", "unknown")
-                    score = src.get("score", 0.0)
-                    text = src.get("text", "")[:300]
-                    output += f"[{i}] **{filename}** (相似度: {score:.3f})\n{text}...\n\n"
-
-                return output.strip()
-            except Exception as e:
-                logger.error(f"LLM工具检索失败: {e}")
-                return f"❌ 检索异常: {e}"
-
-        # 注册工具
         try:
             self.context.register_llm_tool(
                 name="search_papers",
@@ -312,8 +348,8 @@ class PaperRAGPlugin(Star):
                     {"type": "string", "name": "query", "description": "搜索查询关键词或问题"},
                     {"type": "integer", "name": "top_k", "description": "返回结果数量，默认5"},
                 ],
-                desc="搜索本地论文库，使用RAG生成答案。适用于回答关于论文内容的问题。",
-                func_obj=search_papers_tool
+                desc="【严格使用条件】仅当用户明确提到需要搜索本地论文库、查找论文内容、查询已索引的文档时才能调用。例如：'搜索本地论文'、'查找相关论文'、'查询某篇论文的内容'等明确提及本地论文的场景。如果用户只是询问一般性问题而未提及本地论文，禁止调用此工具。",
+                func_obj=search_tool
             )
 
             self.context.register_llm_tool(
@@ -322,8 +358,8 @@ class PaperRAGPlugin(Star):
                     {"type": "string", "name": "query", "description": "搜索查询关键词"},
                     {"type": "integer", "name": "top_k", "description": "返回结果数量，默认5"},
                 ],
-                desc="仅检索本地论文库中的相关片段，不生成回答。适用于需要直接查看原文的场景。",
-                func_obj=retrieve_papers_tool
+                desc="【严格使用条件】仅当用户明确提到需要检索本地已索引论文的原文片段、查看论文原文内容时才能调用。例如：'查看相关论文原文'、'检索论文片段'等明确要求查看本地论文内容的场景。如果用户未明确提及本地论文，禁止调用此工具。",
+                func_obj=retrieve_tool
             )
 
             logger.info("✅ Paper RAG LLM工具已注册: search_papers, retrieve_papers")

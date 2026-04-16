@@ -24,7 +24,7 @@ except ImportError:
 
 # 导入核心重排序器（兼容直接运行和包运行）
 try:
-    from embedding.reranker import (
+    from .reranker import (
         ContentReranker,
         AdaptiveReranker as CoreAdaptiveReranker,
         RerankerConfig,

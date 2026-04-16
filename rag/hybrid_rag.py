@@ -9,7 +9,9 @@
 5. 生成 → GLM LLM（支持多模态：glm-4.6v-flash）
 """
 
+import asyncio
 import os
+import re
 import time
 import base64
 from typing import List, Dict, Any, Optional, Union, cast
@@ -41,14 +43,14 @@ try:
         create_reranker
     )
 except ImportError:
-    from hybrid_parser import HybridPDFParser, Node
-    from hybrid_index import HybridIndexManager
+    from .hybrid_parser import HybridPDFParser, Node
+    from .hybrid_index import HybridIndexManager
     from ..embedding.embedding_providers import (
         create_embedding_provider,
         OllamaEmbeddingProvider,
         AstrBotEmbeddingProvider
     )
-    from rag_engine import RAGConfig
+    from .rag_engine import RAGConfig
     from ..embedding.reranker import (
         AdaptiveReranker,
         RerankerConfig,
@@ -59,10 +61,7 @@ except ImportError:
 LLAMA_CPP_VLM_AVAILABLE = False
 LLAMA_CPP_VLM_IMPORT_ERROR = None
 try:
-    try:
-        from ..idea.llama_cpp_vlm_provider import LlamaCppVLMProvider
-    except ImportError:
-        from ..idea.llama_cpp_vlm_provider import LlamaCppVLMProvider
+    from ..idea.llama_cpp_vlm_provider import LlamaCppVLMProvider
     LLAMA_CPP_VLM_AVAILABLE = True
     logger.info("[Llama.cpp-VLM] Llama.cpp VLM Provider 已加载")
 except ImportError as e:
@@ -421,6 +420,225 @@ BM25检索结果（Top 5）：
         return fused
 
 
+# ==================== 查询类型检测 & 实体匹配过滤 ====================
+
+# 事实型查询的检测模式
+FACT_TYPE_PATTERNS = [
+    # 英文
+    r'\bwhat\s+is\b', r'\bwhat\s+are\b', r'\bwhat\s+does\b', r'\bwhat\s+did\b',
+    r'\bmean\b.*\bby\b', r'\bmeans\b', r'\brefer\s+to\b',
+    r'\bdefine\b', r'\bdefinition\b',
+    r'\bhow\s+do\b', r'\bhow\s+does\b',  # "how do CNNs work"
+    # 中文
+    r'是什么', r'是指', r'定义是', r'含义是', r'意思是',
+    r'什么叫', r'哪几个', r'有哪些', r'都有哪些',
+]
+
+# 需要精确实体匹配的查询关键词
+ENTITY_NEED_EXACT_MATCH = [
+    # 数据集/方法缩写
+    'freiburg1', 'CoRGS', 'DPT-Large', 'RegNeRF', 'NeRF', '3DGS', 'GS', 'SfM',
+    'SAM', 'SAM 2', 'ViT', 'CNN', 'LoRA',
+    # 会议/期刊
+    'CVPR', 'ICCV', 'ECCV', 'NeurIPS', 'ICML',
+    # 专有名词
+    'Mip-Splatting', 'InstantSplat', 'DUSt3R', 'MASt3R',
+]
+
+
+def classify_query_complexity(query: str) -> str:
+    """
+    查询复杂度分类（不需要 LLM，启发式规则）
+
+    Returns:
+        "simple_direct": 极简单查询 → 直接向量检索 → 跳过 CRAG
+        "standard": 标准查询 → 当前完整流程
+        "multi_hop": 多跳/比较查询 → 完整 CRAG
+        "complex": 复杂理解/分析 → HyDE + 完整流程
+    """
+    query_lower = query.lower()
+
+    # ========== 极简单查询 ==========
+    # 短小的定义型/事实型查询，不需要多跳推理
+    if len(query.split()) <= 8:
+        if any(kw in query_lower for kw in [
+            '是什么', '什么是', 'what is', 'what are',
+            'means', 'meaning of', '定义是', '含义是',
+            '哪个', 'what does', "what's"
+        ]):
+            return "simple_direct"
+
+    # ========== 多跳/比较查询 ==========
+    if any(kw in query_lower for kw in [
+        '比较', 'difference', 'compared', ' vs ', ' versus ',
+        '与...区别', '和...区别', '哪个更好', '优势', '劣势',
+        'compared to', 'compare to', 'versus'
+    ]):
+        return "multi_hop"
+
+    # ========== 复杂理解/分析查询 ==========
+    if any(kw in query_lower for kw in [
+        '如何', 'how does', 'how do', 'why', '为什么',
+        '原因', '分析', '原因', 'explain', '原因分析',
+        '原理', '机制'
+    ]):
+        return "complex"
+
+    # ========== 标准查询 ==========
+    return "standard"
+
+
+def detect_query_type(query: str) -> Dict[str, Any]:
+    """
+    检测查询类型
+
+    Returns:
+        {
+            "is_fact_type": bool,  # 是否为事实型查询
+            "query_subtype": str,   # single_entity/definition/comparison/procedure
+            "core_entities": List[str],  # 核心实体（人名/方法名/数据集名）
+            "needs_exact_match": bool  # 是否需要精确实体匹配
+        }
+    """
+    query_lower = query.lower()
+    is_fact_type = False
+    query_subtype = "general"
+
+    # 检测是否为事实型查询
+    for pattern in FACT_TYPE_PATTERNS:
+        if re.search(pattern, query, re.IGNORECASE):
+            is_fact_type = True
+            break
+
+    # 检测查询子类型
+    if is_fact_type:
+        # 定义型查询
+        if any(kw in query_lower for kw in ['what is', 'what are', '是什么', '是指', 'define', 'definition']):
+            query_subtype = "definition"
+        # 实体存在性查询
+        elif any(kw in query_lower for kw in ['what', 'which', '哪些', '哪个']):
+            query_subtype = "entity_list"
+        # 过程/步骤查询
+        elif any(kw in query_lower for kw in ['how does', 'how do', '如何', '怎么', '过程']):
+            query_subtype = "procedure"
+        else:
+            query_subtype = "general_fact"
+
+    # 提取核心实体（简单的启发式方法）
+    core_entities = []
+    for entity in ENTITY_NEED_EXACT_MATCH:
+        if entity.lower() in query_lower:
+            core_entities.append(entity)
+
+    # 检测是否需要精确匹配（包含缩写/专有名词）
+    needs_exact_match = len(core_entities) > 0
+
+    return {
+        "is_fact_type": is_fact_type,
+        "query_subtype": query_subtype,
+        "core_entities": core_entities,
+        "needs_exact_match": needs_exact_match
+    }
+
+
+def filter_by_entity_match(
+    results: List[Dict[str, Any]],
+    core_entities: List[str],
+    score_threshold: float = 0.3
+) -> List[Dict[str, Any]]:
+    """
+    实体匹配过滤：保留包含核心实体的 chunks
+
+    对于 fact-type 查询，如果 top 结果没有包含核心实体，
+    则降级为直接全文检索而非两阶段检索
+
+    Args:
+        results: 检索结果
+        core_entities: 需要匹配的实体列表
+        score_threshold: 低置信度阈值
+
+    Returns:
+        过滤后的结果
+    """
+    if not core_entities:
+        return results
+
+    filtered = []
+    has_entity_match = False
+
+    for r in results:
+        text_lower = r.get("text", "").lower()
+        score = r.get("score", 0.0)
+
+        # 检查是否有实体匹配
+        entity_matched = any(
+            entity.lower() in text_lower for entity in core_entities
+        )
+
+        if entity_matched:
+            has_entity_match = True
+            filtered.append(r)
+        elif score > score_threshold:
+            # 低置信度结果中没有实体匹配，保留但标记
+            r_copy = r.copy()
+            r_copy["_entity_matched"] = False
+            filtered.append(r_copy)
+
+    # 如果没有任何实体匹配，返回原始结果（让调用方决定如何处理）
+    if not has_entity_match and filtered:
+        logger.debug(f"[EntityFilter] 警告：没有任何结果包含实体 {core_entities}")
+
+    return filtered
+
+
+def detect_and_downgrade_to_fulltext(
+    query: str,
+    results: List[Dict[str, Any]],
+    config: Any = None
+) -> bool:
+    """
+    检测是否需要降级到全文检索
+
+    条件：
+    1. 是 fact-type 查询
+    2. 检索结果的 top-k 内没有任何包含核心实体的 chunk
+    3. top 结果的平均分较低
+
+    Returns:
+        True 如果应该降级到全文检索
+    """
+    query_info = detect_query_type(query)
+
+    if not query_info["is_fact_type"]:
+        return False
+
+    if not query_info["needs_exact_match"]:
+        return False
+
+    core_entities = query_info["core_entities"]
+    if not core_entities:
+        return False
+
+    # 检查 top 结果是否有实体匹配
+    top_k = getattr(config, 'two_stage_rerank_k', 5) if config else 5
+    top_results = results[:min(top_k, len(results))]
+
+    entity_matched_count = 0
+    for r in top_results:
+        text_lower = r.get("text", "").lower()
+        if any(entity.lower() in text_lower for entity in core_entities):
+            entity_matched_count += 1
+
+    # 如果没有任何 top 结果匹配实体，且分数较低
+    avg_score = sum(r.get("score", 0.0) for r in top_results) / len(top_results) if top_results else 0.0
+
+    if entity_matched_count == 0 and avg_score < 0.5:
+        logger.info(f"[FactType] 检测到 fact-type 查询但 top 结果无实体匹配，降级到全文检索")
+        return True
+
+    return False
+
+
 # ==================== CRAG (Corrective RAG) 评估和修正 ====================
 
 class CragEvaluator:
@@ -490,13 +708,17 @@ class CragEvaluator:
             for i, r in enumerate(top_results)
         ])
 
-        prompt = f"""你是一个检索质量评估专家。请评估以下检索结果与查询的相关性。
+        prompt = f"""你是一个严格的信息完整性评估专家。
 
 【查询】
 {query}
 
 【检索结果】
 {context_text}
+
+【评估任务】
+1. 评估检索结果是否能回答这个问题
+2. 如果不能完全回答，指出缺失的方面
 
 【评估标准】
 - 高相关性 (0.7-1.0): 检索结果直接包含答案或高度相关信息
@@ -508,7 +730,8 @@ class CragEvaluator:
 {{
     "score": 0.0-1.0 的数字，
     "level": "high/medium/low",
-    "reasoning": "简要说明评估理由"
+    "reasoning": "简要说明评估理由",
+    "missing_aspects": "缺失的方面描述，如果没有缺失则为空字符串"
 }}
 
 【评估】"""
@@ -551,22 +774,26 @@ class CragEvaluator:
                     level = level_match.group(1) if level_match else "medium"
                     reasoning_match = re.search(r'"reasoning"\s*:\s*"([^"]*)"', matched_json)
                     reasoning = reasoning_match.group(1) if reasoning_match else ""
-                    result = {"score": score, "level": level, "reasoning": reasoning}
+                    missing_match = re.search(r'"missing_aspects"\s*:\s*"([^"]*)"', matched_json)
+                    missing_aspects = missing_match.group(1) if missing_match else ""
+                    result = {"score": score, "level": level, "reasoning": reasoning, "missing_aspects": missing_aspects}
                     logger.info(f"[CRAG] 正则提取: score={score}, level={level}, reasoning={reasoning[:50]}...")
 
                 score = float(result.get("score", 0.5))
                 level = result.get("level", "medium")
                 reasoning = result.get("reasoning", "")
+                missing_aspects = result.get("missing_aspects", "")
 
                 # 验证结果有效性
                 if level not in ["high", "medium", "low"]:
                     level = "medium" if score >= 0.3 else "low"
 
-                logger.debug(f"[CRAG LLM评估] score={score:.2f}, level={level}")
+                logger.debug(f"[CRAG LLM评估] score={score:.2f}, level={level}, missing={missing_aspects[:30] if missing_aspects else 'none'}...")
                 return {
                     "score": min(score, 1.0),
                     "level": level,
-                    "reasoning": reasoning
+                    "reasoning": reasoning,
+                    "missing_aspects": missing_aspects
                 }
 
         except Exception as e:
@@ -586,6 +813,14 @@ class CragEvaluator:
         # 1. 分析查询特征
         query_lower = query.lower()
         query_terms = set(query_lower.split())
+
+        if not results:
+            return {
+                "score": 0.0,
+                "level": "low",
+                "reasoning": "无检索结果",
+                "missing_aspects": ""
+            }
 
         # 2. 分析检索结果
         top_result = results[0]
@@ -628,7 +863,8 @@ class CragEvaluator:
         return {
             "score": min(score, 1.0),
             "level": level,
-            "reasoning": reasoning
+            "reasoning": reasoning,
+            "missing_aspects": ""
         }
 
 
@@ -648,7 +884,8 @@ class CragCorrector:
         self,
         query: str,
         level: str,
-        original_results: List[Dict[str, Any]]
+        original_results: List[Dict[str, Any]],
+        missing_aspects: str = ""
     ) -> List[Dict[str, Any]]:
         """
         根据评估等级执行修正策略
@@ -657,6 +894,7 @@ class CragCorrector:
             query: 原始查询
             level: high/medium/low
             original_results: 原始检索结果
+            missing_aspects: 评估时发现的缺失方面（用于针对性重写）
 
         Returns:
             修正后的检索结果
@@ -669,20 +907,21 @@ class CragCorrector:
         elif level == "medium":
             # 中等质量：查询重写 + 补充检索
             logger.debug(f"[CRAG] 检索质量中等，执行查询重写补充")
-            return await self._rewrite_and_retrieve(query, original_results)
+            return await self._rewrite_and_retrieve(query, original_results, missing_aspects)
 
         else:  # low
-            # 低质量：执行查询重写 + 重新检索
-            logger.debug(f"[CRAG] 检索质量低，执行查询重写重新检索")
-            return await self._rewrite_and_merge(query, original_results)
+            # 低质量：执行查询重写 + 重新检索（完全重检，不保留原结果）
+            logger.debug(f"[CRAG] 检索质量低，执行完全重检（HyDE增强）")
+            return await self._rewrite_and_merge(query, original_results, missing_aspects, discard_original=True, use_hyde=True)
 
     async def _rewrite_and_retrieve(
         self,
         query: str,
-        original_results: List[Dict[str, Any]]
+        original_results: List[Dict[str, Any]],
+        missing_aspects: str = ""
     ) -> List[Dict[str, Any]]:
         """中等质量修正：多查询重写 + 补充检索 + RRF融合"""
-        rewritten_queries = await self._rewrite_query_multi(query)
+        rewritten_queries = await self._rewrite_query_multi(query, missing_aspects)
         if len(rewritten_queries) <= 1:
             return original_results
 
@@ -706,14 +945,30 @@ class CragCorrector:
     async def _rewrite_and_merge(
         self,
         query: str,
-        original_results: List[Dict[str, Any]]
+        original_results: List[Dict[str, Any]],
+        missing_aspects: str = "",
+        discard_original: bool = False,
+        use_hyde: bool = True
     ) -> List[Dict[str, Any]]:
-        """低质量修正：多查询重写 + 混合检索 + RRF融合"""
-        rewritten_queries = await self._rewrite_query_multi(query)
+        """低质量修正：多查询重写 + 混合检索 + RRF融合
+
+        Args:
+            discard_original: 如果为 True，则完全丢弃原结果，进行"完全重检"
+            use_hyde: 是否使用 HyDE 增强检索
+        """
+        rewritten_queries = await self._rewrite_query_multi(query, missing_aspects)
 
         try:
             all_results = []
 
+            # 1. HyDE 增强检索（可选）
+            if use_hyde:
+                hyde_results = await self.hyde_enhanced_retrieve(query, top_k=15)
+                if hyde_results:
+                    all_results.extend(hyde_results)
+                    logger.debug(f"[CRAG] HyDE 检索到 {len(hyde_results)} 个结果")
+
+            # 2. 多查询扩展检索
             for rewritten_query in rewritten_queries:
                 # 并行执行向量和BM25检索
                 query_embedding = await self._embed_provider.get_text_embedding(rewritten_query)
@@ -731,8 +986,9 @@ class CragCorrector:
                 combined = self._simple_fusion(vector_results, bm25_results, top_k=15)
                 all_results.extend(combined)
 
-            # 与原结果融合
-            all_results.extend(original_results)
+            # 完全重检：低质量时不保留原结果，避免错误传递
+            if not discard_original:
+                all_results.extend(original_results)
 
             # 使用RRF融合
             return self._rrf_fusion(all_results, top_k=5)
@@ -740,8 +996,13 @@ class CragCorrector:
             logger.warning(f"[CRAG] 重新检索失败: {e}")
             return original_results
 
-    async def _rewrite_query_multi(self, query: str) -> List[str]:
-        """使用LLM生成多个查询改写（多查询扩展）"""
+    async def _rewrite_query_multi(self, query: str, missing_aspects: str = "") -> List[str]:
+        """使用LLM生成多个查询改写（多查询扩展）
+
+        Args:
+            query: 原始查询
+            missing_aspects: 评估发现的缺失方面（用于针对性改写）
+        """
         if not self._llm_provider:
             return [query]
 
@@ -749,9 +1010,14 @@ class CragCorrector:
             # 提取相关术语增强改写
             relevant_terms = await self._extract_relevant_terms(query)
 
+            # 如果有缺失方面，增加针对性改写
+            missing_section = ""
+            if missing_aspects:
+                missing_section = f"\n【重点改写方向】检索结果缺失以下方面，请针对这些方面生成不同的检索表述：\n{missing_aspects}\n"
+
             prompt = f"""将以下学术查询改写为3-5个不同的检索表述，覆盖不同角度。
 保持核心术语不变，仅改变句式和表达方式。
-
+{missing_section}
 原始查询：{query}
 {relevant_terms}
 改写查询（每行一个，不要编号）：
@@ -843,6 +1109,129 @@ class CragCorrector:
             logger.debug(f"[CRAG] 术语提取失败: {e}")
 
         return ""
+
+    async def _hyde_generate_answer(self, query: str) -> Optional[str]:
+        """
+        HyDE: 使用 LLM 生成假设性答案片段
+
+        用于增强检索：先让 LLM 根据问题生成一个假设性的答案，
+        然后用这个答案去找相似的文档片段
+
+        Args:
+            query: 用户查询
+
+        Returns:
+            假设性答案文本，如果失败返回 None
+        """
+        if not self._llm_provider:
+            return None
+
+        prompt = f"""你是一个学术论文助手。请针对以下问题写出一个精确的答案片段（2-3句话）。
+这个答案将用于检索相关文档，请确保回答准确、包含关键术语和具体信息。
+
+【问题】
+{query}
+
+【你的回答】（直接输出答案，不要解释）
+"""
+
+        try:
+            response = await self._llm_provider.text_chat(
+                prompt=prompt,
+                contexts=[],
+                temperature=0.1,
+                max_tokens=300
+            )
+
+            answer = ""
+            if hasattr(response, 'content'):
+                answer = response.content
+            elif isinstance(response, dict):
+                answer = response.get("content", "") or response.get("text", "")
+            else:
+                answer = str(response)
+
+            answer = answer.strip().strip('`').strip()
+            if answer and len(answer) > 10:
+                logger.debug(f"[HyDE] 生成假设性答案: {answer[:80]}...")
+                return answer
+        except Exception as e:
+            logger.debug(f"[HyDE] 生成假设性答案失败: {e}")
+
+        return None
+
+    async def hyde_enhanced_retrieve(
+        self,
+        query: str,
+        top_k: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        HyDE 增强检索：先用 LLM 生成假设性答案，再用相似性检索找到真实文档
+
+        流程：
+        1. 用 HyDE 生成假设性答案
+        2. 用假设性答案做向量检索（相似于答案的文档更可能包含正确答案）
+        3. 同时用原始查询检索
+        4. RRF 融合两种结果
+
+        Args:
+            query: 原始查询
+            top_k: 返回结果数
+
+        Returns:
+            检索结果列表
+        """
+        all_results = []
+
+        # 1. 并行执行：原始查询检索 + HyDE 答案生成
+        async def original_query_search():
+            try:
+                query_embedding = await self._embed_provider.get_text_embedding(query)
+                query_results = await self._index_manager.search(
+                    query_embedding=query_embedding,
+                    top_k=top_k
+                )
+                return query_results
+            except Exception as e:
+                logger.debug(f"[HyDE] 原始查询检索失败: {e}")
+                return []
+
+        async def hyde_generation():
+            hyde_answer = await self._hyde_generate_answer(query)
+            if not hyde_answer:
+                return None
+            try:
+                hyde_embedding = await self._embed_provider.get_text_embedding(hyde_answer)
+                hyde_results = await self._index_manager.search(
+                    query_embedding=hyde_embedding,
+                    top_k=top_k
+                )
+                logger.debug(f"[HyDE] 假设性答案检索到 {len(hyde_results)} 个结果")
+                return hyde_results
+            except Exception as e:
+                logger.debug(f"[HyDE] 假设性答案检索失败: {e}")
+                return None
+
+        # 并行执行两个任务
+        query_results, hyde_results = await asyncio.gather(
+            original_query_search(),
+            hyde_generation(),
+            return_exceptions=True
+        )
+
+        # 处理查询结果
+        if isinstance(query_results, list):
+            all_results.extend(query_results)
+
+        # 处理 HyDE 结果
+        if isinstance(hyde_results, list):
+            all_results.extend(hyde_results)
+
+        if not all_results:
+            return []
+
+        # 3. RRF 融合（相同文本取最高分）
+        return self._rrf_fusion(all_results, top_k=top_k)
 
     def _simple_fusion(
         self,
@@ -1462,7 +1851,7 @@ class HybridRAGEngine:
                     if embed_prov is None:
                         use_two_stage = False
                     else:
-                        # 阶段1: 从摘要索引检索相关论文
+                        # 阶段1: 从摘要索引检索相关论文（扩大召回量）
                         abstract_results = await cast(Any, abstract_mgr).search_by_abstract(query, top_k=abstract_top_k)
                         if abstract_results:
                             # 注意：abstract index 存储 paper_id（如 "2412.11752v2（DRKS）"）
@@ -1478,16 +1867,70 @@ class HybridRAGEngine:
                                     else:
                                         # 是 paper_id 格式，转换为 file_name
                                         paper_ids.append(pid + ".pdf")
-                            logger.debug(f"[两阶段检索] 阶段1: 找到 {len(abstract_results)} 篇相关论文")
+                            logger.debug(f"[两阶段检索] 阶段1: 摘要向量检索找到 {len(abstract_results)} 篇候选论文")
 
-                            # 阶段2: 在这些论文内检索chunks
+                            # ========== 阶段1.5: Rerank 重排序（新增）==========
+                            # 使用 reranker 对候选论文的摘要进行重排序，选择最相关的 top_k
+                            two_stage_rerank_k = getattr(self.config, 'two_stage_rerank_k', 5)
+                            reranked_paper_ids = paper_ids  # 默认使用原始顺序
+
+                            if reranker and len(abstract_results) >= 3:
+                                try:
+                                    # 构建摘要文本用于 rerank
+                                    rerank_candidates = []
+                                    for r in abstract_results:
+                                        abstract_text = r.get("abstract_text", "")
+                                        title = r.get("title", "")
+                                        paper_id = r.get("paper_id", "")
+                                        rerank_candidates.append({
+                                            "text": f"{title}\n{abstract_text}" if title else abstract_text,
+                                            "metadata": {"paper_id": paper_id, "file_name": r.get("file_name", "")},
+                                            "score": r.get("score", 0.0)
+                                        })
+
+                                    # Rerank 选择 top_k
+                                    reranked = await reranker.rerank(
+                                        query=query,
+                                        results=rerank_candidates,
+                                        top_k=min(two_stage_rerank_k, len(rerank_candidates))
+                                    )
+
+                                    # 提取 rerank 后的 paper_ids
+                                    reranked_paper_ids = []
+                                    for item in reranked:
+                                        pid = item.get("metadata", {}).get("paper_id", "")
+                                        fname = item.get("metadata", {}).get("file_name", "")
+                                        if pid:
+                                            if pid.lower().endswith(".pdf"):
+                                                reranked_paper_ids.append(pid)
+                                            else:
+                                                reranked_paper_ids.append(pid + ".pdf")
+                                        elif fname:
+                                            reranked_paper_ids.append(fname)
+
+                                    logger.info(f"[两阶段检索] 阶段1.5: Rerank重排序完成 {len(paper_ids)} → {len(reranked_paper_ids)} 篇")
+                                except Exception as e:
+                                    logger.warning(f"[两阶段检索] Rerank失败，使用原始顺序: {e}")
+                                    reranked_paper_ids = paper_ids
+                            else:
+                                # 不启用 rerank 或候选太少，只取 top_k
+                                reranked_paper_ids = paper_ids[:two_stage_rerank_k]
+
+                            # 阶段2: 在重排序后的论文内检索chunks
                             query_embedding = await embed_prov.get_text_embedding(query)
                             chunk_results = await self._index_manager.search_with_paper_filter(
                                 query_embedding=query_embedding,
-                                paper_ids=paper_ids,
+                                paper_ids=reranked_paper_ids,
                                 top_k=top_k
                             )
-                            logger.debug(f"[两阶段检索] 阶段2: 找到 {len(chunk_results)} 个相关chunks")
+                            logger.debug(f"[两阶段检索] 阶段2: 在 {len(reranked_paper_ids)} 篇论文内检索到 {len(chunk_results)} 个chunks")
+
+                            # ========== Fact-Type 查询降级检查（新增）==========
+                            # 如果是 fact-type 查询但 top 结果没有实体匹配，降级到全文检索
+                            if detect_and_downgrade_to_fulltext(query, chunk_results, self.config):
+                                logger.info(f"[FactType] 两阶段检索结果无实体匹配，降级到全文检索")
+                                use_two_stage = False
+                                chunk_results = []
 
                             # 将结果转换为 QueryResult 格式
                             if chunk_results:
@@ -1519,6 +1962,10 @@ class HybridRAGEngine:
                     query_result = await retriever.retrieve(query, top_k)
             # type: ignore[has-type] - avoiding mypy duplicate variable warning; fallback result overwrites initial empty value
 
+            # ========== 查询复杂度路由 ==========
+            complexity = classify_query_complexity(query)
+            logger.debug(f"[复杂度路由] query='{query[:30]}...' → {complexity}")
+
             # ========== CRAG: 分层检索 + 质量评估 + 修正 ==========
             # 将检索结果转换为字典格式（用于评估和修正）
             results_dict = []
@@ -1529,45 +1976,107 @@ class HybridRAGEngine:
                     "score": query_result.scores[i] if i < len(query_result.scores) else 0.0
                 })
 
-            # 阶段1: CRAG 评估检索质量（使用 LLM 评估）
-            # 确保 LLM 已加载（如果还未加载）
-            if llm_provider is None:
-                try:
-                    llm_provider = await self._ensure_llm_initialized()
-                except Exception:
-                    pass
+            # ========== Threshold Gate: 根据 top score + 查询复杂度决定是否需要 CRAG ==========
+            top_score = results_dict[0].get("score", 0.0) if results_dict else 0.0
+            crag_action = "evaluate"  # "skip" | "evaluate" | "full_retry"
 
-            evaluator = CragEvaluator(llm_provider=llm_provider)
-            evaluation = await evaluator.evaluate_retrieval_quality(query, results_dict)
-            logger.debug(f"[CRAG评估] query='{query[:50]}...', score={evaluation['score']:.2f} ({evaluation['level']})")
+            # 根据查询复杂度调整 CRAG 阈值
+            # simple_direct: 更倾向于跳过（简单定义/事实查询通常高置信）
+            # multi_hop/complex: 更严格（多跳/复杂查询需要更仔细评估）
+            if complexity == "simple_direct":
+                skip_threshold = 0.80   # 简单查询更高置信阈值
+                full_retry_threshold = 0.60
+            elif complexity in ("multi_hop", "complex"):
+                skip_threshold = 0.92   # 复杂查询需要更严格
+                full_retry_threshold = 0.70
+            else:  # standard
+                skip_threshold = 0.85
+                full_retry_threshold = 0.65
 
-            # 阶段2: 如果质量低或中，执行修正策略
-            if evaluation['level'] in ['low', 'medium']:
-                # 复用已加载的 LLM provider
+            if top_score > skip_threshold:
+                # 高置信：跳过 CRAG，直接使用原结果
+                crag_action = "skip"
+                logger.debug(f"[CRAG Gate] {complexity} skip (top_score={top_score:.3f} > {skip_threshold})")
+            elif top_score < full_retry_threshold:
+                # 低置信：跳过 LLM 评估，直接全量重检 + HyDE
+                crag_action = "full_retry"
+                logger.debug(f"[CRAG Gate] {complexity} full_retry (top_score={top_score:.3f} < {full_retry_threshold})")
+            else:
+                # 中置信：正常 CRAG 评估
+                crag_action = "evaluate"
+                logger.debug(f"[CRAG Gate] {complexity} evaluate ({full_retry_threshold} <= top_score <= {skip_threshold})")
+
+            missing_aspects = ""
+
+            if crag_action == "skip":
+                # 直接使用原始检索结果，跳过所有 CRAG 处理
+                corrected_results = results_dict
+                logger.debug(f"[CRAG Gate] 高置信跳过，直接使用原结果")
+
+            elif crag_action == "full_retry":
+                # 低置信：创建修正器，直接执行完全重检（不调用 LLM 评估）
                 if llm_provider is None:
                     try:
                         llm_provider = await self._ensure_llm_initialized()
                     except Exception:
-                        llm_provider = None
+                        pass
 
-                # 创建 CRAG 修正器（复用同一个 LLM provider）
                 corrector = CragCorrector(
                     index_manager=self._index_manager,
                     embed_provider=self._embed_provider,
                     llm_provider=llm_provider
                 )
-
-                # 执行修正
+                # 直接触发 low 级别的完全重检
                 corrected_results = await corrector.correct(
                     query=query,
-                    level=evaluation['level'],
-                    original_results=results_dict
+                    level="low",
+                    original_results=results_dict,
+                    missing_aspects=""
                 )
+                logger.debug(f"[CRAG Gate] 低置信完全重检，原始 {len(results_dict)} → {len(corrected_results)} 条")
 
-                # 更新结果
-                if corrected_results != results_dict:
-                    logger.info(f"[CRAG] 修正完成: {len(results_dict)} → {len(corrected_results)} 条结果")
-                    results_dict = corrected_results
+            else:  # crag_action == "evaluate"
+                # 中置信：正常 CRAG 评估 + 修正
+                if llm_provider is None:
+                    try:
+                        llm_provider = await self._ensure_llm_initialized()
+                    except Exception:
+                        pass
+
+                evaluator = CragEvaluator(llm_provider=llm_provider)
+                evaluation = await evaluator.evaluate_retrieval_quality(query, results_dict)
+                logger.debug(f"[CRAG评估] query='{query[:50]}...', score={evaluation['score']:.2f} ({evaluation['level']})")
+
+                missing_aspects = evaluation.get('missing_aspects', '')
+
+                # 如果质量低或中，执行修正策略
+                if evaluation['level'] in ['low', 'medium']:
+                    # 复用已加载的 LLM provider
+                    if llm_provider is None:
+                        try:
+                            llm_provider = await self._ensure_llm_initialized()
+                        except Exception:
+                            llm_provider = None
+
+                    # 创建 CRAG 修正器（复用同一个 LLM provider）
+                    corrector = CragCorrector(
+                        index_manager=self._index_manager,
+                        embed_provider=self._embed_provider,
+                        llm_provider=llm_provider
+                    )
+
+                    # 执行修正（传入缺失方面用于针对性重写）
+                    corrected_results = await corrector.correct(
+                        query=query,
+                        level=evaluation['level'],
+                        original_results=results_dict,
+                        missing_aspects=missing_aspects
+                    )
+
+                    # 更新结果
+                    if corrected_results != results_dict:
+                        logger.info(f"[CRAG] 修正完成: {len(results_dict)} → {len(corrected_results)} 条结果")
+                        results_dict = corrected_results
             # ========== CRAG 修正结束 ==========
 
             # 如果启用了重排序且结果数量足够，进行重排序
@@ -2067,11 +2576,15 @@ class HybridRAGEngine:
             if force_english:
                 text_prompt = f"""Based on the following paper content, answer the question in English. Keep the answer concise (2-4 sentences), factual, and in plain text without markdown formatting.
 
+IMPORTANT: If the retrieved context does NOT contain sufficient information to answer the question, you MUST respond with "Insufficient information" instead of fabricating an answer. Do not make up or assume any information not explicitly present in the context below.
+
 {context}
 
 Question: {query}"""
             else:
                 text_prompt = f"""基于以下论文内容，用简洁的纯文本回答问题（2-4句话，不使用Markdown格式）：
+
+重要提醒：如果检索到的上下文没有直接包含回答问题所需的充分信息，你必须回答"信息不足"，不要编造答案。不要凭空捏造或假设任何上下文未明确提供的信息。
 
 {context}
 

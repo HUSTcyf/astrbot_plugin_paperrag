@@ -1,0 +1,3 @@
+"""
+AstrBot Paper RAG Plugin
+"""
