@@ -69,7 +69,7 @@ class RAGConfig:
     enable_multimodal: bool = True
     figures_dir: str = ""
 
-    # 混合检索配置（稀疏权重 + 稠密向量）
+    # 混合检索配置（稀疏权重 + 稠密向量 + BM25精确匹配）
     enable_sparse_retrieval: bool = True  # 使用 BGE-M3 稀疏权重
     enable_multi_vector_rerank: bool = False  # 使用 ColBERT reranking
     enable_noise_filter: bool = True  # 使用本地 LLM 过滤噪声 chunks（参考文献/表格/符号等）
@@ -77,9 +77,9 @@ class RAGConfig:
     hybrid_alpha: float = 0.5    # RRF 融合权重（0=纯稀疏, 1=纯向量）
     hybrid_rrf_k: int = 60      # RRF 常数 k
 
-    # 向后兼容：保留旧的 BM25 配置名称（但不再使用）
-    enable_bm25: bool = False    # 已废弃，使用 enable_sparse_retrieval
-    bm25_top_k: int = 20        # 复用为 sparse_top_k
+    # BM25 精确匹配配置（用于专有名词、作者名等需要精确匹配的场景）
+    enable_bm25: bool = True    # 启用 BM25 精确匹配（当检测到精确匹配意图时自动启用）
+    bm25_top_k: int = 20       # BM25 召回数量
 
     # 重排序配置（向后兼容，内部使用 ColBERT reranking）
     enable_reranking: bool = False  # 使用 ColBERT reranking

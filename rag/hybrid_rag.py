@@ -201,6 +201,166 @@ class SparseRetriever(BaseRetriever):
             return await fallback.retrieve(query, top_k)
 
 
+class BM25Retriever:
+    """
+    BM25 精确匹配检索器
+
+    用于专有名词、作者名、数字等需要精确匹配的查询。
+    使用 jieba 分词 + rank_bm25 计算相关性分数。
+    """
+
+    def __init__(self, index_manager: HybridIndexManager):
+        self._index_manager = index_manager
+        self._bm25 = None
+        self._corpus_texts: List[str] = []
+        self._corpus_metadata: List[Dict[str, Any]] = []
+
+    def _tokenize(self, text: str) -> List[str]:
+        """使用 jieba 分词并标准化（与 legacy/hybrid_index.py 一致）"""
+        import jieba
+        import re
+
+        # 1. 转小写
+        text = text.lower()
+        # 2. 将连字符/下划线连接的词合并（如 anti-scam -> antiscam）
+        text = re.sub(r'([a-z])[-_]([a-z])', r'\1\2', text)
+        # 3. 使用 jieba 分词
+        tokens = list(jieba.cut(text))
+        # 4. 去除纯标点 token
+        tokens = [t for t in tokens if not re.match(r'^[\s\W]+$', t)]
+        return tokens
+
+    async def _ensure_index(self) -> bool:
+        """确保 BM25 索引已构建"""
+        if self._bm25 is not None:
+            return True
+
+        try:
+            from rank_bm25 import BM25Okapi
+
+            # 从 Milvus 获取所有 chunks
+            chunks = await self._index_manager.get_all_chunks()
+            if not chunks:
+                logger.warning("[BM25Retriever] Milvus 中无数据，无法构建 BM25 索引")
+                return False
+
+            self._corpus_texts = [c["text"] for c in chunks]
+            self._corpus_metadata = [c.get("metadata", {}) for c in chunks]
+
+            # 使用 jieba 分词构建 BM25 索引
+            tokenized_corpus = [self._tokenize(text) for text in self._corpus_texts]
+            self._bm25 = BM25Okapi(tokenized_corpus)
+
+            logger.info(f"✅ BM25 索引构建完成: {len(self._corpus_texts)} 个 chunks")
+            return True
+
+        except ImportError:
+            logger.error("rank_bm25 未安装，请运行: pip install rank-bm25")
+            return False
+        except Exception as e:
+            logger.error(f"[BM25Retriever] BM25 索引构建失败: {e}")
+            return False
+
+    def is_exact_match_query(self, query: str) -> bool:
+        """
+        检测查询是否需要精确匹配（专有名词、作者名、数字等）
+
+        返回 True 的情况：
+        - 查询包含人名（带 "et al." 或 "等"）
+        - 查询包含数字（年份、DOI、arXiv ID）
+        - 查询包含具体名称（论文标题、机构名）
+        - 查询包含特殊符号（括号、连字符等）
+        """
+        import re
+
+        query_lower = query.lower()
+
+        # 1. 检测是否包含具体名称模式（这些需要精确匹配）
+        exact_match_patterns = [
+            r'\b[A-Z][a-z]+\s+(?:et\s+al\.?|等)\b',  # "Smith et al."
+            r'\b[A-Z][a-z]+,\s*[A-Z]\.\b',  # "Smith, J."
+            r'\b\d{4}\b',  # 年份 "2024"
+            r'arxiv:\s*\d+\.\d+',  # arXiv ID
+            r'doi:\s*\d+',  # DOI
+            r'\b\d{2,}\b',  # 数字（页码、版本号等）
+            r'["""].*["""]',  # 引用的确切词语
+            r'\([^)]{1,30}\)',  # 括号内的短文本（可能是专有名词）
+            r'[-_]',  # 包含连字符的专有名词
+        ]
+
+        for pattern in exact_match_patterns:
+            if re.search(pattern, query):
+                return True
+
+        # 2. 检测是否是事实性问题（who, when, where, which name）
+        # 这些问题通常需要精确匹配
+        factual_patterns = [
+            r'\bwho\s+(?:proposed|suggested|developed|created|invented|authored)\b',
+            r'\bwhen\s+(?:was|did|were)\b',
+            r'\bwhere\s+(?:was|did|did\s+it)\b',
+            r'\bwhat\s+is\s+the\s+name\b',
+            r'\bwhich\s+(?:paper|author|method|model)\b',
+        ]
+
+        for pattern in factual_patterns:
+            if re.search(pattern, query_lower):
+                return True
+
+        return False
+
+    async def retrieve(self, query: str, top_k: int = 20) -> QueryResult:
+        """使用 BM25 检索"""
+        try:
+            # 确保索引已构建
+            if not await self._ensure_index():
+                return QueryResult(nodes=[], scores=[])
+
+            # 分词查询
+            tokenized_query = self._tokenize(query)
+
+            if not tokenized_query:
+                return QueryResult(nodes=[], scores=[])
+
+            # 计算 BM25 分数
+            assert self._bm25 is not None
+            scores = self._bm25.get_scores(tokenized_query)
+
+            # 构建结果列表
+            results = []
+            for i, score in enumerate(scores):
+                if score > 0:  # 只返回有匹配的
+                    results.append({
+                        "text": self._corpus_texts[i],
+                        "metadata": self._corpus_metadata[i],
+                        "score": float(score)
+                    })
+
+            # 按分数降序排列
+            results.sort(key=lambda x: x["score"], reverse=True)
+
+            nodes = []
+            scores_list = []
+            for item in results[:top_k]:
+                nodes.append(Node(
+                    text=item["text"],
+                    metadata=item.get("metadata", {})
+                ))
+                scores_list.append(item.get("score", 0.0))
+
+            return QueryResult(nodes=nodes, scores=scores_list)
+
+        except Exception as e:
+            logger.error(f"[BM25Retriever] BM25 检索失败: {e}")
+            return QueryResult(nodes=[], scores=[])
+
+    def refresh_index(self) -> None:
+        """刷新 BM25 索引（如论文增删后）"""
+        self._bm25 = None
+        self._corpus_texts = []
+        self._corpus_metadata = []
+        logger.info("🔄 BM25 索引已重置，下次检索时将重新构建")
+
+
 class MultiVectorReranker:
     """
     ColBERT 式多向量 reranker
@@ -334,12 +494,13 @@ class MultiVectorReranker:
 
 class HybridRetriever(BaseRetriever):
     """
-    混合检索器：稀疏权重 + 稠密向量 + RRF 融合 + ColBERT Reranking
+    混合检索器：稠密向量 + 稀疏权重 + BM25精确匹配 + RRF 融合 + ColBERT Reranking
 
     流程：
-    1. 并行执行稀疏权重检索和向量搜索
-    2. 使用 Reciprocal Rank Fusion (RRF) 合并两路结果
-    3. 可选：ColBERT 多向量 reranking
+    1. 并行执行向量搜索和稀疏权重检索
+    2. 如果查询需要精确匹配（专有名词、作者名等），同时执行 BM25 检索
+    3. 使用 Reciprocal Rank Fusion (RRF) 合并多路结果
+    4. 可选：ColBERT 多向量 reranking
     """
 
     def __init__(
@@ -352,6 +513,8 @@ class HybridRetriever(BaseRetriever):
         rrf_k: int = 60,
         enable_reranking: bool = False,
         rerank_top_k: int = 5,
+        enable_bm25: bool = True,
+        bm25_top_k: int = 20,
     ):
         super().__init__(index_manager, embed_provider)
         self._sparse_top_k = sparse_top_k
@@ -360,11 +523,14 @@ class HybridRetriever(BaseRetriever):
         self._rrf_k = rrf_k
         self._enable_reranking = enable_reranking
         self._rerank_top_k = rerank_top_k
+        self._enable_bm25 = enable_bm25
+        self._bm25_top_k = bm25_top_k
         self._sparse_retriever = SparseRetriever(index_manager, embed_provider)
+        self._bm25_retriever = BM25Retriever(index_manager)
         self._reranker = MultiVectorReranker(embed_provider)
 
     async def retrieve(self, query: str, top_k: int = 5) -> QueryResult:
-        """混合检索：稀疏权重 + 向量 + RRF 融合"""
+        """混合检索：向量 + 稀疏权重 + BM25（按需）+ RRF 融合"""
 
         try:
             # 1. 稠密向量搜索
@@ -383,10 +549,23 @@ class HybridRetriever(BaseRetriever):
                 for node, score in zip(sparse_results.nodes, sparse_results.scores)
             }
 
-            # 3. RRF 融合
+            # 3. BM25 精确匹配（仅当查询需要精确匹配时）
+            bm25_dict: Dict[str, float] = {}
+            if self._enable_bm25 and self._bm25_retriever.is_exact_match_query(query):
+                logger.debug(f"[HybridRetriever] 精确匹配查询，启动 BM25 检索: {query}")
+                bm25_result = await self._bm25_retriever.retrieve(
+                    query, top_k=self._bm25_top_k
+                )
+                bm25_dict = {
+                    node.text: score
+                    for node, score in zip(bm25_result.nodes, bm25_result.scores)
+                }
+
+            # 4. RRF 融合
             fused = self._rrf_fusion(
                 vector_results=vector_results,
                 sparse_results=sparse_dict,
+                bm25_results=bm25_dict if bm25_dict else None,
                 top_k=top_k * 2 if self._enable_reranking else top_k,
             )
 
@@ -400,7 +579,7 @@ class HybridRetriever(BaseRetriever):
                 ))
                 scores.append(item.get("fused_score", 0.0))
 
-            # 4. 可选：ColBERT reranking
+            # 5. 可选：ColBERT reranking
             if self._enable_reranking and len(nodes) > top_k:
                 reranked = await self._reranker.rerank(
                     query, nodes, scores, top_k=top_k
@@ -422,22 +601,30 @@ class HybridRetriever(BaseRetriever):
         self,
         vector_results: List[Dict[str, Any]],
         sparse_results: Dict[str, float],
-        top_k: int,
+        bm25_results: Dict[str, float] | None = None,
+        top_k: int = 10,
     ) -> List[Dict[str, Any]]:
         """
         RRF (Reciprocal Rank Fusion) 分数融合
 
-        RRF score = Σ 1/(k + rank)
+        支持两路或三路融合：
+        - 两路：向量 + 稀疏权重
+        - 三路：向量 + 稀疏权重 + BM25（当需要精确匹配时）
+
+        RRF score = Σ α_v * 1/(k + v_rank) + α_s * 1/(k + s_rank) + α_b * 1/(k + b_rank)
 
         Args:
             vector_results: 向量检索结果
             sparse_results: 稀疏权重检索结果 {text: score}
+            bm25_results: BM25 检索结果 {text: score}（可选）
             top_k: 返回结果数量
 
         Returns:
             融合排序后的结果列表
         """
-        # 构建 text -> vector_score 和 vector_rank 映射
+        has_bm25 = bm25_results is not None and len(bm25_results) > 0
+
+        # 构建 text -> vector_rank 映射
         vector_rank_map: Dict[str, int] = {}
         for i, item in enumerate(vector_results):
             vector_rank_map[item["text"]] = i + 1
@@ -448,21 +635,51 @@ class HybridRetriever(BaseRetriever):
         for i, (text, _) in enumerate(sorted_sparse):
             sparse_rank_map[text] = i + 1
 
+        # BM25 结果按分数排序并分配 rank
+        bm25_rank_map: Dict[str, int] = {}
+        sorted_bm25: List[Tuple[str, float]] = []
+        if has_bm25 and bm25_results:
+            sorted_bm25 = sorted(bm25_results.items(), key=lambda x: x[1], reverse=True)
+            for i, (text, _) in enumerate(sorted_bm25):
+                bm25_rank_map[text] = i + 1
+
         # 合并所有文本
         all_texts = set(vector_rank_map.keys()) | set(sparse_rank_map.keys())
+        if has_bm25:
+            all_texts |= set(bm25_rank_map.keys())
 
         # 计算 RRF 分数
         rrf_scores: Dict[str, float] = {}
+        n_vector = len(vector_results)
+        n_sparse = len(sorted_sparse)
+        n_bm25 = len(sorted_bm25) if has_bm25 else 0
+
+        # 计算归一化权重
+        if has_bm25:
+            # 三路融合：向量 0.4, 稀疏 0.4, BM25 0.2
+            alpha_v = 0.4
+            alpha_s = 0.4
+            alpha_b = 0.2
+        else:
+            # 两路融合：向量 α, 稀疏 (1-α)
+            alpha_v = self._alpha
+            alpha_s = 1 - self._alpha
+            alpha_b = 0.0
+
         for text in all_texts:
-            v_rank = vector_rank_map.get(text, len(vector_results) + 1)
-            s_rank = sparse_rank_map.get(text, len(sorted_sparse) + 1)
+            v_rank = vector_rank_map.get(text, n_vector + 1)
+            s_rank = sparse_rank_map.get(text, n_sparse + 1)
 
             # RRF 公式
-            v_rrf = 1.0 / (self._rrf_k + v_rank)
-            s_rrf = 1.0 / (self._rrf_k + s_rank)
+            v_rrf = alpha_v * (1.0 / (self._rrf_k + v_rank)) if alpha_v > 0 else 0
+            s_rrf = alpha_s * (1.0 / (self._rrf_k + s_rank)) if alpha_s > 0 else 0
 
-            # 加权融合
-            rrf_scores[text] = self._alpha * v_rrf + (1 - self._alpha) * s_rrf
+            if has_bm25:
+                b_rank = bm25_rank_map.get(text, n_bm25 + 1)
+                b_rrf = alpha_b * (1.0 / (self._rrf_k + b_rank))
+                rrf_scores[text] = v_rrf + s_rrf + b_rrf
+            else:
+                rrf_scores[text] = v_rrf + s_rrf
 
         # 按分数降序排列
         sorted_texts = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
@@ -1111,12 +1328,14 @@ class HybridRAGEngine:
         self._retriever = HybridRetriever(
             index_manager=index_manager,
             embed_provider=embed_provider,
-            sparse_top_k=self.config.bm25_top_k,  # 复用配置
+            sparse_top_k=self.config.sparse_top_k,
             vector_top_k=50,
             alpha=self.config.hybrid_alpha,
             rrf_k=self.config.hybrid_rrf_k,
-            enable_reranking=self.config.enable_reranking,
+            enable_reranking=self.config.enable_multi_vector_rerank,
             rerank_top_k=self.config.top_k,
+            enable_bm25=self.config.enable_bm25,
+            bm25_top_k=self.config.bm25_top_k,
         )
         self._retriever_initialized = True
 
@@ -1126,10 +1345,15 @@ class HybridRAGEngine:
             self._retriever._reranker.set_colbert_storage(colbert_storage)
             logger.info("[ColBERTStorage] 已绑定到 MultiVectorReranker")
 
+        # 绑定 ColBERT 存储到 BM25 retriever（用于刷新索引）
+        if hasattr(self._retriever, '_bm25_retriever'):
+            logger.info("[BM25Retriever] 已初始化")
+
         logger.info(
             f"✅ HybridRetriever初始化完成 "
-            f"(sparse_top_k={self.config.bm25_top_k}, alpha={self.config.hybrid_alpha}, "
-            f"reranking={self.config.enable_reranking})"
+            f"(sparse_top_k={self.config.sparse_top_k}, alpha={self.config.hybrid_alpha}, "
+            f"bm25={self.config.enable_bm25}, bm25_top_k={self.config.bm25_top_k}, "
+            f"reranking={self.config.enable_multi_vector_rerank})"
         )
 
         assert self._retriever is not None
@@ -1387,6 +1611,11 @@ class HybridRAGEngine:
             if prefix:
                 colbert_storage.delete_by_file_prefix(prefix)
 
+            # 刷新 BM25 索引
+            bm25_retriever = getattr(self._retriever, '_bm25_retriever', None)
+            if bm25_retriever is not None:
+                bm25_retriever.refresh_index()
+
             return {
                 "status": "success",
                 "deleted_count": result.get("deleted_count", 0),
@@ -1409,6 +1638,11 @@ class HybridRAGEngine:
             # 同时清空 ColBERT 存储
             colbert_storage = self._ensure_colbert_storage_initialized()
             colbert_storage.clear_storage()
+
+            # 刷新 BM25 索引
+            bm25_retriever = getattr(self._retriever, '_bm25_retriever', None)
+            if bm25_retriever is not None:
+                bm25_retriever.refresh_index()
 
             return {"status": "success"}
         except Exception as e:

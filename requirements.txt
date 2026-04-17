@@ -60,6 +60,10 @@ arxiv>=2.0.0  # arXiv 论文查询（备用，新论文）
 # 数据集处理
 datasets>=2.14.0  # HuggingFace 数据集加载
 
+# BM25 精确匹配（用于专有名词、作者名等需要精确匹配的查询）
+rank-bm25>=0.15  # BM25 算法实现
+jieba>=0.42.1  # 中文分词（BM25 索引构建）
+
 # Docling PDF 多模态提取
 docling==2.84.0  # PDF 多模态提取（图片、表格）
 

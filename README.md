@@ -15,10 +15,10 @@ PaperRAG 是一个基于两阶段检索的学术论文问答系统，其架构�
 1. **Stage 1 - 摘要索引**：`AbstractIndexManager` 通过 `LocalGGUFClient`（Qwen3.5-9B GGUF 模型）提取论文摘要，或回退到基于关键词的规则提取。摘要向量存储在独立的 Milvus collection (`paper_abstracts`)，查询时先通过摘要匹配快速过滤出相关论文。
 
 2. **Stage 2 - Chunk 检索**：`HybridRAGEngine` 在 Stage 1 筛选出的论文集内执行混合检索：
-   - **向量检索**：基于 cosine 相似度
-   - **BM25 检索**：基于关键词匹配
+   - **向量检索**：基于 cosine 相似度（BGE-M3 稠密向量 1024维）
+   - **稀疏权重检索**：BGE-M3 稀疏权重通过 ABSPEC 公式计算关键词相似度
    - **RRF 融合**：双路分数通过 Reciprocal Rank Fusion 融合 (k=60)
-   - **可选重排序**：通过 FlagEmbedding BAAI/bge-reranker-v2-m3 交叉注意力重排
+   - **可选重排序**：通过 ColBERT 多向量 MaxSim Late Interaction 重排
 
 **知识图谱增强**：`GraphRAGEngine` 通过 `MultimodalGraphBuilder` 从 Chunk 中提取知识三元组（实体-关系-实体），支持 MemoryGraphStore（JSON 持久化）和 Neo4j 两种存储后端，支持局部遍历和全局遍历。
 
@@ -32,15 +32,15 @@ PaperRAG 是一个基于两阶段检索的学术论文问答系统，其架构�
 
 ## ✨ 核心功能
 
-- 🔍 **混合检索**：BM25 关键词 + 向量语义双路召回 + RRF 分数融合，兼顾精确术语匹配与语义理解
+- 🔍 **混合检索**：稀疏权重(ABSPEC) + BGE-M3 稠密向量 + BM25 精确匹配三路召回 + RRF 分数融合，兼顾精确术语匹配与语义理解
 - 💡 **AI问答**：结合检索内容生成准确、有引用的答案
 - 📄 **多格式支持**：PDF、Word、TXT、Markdown、HTML
 - 🖼️ **多模态提取**：自动识别PDF中的图片、表格、公式
 - 🖼️ **多模态查询**：支持图片输入进行VLM问答（原图+VLM）
 - 💾 **本地存储**：所有数据存储在本地，保护隐私
 - ⚡ **缓存加速**：常用查询结果缓存，响应更快
-- 🦙 **Ollama支持**：使用本地Ollama服务进行免费无限制的向量化（推荐）
-- 🏎️ **重排序支持**：FlagEmbedding加速检索精度
+- 🦙 **Unsloth本地Embedding**：使用 Unsloth BGE-M3 本地加载，支持稠密向量+稀疏权重+多向量输出
+- 🏎️ **重排序支持**：ColBERT 多向量 MaxSim Late Interaction 加速检索精度
 
 ---
 
@@ -55,31 +55,26 @@ pip install -r requirements.txt
 
 ### 第二步：配置插件
 
-**方式A：使用Ollama本地Embedding（推荐，免费无限制）**
+**方式A：使用Unsloth本地Embedding（推荐，免费无限制）**
 
 在 **AstrBot WebUI → 插件 → paper_rag → 插件配置** 中：
 
 | 配置项 | 值 | 说明 |
 |-------|-----|------|
-| Embedding模式 | `Ollama本地模式` | 使用Ollama |
+| Embedding模式 | `Unsloth本地模式` | 使用Unsloth BGE-M3 |
 | 向量嵌入维度 | `1024` | BGE-M3固定1024维 |
-| Ollama模型名称 | `bge-m3` | 模型名称 |
 | 文本问答Provider | （从AstrBot选取） | 用于RAG回答生成 |
 | 论文文件存放目录 | `./papers` | PDF存放路径 |
 | 启用插件 | ✅ | - |
 
-> ⚠️ **使用Ollama前需要先安装和配置**：
+> ⚠️ **Unsloth BGE-M3 模型会自动下载**：
+> 首次使用时会自动从 HuggingFace 下载 `unsloth/bge-m3` 模型到 `./models/bge-m3/`
+> 可选手动下载：
 > ```bash
-> # 1. 安装Ollama
-> curl -fsSL https://ollama.com/install.sh | sh
->
-> # 2. 下载BGE-M3模型
-> ollama pull bge-m3
->
-> # 3. 启动服务
-> ollama serve
+> # 手动下载 BGE-M3 模型
+> huggingface-cli download unsloth/bge-m3 --local-dir ./models/bge-m3
 > ```
-> 详细配置见：[OLLAMA_GUIDE.md](docs/OLLAMA_GUIDE.md)
+> 详细配置见：[OLLAMA_GUIDE.md](docs/OLLAMA_GUIDE.md)（BGE-M3 部分）
 
 **方式B：使用Gemini API（快速，有配额限制）**
 
@@ -359,7 +354,7 @@ API 配置从 `evaluation/freeapi.json` 读取，包含：
 | 配置项 | 说明 | 默认值 | 推荐值 |
 |-------|------|--------|--------|
 | `enabled` | 启用插件 | `true` | ✅ |
-| `embedding_mode` | Embedding模式 | `ollama` | `ollama`（推荐免费）/ `api` |
+| `embedding_mode` | Embedding模式 | `unsloth` | `unsloth`（推荐）/ `api` |
 | `embedding_provider_id` | Embedding Provider ID（API模式） | `gemini_embedding` | Gemini / OpenAI |
 | `compress_provider_id` | 上下文压缩LLM | 空 | 从AstrBot提供商选取 |
 | `text_provider_id` | 文本问答LLM | 空 | 从AstrBot提供商选取 |
@@ -369,19 +364,18 @@ API 配置从 `evaluation/freeapi.json` 读取，包含：
 | `embed_dim` | 向量维度 | `768` | `1024` (BGE-M3) / `768` (Gemini) / `1536` (OpenAI) |
 
 > 💡 **Embedding模式对比**：
-> - **Ollama模式**：免费、无限制、隐私保护、需要安装Ollama
+> - **Unsloth模式**：免费、无限制、隐私保护、本地加载 BGE-M3（推荐）
 > - **API模式**：快速、有配额限制、需要API密钥
 
-### Ollama本地Embedding配置
+### Unsloth本地Embedding配置
 
 | 配置项 | 说明 | 默认值 | 推荐值 |
 |-------|------|--------|--------|
-| `ollama.base_url` | Ollama服务地址 | `http://localhost:11434` | 默认 |
-| `ollama.model` | Ollama模型名称 | `bge-m3` | `bge-m3`（推荐）/ `nomic-embed-text` |
-| `ollama.batch_size` | 并发批处理大小 | `10` | `10-20`（根据硬件） |
-| `ollama.timeout` | 请求超时（秒） | `120.0` | 默认 |
+| `unsloth.model_path` | BGE-M3模型路径 | `./models/bge-m3` | 默认 |
+| `unsloth.device` | 运行设备 | `mps` | `mps`（Apple Silicon）/ `cuda`（NVIDIA）/ `cpu` |
+| `unsloth.max_seq_length` | 最大序列长度 | `512` | 默认 |
 
-> 🦙 **Ollama详细配置指南**：[OLLAMA_GUIDE.md](docs/OLLAMA_GUIDE.md)
+> 🦙 **Unsloth BGE-M3 配置指南**：[OLLAMA_GUIDE.md](docs/OLLAMA_GUIDE.md)（BGE-M3 部分）
 
 ### 检索配置
 
@@ -389,11 +383,12 @@ API 配置从 `evaluation/freeapi.json` 读取，包含：
 |-------|------|--------|--------|
 | `top_k` | 返回片段数 | `5` | `5` |
 | `similarity_cutoff` | 相似度阈值 | `0.3` | `0.3` |
-| `enable_bm25` | 启用 BM25 混合检索 | `false` | ✅ |
-| `bm25_top_k` | BM25 召回数量 | `20` | `20-50` |
+| `enable_sparse_retrieval` | 启用稀疏权重检索(ABSPEC) | `true` | ✅ |
+| `sparse_top_k` | 稀疏检索召回数量 | `20` | `20-50` |
 | `hybrid_alpha` | RRF 融合权重 | `0.5` | `0.5`（平等权重） |
+| `enable_noise_filter` | 启用噪声过滤(LLM) | `true` | ✅ |
 
-> 💡 **Embedding Provider 说明**：插件使用 AstrBot 中配置的 Embedding Provider。推荐使用 Ollama（免费无限制）。
+> 💡 **Embedding Provider 说明**：插件使用 Unsloth BGE-M3 本地加载，支持稠密向量、稀疏权重、多向量三种输出。
 
 ### 分块配置
 
@@ -566,33 +561,30 @@ print('✅ PaperBanana 连接成功')
 
 | 配置项 | 说明 | 默认值 | 推荐值 |
 |-------|------|--------|--------|
-| `enable_reranking` | 启用重排序 | `false` | ✅（提升精度） |
-| `reranking_model` | 重排序模型 | `BAAI/bge-reranker-v2-m3` | 默认 |
-| `reranking_device` | 运行设备 | `auto` | `auto`（自动检测） |
+| `enable_multi_vector_rerank` | 启用 ColBERT 多向量重排序 | `false` | ✅（提升精度） |
 | `reranking_adaptive` | 自适应模式 | `true` | ✅ |
-| `reranking_batch_size` | 批处理大小 | `32` | `32-64` |
 | `reranking_threshold` | 分数阈值 | `0.0` | `0.0` |
 
-> 💡 **重排序说明**：
+> 💡 **ColBERT 多向量重排序说明**：
+> - **原理**：ColBERT (Late Interaction) 每个 query token 和 doc token 分别编码为向量，检索时用 MaxSim 计算相似度
+> - **优势**：兼顾语义理解与精确词项匹配，比 Cross-Encoder 更快且支持长 doc
 > - **性能提升**：检索精度提升15-25%
 > - **延迟增加**：200-500ms（MPS加速）
-> - **内存占用**：约2GB
-> - **依赖安装**：`pip install -U FlagEmbedding`
+> - **依赖**：BGE-M3 多向量输出（Unsloth 模式自动启用）
 
 **配置场景示例**：
 
 1. **新手/默认配置**（推荐）
 ```json
 {
-  "enable_reranking": true
+  "enable_multi_vector_rerank": true
 }
 ```
 
 2. **Apple Silicon Mac**（MPS加速）
 ```json
 {
-  "enable_reranking": true,
-  "reranking_device": "mps",
+  "enable_multi_vector_rerank": true,
   "reranking_batch_size": 64
 }
 ```
@@ -600,8 +592,7 @@ print('✅ PaperBanana 连接成功')
 3. **NVIDIA GPU**（CUDA加速）
 ```json
 {
-  "enable_reranking": true,
-  "reranking_device": "cuda",
+  "enable_multi_vector_rerank": true,
   "reranking_batch_size": 128
 }
 ```
@@ -609,8 +600,7 @@ print('✅ PaperBanana 连接成功')
 4. **低内存/CPU**
 ```json
 {
-  "enable_reranking": true,
-  "reranking_device": "cpu",
+  "enable_multi_vector_rerank": true,
   "reranking_batch_size": 16
 }
 ```
@@ -618,32 +608,34 @@ print('✅ PaperBanana 连接成功')
 5. **高精度模式**
 ```json
 {
-  "enable_reranking": true,
-  "reranking_model": "BAAI/bge-reranker-large",
+  "enable_multi_vector_rerank": true,
   "reranking_threshold": 0.3
 }
 ```
 
-### 混合检索配置（BM25 + 向量）
+### 混合检索配置（稠密向量 + 稀疏权重 + BM25）
 
-BM25 混合检索通过 **双路召回 + 分数融合** 兼顾关键词精确匹配与语义理解：
+混合检索通过 **三路召回 + RRF 分数融合** 兼顾关键词精确匹配与语义理解：
 
 | 配置项 | 说明 | 默认值 | 推荐值 |
 |-------|------|--------|--------|
-| `enable_bm25` | 是否启用混合检索 | `false` | ✅ |
-| `bm25_top_k` | BM25 召回数量 | `20` | `20-50` |
-| `hybrid_alpha` | RRF 向量权重（0=纯BM25，1=纯向量） | `0.5` | `0.5` |
+| `enable_sparse_retrieval` | 是否启用稀疏权重检索(ABSPEC) | `true` | ✅ |
+| `sparse_top_k` | 稀疏检索召回数量 | `20` | `20-50` |
+| `hybrid_alpha` | RRF 向量权重（0=纯稀疏，1=纯向量） | `0.5` | `0.5` |
 | `hybrid_rrf_k` | RRF 常数 k | `60` | 默认 |
+| `enable_bm25` | 是否启用 BM25 精确匹配 | `true` | ✅ |
+| `bm25_top_k` | BM25 召回数量 | `20` | `20-50` |
 
-> **适用场景**：查询中包含明确关键词（论文标题、专业术语、作者名等）时，BM25 混合检索效果显著优于纯向量检索。
+> **精确匹配检测**：当查询包含专有名词（作者名、论文标题）、数字（年份、DOI、arXiv ID）、事实性问题（who/when/where/which name）时，自动启用 BM25 精确匹配。
 
 **检索流程**：
 ```
 Query
-  ├─ BM25 关键词搜索 ──→ 倒排索引命中 ──→ top_k 候选
-  └─ 向量语义搜索 ──→ Milvus COSINE ──→ top_k 候选
+  ├─ 稠密向量搜索(Milvus) ──→ COSINE ──→ top_k 候选
+  ├─ 稀疏权重搜索(ABSPEC) ──→ token hidden states ──→ top_k 候选
+  └─ BM25 精确匹配（按需）──→ jieba分词 ──→ top_k 候选
                         ↓
-              RRF 分数融合 ──→ 排序取 top_k
+              RRF 分数融合（2路或3路）─→ 排序取 top_k
 ```
 
 **典型配置**：
@@ -651,27 +643,33 @@ Query
 1. **默认（推荐）** — 关键词与语义兼顾
 ```json
 {
+  "enable_sparse_retrieval": true,
+  "sparse_top_k": 20,
+  "hybrid_alpha": 0.5,
   "enable_bm25": true,
-  "bm25_top_k": 20,
-  "hybrid_alpha": 0.5
+  "bm25_top_k": 20
 }
 ```
 
 2. **强关键词匹配** — 适合专有名词、技术术语查询
 ```json
 {
+  "enable_sparse_retrieval": true,
+  "sparse_top_k": 50,
+  "hybrid_alpha": 0.3,
   "enable_bm25": true,
-  "bm25_top_k": 50,
-  "hybrid_alpha": 0.3
+  "bm25_top_k": 50
 }
 ```
 
 3. **强语义理解** — 适合复杂问题、同义表述查询
 ```json
 {
+  "enable_sparse_retrieval": true,
+  "sparse_top_k": 20,
+  "hybrid_alpha": 0.7,
   "enable_bm25": true,
-  "bm25_top_k": 20,
-  "hybrid_alpha": 0.7
+  "bm25_top_k": 20
 }
 ```
 
@@ -699,7 +697,7 @@ Query
 
 ### 3. 加速导入
 
-- **使用Ollama**：本地批量向量化，无API限制（推荐）
+- **使用Unsloth**：本地 BGE-M3 批量向量化，无API限制（推荐）
 - **批量Embedding**：自动启用批量处理
 - **批量导入**：一次性添加多个PDF
 - **禁用图片提取**：设置 `multimodal.extract_images: false`
@@ -751,20 +749,21 @@ Query
 
 **解决**：无需处理，系统会自动降级到文本模式，不影响使用
 
-### Q6: 重排序功能不可用
+### Q6: ColBERT 多向量重排序不可用
 
-**原因**：FlagEmbedding与transformers版本不兼容
+**原因**：BGE-M3 多向量未正确加载
 
 **解决**：
 ```bash
-# 确保 transformers 版本 < 5.0
-pip install "transformers>=4.40.0,<5.0"
-pip install -U FlagEmbedding
+# 确保安装了 unsloth
+pip install unsloth
+# 确保 BGE-M3 模型存在
+ls models/bge-m3/
 ```
 
-**已知冲突**：
-- `mlx-lm`、`mlx-vlm` 与 `transformers<5.0` 冲突，如已安装请卸载
-- transformers 5.x 移除了 `is_torch_fx_available`，导致 FlagEmbedding 导入失败
+**检查配置**：
+- 确认 `embedding_mode` 设置为 `unsloth`
+- 确认 `enable_multi_vector_rerank` 设置为 `true`
 
 **MPS加速不可用**：
 - 检查macOS版本 ≥ 12.3
@@ -911,7 +910,7 @@ python -m evaluation.run_evaluation_ragas --step all --use-existing-chunks --tes
 | `--test-size` | 生成测试问题数量 | 50 |
 | `--max-rpm` | RPM 限制（避免 API 限流） | 96 |
 | `--max-concurrent` | 最大并发数 | 5 |
-| `--embedding-mode` | Embedding 模式：`api`/`ollama` | `ollama` |
+| `--embedding-mode` | Embedding 模式：`api`/`unsloth` | `unsloth` |
 | `--output-dir` | 输出目录 | `results` |
 | `--use-existing-chunks` | 使用已有 chunks 文件 | False |
 | `--existing-chunks-path` | 已有 chunks 文件路径 | `results/milvus_chunks.json` |
