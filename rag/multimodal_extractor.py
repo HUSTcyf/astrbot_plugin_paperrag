@@ -865,7 +865,7 @@ def _configure_docling_globals() -> None:
     import os
     from pathlib import Path
 
-    models_dir = Path(__file__).parent / "models"
+    models_dir = Path(__file__).parent.parent / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. 设置 HF_HOME，使 huggingface_hub 缓存到本地目录
@@ -891,7 +891,7 @@ class DoclingExtractor:
     """基于 docling 的 PDF 多模态提取器，支持图片和表格提取"""
 
     # 本地模型目录（插件目录下）
-    _LOCAL_MODELS_DIR = Path(__file__).parent / "models"
+    _LOCAL_MODELS_DIR = Path(__file__).parent.parent / "models"
 
     def __init__(self, fallback_extractor: Optional["MultimodalPDFExtractor"] = None):
         """
@@ -1017,7 +1017,7 @@ import io
 import json
 from pathlib import Path
 
-models_dir = Path("{plugin_dir}") / "models"
+models_dir = Path(__file__).parent.parent / "models"
 os.environ["HF_HOME"] = str(models_dir)
 os.environ["TRANSFORMERS_CACHE"] = str(models_dir)
 

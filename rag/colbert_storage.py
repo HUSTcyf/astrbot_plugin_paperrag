@@ -48,7 +48,7 @@ class ColBERTStorage:
         self._is_loaded = False
 
         self.EMBEDDING_DIM = 1024
-        self.MAX_TOKENS_PER_CHUNK = 128  # 每个 chunk 最多存 128 tokens
+        self.MAX_TOKENS_PER_CHUNK = 512  # 每个 chunk 最多存 512 tokens（匹配 BGE-M3 max_seq_length）
 
     def _get_faiss_id(self, chunk_idx: int, token_pos: int) -> int:
         """将 (chunk_idx, token_pos) 映射为 FAISS vector ID"""
@@ -104,8 +104,18 @@ class ColBERTStorage:
         for i, (vectors, chunk_id) in enumerate(zip(chunk_vectors, chunk_ids)):
             # chunk_idx = 当前已有的 chunk 数量（即新 chunks 的起始位置）
             chunk_idx = len(self._id_mapping)
-            n_tokens = min(len(vectors), self.MAX_TOKENS_PER_CHUNK)
-            n_tokens = min(len(vectors), self.MAX_TOKENS_PER_CHUNK)
+            actual_tokens = len(vectors)
+
+            # 防截断断言：绝不静默丢弃 token 向量
+            if actual_tokens > self.MAX_TOKENS_PER_CHUNK:
+                raise ValueError(
+                    f"[ColBERT Storage] Chunk '{chunk_id}' has {actual_tokens} tokens, "
+                    f"exceeds MAX_TOKENS_PER_CHUNK={self.MAX_TOKENS_PER_CHUNK}. "
+                    f"Increase MAX_TOKENS_PER_CHUNK (recommended: >= {actual_tokens}) "
+                    f"or reduce chunk_size in HybridPDFParser."
+                )
+
+            n_tokens = actual_tokens  # 不再截断，直接使用全部 token
 
             self._doc_vectors[chunk_idx, :n_tokens] = vectors[:n_tokens]
             self._id_mapping.append({

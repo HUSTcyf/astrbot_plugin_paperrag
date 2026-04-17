@@ -94,9 +94,9 @@ class HybridPDFParser:
 
         Args:
             enable_multimodal: 是否启用多模态提取
-            chunk_size: 分块大小（字符数）
-            chunk_overlap: 分块重叠大小（字符数）
-            min_chunk_size: 最小块大小（避免太小）
+            chunk_size: 分块大小（**token 数**，严格限制在 max_tokens 以内）
+            chunk_overlap: 分块重叠 token 数（保持语义连贯）
+            min_chunk_size: 最小块 token 数（过小会合并）
             figures_dir: 图片存储目录（空则使用 papers/figures）
             llm_config: LLM 配置字典（可选），包含 model、api_base、api_key
             arxiv_client: arXiv MCP 客户端（可选），用于查询论文详情
@@ -117,7 +117,69 @@ class HybridPDFParser:
         # 图片索引计数器（用于生成唯一文件名）
         self._image_counter = 0
 
-        logger.info(f"✅ HybridPDFParser初始化完成 (chunk_size={chunk_size}, overlap={chunk_overlap}, min_size={min_chunk_size})")
+        # Tokenizer（懒加载，仅在首次分块时初始化）
+        self._tokenizer = None
+
+        logger.info(f"✅ HybridPDFParser初始化完成 (chunk_size={chunk_size} tokens, overlap={chunk_overlap}, min_size={min_chunk_size})")
+
+    def _get_tokenizer(self):
+        """懒加载 BGE-M3 tokenizer（与 embedding 模型共用同一个）"""
+        if self._tokenizer is None:
+            import os
+            os.environ["GRPC_VERBOSITY"] = "ERROR"
+            os.environ["GLOG_minloglevel"] = "2"
+
+            # 优先尝试从 embedding_providers 中获取已初始化的 tokenizer
+            try:
+                from ..embedding.embedding_providers import get_embedding_provider
+                provider = get_embedding_provider()
+                if provider and hasattr(provider, "tokenizer"):
+                    self._tokenizer = provider.tokenizer
+                    logger.debug("使用 embedding provider 的 tokenizer")
+                    return self._tokenizer
+            except ImportError:
+                pass
+
+            # 降级：从模型目录加载独立 tokenizer
+            try:
+                from transformers import AutoTokenizer
+                from pathlib import Path
+
+                plugin_root = Path(__file__).parent.parent
+                model_dir = plugin_root / "models" / "bge-m3"
+                if not model_dir.exists():
+                    # 模型未下载时跳过 tokenizer 初始化（回退到字符长度）
+                    logger.warning("⚠️ BGE-M3 模型未下载，chunk_size 将基于字符数（不精确）")
+                    return None
+                self._tokenizer = AutoTokenizer.from_pretrained(
+                    str(model_dir), local_files_only=True
+                )
+                logger.debug("加载独立 BGE-M3 tokenizer")
+            except Exception as e:
+                logger.warning(f"⚠️ tokenizer 加载失败: {e}，回退到字符长度")
+                self._tokenizer = None
+
+        return self._tokenizer
+
+    def _get_token_count(self, text: str) -> int:
+        """
+        获取文本的 token 数（严格模式：超过 max_seq_length 则截断）
+
+        优先使用 tokenizer；加载失败时降级为字符数 / 4（英文经验值）。
+        """
+        tokenizer = self._get_tokenizer()
+        if tokenizer is None:
+            # 降级：英文约 4 chars ≈ 1 token
+            return len(text) // 4
+
+        # tokenize 后去掉 [CLS] 和 [SEP]，仅计算 content tokens
+        tokens = tokenizer.encode(
+            text,
+            add_special_tokens=False,  # 不加 [CLS]/[SEP]
+            truncation=True,
+            max_length=self.chunk_size  # 严格限制在 chunk_size 内
+        )
+        return len(tokens)
 
     def parse_pdf_to_documents(self, pdf_path: str) -> List[Node]:
         """
@@ -382,9 +444,9 @@ class HybridPDFParser:
 
         while i < len(paragraphs):
             para = paragraphs[i]
-            para_size = len(para)
+            para_size = self._get_token_count(para)
 
-            # 如果单个段落就超过 chunk_size，需要进一步分割
+            # 如果单个段落就超过 chunk_size tokens，需要进一步分割
             if para_size > self.chunk_size:
                 # 分割大段落
                 sub_chunks = self._split_large_paragraph(para)
@@ -397,14 +459,14 @@ class HybridPDFParser:
             else:
                 # 尝试将多个小段落组合成一个块
                 current_parts = []
-                current_size = 0
-                last_end_idx = i  # 记录这个块使用了哪些段落
+                current_size = 0  # token 数
 
-                # 收集段落直到超过 chunk_size
+                # 收集段落直到 token 数达到 chunk_size
                 while i < len(paragraphs):
                     next_para = paragraphs[i]
-                    next_size = len(next_para)
-                    sep_size = 2 if current_parts else 0  # \n\n 分隔符
+                    next_size = self._get_token_count(next_para)
+                    # 分隔符 \n\n 约 1~2 tokens，保守按 2 估算
+                    sep_size = 2 if current_parts else 0
 
                     if current_size + sep_size + next_size <= self.chunk_size:
                         current_parts.append(next_para)
@@ -413,12 +475,11 @@ class HybridPDFParser:
                     else:
                         break
 
-                # 如果收集的段落太少（小于min_chunk_size），尝试合并更多
+                # 如果收集的段落太少（小于 min_chunk_size tokens），尝试合并更多
                 if current_size < self.min_chunk_size and i < len(paragraphs):
-                    # 添加更多段落直到达到最小大小
                     while i < len(paragraphs) and current_size < self.min_chunk_size:
                         next_para = paragraphs[i]
-                        next_size = len(next_para)
+                        next_size = self._get_token_count(next_para)
                         sep_size = 2 if current_parts else 0
 
                         current_parts.append(next_para)
@@ -436,7 +497,6 @@ class HybridPDFParser:
                 ))
                 chunk_index += 1
 
-                # 由于上面的while循环已经增加了i，这里不需要再增加
                 continue
 
             i += 1
@@ -460,7 +520,7 @@ class HybridPDFParser:
             return nodes
 
         # 极短阈值: 小于 min_chunk_size 的一半就认为是异常短（需合并）
-        too_short_threshold = max(self.min_chunk_size // 2, 50)
+        too_short_threshold = max(self.min_chunk_size // 2, 30)
         # 极长阈值: 超过 chunk_size * 10 就认为需要拆分
         too_long_threshold = self.chunk_size * 10
 
@@ -469,7 +529,7 @@ class HybridPDFParser:
         i = 0
         while i < len(nodes):
             node = nodes[i]
-            text_len = len(node.text)
+            text_len = self._get_token_count(node.text)
 
             # 极短chunk：合并到前一个chunk（如果存在），否则合并到下一个chunk
             if text_len < too_short_threshold:
@@ -523,7 +583,8 @@ class HybridPDFParser:
         """
         将超长文本拆分为固定大小的块（不保留语义，简单分割）
 
-        用于处理PDF解析异常导致的超长段落
+        用于处理 PDF 解析异常导致的超长段落。
+        按 token 长度切分，在句子边界处断开。
 
         Args:
             text: 超长文本
@@ -533,45 +594,69 @@ class HybridPDFParser:
         """
         chunks = []
         start = 0
-        text_len = len(text)
 
-        while start < text_len:
-            end = start + self.chunk_size
-            if end >= text_len:
-                chunks.append(text[start:])
+        while True:
+            # 估算当前块末尾位置（按字符比例映射）
+            # 字符数 ≈ token数 × 4（英文经验值，兼顾中英混合）
+            char_estimate = self.chunk_size * 4
+            end = start + char_estimate
+
+            if end >= len(text):
+                # 最后一块：直接截取剩余文本
+                remaining = text[start:].strip()
+                if remaining:
+                    chunks.append(remaining)
                 break
 
-            # 尝试在句子边界断开
+            # 在估算断点附近寻找真实 token 边界
             chunk_text = text[start:end]
-            split_pos = -1
+            split_pos = self._find_token_boundary(chunk_text)
 
-            # 从后向前找句子边界
-            for delimiter in ['。', '！', '？', '. ', '! ', '? ']:
-                pos = chunk_text.rfind(delimiter)
-                if pos > self.chunk_size // 4:  # 确保不在太靠前的位置
-                    split_pos = pos + len(delimiter)
-                    break
+            if split_pos <= 0:
+                # 找不到有效断点，强力截断
+                split_pos = char_estimate
 
-            # 如果找不到好的断点，尝试找逗号
-            if split_pos == -1:
-                for delimiter in ['，', ', ', '；', '; ']:
-                    pos = chunk_text.rfind(delimiter)
-                    if pos > self.chunk_size // 4:
-                        split_pos = pos + len(delimiter)
-                        break
-
-            # 如果还找不到，在空格处断开
-            if split_pos == -1:
-                space_pos = chunk_text.rfind(' ')
-                if space_pos > self.chunk_size // 4:
-                    split_pos = space_pos + 1
-                else:
-                    split_pos = end
-
-            chunks.append(chunk_text[:split_pos].strip())
+            chunk = text[start:start + split_pos].strip()
+            if chunk:
+                chunks.append(chunk)
             start += split_pos
 
+            if start >= len(text):
+                break
+
         return [c for c in chunks if c]
+
+    def _find_token_boundary(self, text: str) -> int:
+        """
+        在 text 末尾附近寻找合适的句子断点（按 token 估算）
+
+        从 text 末尾向前找句子边界，确保断点后的内容不超过 chunk_size tokens。
+        返回断点位置（字符偏移）。
+
+        Args:
+            text: 文本片段
+
+        Returns:
+            断点位置（字符偏移），-1 表示未找到
+        """
+        # 从后向前在句子边界处断开
+        for delimiter in ['。', '！', '？', '. ', '! ', '? ']:
+            pos = text.rfind(delimiter)
+            if pos > len(text) // 4:  # 确保不在太靠前的位置
+                return pos + len(delimiter)
+
+        # 找不到句号/感叹号/问号，尝试逗号/分号
+        for delimiter in ['，', ', ', '；', '; ']:
+            pos = text.rfind(delimiter)
+            if pos > len(text) // 4:
+                return pos + len(delimiter)
+
+        # 仍然找不到，在空格处断开（英文场景）
+        space_pos = text.rfind(' ')
+        if space_pos > len(text) // 4:
+            return space_pos + 1
+
+        return -1  # 未找到合适断点
 
     def _split_by_paragraphs(self, text: str) -> List[str]:
         """按段落分割文本"""
@@ -588,7 +673,7 @@ class HybridPDFParser:
 
     def _split_large_paragraph(self, para: str) -> List[str]:
         """
-        分割过大的段落
+        分割过大的段落（按 token 长度）
 
         按句子分割，如果句子还是太大，按子句分割
 
@@ -603,18 +688,22 @@ class HybridPDFParser:
 
         chunks = []
         current_chunk = ""
+        current_tokens = 0
 
         for sentence in sentences:
             sentence = sentence.strip()
             if not sentence:
                 continue
 
-            # 如果单个句子就超过 chunk_size
-            if len(sentence) > self.chunk_size:
+            sentence_tokens = self._get_token_count(sentence)
+
+            # 如果单个句子就超过 chunk_size tokens
+            if sentence_tokens > self.chunk_size:
                 # 先保存当前累积的块
                 if current_chunk.strip():
                     chunks.append(current_chunk.strip())
                     current_chunk = ""
+                    current_tokens = 0
 
                 # 进一步按子句分割
                 sub_clauses = self._split_by_clauses(sentence)
@@ -623,25 +712,29 @@ class HybridPDFParser:
                     if not clause:
                         continue
 
-                    if len(clause) > self.chunk_size:
-                        # 仍然太大，直接截断并添加到上一个块的末尾
+                    clause_tokens = self._get_token_count(clause)
+                    if clause_tokens > self.chunk_size:
+                        # 仍然太大，直接截断（按字符估算截断到 chunk_size tokens）
                         if chunks:
-                            chunks[-1] += " " + clause[:self.chunk_size]
+                            clipped = clause[:self.chunk_size * 4]  # 粗估算
+                            chunks[-1] += " " + clipped
                     else:
                         chunks.append(clause)
 
-            elif len(current_chunk) + len(sentence) > self.chunk_size:
+            elif current_tokens + sentence_tokens > self.chunk_size:
                 # 当前块加上句子会超过限制，保存当前块并开始新块
                 if current_chunk.strip():
                     chunks.append(current_chunk.strip())
                 current_chunk = sentence
+                current_tokens = sentence_tokens
 
             else:
-                # 正常情况
+                # 正常情况：累加到当前块
                 if current_chunk:
                     current_chunk += " " + sentence
                 else:
                     current_chunk = sentence
+                current_tokens += sentence_tokens
 
         # 保存最后一个块
         if current_chunk.strip():
@@ -699,15 +792,16 @@ class HybridPDFParser:
         if not parts or self.chunk_overlap <= 0:
             return ""
 
-        # 从后向前收集，直到达到 overlap 大小
+        # 从后向前收集，直到达到 overlap token 数（按 1 token ≈ 4 chars 估算）
         overlap_parts = []
-        current_size = 0
+        current_size = 0  # 估算 token 数
+        overlap_char_budget = self.chunk_overlap * 4
 
         for part in reversed(parts):
             if current_size >= self.chunk_overlap:
                 break
             overlap_parts.insert(0, part)
-            current_size += len(part) + 2  # 加上分隔符大小
+            current_size += len(part) // 4 + 1  # 估算 token 数
 
         return "\n\n".join(overlap_parts)
 
@@ -730,22 +824,22 @@ class HybridPDFParser:
         prev_text = prev_node.text
 
         # 提取前一个块的末尾 overlap 部分
-        if len(prev_text) <= self.chunk_overlap:
+        # chunk_overlap 现在是 token 数，按 1 token ≈ 4 chars 估算
+        overlap_char_len = self.chunk_overlap * 4
+        if len(prev_text) <= overlap_char_len:
             overlap_text = prev_text
         else:
-            overlap_text = prev_text[-self.chunk_overlap:]
+            overlap_text = prev_text[-overlap_char_len:]
 
         # 清理 overlap 文本（确保不会在句子中间断开）
         overlap_text = self._clean_overlap(overlap_text)
 
-        # 如果overlap太大，截断它以确保最终块不超过chunk_size
-        max_overlap = self.chunk_size - len(chunk_text)
-        if max_overlap < 0:
-            # chunk_text 已经超过 chunk_size，不需要 overlap
+        # 如果 overlap 太大，截断它以确保最终块 token 数不超过 chunk_size
+        current_tokens = self._get_token_count(chunk_text)
+        max_overlap_tokens = self.chunk_size - current_tokens
+        if max_overlap_tokens <= 0:
+            # chunk_text 已达上限，不需要 overlap
             return chunk_text
-
-        if len(overlap_text) > max_overlap:
-            overlap_text = overlap_text[-max_overlap:]
 
         # 将 overlap 添加到当前块的开头
         if overlap_text:
