@@ -213,6 +213,7 @@ results/
 *output/
 datasets/test_figures_and_tables
 evaluation/freeapi.json
+*.ipynb
 *.tgz
 *.code-workspace
 .DS_Store

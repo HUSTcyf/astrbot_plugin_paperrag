@@ -1,7 +1,9 @@
 """
-混合架构索引管理器 - 完善版本
+混合架构索引管理器 - 移除 BM25 版本
 
-参照 mnemosyne/milvus_manager.py 实现，避免与llama-index集成问题
+使用 Unsloth BGE-M3 的稀疏权重替代 BM25，不再需要：
+- rank_bm25
+- jieba
 
 特性：
 1. 直接使用pymilvus进行向量存储
@@ -29,13 +31,10 @@ from astrbot.api import logger
 
 class HybridIndexManager:
     """
-    混合索引管理器（完善版）
+    混合索引管理器（移除 BM25 版本）
 
-    参照 mnemosyne/milvus_manager.py 实现：
-    - 使用唯一的连接别名（避免与主进程冲突）
-    - 延迟连接模式
-    - 异步操作支持
-    - 支持 Milvus Lite 和标准网络 URI
+    使用 Unsloth BGE-M3 的稀疏权重替代 BM25 关键词检索。
+    保留原有的向量检索功能。
     """
 
     def __init__(
@@ -57,7 +56,7 @@ class HybridIndexManager:
             milvus_uri: Milvus Lite 数据库文件路径（已弃用，用 lite_path）
             collection_name: 集合名称
             embed_dim: embedding维度
-            hybrid_search: 是否启用混合检索
+            hybrid_search: 是否启用混合检索（现在由 BGE-M3 稀疏权重处理）
             lite_path: Milvus Lite 数据库文件路径
             uri: 标准 Milvus 连接 URI
             authentication: 认证信息 {"token": "..."} 或 {"user": "...", "password": "..."}
@@ -65,10 +64,8 @@ class HybridIndexManager:
             alias: 连接别名（必须唯一）
         """
         # 向后兼容：milvus_uri 转为 lite_path
-        # 仅当 lite_path 未提供（None）时才使用 milvus_uri
         if lite_path is None and milvus_uri:
             lite_path = milvus_uri
-        # 如果 lite_path 是空字符串，不使用 milvus_uri（让管理器使用插件目录下的默认路径）
 
         self.alias = alias
         self._collection_name = collection_name
@@ -87,17 +84,10 @@ class HybridIndexManager:
         self._connection_info = {}
         self._collection: Optional[Collection] = None
 
-        # 文档统计追踪（用于解决 Milvus Lite 大数据量查询限制）
-        self._doc_stats_file = None  # JSON 文件路径
-        # file_name -> {chunk_count, added_time, chunk_index_start, chunk_index_end, milvus_id_start, milvus_id_end}
+        # 文档统计追踪
+        self._doc_stats_file = None
         self._doc_stats: Dict[str, Dict[str, Any]] = {}
-        # 存储的 file_name 是否带 .pdf 后缀（从 doc_stats 自动推断）
         self._file_name_has_pdf_suffix: Optional[bool] = None
-
-        # BM25 内存索引（延迟构建）
-        self._bm25: Any = None  # BM25Okapi 实例
-        self._bm25_corpus_texts: List[str] = []
-        self._bm25_corpus_metadata: List[Any] = []
 
         # 确定连接模式
         self._configure_connection_mode()
@@ -109,7 +99,6 @@ class HybridIndexManager:
 
     def _init_doc_stats(self):
         """初始化文档统计追踪文件"""
-        # 使用与 Milvus 数据库相同的目录
         if self._lite_path:
             db_dir = os.path.dirname(self._lite_path)
         elif self._uri:
@@ -118,11 +107,8 @@ class HybridIndexManager:
             plugin_dir = Path(__file__).parent
             db_dir = str(plugin_dir / "data")
 
-        # 根据 Milvus 数据库文件名自动选择对应的 doc_stats 文件
-        # 例如：milvus_qasper_text.db -> qasper_doc_stats_text.json
         db_name = os.path.basename(self._lite_path) if self._lite_path else "milvus.db"
 
-        # 替换数据库文件名为 doc_stats 文件名
         if "qasper" in db_name.lower():
             if "text" in db_name.lower():
                 doc_stats_filename = "qasper_doc_stats_text.json"
@@ -148,7 +134,6 @@ class HybridIndexManager:
                 self._doc_stats = json.load(f)
             logger.info(f"📊 已加载文档统计: {len(self._doc_stats)} 个文件")
 
-            # 推断存储的 file_name 是否带 .pdf 后缀
             if self._doc_stats:
                 first_file_name = next(iter(self._doc_stats.values())).get("file_name", "")
                 self._file_name_has_pdf_suffix = first_file_name.lower().endswith(".pdf")
@@ -163,7 +148,6 @@ class HybridIndexManager:
             return
 
         try:
-            # 确保目录存在
             db_dir = os.path.dirname(self._doc_stats_file)
             if db_dir and not os.path.exists(db_dir):
                 os.makedirs(db_dir, exist_ok=True)
@@ -185,7 +169,6 @@ class HybridIndexManager:
 
                 if file_name in self._doc_stats:
                     self._doc_stats[file_name]["chunk_count"] += 1
-                    # 如果新节点有 github_url 但 doc_stats 没有，则更新
                     if github_url and not self._doc_stats[file_name].get("github_url"):
                         self._doc_stats[file_name]["github_url"] = github_url
                 else:
@@ -224,7 +207,6 @@ class HybridIndexManager:
         if not path.is_absolute():
             path = path.resolve()
 
-        # 如果是目录，附加默认文件名
         if path.is_dir() or (not path.exists() and not str(path).endswith('.db')):
             path = path / "milvus_papers.db"
 
@@ -245,7 +227,6 @@ class HybridIndexManager:
         abs_path = os.path.abspath(self._lite_path) if self._lite_path else "None"
         logger.info(f"配置 Milvus Lite (别名: {self.alias}), 路径: '{abs_path}'")
 
-        # 确保目录存在
         if self._lite_path:
             db_dir = os.path.dirname(self._lite_path)
             if db_dir and not os.path.exists(db_dir):
@@ -259,16 +240,14 @@ class HybridIndexManager:
         self._connection_info["uri"] = self._lite_path
 
     def _configure_lite_default(self):
-        """配置使用默认的 Milvus Lite 路径（相对于插件目录）"""
+        """配置使用默认的 Milvus Lite 路径"""
         self._is_lite = True
-        # 使用插件目录作为基准路径
         plugin_dir = Path(__file__).parent
         default_path = plugin_dir / "data" / "milvus_papers.db"
         abs_path = str(default_path.resolve())
 
         logger.warning(f"使用默认 Milvus Lite 路径: '{abs_path}'")
 
-        # 确保目录存在
         db_dir = default_path.parent
         if not db_dir.exists():
             os.makedirs(db_dir, exist_ok=True)
@@ -283,7 +262,6 @@ class HybridIndexManager:
 
     def connect(self) -> None:
         """建立到 Milvus 的连接"""
-        # 先尝试断开旧连接（如果存在）
         try:
             if connections.has_connection(self.alias):
                 connections.disconnect(self.alias)
@@ -299,30 +277,20 @@ class HybridIndexManager:
         try:
             logger.debug(f"尝试连接到 {mode} (别名: {self.alias})")
 
-            # 构建连接参数
             connect_params = dict(self._connection_info)
 
-            # 添加认证信息
             if self.authentication.get("token"):
                 connect_params["token"] = self.authentication["token"]
-                logger.debug("使用 token 认证")
             elif self.authentication.get("user"):
                 connect_params["user"] = self.authentication["user"]
                 if self.authentication.get("password"):
                     connect_params["password"] = self.authentication["password"]
-                logger.debug("使用用户名/密码认证")
 
-            # 添加数据库名称（如果不是默认）
             if self.db_name != "default":
                 connect_params["db_name"] = self.db_name
-                logger.debug(f"连接到数据库: {self.db_name}")
 
-            connections.connect(
-                alias=self.alias,
-                **connect_params
-            )
+            connections.connect(alias=self.alias, **connect_params)
 
-            # 验证连接是否真的建立了
             if connections.has_connection(self.alias):
                 self._is_connected = True
                 logger.info(f"✅ 成功连接到 {mode} (别名: {self.alias})")
@@ -352,74 +320,32 @@ class HybridIndexManager:
             logger.warning(f"断开连接时出错: {e}")
             self._is_connected = False
 
-    @staticmethod
-    async def _await_if_needed(result: Any) -> None:
-        """
-        等待异步操作完成（如果需要）
-
-        Args:
-            result: pymilvus 操作的返回值
-        """
-        if asyncio.iscoroutine(result):
-            await result
-        elif result is not None and hasattr(result, 'done'):
-            try:
-                result.result()
-            except Exception as e:
-                logger.warning(f"Future.result() 调用失败: {e}")
-
-    async def _await_if_needed_with_result(self, result: Any) -> Any:
-        """
-        等待异步操作完成并返回结果（如果需要）
-
-        Args:
-            result: pymilvus 操作的返回值
-
-        Returns:
-            操作结果（如果有）
-        """
-        if asyncio.iscoroutine(result):
-            return await result
-        elif result is not None and hasattr(result, 'done'):
-            try:
-                return result.result()
-            except Exception as e:
-                logger.warning(f"Future.result() 调用失败: {e}")
-                return None
-        return result
-
     async def _ensure_collection(self):
         """确保集合已创建"""
         if self._collection is not None:
             return
 
         try:
-            # 先确保已连接
             if not self._is_connected:
                 self.connect()
             else:
-                # 检查连接是否真的有效
                 if not connections.has_connection(self.alias):
                     self._is_connected = False
                     self.connect()
 
-            # 再次验证连接
             if not connections.has_connection(self.alias):
                 raise Exception(f"连接验证失败: {self.alias}")
 
-            # 检查集合是否存在
             if utility.has_collection(self._collection_name, using=self.alias):
                 logger.debug(f"集合 '{self._collection_name}' 已存在，加载")
                 self._collection = Collection(self._collection_name, using=self.alias)
                 collection = cast(Collection, self._collection)
 
-                # load 是阻塞操作，使用线程池避免阻塞事件循环
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, collection.load)  # type: ignore[misc]
+                await loop.run_in_executor(None, collection.load)
             else:
                 logger.debug(f"创建新集合 '{self._collection_name}'")
 
-                # 定义 schema
                 fields = [
                     FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
                     FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=self._dim),
@@ -438,7 +364,6 @@ class HybridIndexManager:
                     using=self.alias
                 )
 
-                # 创建索引
                 is_lite = self._is_lite
                 index_type = "AUTOINDEX" if is_lite else "HNSW"
                 index_params: Dict[str, Any] = {
@@ -446,18 +371,16 @@ class HybridIndexManager:
                     "metric_type": "COSINE"
                 }
 
-                # 如果是 HNSW，添加参数
                 if not is_lite:
                     index_params["params"] = {"M": 8, "efConstruction": 64}
 
-                # 创建索引和加载是阻塞操作，使用线程池
                 collection = cast(Collection, self._collection)
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(  # type: ignore[misc]
+                await loop.run_in_executor(
                     None,
                     lambda c=collection, ip=index_params: c.create_index(field_name="vector", index_params=ip)
                 )
-                await loop.run_in_executor(None, collection.load)  # type: ignore[misc]
+                await loop.run_in_executor(None, collection.load)
 
                 logger.info(f"✅ 集合 '{self._collection_name}' 创建成功 (索引: {index_type})")
 
@@ -470,7 +393,7 @@ class HybridIndexManager:
         插入Nodes到Milvus
 
         Args:
-            nodes: Node列表（具有 text 和 metadata 属性）
+            nodes: Node列表
             embeddings: 对应的embedding列表
 
         Returns:
@@ -492,40 +415,32 @@ class HybridIndexManager:
             elif isinstance(obj, (str, int, float, bool)) or obj is None:
                 return obj
             else:
-                # 其他类型尝试转换为列表或字符串
                 try:
-                    # 检查是否有 __iter__ 属性
                     if hasattr(obj, '__iter__') and not isinstance(obj, (str, bytes)):
                         return [make_serializable(item) for item in obj]
                 except Exception:
                     pass
-                # 最后转换为字符串
                 return str(obj)
 
         try:
-            # 准备数据
             data = []
 
             for i, (node, embedding) in enumerate(zip(nodes, embeddings)):
                 metadata = node.metadata if hasattr(node, 'metadata') else {}
 
-                # 确保 metadata 是可 JSON 序列化的
                 if isinstance(metadata, dict):
                     metadata = make_serializable(metadata)
                     metadata_str = json.dumps(metadata, ensure_ascii=False)
                 elif isinstance(metadata, str):
-                    # 已经是字符串，尝试解析确保它是有效 JSON
                     try:
-                        json.loads(metadata)  # 验证是否是有效 JSON
+                        json.loads(metadata)
                         metadata_str = metadata
                     except json.JSONDecodeError:
-                        # 不是有效 JSON，可能是 Python repr 格式，转换
                         try:
-                            # 替换单引号为双引号（简单处理）
                             metadata_str = metadata.replace("'", '"')
-                            json.loads(metadata_str)  # 再次验证
+                            json.loads(metadata_str)
                         except Exception:
-                            metadata_str = metadata  # 使用原字符串
+                            metadata_str = metadata
                 else:
                     metadata = make_serializable(metadata)
                     metadata_str = json.dumps(metadata, ensure_ascii=False)
@@ -536,27 +451,22 @@ class HybridIndexManager:
                     "metadata": metadata_str
                 })
 
-            # 统计 chunks 大小信息
             total_text_size = sum(len(d["text"]) for d in data)
             total_metadata_size = sum(len(d["metadata"]) for d in data)
-            total_vector_size = sum(len(d["vector"]) * 4 for d in data)  # float32 = 4 bytes
-            total_data_size = total_text_size + total_metadata_size + total_vector_size
+            total_vector_size = sum(len(d["vector"]) * 4 for d in data)
 
             logger.info(f"📊 Chunks 统计: {len(data)} 个, "
                        f"文本 {total_text_size / 1024:.1f}KB, "
                        f"元数据 {total_metadata_size / 1024:.1f}KB, "
-                       f"向量 {total_vector_size / 1024:.1f}KB, "
-                       f"总大小 {total_data_size / 1024 / 1024:.2f}MB")
+                       f"向量 {total_vector_size / 1024:.1f}KB")
 
-            # 插入数据 - 使用线程池避免阻塞事件循环
             collection = cast(Collection, self._collection)
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, lambda: collection.insert(data))  # type: ignore[misc]
-            await loop.run_in_executor(None, lambda: collection.flush())  # type: ignore[misc]
+            await loop.run_in_executor(None, lambda: collection.insert(data))
+            await loop.run_in_executor(None, lambda: collection.flush())
 
             logger.info(f"✅ 插入 {len(data)} 个 nodes")
 
-            # 更新文档统计追踪
             self._update_doc_stats_on_insert(nodes)
 
             return len(data)
@@ -583,8 +493,6 @@ class HybridIndexManager:
         await self._ensure_collection()
 
         try:
-            # 构建搜索参数
-            # 对于 HNSW 索引，使用较大的 ef 参数提高搜索精度
             search_params: Dict[str, Any] = {
                 "metric_type": "COSINE",
                 "params": {
@@ -592,18 +500,14 @@ class HybridIndexManager:
                 }
             }
 
-            # 对于 AUTOINDEX（Milvus Lite），参数可能不同
             if self._is_lite:
                 search_params = {
                     "metric_type": "COSINE",
                     "params": {}
                 }
 
-            # 执行搜索 - 使用线程池避免阻塞事件循环
             collection = cast(Collection, self._collection)
             loop = asyncio.get_event_loop()
-            # pymilvus 类型标注与运行时行为不符，使用 cast(Any, ...) 避免类型检查错误
-            # type: ignore[misc] run_in_executor 类型标注与实际返回值不符
             raw_results = await loop.run_in_executor(
                 None,
                 lambda: collection.search(
@@ -619,18 +523,15 @@ class HybridIndexManager:
             if results is None:
                 return []
 
-            # 转换结果
             import json
             documents = []
             results_first: Any = cast(Any, results[0])
             for hit in results_first:
                 metadata = hit.entity.get("metadata", {})
-                # 如果 metadata 是字符串，尝试反序列化
                 if isinstance(metadata, str):
                     try:
                         metadata = json.loads(metadata)
                     except json.JSONDecodeError:
-                        # 尝试替换单引号为双引号后解析
                         try:
                             metadata = json.loads(metadata.replace("'", '"'))
                         except Exception:
@@ -654,11 +555,11 @@ class HybridIndexManager:
         top_k: int = 10
     ) -> List[Dict[str, Any]]:
         """
-        在指定论文范围内进行向量搜索（阶段2检索）
+        在指定论文范围内进行向量搜索
 
         Args:
             query_embedding: 查询向量
-            paper_ids: 论文 ID 列表（只在这范围内搜索）
+            paper_ids: 论文 ID 列表
             top_k: 返回结果数量
 
         Returns:
@@ -667,24 +568,20 @@ class HybridIndexManager:
         await self._ensure_collection()
 
         try:
-            # 构建过滤表达式：匹配指定论文
             if not paper_ids:
                 return []
 
-            # 构建 OR 表达式
             paper_conditions = [f'metadata["file_name"] == "{pid}"' for pid in paper_ids]
             if len(paper_conditions) == 1:
                 filter_expr = paper_conditions[0]
             else:
                 filter_expr = " || ".join(paper_conditions)
 
-            # 搜索参数
             search_params: Dict[str, Any] = {
                 "metric_type": "COSINE",
                 "params": {}
             }
 
-            # 执行搜索
             collection = cast(Collection, self._collection)
             loop = asyncio.get_event_loop()
 
@@ -704,7 +601,6 @@ class HybridIndexManager:
             if results is None or len(results) == 0:
                 return []
 
-            # 转换结果
             import json
             documents = []
             results_first: Any = cast(Any, results[0])
@@ -735,8 +631,6 @@ class HybridIndexManager:
             await self._ensure_collection()
 
             collection = cast(Collection, self._collection)
-
-            # 获取实体数量
             num_entities = collection.num_entities
 
             return {
@@ -754,267 +648,9 @@ class HybridIndexManager:
                 "error": str(e)
             }
 
-    async def get_all_references(self, allow_duplicates: bool = True) -> Dict[str, Any]:
-        """
-        从数据库中提取所有参考文献，统计论文名称出现频次
-
-        Args:
-            allow_duplicates: 是否允许同一篇论文对同一参考文献重复统计。
-                              True = 原始行为，统计每条引用（默认）
-                              False = 每篇论文对每篇参考文献只算1次
-
-        Returns:
-            Dict containing:
-            - references: List of unique reference titles with frequency
-            - total_refs: Total number of references extracted
-            - total_chunks: Total chunks processed
-        """
-        try:
-            all_chunks = await self.get_all_chunks()
-            if not all_chunks:
-                return {
-                    "references": [],
-                    "total_refs": 0,
-                    "total_chunks": 0
-                }
-
-            # 统计论文标题出现频次
-            title_counter: Dict[str, Dict[str, Any]] = {}
-            total_refs = 0
-
-            if allow_duplicates:
-                # 原始行为：统计每条引用（chunk 粒度）
-                for chunk in all_chunks:
-                    metadata = chunk.get("metadata", {})
-                    if not isinstance(metadata, dict):
-                        continue
-
-                    references = metadata.get("cited_references", [])
-                    if not references:
-                        continue
-
-                    for ref in references:
-                        if not isinstance(ref, dict):
-                            continue
-
-                        title = ref.get("ref_title", "").strip()
-                        if not title or len(title) < 5:
-                            continue
-
-                        title_normalized = " ".join(title.lower().split())
-
-                        if title_normalized in title_counter:
-                            title_counter[title_normalized]["count"] += 1
-                            title_counter[title_normalized]["raw_title"] = title
-                        else:
-                            title_counter[title_normalized] = {
-                                "count": 1,
-                                "raw_title": title,
-                                "ref_authors": ref.get("ref_authors", ""),
-                                "ref_year": ref.get("ref_year"),
-                                "ref_doi": ref.get("ref_doi", "")
-                            }
-                        total_refs += 1
-            else:
-                # 去重模式：每篇来源论文对每篇参考文献只算1次
-                # 记录每个引用论文被哪些来源论文引用过
-                title_to_papers: Dict[str, set] = {}
-
-                for chunk in all_chunks:
-                    metadata = chunk.get("metadata", {})
-                    if not isinstance(metadata, dict):
-                        continue
-
-                    # 获取来源论文名称（用于去重）
-                    citing_paper = metadata.get("file_name", "") or metadata.get("paper_id", "")
-
-                    references = metadata.get("cited_references", [])
-                    if not references:
-                        continue
-
-                    for ref in references:
-                        if not isinstance(ref, dict):
-                            continue
-
-                        title = ref.get("ref_title", "").strip()
-                        if not title or len(title) < 5:
-                            continue
-
-                        title_normalized = " ".join(title.lower().split())
-
-                        # 初始化
-                        if title_normalized not in title_counter:
-                            title_counter[title_normalized] = {
-                                "count": 0,
-                                "raw_title": title,
-                                "ref_authors": ref.get("ref_authors", ""),
-                                "ref_year": ref.get("ref_year"),
-                                "ref_doi": ref.get("ref_doi", "")
-                            }
-                            title_to_papers[title_normalized] = set()
-
-                        # 去重逻辑
-                        if citing_paper and citing_paper in title_to_papers[title_normalized]:
-                            # 该来源论文已统计过这篇参考文献，跳过
-                            continue
-
-                        title_counter[title_normalized]["count"] += 1
-                        title_to_papers[title_normalized].add(citing_paper)
-                        total_refs += 1
-
-            # 转换为列表并按频次排序
-            refs_list = []
-            for title_norm, info in title_counter.items():
-                refs_list.append({
-                    "title": info["raw_title"],
-                    "count": info["count"],
-                    "authors": info["ref_authors"],
-                    "year": info["ref_year"],
-                    "doi": info["ref_doi"]
-                })
-
-            refs_list.sort(key=lambda x: x["count"], reverse=True)
-
-            logger.info(f"📚 提取参考文献统计: {len(refs_list)} 种不同论文, 共 {total_refs} 条引用")
-
-            return {
-                "references": refs_list,
-                "total_refs": total_refs,
-                "total_chunks": len(all_chunks)
-            }
-
-        except Exception as e:
-            logger.error(f"提取参考文献统计失败: {e}")
-            return {
-                "references": [],
-                "total_refs": 0,
-                "total_chunks": 0,
-                "error": str(e)
-            }
-
-    async def get_papers_with_zero_references(self) -> Dict[str, Any]:
-        """
-        获取参考文献数量为0的论文列表
-
-        Returns:
-            Dict containing:
-            - papers: List of papers with zero references
-            - total_papers: Total number of papers checked
-            - total_zero_ref: Number of papers with zero references
-        """
-        try:
-            import json
-
-            await self._ensure_collection()
-            collection = cast(Collection, self._collection)
-            loop = asyncio.get_event_loop()
-
-            # 获取所有论文列表
-            papers = await self.list_unique_documents()
-            paper_names = [p.get("file_name", "") for p in papers if p.get("file_name")]
-
-            logger.info(f"🔍 开始检查 {len(paper_names)} 篇论文的参考文献数量...")
-
-            zero_ref_papers = []
-            checked_count = 0
-
-            for i, paper_name in enumerate(paper_names):
-                if i % 20 == 0:
-                    await self._ensure_collection()
-                    collection = cast(Collection, self._collection)
-
-                try:
-                    # 构建查询表达式
-                    query_name = paper_name
-                    if self._file_name_has_pdf_suffix is not None:
-                        if self._file_name_has_pdf_suffix and not query_name.lower().endswith('.pdf'):
-                            query_name = query_name + ".pdf"
-                        elif not self._file_name_has_pdf_suffix and query_name.lower().endswith('.pdf'):
-                            query_name = query_name[:-4]
-
-                    # 查询论文所有 chunks (Milvus Lite limit: 16384)
-                    all_results: Any = await loop.run_in_executor(
-                        None,
-                        lambda pn=query_name: collection.query(
-                            expr=f'metadata["file_name"] == "{pn}"',
-                            output_fields=["metadata"],
-                            limit=16384
-                        )
-                    )
-                    all_results = cast(List[Dict[str, Any]], all_results)
-
-                    if not all_results:
-                        zero_ref_papers.append({
-                            "file_name": paper_name,
-                            "chunk_count": 0
-                        })
-                        checked_count += 1
-                        continue
-
-                    # 检查是否所有 chunks 都没有参考文献
-                    # 注意：必须检查字段是否存在，而不是检查值是否非空
-                    # 因为 CitationLinker 会为没有引用的 chunk 设置 cited_references = []（空列表）
-                    has_any_ref = False
-                    refs_found_count = 0
-                    chunks_with_refs = 0
-                    chunks_without_field = 0
-                    for row in all_results:
-                        meta = row.get("metadata", "{}")
-                        if isinstance(meta, str):
-                            try:
-                                meta = json.loads(meta)
-                            except json.JSONDecodeError:
-                                meta = {}
-
-                        # 检查字段是否存在，且值是非空列表
-                        if "cited_references" in meta:
-                            cited_refs = meta["cited_references"]
-                            if isinstance(cited_refs, list) and len(cited_refs) > 0:
-                                has_any_ref = True
-                                refs_found_count += len(cited_refs)
-                                chunks_with_refs += 1
-                        else:
-                            # 字段不存在
-                            chunks_without_field += 1
-
-                    if chunks_with_refs > 0 or chunks_without_field > 0:
-                        logger.debug(f"📝 {paper_name}: {chunks_with_refs}/{len(all_results)} chunks有引用, {chunks_without_field} chunks无字段, 共 {refs_found_count} 条")
-
-                    if not has_any_ref:
-                        zero_ref_papers.append({
-                            "file_name": paper_name,
-                            "chunk_count": len(all_results)
-                        })
-                        logger.info(f"📝 {paper_name}: {len(all_results)} chunks, 有引用: {chunks_with_refs}, 无字段: {chunks_without_field}")
-
-                    checked_count += 1
-
-                except Exception as e:
-                    logger.warning(f"⚠️ 检查论文 {paper_name} 失败: {e}")
-                    continue
-
-            logger.info(f"📊 检查完成: {checked_count} 篇论文, {len(zero_ref_papers)} 篇无参考文献")
-
-            return {
-                "papers": zero_ref_papers,
-                "total_papers": checked_count,
-                "total_zero_ref": len(zero_ref_papers)
-            }
-
-        except Exception as e:
-            logger.error(f"获取零引用论文列表失败: {e}")
-            return {
-                "papers": [],
-                "total_papers": 0,
-                "total_zero_ref": 0,
-                "error": str(e)
-            }
-
     async def get_all_chunks(self) -> List[Dict[str, Any]]:
         """
-        从 Milvus 提取全量文本 chunks（用于生成评测数据集）
-
-        使用按论文分组查询的方式，避免 Milvus Lite 全表扫描限制。
+        从 Milvus 提取全量文本 chunks
 
         Returns:
             [{"text": str, "metadata": dict, "id": int}, ...]
@@ -1028,27 +664,21 @@ class HybridIndexManager:
             all_chunks = []
             loop = asyncio.get_event_loop()
 
-            # 获取所有论文列表（使用追踪的统计数据，避免全表扫描）
             papers = await self.list_unique_documents()
             paper_names = [p.get("file_name", "") for p in papers if p.get("file_name")]
 
             logger.info(f"🔍 开始从 Milvus 提取全量 chunks ({len(paper_names)} 篇论文)...")
 
-            # 按论文逐个查询，避免全表扫描超出 Milvus Lite 限制
-            # 每隔20篇论文重新确保连接有效，避免连接超时
             for i, paper_name in enumerate(paper_names):
                 if i % 20 == 0:
                     await self._ensure_collection()
                     collection = cast(Collection, self._collection)
 
                 try:
-                    # 根据初始化时推断的格式构建查询表达式
                     query_name = paper_name
                     if self._file_name_has_pdf_suffix is not None:
-                        # 如果数据库存储带 .pdf，但查询名称不带，则添加
                         if self._file_name_has_pdf_suffix and not query_name.lower().endswith('.pdf'):
                             query_name = query_name + ".pdf"
-                        # 如果数据库存储不带 .pdf，但查询名称带，则去除
                         elif not self._file_name_has_pdf_suffix and query_name.lower().endswith('.pdf'):
                             query_name = query_name[:-4]
 
@@ -1066,7 +696,6 @@ class HybridIndexManager:
                             "id": row.get("id"),
                             "text": row.get("text", ""),
                         }
-                        # 解析 metadata JSON 字符串
                         meta = row.get("metadata", "{}")
                         if isinstance(meta, str):
                             try:
@@ -1075,7 +704,6 @@ class HybridIndexManager:
                                 meta = {"raw": meta}
                         chunk["metadata"] = meta
 
-                        # 提取关键字段到顶层
                         if isinstance(meta, dict):
                             chunk["file_name"] = meta.get("file_name", "")
                             chunk["paper_id"] = meta.get("paper_id", chunk["file_name"])
@@ -1086,13 +714,11 @@ class HybridIndexManager:
                     logger.warning(f"  查询论文 {paper_name} 时出错: {e}")
                     continue
 
-                # 进度显示
                 if (i + 1) % 10 == 0:
                     logger.info(f"  已处理 {i + 1}/{len(paper_names)} 篇论文...")
 
             logger.info(f"✅ 共提取 {len(all_chunks)} 个 chunks")
 
-            # 按 paper_id 分组统计
             paper_counts: Dict[str, int] = {}
             for c in all_chunks:
                 pid = c.get("paper_id", "unknown")
@@ -1106,13 +732,11 @@ class HybridIndexManager:
             raise
 
     async def list_unique_documents(self) -> List[Dict[str, Any]]:
-        """列出所有不同的文档（按文件分组）- 使用追踪的统计数据"""
-        # 直接返回追踪的文档统计，避免 Milvus Lite 大数据量查询限制
+        """列出所有不同的文档"""
         if self._doc_stats:
             logger.info(f"📊 返回追踪的文档统计: {len(self._doc_stats)} 个文件")
             return list(self._doc_stats.values())
 
-        # 如果追踪统计为空但数据库有数据，需要重建统计
         logger.info("📊 追踪统计为空，正在检查数据库...")
         try:
             await self._ensure_collection()
@@ -1135,7 +759,7 @@ class HybridIndexManager:
             file_name: 要删除的文件名
 
         Returns:
-            删除结果 {"status": "success/error", "deleted_count": int, "message": str}
+            删除结果
         """
         import json
 
@@ -1144,15 +768,11 @@ class HybridIndexManager:
 
             collection = cast(Collection, self._collection)
 
-            # 构建查询表达式：查找 metadata["file_name"] 中匹配的文件名
-            # Milvus JSON 字段使用 metadata["field_name"] 语法访问
-            # 转义特殊字符防止表达式注入
             file_name_escaped = file_name.replace('"', '\\"').replace('%', '\\%')
             expr = f'metadata["file_name"] like "%{file_name_escaped}%"'
 
-            # 提取所有匹配的实体 ID（分批处理，避免超过限制）
             all_ids_to_delete = []
-            BATCH_SIZE = 5000  # 每批处理的 ID 数量
+            BATCH_SIZE = 5000
             loop = asyncio.get_event_loop()
 
             while True:
@@ -1169,17 +789,14 @@ class HybridIndexManager:
                 if not results:
                     break
 
-                # 提取实体 ID
                 for hit in results:
                     entity_id = hit.get("id")
                     if entity_id is not None:
                         all_ids_to_delete.append(entity_id)
 
-                # 如果返回数量少于批次大小，说明已经查询完毕
                 if len(results) < BATCH_SIZE:
                     break
 
-                # 安全限制
                 if len(all_ids_to_delete) >= 100000:
                     logger.warning(f"⚠️ 文件 '{file_name}' 向量数量过大 ({len(all_ids_to_delete)})，已达安全限制")
                     break
@@ -1191,14 +808,12 @@ class HybridIndexManager:
                     "message": f"未找到文件 '{file_name}' 对应的向量数据"
                 }
 
-            # 分批删除（Milvus 对表达式长度有限制）
-            DELETE_BATCH_SIZE = 1000  # 每批删除的 ID 数量
+            DELETE_BATCH_SIZE = 1000
             total_deleted = 0
 
             for i in range(0, len(all_ids_to_delete), DELETE_BATCH_SIZE):
                 batch_ids = all_ids_to_delete[i:i + DELETE_BATCH_SIZE]
 
-                # 构建删除表达式
                 if len(batch_ids) == 1:
                     delete_expr = f"id == {batch_ids[0]}"
                 else:
@@ -1216,7 +831,6 @@ class HybridIndexManager:
 
             logger.info(f"✅ 删除文件 '{file_name}': {total_deleted} 个向量")
 
-            # 更新文档统计追踪
             self._update_doc_stats_on_delete(file_name)
 
             return {
@@ -1238,16 +852,14 @@ class HybridIndexManager:
         try:
             await self._ensure_collection()
 
-            # drop_collection 是阻塞操作，在线程池中执行
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, lambda: utility.drop_collection(  # type: ignore[misc]
+            await loop.run_in_executor(None, lambda: utility.drop_collection(
                 self._collection_name, using=self.alias
             ))
 
             self._collection = None
             logger.info(f"✅ 集合 '{self._collection_name}' 已清空")
 
-            # 清空文档统计追踪
             self._clear_doc_stats()
 
             return True
@@ -1256,390 +868,189 @@ class HybridIndexManager:
             logger.error(f"清空索引失败: {e}")
             return False
 
-    # ============================================================================
-    # BM25 检索器
-    # ============================================================================
-
-    async def bm25_search(
-        self,
-        query: str,
-        top_k: int = 20,
-        llm_provider: Any = None  # 可选：复用的 LLM provider
-    ) -> List[Dict[str, Any]]:
+    async def get_all_references(self, allow_duplicates: bool = True) -> Dict[str, Any]:
         """
-        BM25 关键词检索（基于 rank_bm25）
+        从数据库中提取所有参考文献，统计论文名称出现频次
 
         Args:
-            query: 查询文本
-            top_k: 返回结果数量
-            llm_provider: 可选的 LLM provider，用于 Query Expansion（复用已加载实例）
+            allow_duplicates: 是否允许同一篇论文对同一参考文献重复统计
 
         Returns:
-            BM25 得分列表 [{"text", "metadata", "score"}, ...]
+            {"references": [...], "total_refs": int, "total_chunks": int}
         """
-        import json
-
-        # 延迟导入，避免未安装时阻塞
         try:
-            from rank_bm25 import BM25Okapi
-        except ImportError:
-            logger.error("rank_bm25 未安装，请运行: pip install rank-bm25")
-            return []
+            all_chunks = await self.get_all_chunks()
+            if not all_chunks:
+                return {"references": [], "total_refs": 0, "total_chunks": 0}
 
-        # 构建或刷新内存索引
-        await self._ensure_bm25_index()
+            title_counter: Dict[str, Dict[str, Any]] = {}
+            total_refs = 0
 
-        if self._bm25 is None:
-            return []
+            if allow_duplicates:
+                for chunk in all_chunks:
+                    metadata = chunk.get("metadata", {})
+                    if not isinstance(metadata, dict):
+                        continue
+                    references = metadata.get("cited_references", [])
+                    if not references:
+                        continue
+                    for ref in references:
+                        if not isinstance(ref, dict):
+                            continue
+                        title = ref.get("ref_title", "").strip()
+                        if not title or len(title) < 5:
+                            continue
+                        title_norm = " ".join(title.lower().split())
+                        if title_norm in title_counter:
+                            title_counter[title_norm]["count"] += 1
+                        else:
+                            title_counter[title_norm] = {
+                                "count": 1,
+                                "raw_title": title,
+                                "ref_authors": ref.get("ref_authors", ""),
+                                "ref_year": ref.get("ref_year"),
+                                "ref_doi": ref.get("ref_doi", "")
+                            }
+                        total_refs += 1
+            else:
+                title_to_papers: Dict[str, set] = {}
+                for chunk in all_chunks:
+                    metadata = chunk.get("metadata", {})
+                    if not isinstance(metadata, dict):
+                        continue
+                    citing_paper = metadata.get("file_name", "") or metadata.get("paper_id", "")
+                    references = metadata.get("cited_references", [])
+                    if not references:
+                        continue
+                    for ref in references:
+                        if not isinstance(ref, dict):
+                            continue
+                        title = ref.get("ref_title", "").strip()
+                        if not title or len(title) < 5:
+                            continue
+                        title_norm = " ".join(title.lower().split())
+                        if title_norm not in title_counter:
+                            title_counter[title_norm] = {
+                                "count": 0,
+                                "raw_title": title,
+                                "ref_authors": ref.get("ref_authors", ""),
+                                "ref_year": ref.get("ref_year"),
+                                "ref_doi": ref.get("ref_doi", "")
+                            }
+                            title_to_papers[title_norm] = set()
+                        if citing_paper and citing_paper in title_to_papers[title_norm]:
+                            continue
+                        title_counter[title_norm]["count"] += 1
+                        title_to_papers[title_norm].add(citing_paper)
+                        total_refs += 1
 
-        try:
-            # 使用jieba分词并标准化（与索引构建时一致）
-            import jieba
-            import re
-
-            def tokenize_text(text: str) -> list:
-                """使用jieba分词并标准化：去除标点，合并被标点分隔的单词"""
-                text = text.lower()
-                text = re.sub(r'([a-z])[-_]([a-z])', r'\1\2', text)
-                tokens = list(jieba.cut(text))
-                tokens = [t for t in tokens if not re.match(r'^[\s\W]+$', t)]
-                return tokens
-
-            async def rewrite_query_by_llm(query: str, llm_provider) -> str:
-                """
-                LLM-based Query Rewriting：将原始查询重写为1个更精确的检索表述
-
-                级联策略第一步：先用LLM聚焦核心意图，生成1个优化查询
-                """
-                rewrite_prompt = f"""你是一个学术检索专家。请将以下查询重写为精确的检索表述。
-
-【要求】
-1. 使用领域标准术语
-2. 保留核心意图和关键标识（作者、年份等）
-3. 表述简洁清晰
-
-原始查询：{query}
-重写查询："""
-
-                try:
-                    response = await llm_provider.text_chat(
-                        prompt=rewrite_prompt,
-                        contexts=[],
-                        temperature=0.1,
-                        max_tokens=100
-                    )
-                    response_text = ""
-                    if hasattr(response, 'content'):
-                        response_text = response.content
-                    elif isinstance(response, dict):
-                        response_text = response.get("content", "") or response.get("text", "")
-                    else:
-                        response_text = str(response)
-
-                    # 清理反引号和多余空白
-                    response_text = response_text.strip().strip('`').strip()
-                    if response_text:
-                        logger.debug(f"[Query Rewrite] '{query}' → '{response_text}'")
-                        return response_text
-                except Exception as e:
-                    logger.warning(f"[Query Rewrite] LLM调用失败: {e}")
-
-                # 重写失败时返回原始查询
-                return query
-
-            def _detect_question_type(query: str) -> str:
-                """
-                检测问题类型，用于针对性扩展
-                返回: 'quantity' | 'comparison' | 'definition' | 'general'
-                """
-                query_lower = query.lower()
-
-                # 数量型问题
-                if any(kw in query_lower for kw in ['how many', 'how much', 'how big', 'how large',
-                                                      'how long', 'how far', 'how fast', 'how old',
-                                                      'how deep', 'how wide', 'how tall', 'how heavy',
-                                                      'size', 'number of', 'quantity', 'count', 'total']):
-                    return 'quantity'
-
-                # 对比型问题
-                if any(kw in query_lower for kw in ['compare', 'comparison', 'versus', 'vs ',
-                                                      'difference', 'better', 'worse', 'superior', 'inferior',
-                                                      'outperform', 'exceed', 'surpass']):
-                    return 'comparison'
-
-                # 定义型问题
-                if query_lower.startswith('what is') or query_lower.startswith('what are') \
-                   or query_lower.startswith('define') or query_lower.startswith('what does'):
-                    return 'definition'
-
-                return 'general'
-
-            async def expand_query_by_llm(query: str, llm_provider: Any = None) -> List[str]:
-                """
-                重写 + 扩展混合策略（级联策略）：
-                步骤1：先用LLM将原始查询重写为1个更精确的表述
-                步骤2：根据问题类型对重写后的查询进行针对性扩展
-
-                Args:
-                    query: 查询文本
-                    llm_provider: 可选的 LLM provider（复用已加载实例，避免重复加载）
-
-                返回：[原始查询, 重写查询, 扩展查询1, 扩展查询2, ...]
-                """
-                # 如果没有提供 LLM provider，尝试加载
-                if llm_provider is None:
-                    # 尝试获取缓存的 Provider
-                    try:
-                        try:
-                            from ..idea.llama_cpp_vlm_provider import (
-                                get_cached_llama_cpp_provider,
-                                check_llama_cpp_vlm_available
-                            )
-                        except ImportError:
-                            from ..idea.llama_cpp_vlm_provider import (
-                                get_cached_llama_cpp_provider,
-                                check_llama_cpp_vlm_available
-                            )
-
-                        # 优先使用缓存的 Provider
-                        cached = get_cached_llama_cpp_provider()
-                        if cached is not None:
-                            llm_provider = cached
-                            logger.debug("[Query Expansion] 复用已缓存的 LlamaCpp 模型")
-                        elif check_llama_cpp_vlm_available():
-                            # 缓存不存在但模型文件存在，创建新 Provider
-                            from pathlib import Path
-                            plugin_dir = Path(__file__).parent
-                            llama_model_path = str(plugin_dir / "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf")
-                            llama_mmproj_path = str(plugin_dir / "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf")
-
-                            from ..idea.llama_cpp_vlm_provider import init_llama_cpp_vlm_provider
-                            llm_provider = init_llama_cpp_vlm_provider(
-                                model_path=llama_model_path,
-                                mmproj_path=llama_mmproj_path,
-                                n_ctx=8192,
-                                n_gpu_layers=99,
-                                max_tokens=512,
-                                temperature=0.3
-                            )
-                            logger.debug("[Query Expansion] 初始化新的 LlamaCpp 模型")
-                    except Exception as e:
-                        logger.debug(f"[Query Expansion] LlamaCpp获取失败: {e}")
-
-                # 如果没有本地模型，返回原始查询
-                if llm_provider is None:
-                    return [query]
-
-                # ========== 步骤1：查询重写 ==========
-                rewritten_query = await rewrite_query_by_llm(query, llm_provider)
-
-                # ========== 步骤2：查询扩展（问题类型感知） ==========
-                question_type = _detect_question_type(query)
-
-                # 根据问题类型选择不同的few-shot示例
-                if question_type == 'quantity':
-                    # 数量型问题：扩展为数字/统计相关词汇
-                    examples = '''示例：
-查询："how many sentences in dataset"
-扩展：["dataset number of sentences samples", "dataset corpus statistics size", "dataset collection total count"]
-
-查询："how big is the training set"
-扩展：["training set size samples number", "training data corpus volume", "training set statistics scope"]'''
-                elif question_type == 'comparison':
-                    # 对比型问题：扩展为对比/性能相关词汇
-                    examples = '''示例：
-查询："how does model compare to sota"
-扩展：["model performance versus baseline", "accuracy improvement sota comparison", "model results benchmark sota"]
-
-查询："what is accuracy compared tobert"
-扩展：["bert accuracy baseline comparison", "model versus bert performance", "accuracy improvement over bert"]'''
-                elif question_type == 'definition':
-                    # 定义型问题：扩展为术语解释相关
-                    examples = '''示例：
-查询："what is attention mechanism"
-扩展：["attention mechanism definition", "self-attention method explained", "attention architecture principle"]
-
-查询："what is proposed method"
-扩展：["proposed method approach technique", "our method framework model", "methodology contribution approach"]'''
-                else:
-                    # 通用型问题：保持多样化扩展
-                    examples = '''示例：
-查询："how big is the dataset"
-扩展：["dataset size number of samples", "dataset statistics corpus", "dataset scale collection"]
-
-查询："what is the accuracy compared to sota"
-扩展：["accuracy versus sota baseline", "model performance comparison", "accuracy improvement methods"]'''
-
-                expand_prompt = f"""你是一个检索专家。请将以下学术查询重写为3个不同表述的检索查询。
-
-{examples}
-
-查询："{rewritten_query}"
-扩展："""
-
-                try:
-                    response = await llm_provider.text_chat(
-                        prompt=expand_prompt,
-                        contexts=[],
-                        temperature=0.2,
-                        max_tokens=1024
-                    )
-                    response_text = ""
-                    if hasattr(response, 'content'):
-                        response_text = response.content
-                    elif isinstance(response, dict):
-                        response_text = response.get("content", "") or response.get("text", "")
-                    else:
-                        response_text = str(response)
-
-                    # 解析JSON
-                    import json
-                    match = re.search(r'\[.*\]', response_text, re.DOTALL)
-                    if match:
-                        try:
-                            expanded = json.loads(match.group(0))
-                            if isinstance(expanded, list) and len(expanded) > 0:
-                                result = [query, rewritten_query] + expanded
-                                logger.debug(f"[Query Expansion] '{query}' → 重写:'{rewritten_query}' + 扩展:{expanded}")
-                                return result
-                        except json.JSONDecodeError:
-                            pass  # JSON 解析失败，尝试正则 fallback
-
-                    # 正则 fallback：从 Markdown 格式中提取查询
-                    # 匹配 "query" 或 1. "query" 等格式
-                    quote_pattern = r'(?:^|\n)\s*\d*\.?\s*["""]([^"""]+)["""]'
-                    matches = re.findall(quote_pattern, response_text)
-                    if matches:
-                        expanded = [m.strip() for m in matches[:3]]  # 最多3个
-                        result = [query, rewritten_query] + expanded
-                        logger.debug(f"[Query Expansion] 正则fallback: '{query}' → 重写:'{rewritten_query}' + 扩展:{expanded}")
-                        return result
-
-                except Exception as e:
-                    logger.warning(f"[Query Expansion] LLM调用失败: {e}")
-
-                # 扩展失败时返回 [原始查询, 重写查询]
-                return [query, rewritten_query]
-
-            async def _bm25_search_single(expanded_query: str) -> List[tuple]:
-                """对单个扩展查询执行BM25搜索"""
-                tokenized_query = tokenize_text(expanded_query)
-                scores = self._bm25.get_scores(tokenized_query)
-                return list(enumerate(scores))
-
-            # 执行LLM扩展（获取多个查询变体，复用已加载的 LLM provider）
-            expanded_queries = await expand_query_by_llm(query, llm_provider=llm_provider)
-            all_scored = []
-
-            # 对每个扩展查询执行BM25
-            for eq in expanded_queries:
-                scored = await _bm25_search_single(eq)
-                all_scored.append(scored)
-
-            # 合并多查询结果（RRF-style fusion）
-            combined_scores: Dict[int, float] = {}
-            for q_idx, scored in enumerate(all_scored):
-                # 重写+扩展混合策略的权重分配：
-                # - 原始查询 (q_idx=0): 1.0
-                # - 重写查询 (q_idx=1): 0.9
-                # - 扩展变体 (q_idx>=2): 0.7
-                if q_idx == 0:
-                    weight = 1.0  # 原始查询
-                elif q_idx == 1:
-                    weight = 0.9  # 重写查询
-                else:
-                    weight = 0.7  # 扩展变体
-                for doc_idx, score in scored:
-                    if doc_idx not in combined_scores:
-                        combined_scores[doc_idx] = 0.0
-                    combined_scores[doc_idx] += weight * score
-
-            # 按融合分数排序
-            sorted_docs = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
-
-            # 构建最终结果
-            results = []
-            seen_texts: set = set()
-            for doc_idx, fused_score in sorted_docs[:top_k * 2]:  # 取更多备选
-                if doc_idx >= len(self._bm25_corpus_texts):
-                    continue
-                text = self._bm25_corpus_texts[doc_idx]
-                if text in seen_texts:
-                    continue
-                seen_texts.add(text)
-
-                metadata = self._bm25_corpus_metadata[doc_idx]
-                if isinstance(metadata, str):
-                    try:
-                        metadata = json.loads(metadata)
-                    except json.JSONDecodeError:
-                        try:
-                            metadata = json.loads(metadata.replace("'", '"'))
-                        except Exception:
-                            metadata = {}
-                results.append({
-                    "text": text,
-                    "metadata": metadata or {},
-                    "score": float(fused_score)
+            refs_list = []
+            for title_norm, info in title_counter.items():
+                refs_list.append({
+                    "title": info["raw_title"],
+                    "count": info["count"],
+                    "authors": info["ref_authors"],
+                    "year": info["ref_year"],
+                    "doi": info["ref_doi"]
                 })
-                if len(results) >= top_k:
-                    break
+            refs_list.sort(key=lambda x: x["count"], reverse=True)
 
-            logger.debug(f"BM25 检索: query='{query}', 扩展为{len(expanded_queries)}个查询, 返回 {len(results)} 条结果")
-            return results
-
+            return {
+                "references": refs_list,
+                "total_refs": total_refs,
+                "total_chunks": len(all_chunks)
+            }
         except Exception as e:
-            logger.error(f"BM25 检索失败: {e}")
-            return []
+            logger.error(f"提取参考文献统计失败: {e}")
+            return {"references": [], "total_refs": 0, "total_chunks": 0, "error": str(e)}
 
-    async def _ensure_bm25_index(self):
-        """延迟构建 BM25 内存索引"""
-        if self._bm25 is not None:
-            return
+    async def get_papers_with_zero_references(self) -> Dict[str, Any]:
+        """
+        获取参考文献数量为0的论文列表
 
+        Returns:
+            {"papers": [...], "total_papers": int, "total_zero_ref": int}
+        """
         try:
-            # 从 Milvus 提取全量文本
-            chunks = await self.get_all_chunks() # batch_size=1000
+            import json
+            await self._ensure_collection()
+            collection = cast(Collection, self._collection)
+            loop = asyncio.get_event_loop()
 
-            if not chunks:
-                logger.warning("⚠️ BM25 索引构建失败：Milvus 中无数据")
-                return
+            papers = await self.list_unique_documents()
+            paper_names = [p.get("file_name", "") for p in papers if p.get("file_name")]
 
-            self._bm25_corpus_texts = [c["text"] for c in chunks]
-            self._bm25_corpus_metadata = [c.get("metadata", {}) for c in chunks]
+            logger.info(f"🔍 开始检查 {len(paper_names)} 篇论文的参考文献数量...")
 
-            # 构建 BM25 索引（使用jieba分词）
-            from rank_bm25 import BM25Okapi
-            import jieba
-            import re
+            zero_ref_papers = []
+            checked_count = 0
 
-            def tokenize_text(text: str) -> list:
-                """使用jieba分词并标准化：去除标点，合并被标点分隔的单词"""
-                # 1. 转小写
-                text = text.lower()
-                # 2. 将连字符/下划线连接的词合并（如 anti-scam -> antiscam）
-                text = re.sub(r'([a-z])[-_]([a-z])', r'\1\2', text)
-                # 3. 使用jieba分词
-                tokens = list(jieba.cut(text))
-                # 4. 去除纯标点token
-                tokens = [t for t in tokens if not re.match(r'^[\s\W]+$', t)]
-                return tokens
+            for i, paper_name in enumerate(paper_names):
+                if i % 20 == 0:
+                    await self._ensure_collection()
+                    collection = cast(Collection, self._collection)
 
-            tokenized_corpus = [tokenize_text(text) for text in self._bm25_corpus_texts]
-            self._bm25 = BM25Okapi(tokenized_corpus)
+                try:
+                    query_name = paper_name
+                    if self._file_name_has_pdf_suffix is not None:
+                        if self._file_name_has_pdf_suffix and not query_name.lower().endswith('.pdf'):
+                            query_name = query_name + ".pdf"
+                        elif not self._file_name_has_pdf_suffix and query_name.lower().endswith('.pdf'):
+                            query_name = query_name[:-4]
 
-            logger.info(f"✅ BM25 索引构建完成: {len(self._bm25_corpus_texts)} 个 chunks (使用jieba分词)")
+                    all_results: Any = await loop.run_in_executor(
+                        None,
+                        lambda pn=query_name: collection.query(
+                            expr=f'metadata["file_name"] == "{pn}"',
+                            output_fields=["metadata"],
+                            limit=16384
+                        )
+                    )
+                    all_results = cast(List[Dict[str, Any]], all_results)
 
+                    if not all_results:
+                        zero_ref_papers.append({"file_name": paper_name, "chunk_count": 0})
+                        checked_count += 1
+                        continue
+
+                    has_any_ref = False
+                    chunks_with_refs = 0
+                    chunks_without_field = 0
+                    for row in all_results:
+                        meta = row.get("metadata", "{}")
+                        if isinstance(meta, str):
+                            try:
+                                meta = json.loads(meta)
+                            except json.JSONDecodeError:
+                                meta = {}
+                        if "cited_references" in meta:
+                            cited_refs = meta["cited_references"]
+                            if isinstance(cited_refs, list) and len(cited_refs) > 0:
+                                has_any_ref = True
+                                chunks_with_refs += 1
+                        else:
+                            chunks_without_field += 1
+
+                    if not has_any_ref:
+                        zero_ref_papers.append({
+                            "file_name": paper_name,
+                            "chunk_count": len(all_results)
+                        })
+                    checked_count += 1
+
+                except Exception as e:
+                    logger.warning(f"⚠️ 检查论文 {paper_name} 失败: {e}")
+                    continue
+
+            logger.info(f"📊 检查完成: {checked_count} 篇论文, {len(zero_ref_papers)} 篇无参考文献")
+            return {
+                "papers": zero_ref_papers,
+                "total_papers": checked_count,
+                "total_zero_ref": len(zero_ref_papers)
+            }
         except Exception as e:
-            logger.error(f"BM25 索引构建失败: {e}")
-            self._bm25 = None
-
-    def refresh_bm25_index(self):
-        """强制刷新 BM25 索引（如论文增删后）"""
-        self._bm25 = None
-        self._bm25_corpus_texts = []
-        self._bm25_corpus_metadata = []
-        logger.info("🔄 BM25 索引已重置，下次检索时将重新构建")
+            logger.error(f"获取零引用论文失败: {e}")
+            return {"papers": [], "total_papers": 0, "total_zero_ref": 0, "error": str(e)}
 
     def __del__(self):
         """析构函数，确保断开连接"""

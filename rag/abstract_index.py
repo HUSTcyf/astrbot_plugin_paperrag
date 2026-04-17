@@ -778,7 +778,7 @@ class AbstractIndexManager:
                 # 自定义包装的 embed_text 方法（可能同步）
                 vector = self._embed_model.embed_text(text)
             elif hasattr(self._embed_model, 'get_text_embedding'):
-                # OllamaEmbeddingProvider 等（异步方法，返回单向量）
+                # 异步方法，返回单向量
                 vector = await self._embed_model.get_text_embedding(text)
             elif hasattr(self._embed_model, 'embed'):
                 # 其他异步接口（可能返回 List[List[float]]）

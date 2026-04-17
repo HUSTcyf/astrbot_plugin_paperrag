@@ -268,18 +268,16 @@ class PaperRAGPlugin(Star):
 
         try:
             result = await engine.search(query, mode="rag")
-            if result.get("type") == "error":
-                return f"❌ 搜索失败: {result.get('message', '未知错误')}"
 
-            answer = result.get("answer", "")
-            sources = result.get("sources", [])
+            nodes = result.nodes if hasattr(result, 'nodes') else []
+            scores = result.scores if hasattr(result, 'scores') else []
 
-            output = f"💡 **搜索结果**\n\n{answer}\n\n" if answer else "📚 **检索结果**\n\n"
-            for i, src in enumerate(sources[:top_k], 1):
-                metadata = src.get("metadata", {})
+            output = "📚 **检索结果**\n\n"
+            for i, (node, score) in enumerate(zip(nodes[:top_k], scores[:top_k]), 1):
+                metadata = getattr(node, 'metadata', {})
                 filename = metadata.get("file_name", "unknown")
-                text = src.get("text", "")[:200]
-                output += f"[{i}] **{filename}**\n{text}...\n\n"
+                text = getattr(node, 'text', "")[:200]
+                output += f"[{i}] **{filename}** (score={score:.3f})\n{text}...\n\n"
 
             return output.strip() if output.strip() else "❌ 未找到相关文档"
         except Exception as e:
@@ -308,19 +306,17 @@ class PaperRAGPlugin(Star):
 
         try:
             result = await engine.search(query, mode="retrieve")
-            if result.get("type") == "error":
-                return f"❌ 检索失败: {result.get('message', '未知错误')}"
 
-            sources = result.get("sources", [])
-            if not sources:
+            nodes = result.nodes if hasattr(result, 'nodes') else []
+            scores = result.scores if hasattr(result, 'scores') else []
+            if not nodes:
                 return "📭 未找到相关文档"
 
             output = "📚 **检索结果**\n\n"
-            for i, src in enumerate(sources[:top_k], 1):
-                metadata = src.get("metadata", {})
+            for i, (node, score) in enumerate(zip(nodes[:top_k], scores[:top_k]), 1):
+                metadata = getattr(node, 'metadata', {})
                 filename = metadata.get("file_name", "unknown")
-                score = src.get("score", 0.0)
-                text = src.get("text", "")[:300]
+                text = getattr(node, 'text', "")[:300]
                 output += f"[{i}] **{filename}** (相似度: {score:.3f})\n{text}...\n\n"
 
             return output.strip()
@@ -987,11 +983,8 @@ class PaperRAGPlugin(Star):
             # Execute search
             response = await engine.search(query, mode=actual_mode)
 
-            # 安全获取响应类型，避免 KeyError
-            response_type = response.get("type", "unknown")
-
-            # 预解析 arxiv 链接（优先从文件名模式检测，其次从CORE API获取）
-            sources = response.get("sources", [])
+            # 将 QueryResult 转换为 sources 格式
+            sources = self._query_result_to_sources(response)
             if sources:
                 sources = await self._resolve_sources_arxiv(sources)
 
@@ -999,19 +992,7 @@ class PaperRAGPlugin(Star):
             sources = await self._compact_chunk_texts_with_vlm(sources)
 
             # Format output
-            if response_type == "retrieve":
-                # Retrieve mode only
-                output = self._format_retrieve_response(sources)
-            elif response_type == "rag":
-                # RAG mode
-                output = self._format_rag_response(
-                    response.get("answer", ""),
-                    sources
-                )
-            elif response_type == "error":
-                output = f"❌ {response.get('message', 'Unknown error')}"
-            else:
-                output = f"❌ Unknown response type: {response_type}"
+            output = self._format_retrieve_response(sources)
 
             # Cache response
             self._set_cached_response(cache_key, output)
@@ -4985,6 +4966,29 @@ Examples:
             resolved_source = await self._resolve_source_arxiv(source)
             resolved.append(resolved_source)
         return resolved
+
+    def _query_result_to_sources(self, result) -> list:
+        """
+        将 QueryResult 转换为 sources 格式（dict 列表）
+
+        Args:
+            result: QueryResult 或类似对象，有 nodes 和 scores 属性
+
+        Returns:
+            dict 列表，每项包含 text, metadata, score
+        """
+        nodes = getattr(result, 'nodes', [])
+        scores = getattr(result, 'scores', [1.0] * len(nodes))
+        sources = []
+        for node, score in zip(nodes, scores):
+            metadata = getattr(node, 'metadata', {})
+            text = getattr(node, 'text', "")
+            sources.append({
+                "text": text,
+                "metadata": metadata,
+                "score": score,
+            })
+        return sources
 
     async def _compact_chunk_texts_with_vlm(self, sources: list) -> list:
         """

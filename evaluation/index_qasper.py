@@ -290,7 +290,7 @@ async def index_papers(
         - total_indexed: 索引的段落数量
         - paper_stats: {paper_id: {"file_name": ..., "chunk_count": ..., "paper_title": ...}, ...}
     """
-    from ..embedding.embedding_providers import create_embedding_provider, OllamaEmbeddingProvider, OllamaEmbeddingConfig
+    from ..embedding.embedding_providers import create_embedding_provider
     from legacy.milvus_manager import PaperMilvusManager
 
     # 使用覆盖路径或配置中的路径
@@ -322,23 +322,13 @@ async def index_papers(
     await milvus_manager._ensure_collection()
 
     # 初始化 Embedding Provider
-    embedding_mode = config.get("embedding_mode", "ollama")
+    embedding_mode = config.get("embedding_mode", "unsloth")
 
-    if embedding_mode == "ollama":
-        ollama_config = config.get("ollama", {})
-        embed_config = OllamaEmbeddingConfig(
-            base_url=ollama_config.get("base_url", "http://localhost:11434"),
-            model=ollama_config.get("model", "bge-m3"),
-            timeout=ollama_config.get("timeout", 120.0),
-            batch_size=ollama_config.get("batch_size", 10),
-        )
-        embed_provider = OllamaEmbeddingProvider(config=embed_config)
-    else:
-        # API 模式
-        embed_provider = create_embedding_provider(
-            mode="astrbot",
-            provider_id=config.get("embedding_provider_id", ""),
-        )
+    embed_provider = create_embedding_provider(
+        mode=embedding_mode,
+        context=None,
+        provider_id=config.get("embedding_provider_id", ""),
+    )
 
     # 准备所有 nodes 并统计每篇论文的 chunk 数量
     print("\n准备节点...")
@@ -384,10 +374,7 @@ async def index_papers(
 
         # 获取 embeddings
         try:
-            if embedding_mode == "ollama":
-                embeddings = await embed_provider.get_text_embeddings_batch(texts)
-            else:
-                embeddings = await embed_provider.get_text_embeddings_batch(texts)
+            embeddings = await embed_provider.get_text_embeddings_batch(texts)
 
             # 准备插入文档
             documents = []

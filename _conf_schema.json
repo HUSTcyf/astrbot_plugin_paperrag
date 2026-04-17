@@ -13,10 +13,10 @@
     "embedding_mode": {
         "description": "Embedding模式",
         "type": "string",
-        "hint": "选择embedding服务模式。API模式使用Gemini/OpenAI等云端服务；Ollama模式使用本地Ollama服务运行bge-m3等模型，完全免费且无限制",
+        "hint": "选择embedding服务模式。API模式使用Gemini/OpenAI等云端服务；Ollama/Unsloth模式使用本地BGE-M3模型，完全免费且无限制（推荐）",
         "obvious_hint": true,
         "default": "ollama",
-        "enum": ["api", "ollama"]
+        "enum": ["api", "ollama", "unsloth"]
     },
     "embedding_provider_id": {
         "description": "Embedding 服务提供商（API模式）",
@@ -79,7 +79,7 @@
     "llama_vlm_max_tokens": {
         "description": "Llama.cpp VLM 最大生成Token数",
         "type": "int",
-        "hint": "VLM生成的最大token数量，5倍后为2560",
+        "hint": "VLM生成的最大token数量",
         "default": 2560,
         "minimum": 64,
         "maximum": 4096
@@ -156,7 +156,7 @@
     "embed_dim": {
         "description": "向量嵌入维度",
         "type": "int",
-        "hint": "嵌入向量的维度，需与选择的 Embedding Provider 模型匹配。Gemini为768，OpenAI为1536",
+        "hint": "嵌入向量的维度，需与选择的 Embedding Provider 模型匹配。Gemini为768，BGE-M3为1024",
         "default": 768,
         "minimum": 128,
         "maximum": 4096
@@ -277,65 +277,22 @@
             }
         }
     },
-    "enable_reranking": {
-        "description": "是否启用重排序功能",
+    "enable_sparse_retrieval": {
+        "description": "是否启用稀疏权重检索",
         "type": "bool",
-        "hint": "启用后将使用交叉注意力模型对检索结果进行精确重排序，提升15-25%的检索精度。需要安装 FlagEmbedding 依赖（pip install -U FlagEmbedding）。会增加200-500ms延迟",
-        "default": false
-    },
-    "reranking_model": {
-        "description": "重排序模型名称",
-        "type": "string",
-        "hint": "HuggingFace 模型名称或本地路径。推荐使用 BAAI/bge-reranker-v2-m3（多语言支持）",
-        "obvious_hint": true,
-        "default": "BAAI/bge-reranker-v2-m3",
-        "minLength": 1,
-        "enum": [
-            "BAAI/bge-reranker-v2-m3",
-            "BAAI/bge-reranker-large",
-            "BAAI/bge-reranker-base"
-        ]
-    },
-    "reranking_device": {
-        "description": "重排序模型运行设备",
-        "type": "string",
-        "hint": "auto: 自动检测MPS/CUDA/CPU（推荐）；mps: Apple Silicon GPU加速；cuda: NVIDIA GPU加速；cpu: CPU运行",
-        "obvious_hint": true,
-        "default": "auto",
-        "enum": ["auto", "mps", "cuda", "cpu"]
-    },
-    "reranking_adaptive": {
-        "description": "是否使用自适应重排序",
-        "type": "bool",
-        "hint": "启用后将根据结果数量和相似度分布智能决定是否重排序，避免不必要的时间消耗",
+        "hint": "启用后将使用 BGE-M3 的稀疏权重（ABSPEC公式）进行关键词检索，结合稠密向量进行 RRF 融合，提升包含明确关键词的查询效果（如论文标题、专业术语）",
         "default": true
     },
-    "reranking_threshold": {
-        "description": "重排序分数阈值",
-        "type": "float",
-        "hint": "过滤掉低于此分数的重排序结果（0-1之间）。设置为0表示保留所有结果",
-        "default": 0.0,
-        "minimum": 0.0,
-        "maximum": 1.0
-    },
-    "reranking_batch_size": {
-        "description": "重排序批处理大小",
-        "type": "int",
-        "hint": "批量处理文档数量，影响推理速度和内存占用。较大的值速度更快但占用更多内存",
-        "default": 32,
-        "minimum": 1,
-        "maximum": 128
-    },
-    "enable_bm25": {
-        "description": "是否启用 BM25 混合检索",
+    "enable_multi_vector_rerank": {
+        "description": "是否启用 ColBERT 多向量 reranking",
         "type": "bool",
-        "hint": "启用后将同时使用 BM25 关键词检索和向量语义检索，并通过 RRF 分数融合返回最优结果。适合查询中包含明确关键词（如论文标题、专业术语）的情况",
+        "hint": "启用后将使用 BGE-M3 的多向量输出进行 ColBERT 式 late-interaction reranking，进一步提升检索精度。需要更多内存。",
         "default": false
     },
-    "bm25_top_k": {
-        "description": "BM25 召回数量",
+    "sparse_top_k": {
+        "description": "稀疏检索召回数量",
         "type": "int",
-        "hint": "BM25 关键词检索返回的候选文档数量（应大于最终 top_k，以便 RRF 融合时保留更多候选）",
+        "hint": "稀疏权重检索返回的候选文档数量（应大于最终 top_k，以便 RRF 融合时保留更多候选）",
         "default": 20,
         "minimum": 5,
         "maximum": 100
@@ -343,10 +300,65 @@
     "hybrid_alpha": {
         "description": "混合检索融合权重",
         "type": "float",
-        "hint": "RRF 融合中向量检索的权重（0=纯BM25，1=纯向量）。设为 0.5 表示两者平等重要",
+        "hint": "RRF 融合中向量检索的权重（0=纯稀疏权重，1=纯向量）。设为 0.5 表示两者平等重要",
         "default": 0.5,
         "minimum": 0.0,
         "maximum": 1.0
+    },
+    "enable_reranking": {
+        "description": "是否启用重排序功能",
+        "type": "bool",
+        "hint": "启用后将使用 ColBERT 多向量进行 reranking，提升检索精度。需要更多内存。",
+        "default": false
+    },
+    "reranking_model": {
+        "description": "重排序模型名称（已废弃，使用 ColBERT 多向量）",
+        "type": "string",
+        "hint": "此配置已废弃，reranking 现使用 BGE-M3 的多向量输出",
+        "obvious_hint": true,
+        "default": "BAAI/bge-reranker-v2-m3",
+        "minLength": 1
+    },
+    "reranking_device": {
+        "description": "重排序模型运行设备（已废弃）",
+        "type": "string",
+        "hint": "此配置已废弃，reranking 使用 Unsloth 本地模型",
+        "obvious_hint": true,
+        "default": "auto"
+    },
+    "reranking_adaptive": {
+        "description": "是否使用自适应重排序（已废弃）",
+        "type": "bool",
+        "hint": "此配置已废弃",
+        "default": true
+    },
+    "reranking_threshold": {
+        "description": "重排序分数阈值（已废弃）",
+        "type": "float",
+        "default": 0.0,
+        "minimum": 0.0,
+        "maximum": 1.0
+    },
+    "reranking_batch_size": {
+        "description": "重排序批处理大小（已废弃）",
+        "type": "int",
+        "default": 32,
+        "minimum": 1,
+        "maximum": 128
+    },
+    "enable_bm25": {
+        "description": "是否启用 BM25（已废弃，使用稀疏权重替代）",
+        "type": "bool",
+        "hint": "此配置已废弃，请使用 enable_sparse_retrieval 代替。BM25 功能已被 BGE-M3 稀疏权重取代",
+        "default": false
+    },
+    "bm25_top_k": {
+        "description": "BM25 召回数量（已废弃，复用为 sparse_top_k）",
+        "type": "int",
+        "hint": "此配置已废弃，复用为 sparse_top_k",
+        "default": 20,
+        "minimum": 5,
+        "maximum": 100
     },
     "enable_llm_reference_parsing": {
         "description": "启用 LLM 参考文献解析（实验性）",
@@ -376,38 +388,63 @@
         "default": ""
     },
     "ollama": {
-        "description": "Ollama本地Embedding配置",
+        "description": "Ollama本地Embedding配置（已废弃，内部使用Unsloth）",
         "type": "object",
-        "hint": "配置Ollama服务进行本地embedding（需要先安装并启动Ollama）。仅在embedding_mode='ollama'时生效",
+        "hint": "此配置已废弃，请使用 unsloth 配置。Ollama 模式现在内部使用 Unsloth BGE-M3 替代",
         "obvious_hint": true,
         "items": {
             "base_url": {
                 "description": "Ollama服务地址",
                 "type": "string",
-                "default": "http://localhost:11434",
-                "hint": "Ollama服务的HTTP API地址。默认使用本地11434端口"
+                "default": "http://localhost:11434"
             },
             "model": {
                 "description": "Ollama模型名称",
                 "type": "string",
-                "default": "bge-m3",
-                "hint": "Ollama中已安装的模型名称。常用模型: bge-m3（推荐1024维）、nomic-embed-text（768维）、mxbai-embed-large（1024维）"
+                "default": "bge-m3"
             },
             "timeout": {
                 "description": "请求超时时间（秒）",
                 "type": "float",
                 "default": 300.0,
                 "minimum": 10.0,
-                "maximum": 600.0,
-                "hint": "单个请求的超时时间。首次运行模型加载可能需要较长时间，建议设为300秒"
+                "maximum": 600.0
             },
             "batch_size": {
                 "description": "并发批处理大小",
                 "type": "int",
                 "default": 10,
                 "minimum": 1,
-                "maximum": 50,
-                "hint": "同时处理的文本数量。较大的值速度更快但占用更多内存"
+                "maximum": 50
+            }
+        }
+    },
+    "unsloth": {
+        "description": "Unsloth 本地 BGE-M3 配置",
+        "type": "object",
+        "hint": "配置 Unsloth BGE-M3 本地模型，用于获取稠密向量、稀疏权重和多向量序列",
+        "obvious_hint": true,
+        "items": {
+            "model_path": {
+                "description": "模型路径",
+                "type": "string",
+                "default": "./models/bge-m3",
+                "hint": "BGE-M3 模型路径，默认使用 ./models/bge-m3"
+            },
+            "device": {
+                "description": "运行设备",
+                "type": "string",
+                "default": "mps",
+                "enum": ["mps", "cuda", "cpu"],
+                "hint": "mps: Apple Silicon GPU加速（推荐）；cuda: NVIDIA GPU加速；cpu: CPU运行"
+            },
+            "max_seq_length": {
+                "description": "最大序列长度",
+                "type": "int",
+                "default": 512,
+                "minimum": 128,
+                "maximum": 1024,
+                "hint": "最大序列长度，默认512"
             }
         }
     },

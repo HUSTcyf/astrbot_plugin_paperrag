@@ -235,7 +235,7 @@ class IdeaEngineVM(IdeaEngineCitations):
             logger.warning("[IdeaEngine] 没有找到候选图表")
             return []
 
-        logger.info(f"[IdeaEngine] 共有 {len(all_candidates)} 个候选图表，开始 rerank...")
+        logger.info(f"[IdeaEngine] 共有 {len(all_candidates)} 个候选图表，使用 ColBERT 重排序...")
 
         query = "相关研究内容：" + "\n".join(paper_chunk_texts.values())
         candidates_for_rerank = [
@@ -244,15 +244,16 @@ class IdeaEngineVM(IdeaEngineCitations):
         ]
 
         try:
-            from ..embedding.llama_index_reranker import rerank_results
-            reranked = await rerank_results(
-                results=candidates_for_rerank,
-                query=query,
-                top_k=min(10, len(candidates_for_rerank))
-            )
-            logger.info(f"[IdeaEngine] rerank 完成，{len(reranked)} 个候选")
+            from ..embedding.unsloth_embedding import get_embedding_model
+            model = get_embedding_model()
+            doc_texts = [ca["text"] for ca in candidates_for_rerank]
+            reranked_indices = model.colbert_rerank(query, doc_texts, top_k=len(doc_texts))
+            reranked = []
+            for idx, score in reranked_indices:
+                reranked.append({"metadata": candidates_for_rerank[idx]["metadata"], "score": score})
+            logger.info(f"[IdeaEngine] ColBERT rerank 完成，{len(reranked)} 个候选")
         except Exception as e:
-            logger.warning(f"[IdeaEngine] rerank 失败: {e}，使用原始顺序")
+            logger.warning(f"[IdeaEngine] ColBERT rerank 失败: {e}，使用原始顺序")
             reranked = [{"metadata": c, "score": 0.5} for c in all_candidates]
 
         filtered_images = []

@@ -2,7 +2,42 @@
 
 所有值得注意的插件变更都会记录在这个文件中。
 
-## [1.12.0] - 2026-04-15
+## [1.12.1] - 2026-04-17
+
+### 新功能 - Unsloth BGE-M3 集成与稀疏检索
+
+**概述**: 集成 Unsloth BGE-M3 支持稀疏权重检索和 ColBERT 多向量 reranking，替代原有的 Ollama/FlagEmbedding 方案。
+
+**新增**:
+- `embedding/unsloth_embedding.py` - Unsloth BGE-M3 本地模型封装，支持稠密向量、稀疏权重、多向量输出
+- `embedding/embedding_providers.py` (新) - 统一 embedding 提供者，支持 api/ollama/unsloth 三种模式
+- `enable_sparse_retrieval` - 启用 BGE-M3 稀疏权重（ABSPEC公式）进行关键词检索
+- `enable_multi_vector_rerank` - 启用 ColBERT 式 late-interaction reranking
+- `sparse_top_k` - 稀疏检索召回数量配置
+- `unsloth` 配置项 - Unsloth BGE-M3 模型路径、设备、最大序列长度
+
+**重构**:
+- 旧 `embedding/` 模块移至 `legacy/embedding/`
+- 旧 `rag/hybrid_index.py`, `rag/hybrid_rag.py`, `rag/rag_engine.py` 移至 `legacy/`
+- 新增 `rag/colbert_storage.py`, `rag/hybrid_index.py`, `rag/hybrid_rag.py`, `rag/rag_engine.py` - 基于 QueryResult 接口重写
+- `evaluation/evaluate_retrieval.py` - 新增检索评估脚本
+
+**废弃**:
+- `ollama` embedding 模式（内部已使用 Unsloth BGE-M3 替代）
+- `reranking_model` 相关配置（改用 ColBERT 多向量）
+- `enable_bm25`（改用 `enable_sparse_retrieval`）
+
+**依赖变更**:
+- 移除 `FlagEmbedding>=1.2.0`
+- 新增 `unsloth==2026.4.5`
+- `transformers` 版本要求从 `<5.0` 放宽
+
+**其他**:
+- `_conf_schema.json` - 新增 `unsloth` 配置节、稀疏检索开关、多向量 reranking 开关
+- `tools/download_models.py` - 支持分别下载 Docling 和 BGE-M3 模型
+- `.gitignore` - 排除 `*.ipynb` 文件
+
+---
 
 ### 代码重构 - 模块化目录结构
 

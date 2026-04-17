@@ -1,13 +1,13 @@
 """
 Paper RAG Plugin - 核心RAG引擎模块
-混合架构版本：结合自定义PDF解析 + 本地向量存储
+混合架构版本：结合自定义PDF解析 + llama-index管理
 """
 
 from typing import Optional, TYPE_CHECKING
 from dataclasses import dataclass, field
 from astrbot.api import logger
 
-# 使用 TYPE_CHECKING 避免循环导入
+# 使用 TYPE_CHECKING 避免循环导入，兼容直接运行和包运行
 if TYPE_CHECKING:
     try:
         from .hybrid_rag import HybridRAGEngine
@@ -20,9 +20,8 @@ HYBRID_RAG_AVAILABLE = True
 @dataclass
 class RAGConfig:
     """RAG配置类"""
-
     # Embedding配置
-    embedding_mode: str = "unsloth"  # "unsloth", "astrbot"
+    embedding_mode: str = "ollama"  # "api" 或 "ollama"
     embedding_provider_id: str = ""  # API模式下的Provider
 
     # LLM Provider配置
@@ -38,15 +37,12 @@ class RAGConfig:
     llama_vlm_n_ctx: int = 4096
     llama_vlm_n_gpu_layers: int = 99
 
-    # Unsloth配置（保留用于配置传递）
+    # Ollama配置
     ollama_config: dict = field(default_factory=dict)
 
-    # Unsloth Embedding配置
-    unsloth_config: dict = field(default_factory=dict)
-
     # Milvus配置
-    milvus_lite_path: str = ""
-    address: str = ""
+    milvus_lite_path: str = ""  # Lite 模式路径
+    address: str = ""  # 远程 Milvus 服务器地址
     db_name: str = "default"
     authentication: Optional[dict] = None
     collection_name: str = "paper_embeddings"
@@ -67,54 +63,48 @@ class RAGConfig:
 
     # 多模态配置
     enable_multimodal: bool = True
-    figures_dir: str = ""
+    figures_dir: str = ""  # 空则使用插件目录下的 data/figures
 
-    # 混合检索配置（稀疏权重 + 稠密向量）
-    enable_sparse_retrieval: bool = True  # 使用 BGE-M3 稀疏权重
-    enable_multi_vector_rerank: bool = False  # 使用 ColBERT reranking
-    enable_noise_filter: bool = True  # 使用本地 LLM 过滤噪声 chunks（参考文献/表格/符号等）
-    sparse_top_k: int = 20        # 稀疏检索召回数量
-    hybrid_alpha: float = 0.5    # RRF 融合权重（0=纯稀疏, 1=纯向量）
+    # 重排序配置
+    enable_reranking: bool = False
+    reranking_model: str = "BAAI/bge-reranker-v2-m3"
+    reranking_device: str = "auto"
+    reranking_adaptive: bool = True
+    reranking_threshold: float = 0.0
+    reranking_batch_size: int = 32
+
+    # 混合检索配置（BM25 + 向量）
+    enable_bm25: bool = False
+    bm25_top_k: int = 20        # BM25 召回数量
+    hybrid_alpha: float = 0.5    # RRF 融合权重（0=纯BM25, 1=纯向量）
     hybrid_rrf_k: int = 60      # RRF 常数 k
 
-    # 向后兼容：保留旧的 BM25 配置名称（但不再使用）
-    enable_bm25: bool = False    # 已废弃，使用 enable_sparse_retrieval
-    bm25_top_k: int = 20        # 复用为 sparse_top_k
-
-    # 重排序配置（向后兼容，内部使用 ColBERT reranking）
-    enable_reranking: bool = False  # 使用 ColBERT reranking
-    reranking_model: str = "BAAI/bge-reranker-v2-m3"  # 保留字段但不使用
-    reranking_device: str = "auto"  # 保留字段但不使用
-    reranking_adaptive: bool = True  # 保留字段但不使用
-    reranking_threshold: float = 0.0  # 保留字段但不使用
-    reranking_batch_size: int = 32  # 保留字段但不使用
-
     # LLM 参考文献解析配置
-    enable_llm_reference_parsing: bool = True
+    enable_llm_reference_parsing: bool = True  # 是否启用 LLM-based 参考文献解析
 
-    # FreeAPI 配置
-    freeapi_url: str = ""
-    freeapi_key: str = ""
+    # FreeAPI 配置（用于 RAGAS 评估）
+    freeapi_url: str = ""  # FreeAPI 服务地址
+    freeapi_key: str = ""  # FreeAPI 密钥
 
     # Graph RAG 配置
-    enable_graph_rag: bool = False
-    graph_storage_type: str = "memory"
+    enable_graph_rag: bool = False  # 是否启用 Graph RAG
+    graph_storage_type: str = "memory"  # "memory" 或 "neo4j"
     graph_neo4j_uri: str = "bolt://localhost:7687"
     graph_neo4j_user: str = "neo4j"
     graph_neo4j_password: str = ""
     graph_max_triplets_per_chunk: int = 5
     graph_retrieval_top_k: int = 5
-    graph_hybrid_alpha: float = 0.5
-    graph_auto_build: bool = False
-    graph_auto_build_threshold: int = 10
+    graph_hybrid_alpha: float = 0.5  # 混合检索权重（0=纯图，1=纯向量）
+    graph_auto_build: bool = False  # 是否自动构建图谱
+    graph_auto_build_threshold: int = 10  # 自动构建阈值
 
     # 两阶段检索配置
-    enable_two_stage_retrieval: bool = False
-    two_stage_top_k: int = 10
-    two_stage_rerank_k: int = 5
-    graph_multimodal_enabled: bool = True
-    graph_max_images_per_chunk: int = 1
-    graph_extract_image_entities: bool = True
+    enable_two_stage_retrieval: bool = False  # 是否启用两阶段检索（先检索摘要匹配论文，再检索论文内chunks）
+    two_stage_top_k: int = 10  # 两阶段检索：摘要阶段召回的论文数量（rerank后选择top_k）
+    two_stage_rerank_k: int = 5  # 两阶段检索：rerank后选择的论文数量
+    graph_multimodal_enabled: bool = True  # 是否启用多模态图谱抽取
+    graph_max_images_per_chunk: int = 1  # 每个chunk最多处理图片数
+    graph_extract_image_entities: bool = True  # 是否提取图片为实体
 
     def __post_init__(self):
         """初始化后处理"""
@@ -122,30 +112,35 @@ class RAGConfig:
             self.authentication = {}
         if self.ollama_config is None:
             self.ollama_config = {}
-        if self.unsloth_config is None:
-            self.unsloth_config = {}
 
-        # 向后兼容：如果设置了 enable_bm25，确保 sparse_top_k 有值
-        if self.bm25_top_k > 0:
-            self.sparse_top_k = self.bm25_top_k
-
-        # 自动调整 embed_dim（BGE-M3 固定 1024 维）
-        if self.embedding_mode == "unsloth":
-            self.embed_dim = 1024
+        # 自动调整embed_dim（根据embedding_mode和模型）
+        if self.embedding_mode == "ollama":
+            model = self.ollama_config.get("model", "bge-m3")
+            if model == "bge-m3":
+                self.embed_dim = 1024
+            elif model == "nomic-embed-text":
+                self.embed_dim = 768
 
     def validate(self) -> tuple[bool, str]:
         """验证配置"""
         if self.embed_dim % 64 != 0:
             return False, "嵌入维度必须是64的倍数"
+
+        # 检查 Milvus 配置 - 留空让 HybridIndexManager 使用插件目录下的默认路径
+        # if not self.milvus_lite_path and not self.address:
+        #     self.milvus_lite_path = ""  # 留空让管理器使用默认
+
         return True, ""
 
     def get_connection_mode(self) -> str:
         """获取连接模式：'lite' 或 'remote'"""
+        # milvus_lite_path 优先级更高
         if self.milvus_lite_path and self.milvus_lite_path.strip():
             return 'lite'
         elif self.address and self.address.strip():
             return 'remote'
         else:
+            # 默认使用 Lite 模式
             return 'lite'
 
     def get_connection_uri(self) -> str:
@@ -163,7 +158,7 @@ class RAGConfig:
 
 def create_rag_engine(config: RAGConfig, context) -> "HybridRAGEngine":
     """
-    创建RAG引擎实例
+    创建RAG引擎实例（混合架构版本）
 
     Args:
         config: RAG配置
@@ -171,15 +166,18 @@ def create_rag_engine(config: RAGConfig, context) -> "HybridRAGEngine":
 
     Returns:
         RAG引擎实例（HybridRAGEngine）
+
+    Example:
+        >>> engine = create_rag_engine(config, context)
+        >>> result = await engine.search("attention机制")
     """
+    # 延迟导入避免循环依赖
     from .hybrid_rag import HybridRAGEngine
 
     logger.info("✅ 使用混合架构 RAG引擎（HybridRAGEngine）")
     logger.info("   - 自定义PDF解析（多模态）")
     logger.info("   - 语义分块")
     logger.info("   - Milvus向量存储")
-    logger.info("   - BGE-M3 稀疏权重 + 稠密向量检索")
-    if config.enable_multi_vector_rerank:
-        logger.info("   - ColBERT 多向量 reranking")
+    logger.info("   - LLM生成（支持多模态）")
 
     return HybridRAGEngine(config, context)
