@@ -12,6 +12,7 @@
 import asyncio
 import os
 import re
+import shutil
 import time
 import base64
 from typing import List, Dict, Any, Optional, Union, cast
@@ -1389,7 +1390,8 @@ class HybridRAGEngine:
             self._parser = HybridPDFParser(
                 enable_multimodal=self.config.enable_multimodal,
                 chunk_size=self.config.chunk_size,
-                chunk_overlap=self.config.chunk_overlap
+                chunk_overlap=self.config.chunk_overlap,
+                enable_llm_preprocess=self.config.enable_llm_preprocess,
             )
             self._parser_initialized = True
             logger.info("✅ HybridPDFParser初始化完成")
@@ -2965,8 +2967,6 @@ Answer requirements:
         Returns:
             精确的evidence spans列表
         """
-        import re
-
         # 提取关键词
         query_keywords = set(re.findall(r'\b[a-z]{4,}\b', query.lower()))
         answer_keywords = set(re.findall(r'\b[a-z]{4,}\b', answer.lower())) if answer else set()
@@ -3101,8 +3101,6 @@ Answer requirements:
         Returns:
             True: 使用VLM，False: 使用纯文本LLM
         """
-        import re
-
         query_lower = query.lower()
 
         # 检查查询是否包含视觉关键词
@@ -3172,8 +3170,6 @@ Answer requirements:
         Returns:
             图片路径列表（去重，按相关性排序）
         """
-        import re
-
         image_paths = []  # (path, priority) 元组列表
         seen = set()
         paper_ids_with_visual_content: dict[str, set[str]] = {}  # paper_id -> 提及的figure集合
@@ -3275,7 +3271,6 @@ Answer requirements:
         Returns:
             (question_type: str, threshold: float)
         """
-        import re
         query_lower = query.lower()
 
         # 1. Boolean类型检测 - 包含明确的是/否关键词
@@ -3480,6 +3475,19 @@ Output only JSON, no other text:"""
                 # 刷新 BM25 索引
                 if self.config.enable_bm25:
                     index_manager.refresh_bm25_index()
+
+                # 清理物理文件：figures、tables、db 文件
+                plugin_data_dir = Path(__file__).parent.parent.parent / "data"
+                for subdir in ["figures", "tables"]:
+                    subdir_path = plugin_data_dir / subdir
+                    if subdir_path.exists():
+                        shutil.rmtree(subdir_path)
+                        subdir_path.mkdir(parents=True, exist_ok=True)
+
+                # 删除 Milvus 数据库文件
+                for db_file in plugin_data_dir.glob("milvus_*.db"):
+                    db_file.unlink(missing_ok=True)
+
                 return {
                     "status": "success",
                     "message": "知识库已清空"

@@ -13,10 +13,10 @@
     "embedding_mode": {
         "description": "Embedding模式",
         "type": "string",
-        "hint": "选择embedding服务模式。API模式使用Gemini/OpenAI等云端服务；Ollama/Unsloth模式使用本地BGE-M3模型，完全免费且无限制（推荐）",
+        "hint": "选择embedding服务模式。API模式使用Gemini/OpenAI等云端服务；Unsloth模式使用本地BGE-M3模型，完全免费且无限制（推荐）",
         "obvious_hint": true,
-        "default": "ollama",
-        "enum": ["api", "ollama", "unsloth"]
+        "default": "unsloth",
+        "enum": ["api", "unsloth"]
     },
     "embedding_provider_id": {
         "description": "Embedding 服务提供商（API模式）",
@@ -227,7 +227,7 @@
         "maximum": 2048
     },
     "chunk_overlap": {
-        "description": "分块重叠大小（字符数）",
+        "description": "分块重叠大小（tokens数）",
         "type": "int",
         "hint": "相邻块之间的重叠字符数，用于保留上下文连贯性。默认0（禁用重叠）",
         "default": 0,
@@ -235,10 +235,10 @@
         "maximum": 256
     },
     "min_chunk_size": {
-        "description": "最小分块大小（字符数）",
+        "description": "最小分块大小（tokens数）",
         "type": "int",
         "hint": "小于此大小的块会被合并到相邻块中",
-        "default": 100,
+        "default": 128,
         "minimum": 50,
         "maximum": 512
     },
@@ -305,57 +305,16 @@
         "minimum": 0.0,
         "maximum": 1.0
     },
-    "enable_reranking": {
-        "description": "是否启用重排序功能",
+    "enable_bm25": {
+        "description": "是否启用 BM25 精确匹配",
         "type": "bool",
-        "hint": "启用后将使用 ColBERT 多向量进行 reranking，提升检索精度。需要更多内存。",
-        "default": false
-    },
-    "reranking_model": {
-        "description": "重排序模型名称（已废弃，使用 ColBERT 多向量）",
-        "type": "string",
-        "hint": "此配置已废弃，reranking 现使用 BGE-M3 的多向量输出",
-        "obvious_hint": true,
-        "default": "BAAI/bge-reranker-v2-m3",
-        "minLength": 1
-    },
-    "reranking_device": {
-        "description": "重排序模型运行设备（已废弃）",
-        "type": "string",
-        "hint": "此配置已废弃，reranking 使用 Unsloth 本地模型",
-        "obvious_hint": true,
-        "default": "auto"
-    },
-    "reranking_adaptive": {
-        "description": "是否使用自适应重排序（已废弃）",
-        "type": "bool",
-        "hint": "此配置已废弃",
+        "hint": "BM25 与稀疏权重检索是互补的：稀疏权重负责语义+关键词混合召回，BM25 负责更严格的精确匹配补充。建议在需要作者名、论文题目、年份等精确匹配时开启。",
         "default": true
     },
-    "reranking_threshold": {
-        "description": "重排序分数阈值（已废弃）",
-        "type": "float",
-        "default": 0.0,
-        "minimum": 0.0,
-        "maximum": 1.0
-    },
-    "reranking_batch_size": {
-        "description": "重排序批处理大小（已废弃）",
-        "type": "int",
-        "default": 32,
-        "minimum": 1,
-        "maximum": 128
-    },
-    "enable_bm25": {
-        "description": "是否启用 BM25（已废弃，使用稀疏权重替代）",
-        "type": "bool",
-        "hint": "此配置已废弃，请使用 enable_sparse_retrieval 代替。BM25 功能已被 BGE-M3 稀疏权重取代",
-        "default": false
-    },
     "bm25_top_k": {
-        "description": "BM25 召回数量（已废弃，复用为 sparse_top_k）",
+        "description": "BM25 召回数量",
         "type": "int",
-        "hint": "此配置已废弃，复用为 sparse_top_k",
+        "hint": "BM25 召回的候选数量，建议大于最终 top_k，便于后续融合与重排序",
         "default": 20,
         "minimum": 5,
         "maximum": 100
@@ -386,38 +345,6 @@
         "hint": "从 https://github.com/popjane/free_chatgpt_api 获取的API密钥",
         "obvious_hint": true,
         "default": ""
-    },
-    "ollama": {
-        "description": "Ollama本地Embedding配置（已废弃，内部使用Unsloth）",
-        "type": "object",
-        "hint": "此配置已废弃，请使用 unsloth 配置。Ollama 模式现在内部使用 Unsloth BGE-M3 替代",
-        "obvious_hint": true,
-        "items": {
-            "base_url": {
-                "description": "Ollama服务地址",
-                "type": "string",
-                "default": "http://localhost:11434"
-            },
-            "model": {
-                "description": "Ollama模型名称",
-                "type": "string",
-                "default": "bge-m3"
-            },
-            "timeout": {
-                "description": "请求超时时间（秒）",
-                "type": "float",
-                "default": 300.0,
-                "minimum": 10.0,
-                "maximum": 600.0
-            },
-            "batch_size": {
-                "description": "并发批处理大小",
-                "type": "int",
-                "default": 10,
-                "minimum": 1,
-                "maximum": 50
-            }
-        }
     },
     "unsloth": {
         "description": "Unsloth 本地 BGE-M3 配置",

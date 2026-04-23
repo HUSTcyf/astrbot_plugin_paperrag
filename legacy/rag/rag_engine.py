@@ -65,6 +65,9 @@ class RAGConfig:
     enable_multimodal: bool = True
     figures_dir: str = ""  # 空则使用插件目录下的 data/figures
 
+    # LLM预处理配置
+    enable_llm_preprocess: bool = True  # 使用本地 LLM 预处理 PDF 文本（提取标题/摘要/紧凑化）
+
     # 重排序配置
     enable_reranking: bool = False
     reranking_model: str = "BAAI/bge-reranker-v2-m3"

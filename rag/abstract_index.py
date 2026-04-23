@@ -18,12 +18,44 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Set, cast
 from dataclasses import dataclass
 
-from astrbot.api import logger
+try:
+    from astrbot.api import logger
+except Exception:  # pragma: no cover - standalone / test fallback
+    import logging
+
+    logger = logging.getLogger(__name__)
 
 # 延迟导入
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from pymilvus import Collection
+
+try:
+    from .paper_link_resolver import LinkResolution, PaperLinkResolver
+except ImportError:
+    from paper_link_resolver import LinkResolution, PaperLinkResolver
+
+
+_PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_DATA_DIR = _PLUGIN_ROOT / "data"
+
+
+def is_placeholder_title(title: str) -> bool:
+    """判断标题是否像文件名、arXiv 编号这类占位内容。"""
+    if not title:
+        return True
+
+    normalized = re.sub(r"\s+", " ", title).strip()
+    if len(normalized) < 8:
+        return True
+
+    if re.fullmatch(r"\d{4}\.\d{4,5}(?:v\d+)?(?:\([^)]+\))?", normalized):
+        return True
+
+    if re.fullmatch(r"[A-Za-z0-9._\-()]+", normalized) and len(normalized) <= 40:
+        return True
+
+    return False
 
 
 # ============================================================================
@@ -46,8 +78,7 @@ class LocalGGUFClient:
         """解析模型路径（相对于插件目录）"""
         if os.path.isabs(path):
             return path
-        plugin_dir = Path(__file__).parent.resolve()
-        return str(plugin_dir / path)
+        return str((_PLUGIN_ROOT / path).resolve())
 
     async def load(self) -> bool:
         """加载 GGUF 模型"""
@@ -104,10 +135,13 @@ class LocalGGUFClient:
         prompt = f"""从以下论文内容中提取标题和摘要。
 
 要求：
-1. 标题：返回论文的完整标题（通常在页面顶部），保持原文语言
-2. 摘要：只返回摘要部分，完全保持原文语言（英文就返回英文，中文就返回中文），不要翻译，不要润色或修改
-3. 如果内容明显不是论文，返回空标题和空摘要
-4. 严格按照以下JSON格式返回，不要添加任何其他内容：
+1. 标题：返回论文的完整标题，只能根据论文正文判断，不能使用文件名、arXiv ID、编号或简称代替标题
+2. 标题应来自页面顶部的主标题文本，保持原文语言，不要翻译、不要改写、不要补全猜测
+3. 标题后面的作者行、机构行不要并入标题
+4. 摘要：只返回摘要部分，完全保持原文语言（英文就返回英文，中文就返回中文），不要翻译，不要润色或修改
+5. 如果标题无法可靠识别，请返回空字符串，不要猜测
+6. 如果内容明显不是论文，返回空标题和空摘要
+7. 严格按照以下JSON格式返回，不要添加任何其他内容：
 {{"title": "论文标题", "abstract": "摘要内容"}}
 
 论文内容：
@@ -145,6 +179,10 @@ JSON："""
             title = data.get("title", "").strip('"\n ')
             abstract = data.get("abstract", "").strip('"\n ')
 
+            # 过滤明显的占位标题，避免把文件名/编号当成论文标题
+            if is_placeholder_title(title):
+                title = ""
+
             # 验证结果
             if len(abstract) < 30:
                 logger.debug(f"摘要太短，可能是无效内容")
@@ -163,13 +201,15 @@ JSON："""
     def _extract_title_abstract_fallback(self, text: str) -> tuple[Optional[str], Optional[str]]:
         """备用提取：当 JSON 解析失败时使用正则表达式提取"""
         try:
-            import re
             # 尝试匹配 JSON 中的 title 和 abstract
             title_match = re.search(r'"title"\s*:\s*"([^"]+)"', text[:500])
             abstract_match = re.search(r'"abstract"\s*:\s*"([^"]+)"', text)
 
             title = title_match.group(1) if title_match else None
             abstract = abstract_match.group(1) if abstract_match else None
+
+            if title and is_placeholder_title(title):
+                title = None
 
             if abstract and len(abstract) >= 30:
                 return title, abstract
@@ -276,7 +316,7 @@ class AbstractExtractor:
             full_text = ""
 
             for page_num in range(min(len(doc), 5)):  # 只看前5页
-                page = doc[page_num]
+                page = cast(pymupdf.Page, doc[page_num])
                 text = page.get_text()
                 if text:
                     full_text += str(text) + "\n"
@@ -368,13 +408,136 @@ class AbstractExtractor:
 
         return abstract_text if abstract_text else None
 
+    def extract_title_from_text(self, full_text: str) -> Optional[str]:
+        """从论文开头文本中启发式提取标题。"""
+        if not full_text:
+            return None
+
+        lines = [re.sub(r"\s+", " ", line).strip() for line in full_text.split("\n")]
+        title_candidates: List[str] = []
+
+        for line in lines[:40]:
+            if not line:
+                if title_candidates:
+                    break
+                continue
+
+            if self._is_title_boundary(line):
+                break
+
+            if self._is_noise_title_line(line):
+                continue
+
+            if len(line) < 8:
+                continue
+
+            alpha_count = len(re.findall(r"[A-Za-z\u4e00-\u9fff]", line))
+            if alpha_count < 4:
+                continue
+
+            if not title_candidates:
+                title_candidates.append(line)
+                continue
+
+            if self._looks_like_title_continuation(title_candidates[-1], line):
+                title_candidates.append(line)
+            break
+
+        if not title_candidates:
+            return None
+
+        title = " ".join(title_candidates[:2]).strip(" -:|")
+        return title if title else None
+
+    def _is_title_boundary(self, line: str) -> bool:
+        """判断是否已经进入摘要/正文等标题边界。"""
+        for pattern in self.ABSTRACT_KEYWORDS + self.INTRODUCTION_KEYWORDS:
+            if re.match(pattern, line, re.IGNORECASE):
+                return True
+        return False
+
+    def _is_noise_title_line(self, line: str) -> bool:
+        """过滤显然不是标题的行。"""
+        lowered = line.lower()
+        noise_patterns = [
+            r'^arxiv[:\s]',
+            r'^\d{4}\.\d{4,5}(?:v\d+)?',
+            r'^https?://',
+            r'^copyright',
+            r'^submitted',
+            r'^accepted',
+            r'^published',
+            r'^keywords?[:\s]',
+            r'^(author|authors)[:\s]',
+            r'^(affiliation|institute|university|school|department)[:\s]',
+        ]
+        for pattern in noise_patterns:
+            if re.match(pattern, lowered, re.IGNORECASE):
+                return True
+
+        if '@' in line:
+            return True
+
+        if line.count(',') >= 3 and len(line) < 120:
+            return True
+
+        return False
+
+    def _is_author_like_line(self, line: str) -> bool:
+        """判断一行是否更像作者名而不是标题延续。"""
+        normalized = re.sub(r"\s+", " ", line).strip(" ,;:|")
+        if not normalized or len(normalized) > 80:
+            return False
+
+        if any(ch in normalized for ch in "@/\\"):
+            return False
+
+        words = normalized.split()
+        if not 1 <= len(words) <= 5:
+            return False
+
+        stopwords = {"and", "of", "for", "the", "a", "an", "on", "in", "with", "to", "by", "from", "via"}
+        if any(word.lower() in stopwords for word in words):
+            return False
+
+        cleaned_words = [re.sub(r"[^A-Za-z\u00C0-\u024F\u1E00-\u1EFF'’´-]", "", word) for word in words]
+        if any(not word for word in cleaned_words):
+            return False
+
+        return all(word[0].isupper() for word in cleaned_words)
+
+    def _looks_like_title_continuation(self, prev_line: str, line: str) -> bool:
+        """判断下一行是否像标题的续行，而不是作者行。"""
+        if self._is_author_like_line(line):
+            return False
+
+        prev = re.sub(r"\s+", " ", prev_line).strip(" -:|")
+        nxt = re.sub(r"\s+", " ", line).strip()
+        if not prev or not nxt:
+            return False
+
+        if prev.endswith(("-", ":", ";", ",", "—", "–", "/")):
+            return True
+
+        prev_words = prev.split()
+        if prev_words:
+            last_word = re.sub(r"[^A-Za-z\u00C0-\u024F\u1E00-\u1EFF]+", "", prev_words[-1].lower())
+            if last_word in {"of", "for", "and", "in", "with", "to", "the", "a", "an", "on", "by", "from", "via"}:
+                return True
+
+        if len(prev_words) <= 4 and len(prev) < 45 and nxt[:1].islower():
+            return True
+
+        return False
+
     def extract_title_from_pdf(self, pdf_path: str) -> Optional[str]:
         """
         从 PDF 文件提取标题
 
         策略：
         1. 提取 PDF 元数据中的标题
-        2. 如果没有，使用文件名前缀
+        2. 从第一页顶部文本中启发式提取标题
+        3. 如果没有，再使用文件名前缀
 
         Args:
             pdf_path: PDF 文件路径
@@ -392,15 +555,33 @@ class AbstractExtractor:
             if metadata:
                 title = metadata.get('title', '')
                 if title and title.strip():
-                    doc.close()
-                    return title.strip()
+                    cleaned_title = title.strip()
+                    if not is_placeholder_title(cleaned_title):
+                        doc.close()
+                        return cleaned_title
 
-            # 使用文件名前缀作为标题
+            # 从第一页文本中启发式提取标题
+            try:
+                if len(doc) > 0:
+                    page_text = doc[0].get_text()
+                    heuristic_title = self.extract_title_from_text(page_text)
+                    if heuristic_title:
+                        doc.close()
+                        return heuristic_title
+            except Exception:
+                pass
+
+            # 使用文件名前缀作为最后兜底
             doc.close()
             filename = os.path.basename(pdf_path)
             title = os.path.splitext(filename)[0]
-            # 移除常见后缀
-            title = re.sub(r'[_-]?(v\d+)?(\.pdf)?$', '', title, flags=re.IGNORECASE)
+            # 尝试去掉 arXiv ID / 版本号，优先保留更像标题的部分
+            m = re.match(r'^\d{4}\.\d{4,5}(?:v\d+)?\((.+)\)$', title)
+            if m:
+                return m.group(1).strip()
+            m = re.match(r'^\d{4}\.\d{4,5}(?:v\d+)?[ _-]+(.+)$', title)
+            if m:
+                return m.group(1).strip()
             return title if title else None
 
         except Exception as e:
@@ -445,7 +626,9 @@ class AbstractIndexManager:
         collection_name: str = "paper_abstracts",
         embed_dim: int = 1024,
         embed_model = None,
-        alias: str = "abstract_index"
+        alias: str = "abstract_index",
+        core_api_key: Optional[str] = None,
+        use_arxiv_api: bool = True
     ):
         """
         Args:
@@ -462,13 +645,21 @@ class AbstractIndexManager:
         self._llm_client = None
         self._is_connected = False
         self._collection = None
+        self._core_api_key = core_api_key or ""
+        self._use_arxiv_api = use_arxiv_api
+        self._link_resolver = PaperLinkResolver(
+            core_api_key=self._core_api_key,
+            enable_crossref=True,
+            enable_openalex=True,
+            enable_arxiv_library=self._use_arxiv_api,
+            log_prefix="[AbstractIndex]",
+        )
 
         # 解析路径
         if milvus_uri:
-            self._db_path = milvus_uri if milvus_uri else "./data/milvus_abstracts.db"
+            self._db_path = self._resolve_db_path(milvus_uri)
         else:
-            plugin_dir = Path(__file__).parent
-            self._db_path = str(plugin_dir / "data" / "milvus_abstracts.db")
+            self._db_path = str(_DEFAULT_DATA_DIR / "milvus_abstracts.db")
 
         # 确保目录存在
         db_dir = os.path.dirname(self._db_path)
@@ -482,6 +673,13 @@ class AbstractIndexManager:
         self._doc_stats_file = self._db_path.replace('.db', '_doc_stats.json')
 
         logger.info(f"✅ AbstractIndexManager 初始化完成 (collection={collection_name}, dim={embed_dim})")
+
+    def _resolve_db_path(self, db_path: str) -> str:
+        """将 Milvus Lite 路径统一解析到插件根目录的 data/ 下。"""
+        path = Path(db_path).expanduser()
+        if path.is_absolute():
+            return str(path.resolve())
+        return str((_PLUGIN_ROOT / path).resolve())
 
     def set_embed_model(self, embed_model):
         """设置 embedding 模型"""
@@ -512,6 +710,10 @@ class AbstractIndexManager:
         except Exception as e:
             logger.warning(f"提取论文开头失败 {pdf_path}: {e}")
             return None
+
+    async def _resolve_links_by_title(self, title: str) -> LinkResolution:
+        """按标题解析 arXiv / GitHub / DOI 链接。"""
+        return await self._link_resolver.resolve_by_title(title)
 
     async def initialize(self):
         """初始化连接和 collection"""
@@ -597,7 +799,7 @@ class AbstractIndexManager:
             self._abstract_cache = {}
 
     def _save_doc_stats(self):
-        """保存文档统计"""
+        """保存文档统计（不含 vector，vector 只存在向量数据库中）"""
         if not self._doc_stats_file:
             return
 
@@ -613,7 +815,6 @@ class AbstractIndexManager:
                         'file_name': v.file_name,
                         'title': v.title,
                         'abstract_text': v.abstract_text,
-                        'vector': v.vector,
                         'metadata': v.metadata
                     }
                     for k, v in self._abstract_cache.items()
@@ -625,6 +826,21 @@ class AbstractIndexManager:
 
         except Exception as e:
             logger.warning(f"⚠️ 保存摘要统计失败: {e}")
+
+    def _reset_doc_stats(self):
+        """将摘要统计文件重置为空对象。"""
+        if not self._doc_stats_file:
+            return
+
+        try:
+            db_dir = os.path.dirname(self._doc_stats_file)
+            if db_dir and not os.path.exists(db_dir):
+                os.makedirs(db_dir, exist_ok=True)
+
+            with open(self._doc_stats_file, 'w', encoding='utf-8') as f:
+                f.write("{}")
+        except Exception as e:
+            logger.warning(f"⚠️ 重置摘要统计失败: {e}")
 
     async def index_paper(
         self,
@@ -653,25 +869,67 @@ class AbstractIndexManager:
 
         try:
             extractor = AbstractExtractor()
+            normalized_metadata = dict(metadata or {})
+            normalized_metadata.setdefault("source_path", pdf_path)
+            normalized_metadata.setdefault("source_kind", "pdf")
+            normalized_metadata.setdefault("file_name", file_name)
+            normalized_metadata.setdefault("paper_id", paper_id)
 
-            # LLM 同时提取标题和摘要（优先）
-            if self._llm_client is not None and (not abstract_text or not title):
-                paper_beginning = await self._extract_paper_beginning(pdf_path)
-                if paper_beginning:
-                    llm_title, llm_abstract = await self._llm_client.extract_title_and_abstract(paper_beginning)
-                    if llm_abstract and len(llm_abstract) >= 30:
-                        abstract_text = llm_abstract
-                    if llm_title:
-                        title = llm_title
+            title_source = "provided" if title else ""
+            abstract_source = "provided" if abstract_text else ""
+            paper_beginning: Optional[str] = None
 
-            # 常规提取（回退）- 标题和摘要分别提取
-            if not abstract_text or len(abstract_text) < 50:
-                abstract_text = await extractor.extract_abstract_from_pdf(pdf_path)
+            def _is_placeholder(candidate: str) -> bool:
+                normalized = re.sub(r"\s+", "", candidate or "").lower()
+                paper_norm = re.sub(r"\s+", "", paper_id or "").lower()
+                file_norm = re.sub(r"\s+", "", os.path.splitext(file_name)[0]).lower()
+                if not normalized:
+                    return True
+                if normalized in {paper_norm, file_norm}:
+                    return True
+                if re.fullmatch(r"\d{4}\.\d{4,5}(?:v\d+)?(?:\([^)]+\))?", candidate.strip()):
+                    return True
+                if len(re.sub(r"[^A-Za-z\u4e00-\u9fff]", "", candidate)) < 4:
+                    return True
+                return False
 
-            if not title:
-                extracted_title = extractor.extract_title_from_pdf(pdf_path)
-                if extracted_title:
-                    title = extracted_title
+            if title and _is_placeholder(title):
+                title = ""
+                title_source = ""
+
+            # 如果已有有效的标题和摘要，跳过提取
+            has_valid_title = bool(title and len(title) > 0 and not _is_placeholder(title))
+            has_valid_abstract = bool(abstract_text and len(abstract_text) >= 50)
+
+            if not has_valid_title or not has_valid_abstract:
+                # 本地 LLM 优先处理标题和摘要，规则提取只做兜底
+                if self._llm_client is not None:
+                    paper_beginning = await self._extract_paper_beginning(pdf_path)
+                    if paper_beginning:
+                        llm_title, llm_abstract = await self._llm_client.extract_title_and_abstract(paper_beginning)
+                        if llm_title and not _is_placeholder(llm_title):
+                            title = llm_title
+                            title_source = "llm"
+                            has_valid_title = True
+                        if llm_abstract and len(llm_abstract) >= 30 and not abstract_text:
+                            abstract_text = llm_abstract
+                            abstract_source = "llm"
+                            has_valid_abstract = True
+
+                # 标题规则提取作为 LLM 失败后的回退
+                if not has_valid_title:
+                    extracted_title = extractor.extract_title_from_pdf(pdf_path)
+                    if extracted_title:
+                        title = extracted_title
+                        title_source = "pdf"
+                        has_valid_title = True
+
+                # 摘要规则提取作为 LLM 失败后的回退
+                if not has_valid_abstract:
+                    abstract_text = await extractor.extract_abstract_from_pdf(pdf_path)
+                    if abstract_text:
+                        abstract_source = "pdf_text"
+                        has_valid_abstract = True
 
             if not abstract_text or len(abstract_text) < 50:
                 logger.warning(f"未找到有效摘要: {file_name}")
@@ -679,6 +937,29 @@ class AbstractIndexManager:
 
             if not title:
                 title = file_name.replace('.pdf', '').replace('.PDF', '')
+                title_source = "filename"
+
+            if not normalized_metadata.get("arxiv_url") and not normalized_metadata.get("github_url") and not normalized_metadata.get("doi_url"):
+                resolution = await self._link_resolver.resolve_from_pdf(pdf_path, title_hint=title)
+                if resolution.arxiv_url:
+                    normalized_metadata["arxiv_url"] = resolution.arxiv_url
+                if resolution.github_url:
+                    normalized_metadata["github_url"] = resolution.github_url
+                if resolution.doi_url:
+                    normalized_metadata["doi_url"] = resolution.doi_url
+                if resolution.resolution_source:
+                    normalized_metadata["resolution_source"] = resolution.resolution_source
+                if resolution.resolution_score:
+                    normalized_metadata["resolution_score"] = resolution.resolution_score
+                if resolution.matched_title:
+                    normalized_metadata["matched_title"] = resolution.matched_title
+                if resolution.matched_identifier:
+                    normalized_metadata["matched_identifier"] = resolution.matched_identifier
+
+            normalized_metadata.setdefault("title_source", title_source or "unknown")
+            normalized_metadata.setdefault("abstract_source", abstract_source or "unknown")
+            normalized_metadata.setdefault("extracted_title", title)
+            normalized_metadata.setdefault("extracted_abstract_chars", len(abstract_text))
 
             # 生成向量（使用标题 + 摘要的组合）
             if self._embed_model is None:
@@ -713,7 +994,7 @@ class AbstractIndexManager:
                 title=title,
                 abstract_text=abstract_text,
                 vector=vector,
-                metadata=metadata or {}
+                metadata=normalized_metadata
             )
             self._save_doc_stats()
 
@@ -920,13 +1201,19 @@ class AbstractIndexManager:
     def clear(self) -> bool:
         """清除摘要索引（删除 collection）"""
         try:
-            from pymilvus import utility
+            from pymilvus import utility, connections
             if utility.has_collection(self._collection_name, using=self.alias):
                 utility.drop_collection(self._collection_name, using=self.alias)  # type: ignore[func-returns-value]
                 logger.info("✅ 摘要索引已清除")
+            # 断开别名连接，避免 "already creating connections" 错误
+            try:
+                connections.disconnect(alias=self.alias)
+            except Exception:
+                pass
             self._collection = None
             self._is_connected = False
             self._abstract_cache = {}
+            self._reset_doc_stats()
             return True
         except Exception as e:
             logger.error(f"❌ 清除摘要索引失败: {e}")

@@ -129,7 +129,6 @@ def _read_table_csv_as_text(csv_path: str, max_rows: int = 50) -> str:
     Returns:
         表格的文本表示
     """
-    from pathlib import Path
     import csv
     import io
 
@@ -235,7 +234,6 @@ def chunks_to_documents(
     """
     from collections import defaultdict
     from llama_index.core import Document as LIDocument
-    from pathlib import Path
 
     # 确定 figures 目录
     if not figures_dir:
@@ -703,8 +701,6 @@ async def generate_multimodal_testset(
         embed_base_url=llm_base_url,
         embed_api_key=llm_api_key,
         embedding_mode="api",
-        ollama_base_url="http://localhost:11434",
-        ollama_embed_model="bge-m3",
         max_rpm=max_rpm,
     )
 
@@ -865,11 +861,9 @@ async def generate_testset_from_documents(
     llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
     llm_api_key: str = "",
     embedding_model: str = "text-embedding-v3",
-    embed_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
+    embed_base_url: str = "",  # 强制留空，使用 freeapi_url
     embed_api_key: str = "",
     embedding_mode: str = "api",
-    ollama_base_url: str = "http://localhost:11434",
-    ollama_embed_model: str = "bge-m3",
     max_rpm: int = 96,
 ) -> List[Any]:
     """使用 Ragas 生成测试集"""
@@ -887,8 +881,6 @@ async def generate_testset_from_documents(
         embed_base_url=embed_base_url,
         embed_api_key=embed_api_key,
         embedding_mode=embedding_mode,
-        ollama_base_url=ollama_base_url,
-        ollama_embed_model=ollama_embed_model,
         max_rpm=max_rpm,
     )
 
@@ -915,11 +907,9 @@ async def run_evaluation(
     llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
     llm_api_key: str = "",
     embedding_model: str = "text-embedding-v3",
-    embed_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
+    embed_base_url: str = "",  # 强制留空，使用 freeapi_url
     embed_api_key: str = "",
-    embedding_mode: str = "ollama",
-    ollama_base_url: str = "http://localhost:11434",
-    ollama_embed_model: str = "bge-m3",
+    embedding_mode: str = "api",
     eval_embedding_mode: str = "api",
 ) -> Any:
     """执行 Ragas 评估"""
@@ -936,9 +926,7 @@ async def run_evaluation(
         embedding_model=embedding_model,
         embed_base_url=embed_base_url,
         embed_api_key=embed_api_key,
-        embedding_mode=eval_embedding_mode,  # 评估用独立的 embedding 模式
-        ollama_base_url=ollama_base_url,
-        ollama_embed_model=ollama_embed_model,
+        embedding_mode=embedding_mode,
     )
 
     results = await evaluator.evaluate(
@@ -960,11 +948,9 @@ async def run_evaluation_from_raw_answers(
     llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
     llm_api_key: str = "",
     embedding_model: str = "text-embedding-v3",
-    embed_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
+    embed_base_url: str = "",  # 强制留空，使用 freeapi_url
     embed_api_key: str = "",
     embedding_mode: str = "api",
-    ollama_base_url: str = "http://localhost:11434",
-    ollama_embed_model: str = "bge-m3",
 ) -> Any:
     """从已有 raw_answers.json 执行 Ragas 评估（跳过 RAG 推理）"""
     print(f"\n{'='*60}")
@@ -981,8 +967,6 @@ async def run_evaluation_from_raw_answers(
         embed_base_url=embed_base_url,
         embed_api_key=embed_api_key,
         embedding_mode=embedding_mode,
-        ollama_base_url=ollama_base_url,
-        ollama_embed_model=ollama_embed_model,
     )
 
     results = await evaluator.evaluate_from_raw_answers(
@@ -1043,11 +1027,9 @@ async def run_full_pipeline(
     llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
     llm_api_key: str = "",
     embedding_model: str = "text-embedding-v3",
-    embed_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
+    embed_base_url: str = "",  # 强制留空，使用 freeapi_url
     embed_api_key: str = "",
     embedding_mode: str = "api",
-    ollama_base_url: str = "http://localhost:11434",
-    ollama_embed_model: str = "bge-m3",
     max_rpm: int = 96,
     plugin_version: str = "1.0.0",
     eval_llm_model: str = "gpt-4o-mini",
@@ -1102,8 +1084,6 @@ async def run_full_pipeline(
         embed_base_url=embed_base_url,
         embed_api_key=embed_api_key,
         embedding_mode=embedding_mode,
-        ollama_base_url=ollama_base_url,
-        ollama_embed_model=ollama_embed_model,
         max_rpm=max_rpm,
     )
 
@@ -1122,11 +1102,10 @@ async def run_full_pipeline(
         rag_cfg = json.load(f)
 
     config = RAGConfig(
-        embedding_mode=rag_cfg.get("embedding_mode", "ollama"),
+        embedding_mode=rag_cfg.get("embedding_mode", "unsloth"),
         embedding_provider_id=rag_cfg.get("embedding_provider_id", ""),
         compress_provider_id=rag_cfg.get("compress_provider_id", ""),
         text_provider_id=rag_cfg.get("text_provider_id", ""),
-        ollama_config=rag_cfg.get("ollama_config", {}),
         milvus_lite_path=str(plugin_dir / "data" / "milvus_papers.db"),
         address=rag_cfg.get("milvus", {}).get("address", ""),
         db_name=rag_cfg.get("milvus", {}).get("db_name", "default"),
@@ -1137,7 +1116,13 @@ async def run_full_pipeline(
         chunk_size=rag_cfg.get("chunk_size", 512),
         min_chunk_size=rag_cfg.get("min_chunk_size", 100),
         use_semantic_chunking=rag_cfg.get("use_semantic_chunking", True),
-        enable_reranking=rag_cfg.get("enable_reranking", False),
+        enable_sparse_retrieval=rag_cfg.get("enable_sparse_retrieval", True),
+        enable_multi_vector_rerank=rag_cfg.get("enable_multi_vector_rerank", False),
+        sparse_top_k=rag_cfg.get("sparse_top_k", 20),
+        hybrid_alpha=rag_cfg.get("hybrid_alpha", 0.5),
+        hybrid_rrf_k=rag_cfg.get("hybrid_rrf_k", 60),
+        enable_bm25=rag_cfg.get("enable_bm25", True),
+        bm25_top_k=rag_cfg.get("bm25_top_k", 20),
         enable_two_stage_retrieval=rag_cfg.get("enable_two_stage_retrieval", False),
     )
 
@@ -1165,8 +1150,6 @@ async def run_full_pipeline(
         embed_base_url=embed_base_url,
         embed_api_key=embed_api_key,
         embedding_mode=eval_embedding_mode,
-        ollama_base_url=ollama_base_url,
-        ollama_embed_model=ollama_embed_model,
     )
 
     # ========== 步骤 5: 生成报告 ==========
@@ -1258,23 +1241,21 @@ def main():
 
     # Embedding 配置
     parser.add_argument("--embedding-model", default="text-embedding-v3", help="Embedding 模型名称")
-    parser.add_argument("--embed-base-url", default="https://open.bigmodel.cn/api/paas/v4", help="Embedding API 基础 URL")
+    parser.add_argument("--embed-base-url", default="", help="Embedding API 基础 URL（使用 freeapi_url）")
     parser.add_argument("--embed-api-key", default="", help="Embedding API Key")
     parser.add_argument(
         "--embedding-mode",
-        choices=["api", "ollama"],
-        default="ollama",
-        help="Embedding 模式: api=使用远程API, ollama=使用本地 ollama (默认: ollama)"
+        choices=["api"],
+        default="api",
+        help="Embedding 模式: api=使用远程API (默认: api)"
     )
-    parser.add_argument("--ollama-base-url", default="http://localhost:11434", help="Ollama API 基础 URL")
-    parser.add_argument("--ollama-embed-model", default="bge-m3", help="Ollama Embedding 模型名称")
 
-    # 评估用 Embedding 配置（默认使用 API 以保证兼容性）
+    # 评估用 Embedding 配置
     parser.add_argument(
         "--eval-embedding-mode",
-        choices=["api", "ollama"],
-        default="ollama",
-        help="评估指标用 Embedding 模式: api=使用远程API, ollama=使用本地 ollama (默认)"
+        choices=["api"],
+        default="api",
+        help="评估指标用 Embedding 模式: api=使用远程API (默认)"
     )
 
     # 评测参数
@@ -1308,13 +1289,13 @@ def main():
         if config_freeapi_key and not llm_api_key:
             llm_api_key = config_freeapi_key
             print(f"✅ 已从插件配置加载 freeapi key")
-        if config_freeapi_url and args.llm_base_url == "https://open.bigmodel.cn/api/paas/v4":
+        if config_freeapi_url:
             llm_base_url = config_freeapi_url + "/v1/"
             # freeapi 同时用于 LLM 和 Embedding
             embed_base_url = config_freeapi_url + "/v1/"
             print(f"✅ 已从插件配置加载 freeapi: {llm_base_url}")
         else:
-            llm_base_url = args.llm_base_url
+            llm_base_url = args.llm_base_url or "https://open.bigmodel.cn/api/paas/v4"
     else:
         llm_base_url = args.llm_base_url
 
@@ -1325,9 +1306,8 @@ def main():
     print(f"   Embedding 模型: {args.embedding_model}")
     print(f"   Embedding API URL: {embed_base_url}")
     print(f"   Embedding 模式: {args.embedding_mode}")
-    if args.embedding_mode == "ollama":
-        print(f"   Ollama 地址: {args.ollama_base_url}")
-        print(f"   Ollama Embed 模型: {args.ollama_embed_model}")
+    if args.embedding_mode == "unsloth":
+        print(f"   Embedding 模式: Unsloth (本地 BGE-M3)")
 
     if not llm_api_key:
         print("⚠️ 警告: 未提供 API Key（设置 EVAL_LLM_API_KEY 环境变量或使用 --llm-api-key）")
@@ -1350,8 +1330,6 @@ def main():
             embed_base_url=embed_base_url,
             embed_api_key=embed_api_key,
             embedding_mode=args.embedding_mode,
-            ollama_base_url=args.ollama_base_url,
-            ollama_embed_model=args.ollama_embed_model,
             max_rpm=args.max_rpm,
             plugin_version=args.plugin_version,
             eval_llm_model=args.eval_llm_model,
@@ -1390,8 +1368,6 @@ def main():
             embed_base_url=embed_base_url,
             embed_api_key=embed_api_key,
             embedding_mode=args.embedding_mode,
-            ollama_base_url=args.ollama_base_url,
-            ollama_embed_model=args.ollama_embed_model,
             max_rpm=args.max_rpm,
         ))
 
@@ -1424,8 +1400,6 @@ def main():
                 embed_base_url=embed_base_url,
                 embed_api_key=embed_api_key,
                 embedding_mode=args.embedding_mode,
-                ollama_base_url=args.ollama_base_url,
-                ollama_embed_model=args.ollama_embed_model,
             ))
         else:
             # 正常流程：RAG 推理 + 评估
@@ -1451,20 +1425,11 @@ def main():
             else:
                 rag_cfg = {}
 
-            # 当 embedding_mode 为 ollama 时，确保 ollama_config 不为空
-            ollama_cfg = rag_cfg.get("ollama_config") or {}
-            if args.embedding_mode == "ollama" and not ollama_cfg:
-                ollama_cfg = {
-                    "model": args.ollama_embed_model,
-                    "base_url": args.ollama_base_url,
-                }
-
             config = RAGConfig(
                 embedding_mode=args.embedding_mode,
                 embedding_provider_id=rag_cfg.get("embedding_provider_id", ""),
                 compress_provider_id=rag_cfg.get("compress_provider_id", ""),
                 text_provider_id=rag_cfg.get("text_provider_id", ""),
-                ollama_config=ollama_cfg,
                 milvus_lite_path=str(plugin_dir / "data" / "milvus_papers.db"),
                 address=rag_cfg.get("milvus", {}).get("address", ""),
                 db_name=rag_cfg.get("milvus", {}).get("db_name", "default"),
@@ -1475,7 +1440,13 @@ def main():
                 chunk_size=rag_cfg.get("chunk_size", 512),
                 min_chunk_size=rag_cfg.get("min_chunk_size", 100),
                 use_semantic_chunking=rag_cfg.get("use_semantic_chunking", True),
-                enable_reranking=rag_cfg.get("enable_reranking", False),
+                enable_sparse_retrieval=rag_cfg.get("enable_sparse_retrieval", True),
+                enable_multi_vector_rerank=rag_cfg.get("enable_multi_vector_rerank", False),
+                sparse_top_k=rag_cfg.get("sparse_top_k", 20),
+                hybrid_alpha=rag_cfg.get("hybrid_alpha", 0.5),
+                hybrid_rrf_k=rag_cfg.get("hybrid_rrf_k", 60),
+                enable_bm25=rag_cfg.get("enable_bm25", True),
+                bm25_top_k=rag_cfg.get("bm25_top_k", 20),
                 enable_two_stage_retrieval=rag_cfg.get("enable_two_stage_retrieval", False),
             )
 

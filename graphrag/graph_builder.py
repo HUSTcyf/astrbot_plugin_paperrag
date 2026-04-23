@@ -29,6 +29,8 @@ from dataclasses import dataclass, field
 
 from astrbot.api import logger
 
+_PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+
 # 延迟导入避免循环依赖
 if TYPE_CHECKING:
     from .graph_rag_engine import MemoryGraphStore, GraphRAGConfig
@@ -78,6 +80,13 @@ class LocalLLMProvider:
         self.config = config
         self._lock = asyncio.Lock()
 
+    def _resolve_path(self, path: str) -> str:
+        """将相对路径统一解析到插件根目录。"""
+        candidate = Path(path).expanduser()
+        if candidate.is_absolute():
+            return str(candidate.resolve())
+        return str((_PLUGIN_ROOT / candidate).resolve())
+
     @classmethod
     def get_instance(cls, config: Optional[LocalLLMConfig] = None) -> "LocalLLMProvider":
         """获取单例实例"""
@@ -106,13 +115,17 @@ class LocalLLMProvider:
                 return
 
             logger.info("[Graph-LLM] 正在初始化本地推理模型...")
-            logger.info(f"[Graph-LLM] 模型路径: {self.config.model_path}")
-            logger.info(f"[Graph-LLM] mmproj路径: {self.config.mmproj_path}")
+            raw_model_path = self.config.model_path
+            raw_mmproj_path = self.config.mmproj_path
+            self.config.model_path = self._resolve_path(self.config.model_path)
+            self.config.mmproj_path = self._resolve_path(self.config.mmproj_path)
+            logger.info(f"[Graph-LLM] 模型路径: {raw_model_path} -> {self.config.model_path}")
+            logger.info(f"[Graph-LLM] mmproj路径: {raw_mmproj_path} -> {self.config.mmproj_path}")
 
             # 检查模型文件
             model_path = Path(self.config.model_path)
             if not model_path.exists():
-                fallback = model_path.parent.parent / "Qwen3.5-4B-GGUF" / model_path.name
+                fallback = _PLUGIN_ROOT / "models" / "Qwen3.5-4B-GGUF" / model_path.name
                 if fallback.exists():
                     logger.info(f"[Graph-LLM] 降级到 4B 模型: {fallback}")
                     self.config.model_path = str(fallback)
@@ -120,7 +133,7 @@ class LocalLLMProvider:
             # 检查 mmproj
             mmproj_path = Path(self.config.mmproj_path)
             if not mmproj_path.exists():
-                fallback_mmproj = mmproj_path.parent.parent / "Qwen3.5-4B-GGUF" / mmproj_path.name
+                fallback_mmproj = _PLUGIN_ROOT / "models" / "Qwen3.5-4B-GGUF" / mmproj_path.name
                 if fallback_mmproj.exists():
                     logger.info(f"[Graph-LLM] mmproj 降级到 4B: {fallback_mmproj}")
                     self.config.mmproj_path = str(fallback_mmproj)
@@ -212,7 +225,7 @@ class LocalLLMProvider:
                     logger.info(f"[Graph-LLM] create_chat_completion result keys: {result.keys() if isinstance(result, dict) else type(result)}")
                     logger.info(f"[Graph-LLM] choices: {result.get('choices') if isinstance(result, dict) else 'N/A'}")
                     raw_content = result["choices"][0]["message"]["content"]
-                    logger.info(f"[Graph-LLM] 原始响应类型: {type(raw_content)}, 长度: {len(str(raw_content)) if raw_content else 0}, 内容前500: {str(raw_content)[:500]}")
+                    logger.info(f"[Graph-LLM] 原始响应类型: {type(raw_content)}")
                     return raw_content.strip() if raw_content else ""
                 else:
                     result = self._llama(**kwargs)
@@ -220,7 +233,7 @@ class LocalLLMProvider:
                     logger.info(f"[Graph-LLM] __call__ result keys: {result.keys() if isinstance(result, dict) else type(result)}")
                     logger.info(f"[Graph-LLM] choices: {result.get('choices') if isinstance(result, dict) else 'N/A'}")
                     raw_text = result["choices"][0]["text"]
-                    logger.info(f"[Graph-LLM] 原始响应: {str(raw_text)[:500]}")
+                    logger.info(f"[Graph-LLM] 原始响应: {str(raw_text)}")
                     return raw_text.strip() if raw_text else ""
             except Exception as e:
                 logger.error(f"[Graph-LLM] LLM调用失败: {e}")
@@ -595,23 +608,29 @@ class MultimodalGraphBuilder:
 
     def _get_llm_config(self) -> MultimodalLLMConfig:
         """获取 LLM 配置"""
-        plugin_dir = Path(__file__).parent.resolve()
+        plugin_dir = _PLUGIN_ROOT
+
+        def resolve_model_path(raw_path: str) -> str:
+            path = Path(raw_path).expanduser()
+            if path.is_absolute():
+                return str(path.resolve())
+            return str((plugin_dir / path).resolve())
 
         # 从配置获取 GGUF 模型路径
-        model_path = os.environ.get(
+        model_path = resolve_model_path(os.environ.get(
             "PAPERRAG_GGUF_MODEL_PATH",
             str(plugin_dir / "models" / "Qwen3.5-9B-GGUF" / "Qwen3.5-9B-UD-Q4_K_XL.gguf")
-        )
+        ))
         mmproj_path = str(plugin_dir / "models" / "Qwen3.5-9B-GGUF" / "mmproj-BF16.gguf")
 
         # 检查文件是否存在
         if not Path(model_path).exists():
-            fallback = Path(model_path).parent.parent / "Qwen3.5-4B-GGUF" / Path(model_path).name
+            fallback = plugin_dir / "models" / "Qwen3.5-4B-GGUF" / Path(model_path).name
             if fallback.exists():
                 model_path = str(fallback)
 
         if not Path(mmproj_path).exists():
-            fallback_mmproj = Path(mmproj_path).parent.parent / "Qwen3.5-4B-GGUF" / Path(mmproj_path).name
+            fallback_mmproj = plugin_dir / "models" / "Qwen3.5-4B-GGUF" / Path(mmproj_path).name
             if fallback_mmproj.exists():
                 mmproj_path = str(fallback_mmproj)
 

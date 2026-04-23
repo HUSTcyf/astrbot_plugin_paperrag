@@ -26,7 +26,7 @@ torchaudio==2.10.0  # PyTorch音频库
 accelerate>=0.20.0  # 模型加速（可选）
 
 # Unsloth BGE-M3（稀疏权重 + 稠密向量 + 多向量）
-# 用于替代 Ollama 本地加载 BGE-M3，支持 ABSPEC 稀疏权重和多向量输出
+# 本地加载 BGE-M3，支持 ABSPEC 稀疏权重和多向量输出，完全离线
 # 安装命令：uv pip install unsloth==2026.4.5 --torch-backend=auto
 unsloth==2026.4.5  # Unsloth 加速库（本地加载 BGE-M3，自动安装 sentence-transformers 依赖）
 
@@ -53,16 +53,16 @@ openai>=1.0.0  # OpenAI SDK（用于智谱GLM，避免pyjwt版本冲突）
 # zhipuai>=2.0.0  # 智谱AI SDK（已弃用：pyjwt版本冲突）
 
 # 论文搜索
-pyalex>=1.0.0  # OpenAlex API 客户端（抗干扰标题匹配）
-rapidfuzz>=3.0.0  # 模糊匹配（token_set_ratio）
-arxiv>=2.0.0  # arXiv 论文查询（备用，新论文）
+pyalex # OpenAlex API 客户端（抗干扰标题匹配）
+rapidfuzz  # 模糊匹配（token_set_ratio）
+arxiv  # arXiv 论文查询（备用，新论文）
 
 # 数据集处理
 datasets>=2.14.0  # HuggingFace 数据集加载
 
 # BM25 精确匹配（用于专有名词、作者名等需要精确匹配的查询）
-rank-bm25>=0.15  # BM25 算法实现
-jieba>=0.42.1  # 中文分词（BM25 索引构建）
+rank-bm25  # BM25 算法实现
+jieba  # 中文分词（BM25 索引构建）
 
 # Docling PDF 多模态提取
 docling==2.84.0  # PDF 多模态提取（图片、表格）

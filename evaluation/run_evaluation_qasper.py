@@ -299,7 +299,7 @@ async def initialize_rag_engine(config: dict, milvus_lite_path: str = ''):
 
     # 创建 RAG 配置
     rag_config = RAGConfig(
-        embedding_mode=config.get("embedding_mode", "ollama"),
+        embedding_mode=config.get("embedding_mode", "unsloth"),
         embedding_provider_id=config.get("embedding_provider_id", ""),
         compress_provider_id=config.get("compress_provider_id", ""),
         text_provider_id=config.get("text_provider_id", ""),
@@ -310,7 +310,6 @@ async def initialize_rag_engine(config: dict, milvus_lite_path: str = ''):
         llama_vlm_temperature=config.get("llama_vlm_temperature", 0.7),
         llama_vlm_n_ctx=config.get("llama_vlm_n_ctx", 4096),
         llama_vlm_n_gpu_layers=config.get("llama_vlm_n_gpu_layers", 99),
-        ollama_config=config.get("ollama", {}),
         milvus_lite_path=effective_milvus_path,
         address=config.get("address", ""),
         db_name=config.get("db_name", "default"),
@@ -326,16 +325,13 @@ async def initialize_rag_engine(config: dict, milvus_lite_path: str = ''):
         use_semantic_chunking=config.get("use_semantic_chunking", True),
         enable_multimodal=config.get("multimodal", {}).get("enabled", True),
         figures_dir=config.get("figures_dir", ""),
-        enable_reranking=config.get("enable_reranking", False),
-        reranking_model=config.get("reranking_model", "BAAI/bge-reranker-v2-m3"),
-        reranking_device=config.get("reranking_device", "auto"),
-        reranking_adaptive=config.get("reranking_adaptive", True),
-        reranking_threshold=config.get("reranking_threshold", 0.0),
-        reranking_batch_size=config.get("reranking_batch_size", 32),
-        enable_bm25=True,  # Qasper 评估启用 BM25 混合检索
-        bm25_top_k=config.get("bm25_top_k", 50),
+        enable_sparse_retrieval=config.get("enable_sparse_retrieval", True),
+        enable_multi_vector_rerank=config.get("enable_multi_vector_rerank", False),
+        sparse_top_k=config.get("sparse_top_k", 20),
         hybrid_alpha=config.get("hybrid_alpha", 0.5),
         hybrid_rrf_k=config.get("hybrid_rrf_k", 60),
+        enable_bm25=True,  # Qasper 评估启用 BM25 混合检索
+        bm25_top_k=config.get("bm25_top_k", 50),
     )
 
     # 验证配置
@@ -930,9 +926,7 @@ async def run_ragas_full_evaluation(
         embedding_model=embedding_model,
         embed_base_url=llm_base_url,
         embed_api_key=llm_api_key,
-        embedding_mode="ollama",
-        ollama_base_url=config.get("ollama", {}).get("base_url", "http://localhost:11434"),
-        ollama_embed_model=config.get("ollama", {}).get("model", "bge-m3"),
+        embedding_mode="api",
         milvus_lite_path=milvus_qasper_path,
         collection_name=config.get("collection_name", "paper_embeddings"),
         embed_dim=config.get("embed_dim", 1024),
@@ -973,9 +967,7 @@ async def run_ragas_full_evaluation(
         embedding_model=embedding_model,
         embed_base_url=llm_base_url,
         embed_api_key=llm_api_key,
-        embedding_mode="ollama",
-        ollama_base_url=config.get("ollama", {}).get("base_url", "http://localhost:11434"),
-        ollama_embed_model=config.get("ollama", {}).get("model", "bge-m3"),
+        embedding_mode="api",
     )
 
     results_path = str(output_path / "evaluation_results.csv")
@@ -1050,9 +1042,7 @@ async def run_ragas_generate_only(
         embedding_model=embedding_model,
         embed_base_url=llm_base_url,
         embed_api_key=llm_api_key,
-        embedding_mode="ollama",
-        ollama_base_url=config.get("ollama", {}).get("base_url", "http://localhost:11434"),
-        ollama_embed_model=config.get("ollama", {}).get("model", "bge-m3"),
+        embedding_mode="api",
         milvus_lite_path=milvus_qasper_path,
         collection_name=config.get("collection_name", "paper_embeddings"),
         embed_dim=config.get("embed_dim", 1024),

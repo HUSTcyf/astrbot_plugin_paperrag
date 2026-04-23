@@ -919,8 +919,8 @@ class HybridPDFParser:
             base_dir = self.figures_dir
         else:
             # 默认使用插件目录下的 data/figures
-            plugin_dir = Path(__file__).parent
-            base_dir = str(plugin_dir / "data" / "figures")
+            plugin_root = Path(__file__).parent.parent
+            base_dir = str(plugin_root / "data" / "figures")
 
         # 按论文分类存储
         if paper_id:
@@ -929,59 +929,6 @@ class HybridPDFParser:
             # 降级：使用 PDF 文件名作为目录名
             pdf_stem = Path(pdf_path).stem
             return str(Path(base_dir) / pdf_stem)
-
-    def _save_image_to_disk(
-        self,
-        image: Any,
-        pdf_path: str,
-        page_num: int,
-        figure_id: str,  # 格式: "3-Table1-1" 或 "5-Figure1-2"
-        paper_id: Optional[str] = None  # 论文ID，用于按论文分类存储
-    ) -> Optional[str]:
-        """
-        保存图片到磁盘
-
-        将提取的图片保存到磁盘，返回图片路径。
-        这个路径将存储在 Milvus 中，供 VLM 后续加载。
-
-        Args:
-            image: PIL.Image 对象
-            pdf_path: PDF文件路径
-            page_num: 页码
-            figure_id: 图片标识符，格式如 "3-Table1-1"
-            paper_id: 论文ID，用于按论文分类存储
-
-        Returns:
-            图片文件路径，失败返回 None
-        """
-        try:
-            from PIL import Image
-            import io
-
-            figures_dir = self._get_figures_dir(pdf_path, paper_id)
-
-            # 确保目录存在
-            figures_path = Path(figures_dir)
-            figures_path.mkdir(parents=True, exist_ok=True)
-
-            # 生成文件名：{figure_id}.png（对齐 Qasper 格式）
-            # 例如: 3-Table1-1.png, 5-Figure1-2.png
-            filename = f"{figure_id}.png"
-            image_path = figures_path / filename
-
-            # 保存为 PNG（原图保存，查询时再transform）
-            image.save(str(image_path), format="PNG", optimize=True)
-
-            # 获取文件大小
-            file_size = image_path.stat().st_size / 1024  # KB
-
-            logger.info(f"🖼️ 保存图片: {filename} (页{page_num}, {image.size[0]}x{image.size[1]}, {file_size:.1f}KB) → {image_path}")
-
-            return str(image_path)
-
-        except Exception as e:
-            logger.warning(f"⚠️ 保存图片失败: {e}")
-            return None
 
     def _extract_and_save_images(self, multimodal_data: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, int]]:
         """
@@ -1026,12 +973,12 @@ class HybridPDFParser:
 
         return image_paths, image_pages
 
-    def _extract_and_save_tables(self, multimodal_data: Dict[str, Any]) -> Tuple[Dict[str, Tuple[str, str, str]], Dict[str, int]]:
+    def _extract_and_save_tables(self, multimodal_data: Dict[str, Any]) -> Tuple[Dict[str, Tuple[str, str, str, str]], Dict[str, int]]:
         """
-        提取并保存表格（CSV/PNG），返回表格路径映射
+        提取并保存表格（CSV/MD/PNG），返回表格路径映射
 
         策略（优先使用 docling 已保存的表格）：
-        1. docling 已保存（saved_csv_path/saved_png_path 存在）→ 复制到 paper_id 目录
+        1. docling 已保存（saved_csv_path/saved_md_path/saved_png_path 存在）→ 复制到 paper_id 目录
         2. 无 saved_path → 跳过（表格由 docling 原始保存）
 
         Args:
@@ -1040,9 +987,9 @@ class HybridPDFParser:
             paper_id: 论文ID（用于按论文分类存储）
 
         Returns:
-            Tuple[Dict, Dict]: (表注->(csv_path, png_path, caption), 表注->页码) 的映射
+            Tuple[Dict, Dict]: (表注->(csv_path, png_path, md_path, caption), 表注->页码) 的映射
         """
-        table_paths: Dict[str, Tuple[str, str, str]] = {}  # caption -> (csv_path, png_path, caption)
+        table_paths: Dict[str, Tuple[str, str, str, str]] = {}  # caption -> (csv_path, png_path, md_path, caption)
         table_pages: Dict[str, int] = {}
 
         tables = multimodal_data.get("tables", [])
@@ -1050,9 +997,10 @@ class HybridPDFParser:
             return table_paths, table_pages
 
         # 直接使用 docling flat 路径（已包含页码，不会冲突）
-        # 表格路径: data/tables/{page}-Table{idx}.csv/.png
+        # 表格路径: data/tables/{page}-Table{idx}.csv/.md/.png
         for idx, table_info in enumerate(tables):
             saved_csv = table_info.get("saved_csv_path")
+            saved_md = table_info.get("saved_md_path")
             saved_png = table_info.get("saved_png_path")
             caption = table_info.get("caption") or ""
             page_num = table_info.get("page_number", 0)
@@ -1060,10 +1008,12 @@ class HybridPDFParser:
             # 使用字符串键避免类型不匹配，格式 "caption|page_num|idx"
             key = f"{caption}|{page_num}|{idx}"
             if key not in table_paths:
-                table_paths[key] = (saved_csv or "", saved_png or "", caption)
+                table_paths[key] = (saved_csv or "", saved_png or "", saved_md or "", caption)
                 table_pages[key] = page_num
                 if saved_csv:
                     logger.debug(f"📊 [docling] 表格 CSV: {saved_csv}")
+                if saved_md:
+                    logger.debug(f"📊 [docling] 表格 MD: {saved_md}")
                 if saved_png:
                     logger.debug(f"📊 [docling] 表格 PNG: {saved_png}")
 
@@ -1071,112 +1021,6 @@ class HybridPDFParser:
             logger.info(f"📊 使用 docling 表格 {len(table_paths)} 个")
 
         return table_paths, table_pages
-
-    def _group_images_by_caption(self, images: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        将图片按图注分组
-
-        规则：
-        1. 有 caption 的图片：相同 caption 为一组
-        2. 无 caption 的图片：分配到距离最近的 captioned 组
-
-        Args:
-            images: 图片信息列表
-
-        Returns:
-            Dict[str, List[Dict]]: 图注 -> 图片列表 的映射
-        """
-        groups = {}  # {caption: [img_info, ...]}
-        no_caption_images = []
-
-        # 第一步：将所有图片按 caption 分组
-        for img_info in images:
-            caption = img_info.get("caption")
-            if caption:
-                # 有 caption 的图片
-                if caption not in groups:
-                    groups[caption] = []
-                groups[caption].append(img_info)
-            else:
-                # 无 caption 的图片暂存
-                no_caption_images.append(img_info)
-
-        # 第二步：无 caption 的图片分配到最近的组
-        for img in no_caption_images:
-            img_page = img.get("page_number", 0)
-            if img_page == 0:
-                # 无法确定页码，加入第一个组或创建 no_caption 组
-                if groups:
-                    groups[list(groups.keys())[0]].append(img)
-                else:
-                    groups["no_caption"] = [img]
-                continue
-
-            # 找距离最近的组
-            best_caption = None
-            min_distance = float('inf')
-
-            for caption, img_list in groups.items():
-                if not img_list:
-                    continue
-                # 使用该组第一张图片的页码作为组页码
-                group_page = img_list[0].get("page_number", 0)
-                distance = abs(group_page - img_page)
-                if distance < min_distance:
-                    min_distance = distance
-                    best_caption = caption
-
-            # 加入最近的组
-            if best_caption:
-                groups[best_caption].append(img)
-            else:
-                # 没有 captioned 组，创建 no_caption 组
-                if "no_caption" not in groups:
-                    groups["no_caption"] = []
-                groups["no_caption"].append(img)
-
-        return groups
-
-    def _merge_bboxes(self, bboxes: List) -> "fitz.Rect":
-        """
-        计算多个 bbox 的外接矩形
-
-        Args:
-            bboxes: bbox 列表 [(x0, y0, x1, y1), ...]
-
-        Returns:
-            覆盖所有 bbox 的外接矩形
-        """
-        if not bboxes:
-            return fitz.Rect(0, 0, 0, 0)
-
-        x0 = min(b.x0 for b in bboxes)
-        y0 = min(b.y0 for b in bboxes)
-        x1 = max(b.x1 for b in bboxes)
-        y1 = max(b.y1 for b in bboxes)
-
-        return fitz.Rect(x0, y0, x1, y1)
-
-    def _pixmap_to_pil_image(self, pixmap) -> Optional[Any]:
-        """
-        将 PyMuPDF Pixmap 转换为 PIL Image
-
-        Args:
-            pixmap: PyMuPDF Pixmap 对象
-
-        Returns:
-            PIL Image 对象
-        """
-        try:
-            from PIL import Image
-            import io
-
-            # Pixmap 转换为 PNG bytes
-            png_data = pixmap.tobytes("png")
-            return Image.open(io.BytesIO(png_data))
-        except Exception as e:
-            logger.debug(f"⚠️ Pixmap 转 PIL Image 失败: {e}")
-            return None
 
     def _associate_images_with_chunks(
         self,
@@ -1220,7 +1064,6 @@ class HybridPDFParser:
 
         # 预编译图片引用正则表达式
         # 支持: Figure 1, Figure 1a, Figure A1, Figure S1, Figure 1-1, Figures 1 and 2, Fig.1 等
-        import re
         figure_patterns = [
             # 基础模式: Figure 1, Fig. 1, 图 1
             re.compile(r'(?:Figure|Fig\.?|图)\s*([A-Za-z]?\d+[A-Za-z]?(?:-?\d+)?)', re.IGNORECASE),
@@ -1279,7 +1122,7 @@ class HybridPDFParser:
     def _associate_tables_with_chunks(
         self,
         nodes: List[Node],
-        table_paths: Dict[str, Tuple[str, str, str]],
+        table_paths: Dict[str, Tuple[str, str, str, str]],
         table_pages: Dict[str, int] = {}
     ) -> List[Node]:
         """
@@ -1291,7 +1134,7 @@ class HybridPDFParser:
 
         Args:
             nodes: 分块后的节点列表
-            table_paths: 表注 -> (csv_path, png_path, caption) 的映射
+            table_paths: 表注 -> (csv_path, png_path, md_path, caption) 的映射
             table_pages: 表注 -> 页码 的映射
 
         Returns:
@@ -1300,8 +1143,8 @@ class HybridPDFParser:
         if not table_paths:
             return nodes
 
-        # 构建表格引用映射：table编号 -> (csv_path, png_path, caption, 页码)
-        table_refs: Dict[str, Tuple[str, str, str, int]] = {}
+        # 构建表格引用映射：table编号 -> (csv_path, png_path, md_path, caption, 页码)
+        table_refs: Dict[str, Tuple[str, str, str, str, int]] = {}
         for key, paths in table_paths.items():
             # key 格式: "caption|page_num|idx"
             parts = key.split("|")
@@ -1310,7 +1153,7 @@ class HybridPDFParser:
             idx = int(parts[2]) if len(parts) > 2 else 0
             table_num = self._extract_table_number(caption_str)
             if table_num:
-                table_refs[table_num] = (paths[0], paths[1], caption_str, page_num)
+                table_refs[table_num] = (paths[0], paths[1], paths[2], caption_str, page_num)
 
         if not table_refs:
             logger.debug("⚠️ 未找到表格引用编号")
@@ -1318,7 +1161,6 @@ class HybridPDFParser:
 
         # 预编译表格引用正则表达式
         # 支持: Table 1, Table 1a, Table A1, Tables 1 and 2 等
-        import re
         table_patterns = [
             # 基础模式: Table 1, 表 1
             re.compile(r'(?:Table|表)\s*([A-Za-z]?\d+[A-Za-z]?(?:-?\d+)?)', re.IGNORECASE),
@@ -1342,28 +1184,29 @@ class HybridPDFParser:
                 for match in pattern.finditer(node.text):
                     tbl_num = match.group(1)
                     if tbl_num in table_refs:
-                        csv_path, png_path, caption, tbl_page = table_refs[tbl_num]
+                        csv_path, png_path, md_path, caption, tbl_page = table_refs[tbl_num]
                         # 检查页码相近（同一页或相邻2页内）
                         page_match = (chunk_page > 0 and tbl_page > 0 and abs(chunk_page - tbl_page) <= 2)
                         # 去重
                         if csv_path not in [tbl[0] for tbl in found_tables]:
-                            found_tables.append((csv_path, png_path, caption, tbl_num, page_match))
+                            found_tables.append((csv_path, png_path, md_path, caption, tbl_num, page_match))
 
             # 按匹配质量排序（页码匹配的优先）
-            found_tables.sort(key=lambda x: x[4], reverse=True)
+            found_tables.sort(key=lambda x: x[5], reverse=True)
 
             if found_tables:
                 # 关联第一个表格（主要表格）
                 node.metadata["table_csv_path"] = found_tables[0][0]
                 node.metadata["table_png_path"] = found_tables[0][1]
-                node.metadata["table_caption"] = found_tables[0][2]
-                node.metadata["table_num"] = found_tables[0][3]
+                node.metadata["table_md_path"] = found_tables[0][2]
+                node.metadata["table_caption"] = found_tables[0][3]
+                node.metadata["table_num"] = found_tables[0][4]
                 node.metadata["has_table"] = True
 
                 # 如果有多个表格，保存所有表格
                 if len(found_tables) > 1:
                     node.metadata["all_tables"] = [
-                        {"csv_path": tbl[0], "png_path": tbl[1], "caption": tbl[2], "table_num": tbl[3]}
+                        {"csv_path": tbl[0], "png_path": tbl[1], "md_path": tbl[2], "caption": tbl[3], "table_num": tbl[4]}
                         for tbl in found_tables
                     ]
                 associated_count += 1
@@ -1383,7 +1226,6 @@ class HybridPDFParser:
         Returns:
             图片编号，如 "1" 或 "1a"，None 表示未找到
         """
-        import re
         # 匹配 Figure 1, Fig. 1, 图 1, Figure A1, Figure S1 等格式
         patterns = [
             r'(?:Figure|Fig\.?)\s*([A-Za-z]?\d+[A-Za-z]?(?:-?\d+)?)',
@@ -1405,7 +1247,6 @@ class HybridPDFParser:
         Returns:
             表格编号，如 "1" 或 "1a"，None 表示未找到
         """
-        import re
         # 匹配 Table 1, Table 1a, Table A1 等格式
         patterns = [
             r'(?:Table|表)\s*([A-Za-z]?\d+[A-Za-z]?(?:-?\d+)?)',
@@ -1471,7 +1312,6 @@ class HybridPDFParser:
 
         # 预编译公式引用正则表达式
         # 支持: Equation (1), Eq. 1, 式(1), (1) 等
-        import re
         formula_patterns = [
             re.compile(r'(?:Equation|式)\s*\((\d+)\)', re.IGNORECASE),
             re.compile(r'(?:Eq\.?)\s*(\d+)', re.IGNORECASE),
@@ -1512,7 +1352,6 @@ class HybridPDFParser:
 
     def _extract_page_number_from_text(self, text: str) -> int:
         """从文本中提取页码"""
-        import re
         # 匹配 [Page X] 格式
         match = re.search(r'\[Page\s+(\d+)\]', text)
         if match:

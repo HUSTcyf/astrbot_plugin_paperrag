@@ -16,6 +16,8 @@
 import asyncio
 import os
 import re
+import sys
+import shutil
 import time
 import base64
 from typing import List, Dict, Tuple, Any, Optional, Union, cast
@@ -26,10 +28,15 @@ from itertools import zip_longest
 os.environ['GRPC_VERBOSITY'] = 'ERROR'
 os.environ['GLOG_minloglevel'] = '2'
 
+# 添加插件根目录到 sys.path（支持 idea.* 模块导入）
+_plugin_root = Path(__file__).parent.parent
+if str(_plugin_root) not in sys.path:
+    sys.path.insert(0, str(_plugin_root))
+
 from astrbot.api import logger
 
-# 获取插件目录，用于解析相对路径
-_PLUGIN_DIR = Path(__file__).parent.resolve()
+# 获取插件根目录，用于解析相对路径
+_PLUGIN_DIR = _plugin_root
 
 # 导入混合架构组件
 try:
@@ -218,7 +225,6 @@ class BM25Retriever:
     def _tokenize(self, text: str) -> List[str]:
         """使用 jieba 分词并标准化（与 legacy/hybrid_index.py 一致）"""
         import jieba
-        import re
 
         # 1. 转小写
         text = text.lower()
@@ -271,8 +277,6 @@ class BM25Retriever:
         - 查询包含具体名称（论文标题、机构名）
         - 查询包含特殊符号（括号、连字符等）
         """
-        import re
-
         query_lower = query.lower()
 
         # 1. 检测是否包含具体名称模式（这些需要精确匹配）
@@ -507,6 +511,7 @@ class HybridRetriever(BaseRetriever):
         self,
         index_manager: HybridIndexManager,
         embed_provider: Any,
+        enable_sparse_retrieval: bool = True,
         sparse_top_k: int = 20,
         vector_top_k: int = 50,
         alpha: float = 0.5,
@@ -517,6 +522,7 @@ class HybridRetriever(BaseRetriever):
         bm25_top_k: int = 20,
     ):
         super().__init__(index_manager, embed_provider)
+        self._enable_sparse_retrieval = enable_sparse_retrieval
         self._sparse_top_k = sparse_top_k
         self._vector_top_k = vector_top_k
         self._alpha = alpha
@@ -541,13 +547,15 @@ class HybridRetriever(BaseRetriever):
             )
 
             # 2. 稀疏权重检索
-            sparse_results = await self._sparse_retriever.retrieve(
-                query, top_k=self._sparse_top_k
-            )
-            sparse_dict = {
-                node.text: score
-                for node, score in zip(sparse_results.nodes, sparse_results.scores)
-            }
+            sparse_dict: Dict[str, float] = {}
+            if self._enable_sparse_retrieval:
+                sparse_results = await self._sparse_retriever.retrieve(
+                    query, top_k=self._sparse_top_k
+                )
+                sparse_dict = {
+                    node.text: score
+                    for node, score in zip(sparse_results.nodes, sparse_results.scores)
+                }
 
             # 3. BM25 精确匹配（仅当查询需要精确匹配时）
             bm25_dict: Dict[str, float] = {}
@@ -1085,7 +1093,7 @@ class HybridRAGEngine:
         self._parser = HybridPDFParser(
             enable_multimodal=self.config.enable_multimodal,
             chunk_size=self.config.chunk_size,
-            chunk_overlap=self.config.chunk_overlap
+            chunk_overlap=self.config.chunk_overlap,
         )
         self._parser_initialized = True
         logger.info("✅ HybridPDFParser初始化完成")
@@ -1118,24 +1126,69 @@ class HybridRAGEngine:
             logger.error(f"❌ Embedding Provider初始化失败: {e}")
             raise
 
-    def _ensure_llm_provider_initialized(self) -> Any:
+    async def _ensure_llm_provider_initialized(self) -> Any:
         """确保 LLM Provider 已初始化（用于噪声过滤）"""
         if getattr(self, '_llm_provider', None) is not None:
             return self._llm_provider
 
         try:
             from idea.llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
-            import asyncio
             self._llm_provider = get_llama_cpp_vlm_provider()
-            # 同步初始化
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(self._llm_provider.initialize())
+            await self._llm_provider.initialize()
             logger.info("✅ LLM Provider 初始化完成（噪声过滤）")
             return self._llm_provider
         except Exception as e:
             logger.warning(f"⚠️ LLM Provider 初始化失败，过滤将被跳过: {e}")
             self._llm_provider = None
             return None
+
+    async def _ensure_llm_initialized(self) -> Any:
+        """确保LLM Provider已初始化 - 使用配置的text_provider_id"""
+        if self._llm_initialized:
+            assert self._llm_client is not None
+            return self._llm_client
+
+        provider_id = self.config.text_provider_id
+        if not provider_id:
+            # 使用当前会话的 Provider（云端）
+            try:
+                if self.context is not None:
+                    self._llm_client = self.context.get_using_provider()
+                    if self._llm_client:
+                        logger.info("✅ 使用当前会话的 LLM Provider (云端)")
+                        self._llm_initialized = True
+                        return self._llm_client
+            except Exception as e:
+                logger.warning(f"⚠️ 获取当前Provider失败: {e}")
+
+            raise ValueError(
+                "未配置 text_provider_id，无法获取当前LLM Provider。"
+                "请在插件配置中设置 text_provider_id。"
+            )
+
+        # 从 context 获取指定的 provider
+        try:
+            provider_manager = getattr(self.context, "provider_manager", None)
+            if provider_manager:
+                inst_map = getattr(provider_manager, "inst_map", None)
+                if isinstance(inst_map, dict):
+                    self._llm_client = inst_map.get(provider_id)
+                    if self._llm_client:
+                        logger.info(f"✅ 使用 LLM Provider: {provider_id}")
+                        self._llm_initialized = True
+                        return self._llm_client
+
+            # 兼容旧版本
+            self._llm_client = self.context.get_provider_by_id(provider_id)
+            if self._llm_client:
+                logger.info(f"✅ 使用 LLM Provider: {provider_id}")
+                self._llm_initialized = True
+                return self._llm_client
+
+            raise ValueError(f"无法找到 Provider: {provider_id}")
+        except Exception as e:
+            logger.error(f"❌ LLM Provider初始化失败: {e}")
+            raise
 
     NOISE_FILTER_PROMPT = """判断以下文本是否为无意义噪声（适合从 RAG 移除）：
 
@@ -1156,7 +1209,7 @@ class HybridRAGEngine:
     async def _filter_noise_nodes(
         self,
         nodes: List[Any],
-        max_workers: int = 8,
+        max_workers: int = 1,
     ) -> Tuple[List[Any], List[Dict[str, Any]]]:
         """
         使用本地 LLM 过滤噪声 chunks
@@ -1164,11 +1217,9 @@ class HybridRAGEngine:
         Returns:
             (filtered_nodes, noise_report) — noise_report 包含被过滤的 chunks
         """
-        llm = self._ensure_llm_provider_initialized()
+        llm = await self._ensure_llm_provider_initialized()
         if llm is None:
             return nodes, []
-
-        import re, asyncio, json
 
         async def classify_one(node: Any) -> Optional[Dict[str, Any]]:
             text = node.text
@@ -1259,6 +1310,9 @@ class HybridRAGEngine:
 
         if mode == 'lite':
             lite_path = self.config.milvus_lite_path
+            if not lite_path:
+                # 设置默认路径为插件根目录的 data/milvus_papers.db
+                lite_path = str(Path(__file__).parent.parent / "data" / "milvus_papers.db")
             uri: Optional[str] = None
         else:
             lite_path = None
@@ -1285,17 +1339,19 @@ class HybridRAGEngine:
             return self._abstract_manager
 
         try:
-            from .abstract_index import AbstractIndexManager
-        except ImportError:
-            from abstract_index import AbstractIndexManager
+            try:
+                from .abstract_index import AbstractIndexManager
+            except ImportError:
+                from abstract_index import AbstractIndexManager
 
-            plugin_dir = Path(__file__).parent
-            milvus_uri = str(plugin_dir / "data" / "milvus_abstracts.db")
+            milvus_uri = str(Path(__file__).parent.parent / "data" / "milvus_abstracts.db")
 
             self._abstract_manager = AbstractIndexManager(
                 milvus_uri=milvus_uri,
                 collection_name="paper_abstracts",
                 embed_dim=self.config.embed_dim,
+                core_api_key=getattr(self.config, "core_api_key", ""),
+                use_arxiv_api=getattr(self.config, "use_arxiv_api", True),
             )
 
             embed_provider = await self._ensure_embed_provider_initialized()
@@ -1328,6 +1384,7 @@ class HybridRAGEngine:
         self._retriever = HybridRetriever(
             index_manager=index_manager,
             embed_provider=embed_provider,
+            enable_sparse_retrieval=self.config.enable_sparse_retrieval,
             sparse_top_k=self.config.sparse_top_k,
             vector_top_k=50,
             alpha=self.config.hybrid_alpha,
@@ -1490,6 +1547,8 @@ class HybridRAGEngine:
     async def add_papers(
         self,
         file_paths: List[str],
+        llm_config: Dict[str, Any] = {},
+        arxiv_client: Any = None,
         **kwargs
     ) -> Dict[str, Any]:
         """添加论文到索引"""
@@ -1501,11 +1560,47 @@ class HybridRAGEngine:
         colbert_storage = None
         if self.config.enable_multi_vector_rerank:
             colbert_storage = self._ensure_colbert_storage_initialized()
+            # 首次仅做入库时，retriever 可能尚未初始化；这里强制初始化，
+            # 以便 reranker 和 ColBERT storage 能正常绑定并写盘。
+            retriever = self._ensure_retriever_initialized()
             # 如果 reranker 已初始化，绑定新 storage
-            if self._retriever_initialized:
-                reranker = getattr(self._retriever, '_reranker', None)
-                if reranker is not None:
-                    reranker.set_colbert_storage(colbert_storage)
+            reranker = getattr(retriever, '_reranker', None)
+            if reranker is not None:
+                reranker.set_colbert_storage(colbert_storage)
+
+        # 如果启用了 LLM 参考文献解析且没有显式提供 LLM config，
+        # 则自动获取配置的 text_provider_id 并构建 config
+        effective_llm_config = llm_config
+        if not effective_llm_config and self.config.enable_llm_reference_parsing:
+            try:
+                # 优先使用 freeapi 配置（从插件配置读取）
+                api_url = getattr(self.config, 'freeapi_url', '') or ''
+                api_key = getattr(self.config, 'freeapi_key', '') or ''
+                if api_url and api_key:
+                    effective_llm_config = {
+                        "model": "gpt-4o-mini",
+                        "api_base": f"{api_url}/v1",
+                        "api_key": api_key
+                    }
+                    logger.debug("📝 使用 freeapi 配置进行 LLM 参考文献解析")
+                else:
+                    # 回退到从 provider 提取配置信息
+                    provider = await self._ensure_llm_initialized()
+                    if provider:
+                        model = getattr(provider, 'model', None) or getattr(provider, 'model_name', None)
+                        api_base = getattr(provider, 'api_base', None) or getattr(provider, 'base_url', None)
+                        api_key = getattr(provider, 'api_key', None) or getattr(provider, 'key', None)
+                        if model and api_base:
+                            effective_llm_config = {
+                                "model": model,
+                                "api_base": api_base,
+                                "api_key": api_key or "sk-placeholder"
+                            }
+                            logger.debug("📝 使用 Provider 配置进行 LLM 参考文献解析")
+                        else:
+                            logger.warning(f"⚠️ 无法从 Provider 提取完整配置，LLM 参考文献解析被禁用")
+            except Exception as e:
+                logger.warning(f"⚠️ 无法获取 LLM 配置，LLM 参考文献解析被禁用: {e}")
 
         results = {
             "total": len(file_paths),
@@ -1516,20 +1611,15 @@ class HybridRAGEngine:
 
         for file_path in file_paths:
             try:
-                # 解析 PDF
-                nodes = await parser.parse_and_split(file_path)
+                # 解析 PDF（传递 LLM config 和 arXiv client 以支持 LLM-based 引用解析）
+                nodes = await parser.parse_and_split(file_path, effective_llm_config, arxiv_client)
 
                 if not nodes:
                     results["failed"] += 1
                     results["errors"].append({"file": file_path, "error": "无法解析 PDF"})
                     continue
 
-                # 噪声过滤（仅对已解析的 chunks 过滤）
                 noise_report = []
-                if self.config.enable_noise_filter:
-                    nodes, noise_report = await self._filter_noise_nodes(nodes)
-                    if noise_report:
-                        logger.debug(f"[噪声过滤] {file_path}: 过滤 {len(noise_report)} 个噪声 chunks")
 
                 if not nodes:
                     results["failed"] += 1
@@ -1549,19 +1639,55 @@ class HybridRAGEngine:
                     model = reranker._get_embedding_model() if reranker else None
                     chunk_vectors = []
                     chunk_ids = []
-                    if model is None: continue
-                    for i, node in enumerate(nodes):
-                        vec = model.get_multi_vector(node.text)
-                        if vec:
-                            import numpy as np
-                            chunk_vectors.append(np.array(vec, dtype=np.float32))
-                            chunk_id = node.metadata.get("chunk_id", f"{file_path}_{i}")
-                            chunk_ids.append(chunk_id)
-                    if chunk_vectors:
-                        colbert_storage.add_chunks(chunk_vectors, chunk_ids)
-                        logger.debug(f"[ColBERTStorage] 为 {len(chunk_vectors)} 个 chunks 存储了 per-token vectors")
+                    if model is None:
+                        logger.error(
+                            "[ColBERTStorage] 未获取到 ColBERT embedding model，"
+                            f"跳过 per-token vectors 预计算: {file_path}"
+                        )
+                    else:
+                        for i, node in enumerate(nodes):
+                            vec = model.get_multi_vector(node.text)
+                            if vec:
+                                import numpy as np
+                                chunk_vectors.append(np.array(vec, dtype=np.float32))
+                                chunk_id = node.metadata.get("chunk_id", f"{file_path}_{i}")
+                                chunk_ids.append(chunk_id)
+                        if chunk_vectors:
+                            colbert_storage.add_chunks(chunk_vectors, chunk_ids)
+                            logger.debug(f"[ColBERTStorage] 为 {len(chunk_vectors)} 个 chunks 存储了 per-token vectors")
+                        else:
+                            logger.warning(
+                                "[ColBERTStorage] 未生成任何 per-token vectors，"
+                                f"跳过本篇 chunk 存储: {file_path}"
+                            )
 
                 results["successful"] += 1
+
+                # 索引摘要（从第一个 node 的 metadata 中提取）
+                try:
+                    if nodes and file_path.lower().endswith(".pdf"):
+                        abstract_manager = await self._ensure_abstract_manager_initialized()
+                    else:
+                        abstract_manager = None
+
+                    if abstract_manager is not None and nodes:
+                        first_node = nodes[0]
+                        file_name = first_node.metadata.get("file_name", os.path.basename(file_path))
+                        paper_id = os.path.splitext(file_name)[0]
+                        extracted_title = first_node.metadata.get("extracted_title") or ""
+                        extracted_abstract = first_node.metadata.get("extracted_abstract") or ""
+                        await abstract_manager.index_paper(
+                            pdf_path=file_path,
+                            paper_id=paper_id,
+                            file_name=file_name,
+                            title=extracted_title,
+                            abstract_text=extracted_abstract if extracted_abstract else None,
+                        )
+                        indexed = abstract_manager._abstract_cache.get(paper_id)  # type: ignore[attr-defined]
+                        indexed_title = indexed.title if indexed else ""
+                        logger.info(f"📄 已索引摘要: {indexed_title or file_name}")
+                except Exception as e:
+                    logger.warning(f"⚠️ 摘要索引失败: {e}")
 
             except Exception as e:
                 logger.error(f"添加论文失败 {file_path}: {e}")
@@ -1616,6 +1742,16 @@ class HybridRAGEngine:
             if bm25_retriever is not None:
                 bm25_retriever.refresh_index()
 
+            # 删除摘要索引条目
+            try:
+                abstract_manager = await self._ensure_abstract_manager_initialized()
+                if abstract_manager is not None:
+                    paper_id = os.path.splitext(os.path.basename(prefix))[0]
+                    await abstract_manager.delete_paper(paper_id)
+                    logger.info(f"🗑️ 已删除摘要索引: {paper_id}")
+            except Exception as e:
+                logger.warning(f"⚠️ 删除摘要索引失败: {e}")
+
             return {
                 "status": "success",
                 "deleted_count": result.get("deleted_count", 0),
@@ -1643,6 +1779,25 @@ class HybridRAGEngine:
             bm25_retriever = getattr(self._retriever, '_bm25_retriever', None)
             if bm25_retriever is not None:
                 bm25_retriever.refresh_index()
+
+            # 清空摘要索引
+            try:
+                abstract_manager = await self._ensure_abstract_manager_initialized()
+                if abstract_manager is not None:
+                    abstract_manager.clear()
+                    self._abstract_initialized = False
+                    self._abstract_manager = None
+                    logger.info("🗑️ 摘要索引已清空")
+            except Exception as e:
+                logger.warning(f"⚠️ 清空摘要索引失败: {e}")
+
+            # 清理物理文件：figures、tables
+            plugin_data_dir = Path(__file__).parent.parent / "data"
+            for subdir in ["figures", "tables"]:
+                subdir_path = plugin_data_dir / subdir
+                if subdir_path.exists():
+                    shutil.rmtree(subdir_path)
+                    subdir_path.mkdir(parents=True, exist_ok=True)
 
             return {"status": "success"}
         except Exception as e:

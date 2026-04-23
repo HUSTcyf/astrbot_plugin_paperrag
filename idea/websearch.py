@@ -98,7 +98,7 @@ class IdeaEngineWebSearch:
 
                 if stderr:
                     stderr_text = stderr.decode()
-                    logger.info(f"[IdeaEngine] Bright Data stderr: {stderr_text[:500]}")
+                    logger.info(f"[IdeaEngine] Bright Data stderr: {stderr_text}")
 
                 if stdout:
                     stdout_text = stdout.decode().strip()
@@ -117,14 +117,13 @@ class IdeaEngineWebSearch:
                         try:
                             response = json.loads(stdout_text)
                         except json.JSONDecodeError as e:
-                            logger.warning(f"[IdeaEngine] JSON 解析失败: {e}, 内容: {stdout_text[:200]}")
+                            logger.warning(f"[IdeaEngine] JSON 解析失败: {e}, 内容: {stdout_text}")
                             return {"success": False, "error": f"JSON 解析失败: {e}"}
                     content = response.get("result", {}).get("content", [])
                     logger.info(f"[IdeaEngine] Bright Data MCP 原始响应: response_keys={list(response.keys()) if response else None}, content长度={len(content) if content else 0}")
 
                     if content and len(content) > 0:
                         text = content[0].get("text", "")
-                        logger.info(f"[IdeaEngine] Bright Data MCP text长度={len(text) if text else 0}, text前200: {text[:200] if text else 'empty'}")
                         if text:
                             try:
                                 data = json.loads(text)

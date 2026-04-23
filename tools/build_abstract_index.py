@@ -27,6 +27,11 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 
 import httpx
 
+try:
+    from rag.paper_link_resolver import LinkResolution, PaperLinkResolver
+except ImportError:
+    from paper_link_resolver import LinkResolution, PaperLinkResolver
+
 # ============================================================================
 # 简单日志
 # ============================================================================
@@ -58,10 +63,6 @@ class SimpleLogger:
 
 logger = SimpleLogger()
 
-
-# ============================================================================
-# arXiv API 客户端 - 使用 arxiv 库
-# ============================================================================
 
 class OpenAlexAPIClient:
     """OpenAlex API 客户端 - 抗干扰标题模糊匹配"""
@@ -833,6 +834,13 @@ class AbstractIndexManager:
         self._use_arxiv_api = use_arxiv_api
         self._core_client: Optional[CoreAPIClient] = None
         self._arxiv_client: Optional[OpenAlexAPIClient] = None
+        self._link_resolver = PaperLinkResolver(
+            core_api_key=self._core_api_key or "",
+            enable_crossref=True,
+            enable_openalex=True,
+            enable_arxiv_library=self._use_arxiv_api,
+            log_prefix="[BuildAbstract]",
+        )
         self._is_connected = False
         self._collection = None
         self._abstract_cache: Dict[str, PaperAbstract] = {}
@@ -969,7 +977,7 @@ class AbstractIndexManager:
     ) -> bool:
         """为单篇论文建立摘要索引
 
-        提取策略：默认使用 LLM 同时提取标题和摘要，失败时使用常规提取
+        提取策略：优先使用本地 LLM 提取标题和摘要，规则提取只做兜底
         """
         await self._ensure_collection()
 
@@ -981,17 +989,17 @@ class AbstractIndexManager:
                 paper_beginning = self._extract_paper_beginning(pdf_path)
                 if paper_beginning:
                     llm_title, llm_abstract = await self._llm_client.extract_title_and_abstract(paper_beginning)
-                    if llm_abstract and len(llm_abstract) >= 30:
-                        abstract_text = llm_abstract
                     if llm_title:
                         title = llm_title
+                    if llm_abstract and len(llm_abstract) >= 30:
+                        abstract_text = llm_abstract
 
             # 常规提取（回退）- 标题和摘要分别提取
-            if not abstract_text or len(abstract_text) < 50:
-                abstract_text = extractor.extract_abstract_from_pdf(pdf_path)
-
             if not title:
                 title = extractor.extract_title_from_pdf(pdf_path) or ""
+
+            if not abstract_text or len(abstract_text) < 50:
+                abstract_text = extractor.extract_abstract_from_pdf(pdf_path)
 
             if not abstract_text or len(abstract_text) < 50:
                 logger.warning(f"论文 {file_name} 未找到有效摘要，跳过")
@@ -1023,39 +1031,29 @@ class AbstractIndexManager:
             # 刷新确保数据持久化
             await loop.run_in_executor(None, lambda: self._collection.flush())  # type: ignore[union-attr]
 
-            # 获取 arxiv 链接（优先 CORE API，失败时用 arXiv API）
-            arxiv_url = ""
-            github_url = ""
+            # 获取 arxiv / github / doi 链接
             existing_meta = self._abstract_cache.get(paper_id)
+            resolution = None
             if not existing_meta or not existing_meta.metadata.get("arxiv_url"):
-                # 优先使用 CORE API（更稳定，不会被封禁）
-                if self._core_api_key:
-                    try:
-                        if self._core_client is None:
-                            self._core_client = CoreAPIClient(self._core_api_key)
-                        arxiv_url, github_url = await self._core_client.get_arxiv_by_title(title)
-                        if arxiv_url:
-                            logger.info(f"  → arxiv (CORE API): {arxiv_url}")
-                    except Exception as e:
-                        logger.debug(f"  → CORE API 查询失败: {e}")
+                resolution = await self._link_resolver.resolve_from_pdf(pdf_path, title_hint=title)
 
-                # fallback: 使用 arXiv 官方 API（可通过 --no-arxiv-api 禁用）
-                if not arxiv_url and self._use_arxiv_api:
-                    try:
-                        if not hasattr(self, '_arxiv_client') or self._arxiv_client is None:
-                            self._arxiv_client = OpenAlexAPIClient()
-                        arxiv_url, _ = await self._arxiv_client.get_arxiv_by_title(title)
-                        if arxiv_url:
-                            logger.info(f"  → arxiv (arXiv API): {arxiv_url}")
-                    except Exception as e:
-                        logger.debug(f"  → arXiv API 查询失败: {e}")
-
-            # 将 arxiv/github 链接存入 metadata
+            # 将链接存入 metadata
             paper_metadata = dict(metadata) if metadata else {}
-            if arxiv_url:
-                paper_metadata["arxiv_url"] = arxiv_url
-            if github_url:
-                paper_metadata["github_url"] = github_url
+            if resolution is not None:
+                if resolution.arxiv_url:
+                    paper_metadata["arxiv_url"] = resolution.arxiv_url
+                if resolution.github_url:
+                    paper_metadata["github_url"] = resolution.github_url
+                if resolution.doi_url:
+                    paper_metadata["doi_url"] = resolution.doi_url
+                if resolution.resolution_source:
+                    paper_metadata["resolution_source"] = resolution.resolution_source
+                if resolution.resolution_score:
+                    paper_metadata["resolution_score"] = resolution.resolution_score
+                if resolution.matched_title:
+                    paper_metadata["matched_title"] = resolution.matched_title
+                if resolution.matched_identifier:
+                    paper_metadata["matched_identifier"] = resolution.matched_identifier
 
             # 更新缓存
             self._abstract_cache[paper_id] = PaperAbstract(
@@ -1339,45 +1337,13 @@ async def build_abstract_index(
 
             logger.info(f"[{i+1}/{len(existing)}] 查询链接: {abstract.title[:50]}...")
 
-            arxiv_url = ""
-            github_url = ""
-            doi_url = ""
-            best_similarity = 0.0
-            used_api = ""
-
             try:
-                # 1. OpenAlex API 搜索
-                if use_arxiv_api:
-                    works = await arxiv_client.search_by_title(abstract.title)
-                    best_work, best_score = find_best_title_match(abstract.title, works, threshold=80)
-                    if best_work and best_score >= 0.8:
-                        arxiv_url = arxiv_client.extract_arxiv_url(best_work)
-                        doi_url = arxiv_client.extract_doi_url(best_work) if not arxiv_url else None
-                        best_similarity = best_score
-                        used_api = "OpenAlex API"
-                        if arxiv_url:
-                            logger.success(f"  → arxiv (OpenAlex, 相似度 {best_score:.1%}): {arxiv_url}")
-                        elif doi_url:
-                            logger.success(f"  → DOI (OpenAlex, 相似度 {best_score:.1%}): {doi_url}")
-
-                # 2. arxiv 库 fallback
-                if not arxiv_url:
-                    arxiv_result = await arxiv_client._arxiv_library_fallback(abstract.title)
-                    if arxiv_result:
-                        arxiv_url, matched_title = arxiv_result
-                        if matched_title:
-                            from rapidfuzz import fuzz
-                            score = fuzz.token_set_ratio(
-                                arxiv_client._normalize(abstract.title),
-                                arxiv_client._normalize(matched_title)
-                            )
-                            if score >= 80:
-                                best_similarity = score / 100.0
-                                used_api = "arXiv Library"
-                                logger.success(f"  → arxiv (arXiv fallback, 相似度 {best_similarity:.1%}): {arxiv_url}")
-                            else:
-                                logger.warning(f"  → arXiv 结果验证失败: {score:.1%} < 80%")
-                                arxiv_url = ""  # 清除验证失败的 URL
+                resolution = await abstract_index._link_resolver.resolve_by_title(abstract.title)
+                arxiv_url = resolution.arxiv_url
+                github_url = resolution.github_url
+                doi_url = resolution.doi_url
+                best_similarity = resolution.resolution_score / 100.0
+                used_api = resolution.resolution_source or resolution.backend
 
                 detail["similarity"] = best_similarity
                 detail["api"] = used_api

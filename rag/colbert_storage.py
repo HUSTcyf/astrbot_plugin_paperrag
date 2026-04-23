@@ -160,8 +160,14 @@ class ColBERTStorage:
 
     def load(self) -> bool:
         """从磁盘加载"""
-        if not all(p.exists() for p in [self.doc_vectors_path, self.faiss_index_path, self.id_mapping_path]):
-            logger.warning("[ColBERTStorage] 存储文件不完整，跳过加载")
+        paths = [self.doc_vectors_path, self.faiss_index_path, self.id_mapping_path]
+        exists_flags = [p.exists() for p in paths]
+
+        if not all(exists_flags):
+            if any(exists_flags):
+                logger.warning("[ColBERTStorage] 存储文件不完整，跳过加载")
+            else:
+                logger.info(f"[ColBERTStorage] 尚无已保存存储，首次构建后将写入: {self.storage_dir}")
             return False
 
         try:

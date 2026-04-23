@@ -5,7 +5,11 @@
 """
 
 import io
+import json
+import os
 import re
+import subprocess
+import sys
 import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, cast
@@ -78,6 +82,7 @@ class ExtractedTable:
     caption: Optional[str] = None  # 表注（Table X）
     context: Optional[str] = None  # 上下文
     saved_csv_path: Optional[str] = None  # CSV 文件路径
+    saved_md_path: Optional[str] = None  # Markdown 文件路径
     saved_png_path: Optional[str] = None  # PNG 图片路径
 
 
@@ -463,7 +468,7 @@ class MultimodalPDFExtractor:
                 if iou > self.nms_iou_threshold:
                     # 图片重叠，标记移除面积较小的（后续图片）
                     remove_indices.add(idx_j)
-                    logger.debug(f"🔍 [NMS 页 {page_num}] 图片 {idx_j} 与 {idx_i} 重叠 (IoU={iou:.2f})，移除较小的")
+                    # logger.debug(f"🔍 [NMS 页 {page_num}] 图片 {idx_j} 与 {idx_i} 重叠 (IoU={iou:.2f})，移除较小的")
 
         # 返回未被移除的图片
         nms_filtered_images = [valid_bbox_images[idx] for idx in range(len(valid_bbox_images)) if idx not in remove_indices]
@@ -473,11 +478,11 @@ class MultimodalPDFExtractor:
 
         # 🔧 安全机制：如果NMS去重后图片数量为0，禁用NMS去重
         if len(final_images) == 0 and len(current_images) > 0:
-            logger.warning(f"⚠️ [NMS 页 {page_num}] 过滤后图片数量为0，禁用NMS去重")
+            # logger.warning(f"⚠️ [NMS 页 {page_num}] 过滤后图片数量为0，禁用NMS去重")
             return current_images
 
-        if len(current_images) > len(final_images):
-            logger.info(f"🔍 [NMS 页 {page_num}] 位置重叠过滤: {len(current_images)} → {len(final_images)} 张")
+        # if len(current_images) > len(final_images):
+        #     logger.info(f"🔍 [NMS 页 {page_num}] 位置重叠过滤: {len(current_images)} → {len(final_images)} 张")
 
         return final_images
 
@@ -862,9 +867,6 @@ def _configure_docling_globals() -> None:
     if _GLOBAL_DOCLING_CONFIGURED:
         return
 
-    import os
-    from pathlib import Path
-
     models_dir = Path(__file__).parent.parent / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
 
@@ -903,8 +905,8 @@ class DoclingExtractor:
         self.fallback = fallback_extractor
         self._available = self._check_available()
         self._plugin_dir = Path(__file__).parent
-        self._figures_base = self._plugin_dir / "data" / "figures"
-        self._tables_base = self._plugin_dir / "data" / "tables"
+        self._figures_base = self._plugin_dir.parent / "data" / "figures"
+        self._tables_base = self._plugin_dir.parent / "data" / "tables"
 
         # 配置本地模型目录（全局配置，只在首次执行）
         if self._available:
@@ -993,12 +995,6 @@ class DoclingExtractor:
         由于 AstrBot 环境下 docling convert() 会触发 segfault，
         使用独立进程执行以隔离运行环境。
         """
-        import subprocess
-        import sys
-        import tempfile
-        import json
-        import os
-
         pdf_path_obj = Path(pdf_path)
         paper_id: str = pdf_path_obj.stem
 
@@ -1008,229 +1004,24 @@ class DoclingExtractor:
         tables_dir.mkdir(parents=True, exist_ok=True)
 
         plugin_dir = Path(__file__).parent
+        models_dir = plugin_dir.parent / "models"
 
-        # 构建子进程脚本
-        script = f'''
-import sys
-import os
-import io
-import json
-from pathlib import Path
-
-models_dir = Path(__file__).parent.parent / "models"
-os.environ["HF_HOME"] = str(models_dir)
-os.environ["TRANSFORMERS_CACHE"] = str(models_dir)
-
-from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions
-from docling_core.types.doc import PictureItem, TableItem, FormulaItem
-
-def _table_data_to_csv(data):
-    """将表格数据转换为 CSV 格式字符串
-
-    Args:
-        data: TableItem、TableData 对象或 List[List[str]] 原始数据
-    """
-    # TableItem 有 export_to_dataframe 方法（正确处理合并单元格）
-    # TableData 没有此方法
-    if hasattr(data, 'export_to_dataframe'):
-        try:
-            df = data.export_to_dataframe(doc=None)
-            import io
-            buf = io.StringIO()
-            df.to_csv(buf, index=False, header=True, encoding='utf-8')
-            return buf.getvalue()
-        except Exception:
-            pass
-
-    # 回退：使用 grid 遍历
-    if hasattr(data, 'grid'):
-        rows = data.grid
-    else:
-        rows = data
-
-    lines = []
-    for row in rows:
-        cells = []
-        for cell in row:
-            if hasattr(cell, '_get_text'):
-                cell_text = cell._get_text(doc=None) or ""
-            elif isinstance(cell, list):
-                cell_text = str(cell)
-            else:
-                cell_text = str(cell) if cell is not None else ""
-            cell_text = cell_text.replace('"', '""')
-            cells.append(cell_text)
-        escaped_cells = ['"' + c + '"' if ',' in c or '"' in c else c for c in cells]
-        line = ",".join(escaped_cells)
-        lines.append(line)
-    return "\n".join(lines)
-
-def _csv_to_markdown(data):
-    """将表格数据转换为 Markdown 表格格式"""
-    # 优先使用 TableItem 的内置方法（正确处理合并单元格）
-    if hasattr(data, 'export_to_markdown'):
-        try:
-            return data.export_to_markdown(doc=None)
-        except Exception:
-            pass
-
-    if hasattr(data, 'export_to_dataframe'):
-        try:
-            df = data.export_to_dataframe(doc=None)
-            cols = list(df.columns)
-            lines = []
-            lines.append("| " + " | ".join(str(c) for c in cols) + " |")
-            lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
-            for _, row in df.iterrows():
-                cells = [str(v).replace("|", "\\|").replace("\n", " ") for v in row]
-                lines.append("| " + " | ".join(cells) + " |")
-            return "\n".join(lines)
-        except Exception:
-            pass
-
-    if hasattr(data, 'grid'):
-        rows = data.grid
-    else:
-        rows = data
-
-    if not rows:
-        return ""
-    lines = []
-    for i, row in enumerate(rows):
-        cells = []
-        for cell in row:
-            if hasattr(cell, '_get_text'):
-                cell_str = cell._get_text(doc=None) or ""
-            elif isinstance(cell, list):
-                cell_str = str(cell)
-            else:
-                cell_str = str(cell) if cell is not None else ""
-            cell_str = cell_str.replace("|", "\\|").replace("\n", " ")
-            cells.append(cell_str)
-        lines.append("| " + " | ".join(cells) + " |")
-        if i == 0:
-            separator = "| " + " | ".join(["---"] * len(cells)) + " |"
-            lines.append(separator)
-    return "\n".join(lines)
-
-pdf_path = Path("{pdf_path}")
-paper_id = "{paper_id}"
-figures_dir = Path("{figures_dir}")
-tables_dir = Path("{tables_dir}")
-
-pipeline_options = PdfPipelineOptions(
-    generate_picture_images=True,
-    generate_page_images=False,
-    do_table_structure=True,
-    do_ocr=True,
-    do_formula_enrichment=False,
-    images_scale=2.0,
-)
-
-converter = DocumentConverter(
-    format_options={{
-        InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-    }}
-)
-
-result = converter.convert(pdf_path)
-
-images = []
-tables = []
-formulas = []
-text_parts = []
-figure_counters = {{}}
-table_counters = {{}}
-formula_counters = {{}}
-
-for element, _level in result.document.iterate_items():
-    if isinstance(element, PictureItem):
-        page_no = element.prov[0].page_no
-        figure_idx = figure_counters.get(page_no, 0) + 1
-        figure_counters[page_no] = figure_idx
-        if element.image is None:
-            continue
-        pil_image = element.image.pil_image
-        filename = f"{{page_no}}-Figure{{figure_idx}}.png"
-        save_path = figures_dir / filename
-        pil_image.save(save_path, format="PNG")
-        images.append({{
-            "page_number": page_no,
-            "image_index": figure_idx,
-            "bbox": [0, 0, 0, 0],
-            "caption": f"Figure {{figure_idx}}",
-            "saved_path": str(save_path),
-        }})
-    elif isinstance(element, TableItem):
-        page_no = element.prov[0].page_no
-        table_idx = table_counters.get(page_no, 0) + 1
-        table_counters[page_no] = table_idx
-        table_csv = _table_data_to_csv(element)
-        csv_filename = f"{{page_no}}-Table{{table_idx}}.csv"
-        png_filename = f"{{page_no}}-Table{{table_idx}}.png"
-        csv_path = tables_dir / csv_filename
-        png_path = tables_dir / png_filename
-        with open(csv_path, "w", encoding="utf-8") as f:
-            f.write(table_csv)
-        saved_png_path = None
-        if element.image is not None:
-            pil_image = element.image.pil_image
-            pil_image.save(png_path, format="PNG")
-            saved_png_path = str(png_path)
-        table_markdown = _csv_to_markdown(element)
-        tables.append({{
-            "page_number": page_no,
-            "table_index": table_idx,
-            "bbox": [0, 0, 0, 0],
-            "csv": table_csv,
-            "markdown": table_markdown,
-            "caption": f"Table {{table_idx}}",
-            "saved_csv_path": str(csv_path),
-            "saved_png_path": saved_png_path,
-        }})
-    elif isinstance(element, FormulaItem):
-        page_no = element.prov[0].page_no if element.prov else 1
-        formula_idx = formula_counters.get(page_no, 0) + 1
-        formula_counters[page_no] = formula_idx
-        latex_text = element.text or ""
-        formulas.append({{
-            "page_number": page_no,
-            "formula_index": formula_idx,
-            "text": latex_text,
-            "bbox": [0, 0, 0, 0],
-            "type": "display",
-        }})
-
-if result.document.texts:
-    text_parts.extend([t.text for t in result.document.texts])
-
-result_json = json.dumps({{
-    "file_name": pdf_path.name,
-    "images": images,
-    "tables": tables,
-    "formulas": formulas,
-    "text": "\\\\n".join(text_parts),
-}})
-
-print(result_json)
-'''
-
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-            f.write(script)
-            script_path = f.name
+        # 使用固定的子进程脚本
+        script_path = plugin_dir / "_docling_subprocess.py"
 
         try:
             result = subprocess.run(
-                [sys.executable, script_path],
+                [sys.executable, str(script_path),
+                 str(Path(pdf_path)), paper_id,
+                 str(figures_dir), str(tables_dir),
+                 str(models_dir)],
                 capture_output=True,
                 text=True,
                 cwd=str(plugin_dir),
             )
 
             if result.returncode != 0:
-                raise RuntimeError(f"docling extraction failed: {result.stderr}")
+                raise RuntimeError(f"docling extraction failed (rc={result.returncode}):\n{result.stderr}")
 
             output = result.stdout.strip()
             if not output:
@@ -1238,7 +1029,6 @@ print(result_json)
 
             data = json.loads(output)
 
-            # 构建 ExtractedContent
             images_out = [
                 ExtractedImage(
                     page_number=img["page_number"],
@@ -1259,6 +1049,7 @@ print(result_json)
                     markdown=tbl.get("markdown"),
                     caption=tbl.get("caption"),
                     saved_csv_path=tbl.get("saved_csv_path"),
+                    saved_md_path=tbl.get("saved_md_path"),
                     saved_png_path=tbl.get("saved_png_path"),
                 )
                 for tbl in data.get("tables", [])
@@ -1284,9 +1075,8 @@ print(result_json)
                 formulas=formulas_out,
                 text=data.get("text", ""),
             )
-
-        finally:
-            os.unlink(script_path)
+        except Exception:
+            raise
 
     def _pil_to_bytes(self, pil_image: Image.Image) -> bytes:
         """将 PIL Image 转换为 bytes"""
@@ -1370,8 +1160,10 @@ def _build_extracted_content_from_json(data: Dict[str, Any]) -> ExtractedContent
             table_index=tbl["table_index"],
             bbox=tuple(tbl["bbox"]),
             csv=tbl.get("csv"),
+            markdown=tbl.get("markdown"),
             caption=tbl.get("caption"),
             saved_csv_path=tbl.get("saved_csv_path"),
+            saved_md_path=tbl.get("saved_md_path"),
             saved_png_path=tbl.get("saved_png_path"),
         ))
 
@@ -1415,18 +1207,13 @@ class PDFParserAdvanced:
 
         # 初始化多模态提取器
         if self.enable_multimodal:
-            try:
-                self.multimodal_extractor = MultimodalPDFExtractor(
-                    extract_images=True,
-                    extract_tables=True,
-                    extract_formulas=True,
-                    fallback_to_text=True
-                )
-                self.docling_extractor = DoclingExtractor(fallback_extractor=self.multimodal_extractor)
-                logger.info("✅ DoclingExtractor 已启用（默认），MultimodalPDFExtractor 作为 fallback")
-            except Exception as e:
-                logger.warning(f"⚠️ 多模态提取器初始化失败: {e}")
-                self.enable_multimodal = False
+            self.multimodal_extractor = MultimodalPDFExtractor(
+                extract_images=True,
+                extract_tables=True,
+                extract_formulas=True,
+                fallback_to_text=False
+            )
+            self.docling_extractor = DoclingExtractor()
 
     def parse_pdf(self, pdf_path: str) -> tuple[str, Dict[str, Any]]:
         """
@@ -1508,6 +1295,7 @@ class PDFParserAdvanced:
                         "rows": len(table.data) if table.data else 0,
                         "markdown": table.markdown,
                         "saved_csv_path": table.saved_csv_path,
+                        "saved_md_path": table.saved_md_path,
                         "saved_png_path": table.saved_png_path
                     }
                     for table in extracted.tables

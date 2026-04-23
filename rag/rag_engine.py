@@ -38,9 +38,6 @@ class RAGConfig:
     llama_vlm_n_ctx: int = 4096
     llama_vlm_n_gpu_layers: int = 99
 
-    # Unsloth配置（保留用于配置传递）
-    ollama_config: dict = field(default_factory=dict)
-
     # Unsloth Embedding配置
     unsloth_config: dict = field(default_factory=dict)
 
@@ -72,7 +69,6 @@ class RAGConfig:
     # 混合检索配置（稀疏权重 + 稠密向量 + BM25精确匹配）
     enable_sparse_retrieval: bool = True  # 使用 BGE-M3 稀疏权重
     enable_multi_vector_rerank: bool = False  # 使用 ColBERT reranking
-    enable_noise_filter: bool = True  # 使用本地 LLM 过滤噪声 chunks（参考文献/表格/符号等）
     sparse_top_k: int = 20        # 稀疏检索召回数量
     hybrid_alpha: float = 0.5    # RRF 融合权重（0=纯稀疏, 1=纯向量）
     hybrid_rrf_k: int = 60      # RRF 常数 k
@@ -81,20 +77,16 @@ class RAGConfig:
     enable_bm25: bool = True    # 启用 BM25 精确匹配（当检测到精确匹配意图时自动启用）
     bm25_top_k: int = 20       # BM25 召回数量
 
-    # 重排序配置（向后兼容，内部使用 ColBERT reranking）
-    enable_reranking: bool = False  # 使用 ColBERT reranking
-    reranking_model: str = "BAAI/bge-reranker-v2-m3"  # 保留字段但不使用
-    reranking_device: str = "auto"  # 保留字段但不使用
-    reranking_adaptive: bool = True  # 保留字段但不使用
-    reranking_threshold: float = 0.0  # 保留字段但不使用
-    reranking_batch_size: int = 32  # 保留字段但不使用
-
     # LLM 参考文献解析配置
     enable_llm_reference_parsing: bool = True
 
     # FreeAPI 配置
     freeapi_url: str = ""
     freeapi_key: str = ""
+
+    # 论文链接补全配置
+    core_api_key: str = ""
+    use_arxiv_api: bool = True  # 仅控制 arXiv library fallback，不影响 OpenAlex
 
     # Graph RAG 配置
     enable_graph_rag: bool = False
@@ -120,14 +112,8 @@ class RAGConfig:
         """初始化后处理"""
         if self.authentication is None:
             self.authentication = {}
-        if self.ollama_config is None:
-            self.ollama_config = {}
         if self.unsloth_config is None:
             self.unsloth_config = {}
-
-        # 向后兼容：如果设置了 enable_bm25，确保 sparse_top_k 有值
-        if self.bm25_top_k > 0:
-            self.sparse_top_k = self.bm25_top_k
 
         # 自动调整 embed_dim（BGE-M3 固定 1024 维）
         if self.embedding_mode == "unsloth":

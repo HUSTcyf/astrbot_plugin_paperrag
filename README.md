@@ -1,8 +1,15 @@
-# 📚 Paper RAG Plugin v1.12.1 - 用户指南
+# 📚 Paper RAG Plugin v1.12.2 - 用户指南
 
 本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力（支持多模态VLM问答）。
 
-> **版本说明**：当前版本 v1.12.1，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)
+> **版本说明**：当前版本 v1.12.2，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
+
+### 本版变化
+
+- `/paper abstract_build confirm [N]` 已退役，摘要入库统一走 `/paper add`、`/paper addf` 和 `/paper rebuild`
+- Embedding 默认模式切换为 `unsloth`，不再保留 `ollama`
+- 检索配置已收口为 `enable_sparse_retrieval`、`enable_bm25`、`enable_multi_vector_rerank` 三组核心开关
+- ColBERT 持久化文件统一写入插件 `data/` 目录
 
 ## 🏗️ 系统架构
 
@@ -55,13 +62,13 @@ pip install -r requirements.txt
 
 ### 第二步：配置插件
 
-**方式A：使用Unsloth本地Embedding（推荐，免费无限制）**
+**方式A：使用 Unsloth 本地Embedding（推荐，免费无限制）**
 
 在 **AstrBot WebUI → 插件 → paper_rag → 插件配置** 中：
 
 | 配置项 | 值 | 说明 |
 |-------|-----|------|
-| Embedding模式 | `Unsloth本地模式` | 使用Unsloth BGE-M3 |
+| Embedding模式 | `unsloth` | 使用 Unsloth BGE-M3 |
 | 向量嵌入维度 | `1024` | BGE-M3固定1024维 |
 | 文本问答Provider | （从AstrBot选取） | 用于RAG回答生成 |
 | 论文文件存放目录 | `./papers` | PDF存放路径 |
@@ -76,11 +83,11 @@ pip install -r requirements.txt
 > ```
 > 详细配置见：[OLLAMA_GUIDE.md](docs/OLLAMA_GUIDE.md)（BGE-M3 部分）
 
-**方式B：使用Gemini API（快速，有配额限制）**
+**方式B：使用 Gemini API（快速，有配额限制）**
 
 | 配置项 | 值 | 说明 |
 |-------|-----|------|
-| Embedding模式 | `API模式` | 使用API |
+| Embedding模式 | `api` | 使用 API 兼容接口 |
 | Embedding 服务提供商 | `gemini_embedding` | Gemini Embedding API |
 | 向量嵌入维度 | `768` | Gemini固定768维 |
 | 文本问答Provider | （从AstrBot选取） | 用于RAG回答生成 |
@@ -124,7 +131,6 @@ cp ~/Downloads/*.pdf papers/
 | `/paper arxiv_refs [top_k] [每篇数量]` | 下载高频引用论文（需管理员） | `/paper arxiv_refs 10 3` |
 | `/paper arxiv_sync confirm` | 同步MCP已下载论文到数据库（需管理员） | `/paper arxiv_sync confirm` |
 | `/paper arxiv_cleanup confirm` | 清理arXiv论文旧版本（需管理员） | `/paper arxiv_cleanup confirm` |
-| `/paper abstract_build confirm [N]` | 构建摘要索引（支持跳过前N篇，检查点恢复） | `/paper abstract_build confirm 30` |
 | `/paper graph_build` | 构建知识图谱（需管理员） | `/paper graph_build` |
 | `/paper graph_stats` | 查看图谱统计信息 | `/paper graph_stats` |
 | `/paper graph_rebuild confirm` | 重建知识图谱（清空+重建） | `/paper graph_rebuild confirm` |
@@ -386,7 +392,6 @@ API 配置从 `evaluation/freeapi.json` 读取，包含：
 | `enable_sparse_retrieval` | 启用稀疏权重检索(ABSPEC) | `true` | ✅ |
 | `sparse_top_k` | 稀疏检索召回数量 | `20` | `20-50` |
 | `hybrid_alpha` | RRF 融合权重 | `0.5` | `0.5`（平等权重） |
-| `enable_noise_filter` | 启用噪声过滤(LLM) | `true` | ✅ |
 
 > 💡 **Embedding Provider 说明**：插件使用 Unsloth BGE-M3 本地加载，支持稠密向量、稀疏权重、多向量三种输出。
 
@@ -562,8 +567,6 @@ print('✅ PaperBanana 连接成功')
 | 配置项 | 说明 | 默认值 | 推荐值 |
 |-------|------|--------|--------|
 | `enable_multi_vector_rerank` | 启用 ColBERT 多向量重排序 | `false` | ✅（提升精度） |
-| `reranking_adaptive` | 自适应模式 | `true` | ✅ |
-| `reranking_threshold` | 分数阈值 | `0.0` | `0.0` |
 
 > 💡 **ColBERT 多向量重排序说明**：
 > - **原理**：ColBERT (Late Interaction) 每个 query token 和 doc token 分别编码为向量，检索时用 MaxSim 计算相似度
@@ -572,44 +575,12 @@ print('✅ PaperBanana 连接成功')
 > - **延迟增加**：200-500ms（MPS加速）
 > - **依赖**：BGE-M3 多向量输出（Unsloth 模式自动启用）
 
-**配置场景示例**：
+**配置方式**：只需要开启 `enable_multi_vector_rerank`，其余 reranking 细项已经移除。
 
 1. **新手/默认配置**（推荐）
 ```json
 {
   "enable_multi_vector_rerank": true
-}
-```
-
-2. **Apple Silicon Mac**（MPS加速）
-```json
-{
-  "enable_multi_vector_rerank": true,
-  "reranking_batch_size": 64
-}
-```
-
-3. **NVIDIA GPU**（CUDA加速）
-```json
-{
-  "enable_multi_vector_rerank": true,
-  "reranking_batch_size": 128
-}
-```
-
-4. **低内存/CPU**
-```json
-{
-  "enable_multi_vector_rerank": true,
-  "reranking_batch_size": 16
-}
-```
-
-5. **高精度模式**
-```json
-{
-  "enable_multi_vector_rerank": true,
-  "reranking_threshold": 0.3
 }
 ```
 
@@ -673,7 +644,7 @@ Query
 }
 ```
 
-> ⚠️ **注意**：`bm25_top_k` 应大于最终 `top_k`，确保 RRF 融合时有足够候选；`enable_bm25` 与 `enable_reranking` 可同时开启，混合检索结果再经重排序二次优化。
+> ⚠️ **注意**：`bm25_top_k` 应大于最终 `top_k`，确保 RRF 融合时有足够候选；`enable_bm25` 与 `enable_multi_vector_rerank` 可同时开启，混合检索结果再经重排序二次优化。
 
 ---
 
@@ -1026,7 +997,6 @@ evaluation_output/
 - [x] 摘要提取器 `AbstractExtractor`（从论文中提取摘要）
 - [x] 摘要向量索引构建（Milvus）
 - [x] `search_with_paper_filter()` 方法（在指定论文范围内搜索）
-- [x] 命令 `/paper abstract_build confirm [N]`（构建摘要索引，支持检查点恢复）
 
 **技术方案**：
 - 第一阶段：使用摘要向量匹配最相关的论文
@@ -1034,11 +1004,6 @@ evaluation_output/
 - 支持检查点机制，中断后可恢复
 
 **使用方式**：
-```bash
-/paper abstract_build confirm      # 开始构建摘要索引
-/paper abstract_build confirm 30   # 跳过前30篇，从第31篇开始
-```
-
 ---
 
 ### 🔲 创意生成引擎
@@ -1105,7 +1070,7 @@ evaluation_output/
 
 **技术方案**：基于 LangGraph 工作流编排
 
-**版本**：v1.12.1
+**版本**：v1.12.2
 
 ---
 

@@ -221,13 +221,7 @@ def _find_all_reference_sections(text: str) -> Dict[str, str]:
 
 
 def _find_reference_section(text: str) -> Optional[str]:
-    """找到参考文献部分
-
-    策略：
-    1. 从 "References"（不区分大小写）标题之后开始
-    2. 找到最后一个有效的编号参考文献行
-    3. 遇到表格分隔行 | --- | --- | 时截断
-    """
+    """找到参考文献部分（包含标题前的页码行）"""
     lines_text = text.split('\n')
     ref_start = -1
 
@@ -236,63 +230,50 @@ def _find_reference_section(text: str) -> Optional[str]:
         line_stripped = line.strip().lower()
         for kw in REFERENCE_SECTION_KEYWORDS:
             if line_stripped == kw or line_stripped.startswith(kw + ' '):
-                ref_start = i + 1
+                ref_start = i
                 break
-        if ref_start > 0:
+        if ref_start >= 0:
             break
 
     if ref_start < 0:
         return None
 
-    # 自动检测是否存在行号：检查第一条参考文献是否有双重编号格式
-    # 模式如: "[998] [1]" 或 "[123] 1."
+    # 往前扩展最多2行，包含 [Page X] 等页码标记（但不超出0）
+    actual_start = max(0, ref_start - 2)
+
+    # 自动检测是否存在行号
     first_line = lines_text[ref_start].strip()
     has_line_numbers = bool(re.match(r'^\[[0-9]+\]\s*\[[0-9]+\]', first_line)) or \
                        bool(re.match(r'^\[[0-9]+\]\s*[0-9]+\.', first_line))
 
-    # 清洗行号格式：如 "[998] [1] ..." -> "[1] ..."
     def clean_line(line: str) -> str:
         if has_line_numbers:
-            cleaned = re.sub(r'^\[[0-9]+\]\s*', '', line)
-            return cleaned
+            return re.sub(r'^\[[0-9]+\]\s*', '', line)
         return line
 
     # 找到最后一个编号参考文献行
-    # 策略：遇到包含特殊字符的行时停止（如表格分隔符 |、数学公式 $、附录等）
     ref_end = len(lines_text)
-
     for i, line in enumerate(lines_text[ref_start:], start=ref_start):
         stripped = clean_line(line).strip()
-
-        # 遇到 Markdown 表格分隔行 | --- | --- | 直接截断
         if stripped.startswith('|') and stripped.count('|') >= 3:
             ref_end = i
             break
-
-        # 遇到数学公式行（如 $...$ 或纯公式行）直接截断
         if stripped.startswith('$') or stripped.endswith('$'):
             ref_end = i
             break
-
-        # 遇到附录/补充材料/Acknowledgment时截断
-        # 匹配以这些关键词开头的行（更灵活，支持变体）
         if re.match(r'^(acknowledgment|appendix|supplementary)', stripped, re.IGNORECASE):
             ref_end = i
             break
-
-        # 检查是否有新的参考文献编号（清洗后检查）
         has_ref_number = bool(re.match(r'^\[[0-9]+\]', stripped)) or bool(re.match(r'^[0-9]+\.\s+[A-Z]', stripped))
-
         if has_ref_number:
             ref_end = i + 1
 
-    if ref_start >= ref_end:
+    if actual_start >= ref_end:
         return None
 
-    # 使用清洗后的行拼接结果
-    result_lines = [clean_line(lines_text[i]) for i in range(ref_start, ref_end)]
+    result_lines = [clean_line(lines_text[i]) for i in range(actual_start, ref_end)]
     result = '\n'.join(result_lines)
-    logger.info(f"📝 参考文献提取成功: {len(result)} 字符, {ref_end - ref_start} 行")
+    logger.info(f"📝 参考文献提取成功: {len(result)} 字符, {ref_end - actual_start} 行")
     return result
 
 
@@ -901,7 +882,13 @@ class LLMReferenceParser:
                                 continue
                             if resp.status != 200:
                                 text = await resp.text()
-                                logger.warning(f"⚠️ LLM API 请求失败: HTTP {resp.status}, 响应: {text[:500]}")
+                                logger.warning(f"⚠️ LLM API 请求失败: HTTP {resp.status}, 响应前200字符: {text[:200]}")
+                                return None
+                            # 检查 Content-Type，200 但非 JSON 时打印响应体
+                            content_type = resp.headers.get("Content-Type", "")
+                            if "application/json" not in content_type:
+                                body = await resp.text()
+                                logger.warning(f"⚠️ LLM API 返回非JSON (Content-Type={content_type})，响应体前200字符: {body[:200]}")
                                 return None
                             result = await resp.json()
                             logger.info(f"📝 [LLM调用] 响应解析成功")
@@ -1007,7 +994,7 @@ class LLMReferenceParser:
             json_str = self._extract_json(response)
             if not json_str:
                 logger.warning(f"⚠️ 批次 {batch_index+1}: 无法从 LLM 响应中提取 JSON，响应长度: {len(response)} 字符")
-                logger.warning(f"========== LLM 原始输出 ==========\n{response[:500]}\n========== END ==========")
+                logger.warning(f"========== LLM 原始输出 ==========\n{response}\n========== END ==========")
                 return []
 
             parsed_list = json.loads(json_str)
@@ -1060,7 +1047,6 @@ class LLMReferenceParser:
         Returns:
             分割后的文本列表
         """
-        import re
 
         lines = ref_section.split('\n')
         batches = []
@@ -1212,7 +1198,6 @@ class LLMReferenceParser:
 
     def _extract_json(self, text: str) -> Optional[str]:
         """从文本中提取 JSON 字符串"""
-        import re
 
         # 记录原始长度
         original_len = len(text)
@@ -1259,7 +1244,7 @@ class LLMReferenceParser:
         logger.info(f"[_extract_json] 找到 {len(all_matches)} 个潜在 JSON 匹配")
         for i, match in enumerate(all_matches):
             json_str = match.group(1)
-            logger.info(f"[_extract_json] 匹配 {i+1}: 长度={len(json_str)}, 前20字符={repr(json_str[:20])}")
+            logger.info(f"[_extract_json] 匹配 {i+1}: 长度={len(json_str)}, 内容={repr(json_str)}")
             result, _ = try_parse(json_str)
             if result:
                 logger.info(f"[_extract_json] 匹配 {i+1} 解析成功")

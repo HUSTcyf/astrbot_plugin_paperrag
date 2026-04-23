@@ -110,7 +110,7 @@ class IdeaEngineFeishuDoc(IdeaEnginePaperBanana):
                 raw_text = ""
                 if hasattr(result, 'content') and result.content:
                     raw_text = getattr(result.content[0], 'text', '') or str(result.content[0])
-                logger.error(f"[Test] 文本块插入失败: {raw_text[:300]}")
+                logger.error(f"[Test] 文本块插入失败: {raw_text}")
             else:
                 logger.info(f"[Test] 插入 {len(text_batch)} 个块 (index={batch_start_index})")
             text_batch = []
@@ -272,7 +272,7 @@ class IdeaEngineFeishuDoc(IdeaEnginePaperBanana):
                         err = ""
                         if hasattr(upd_result, 'content') and upd_result.content:
                             err = getattr(upd_result.content[0], 'text', '') or str(upd_result.content[0])
-                        logger.error(f"[Test] 列表样式更新失败: {err[:300]}")
+                        logger.error(f"[Test] 列表样式更新失败: {err}")
                     else:
                         updated_lists = len(updates)
                         logger.info(f"[Test] 列表样式更新成功 ({updated_lists} 个)")

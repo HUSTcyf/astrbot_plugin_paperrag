@@ -180,7 +180,7 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
                     ))
                 return ideas
             else:
-                logger.warning(f"[IdeaEngine] JSON解析失败，response前100字符: {response_text[:100]}")
+                logger.warning(f"[IdeaEngine] JSON解析失败，response: {response_text}")
                 return []
         except Exception as e:
             logger.error(f"[IdeaEngine] 创意生成失败: {e}")

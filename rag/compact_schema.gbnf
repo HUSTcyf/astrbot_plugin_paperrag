@@ -1,0 +1,12 @@
+# Compacted text extraction grammar
+# Permissive - allows any field order, optional fields, escaped characters
+
+root ::= "{" ws "}" | "{" pair ("," pair)* ws "}"
+ws ::= [ \t\n\r]*
+pair ::= ws string ws ":" ws value ws
+string ::= "\"" [a-zA-Z_] [a-zA-Z0-9_]* "\""
+value ::= strval | arrval
+strval ::= "\"" chars "\""
+chars ::= (esc | [^"\\])*
+esc ::= "\\" [\\/"bfnrt]
+arrval ::= "[" ws "]" | "[" ws strval ("," ws strval)* ws "]"

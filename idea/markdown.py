@@ -238,7 +238,7 @@ class IdeaEngineMarkdown(IdeaEngineIdeas):
         logger.info(f"[IdeaEngine] normalize 输入长度: {len(markdown_text)}")
         markdown_text = unquote(markdown_text)
 
-        logger.debug(f"[IdeaEngine] normalize 输入前200字符: {markdown_text[:200]}")
+        logger.debug(f"[IdeaEngine] normalize 输入: {markdown_text}")
 
         figure_match = re.search(r'##.*论文图表', markdown_text)
 
@@ -247,7 +247,7 @@ class IdeaEngineMarkdown(IdeaEngineIdeas):
             section = markdown_text[figure_match.start():]
 
             logger.info(f"[IdeaEngine] ✅ 找到论文图表章节: 位置={figure_match.start()}, 正文长度={len(before)}, 章节长度={len(section)}")
-            logger.debug(f"[IdeaEngine] 论文图表章节前100字符: {section[:100]}")
+            logger.debug(f"[IdeaEngine] 论文图表章节: {section}")
 
             body_images = self._extract_markdown_image_from_text(before)
             logger.info(f"[IdeaEngine] 正文中找到 {len(body_images)} 张 markdown 图片")

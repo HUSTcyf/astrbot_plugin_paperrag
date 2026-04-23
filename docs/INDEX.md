@@ -5,7 +5,7 @@
 | 文档 | 说明 |
 |------|------|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 架构设计、组件说明、配置参数 |
-| [CHANGELOG.md](CHANGELOG.md) | 变更记录 |
+| [CHANGELOG.md](CHANGELOG.md) | 变更记录（版本索引见 [docs/changelog/](changelog/INDEX.md)） |
 | [FEISHU_BLOCK_STYLING.md](FEISHU_BLOCK_STYLING.md) | 飞书文档块样式更新技术方案 |
 
 ## 使用指南
@@ -25,8 +25,8 @@
 
 ```json
 {
-  "embedding_mode": "ollama",
-  "ollama_config": {"model": "bge-m3"},
+  "embedding_mode": "unsloth",
+  "unsloth_config": {"model_path": "./models/bge-m3", "device": "mps"},
   "embed_dim": 1024,
   "chunk_size": 512,
   "chunk_overlap": 0,

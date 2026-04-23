@@ -142,8 +142,6 @@ class RagasEvaluator:
         embed_base_url: Optional[str] = None,
         embed_api_key: Optional[str] = None,
         embedding_mode: str = "api",
-        ollama_base_url: str = "http://localhost:11434",
-        ollama_embed_model: str = "bge-m3",
         max_concurrent: int = 3,
     ):
         """
@@ -156,9 +154,7 @@ class RagasEvaluator:
             embedding_model: Embedding 模型
             embed_base_url: Embedding API URL
             embed_api_key: Embedding API Key
-            embedding_mode: Embedding 模式 ("api" 或 "ollama")
-            ollama_base_url: Ollama API 地址
-            ollama_embed_model: Ollama Embedding 模型名称
+            embedding_mode: Embedding 模式 ("api")
         """
         self._llm = None
         self._embed_model = None
@@ -174,8 +170,6 @@ class RagasEvaluator:
             "base_url": embed_base_url,
             "api_key": embed_api_key,
             "mode": embedding_mode,
-            "ollama_base_url": ollama_base_url,
-            "ollama_embed_model": ollama_embed_model,
         }
 
     def _get_llm(self):
@@ -205,23 +199,7 @@ class RagasEvaluator:
         if self._embed_model is None:
             embed_mode = self._embed_config.get("mode", "api")
 
-            if embed_mode == "ollama":
-                embed_api_base = f"{self._embed_config['ollama_base_url']}/v1"
-                # 使用 ragas 0.4.3 新接口 embedding_factory 创建 modern embeddings
-                # 这解决了 AnswerRelevancy 等指标要求的 modern embeddings 接口
-                from openai import OpenAI
-                client = OpenAI(
-                    base_url=embed_api_base,
-                    api_key="ollama",
-                )
-                self._embed_model = embedding_factory(
-                    provider="openai",
-                    model=self._embed_config["ollama_embed_model"],
-                    client=client,
-                    interface="modern",
-                )
-                print(f"✅ Embedding (modern) 初始化成功: {self._embed_config['ollama_embed_model']} @ {embed_api_base}")
-            elif self._embed_config["base_url"]:
+            if self._embed_config["base_url"]:
                 from openai import OpenAI
                 client = OpenAI(
                     base_url=self._embed_config["base_url"].rstrip('/'),
@@ -235,7 +213,7 @@ class RagasEvaluator:
                 )
                 print(f"✅ Embedding (modern) 初始化成功: {self._embed_config['model']} @ {self._embed_config['base_url']}")
             else:
-                raise ValueError("embed_base_url or ollama mode is required for embedding")
+                raise ValueError("embed_base_url is required for embedding")
         return self._embed_model
 
     def _get_embed_model_with_legacy(self):

@@ -455,11 +455,11 @@ async def main_async(args):
 
     # 硬编码配置，不读取配置文件
     plugin_config = {
-        "ollama": {
-            "base_url": "http://localhost:11434",
-            "model": "bge-m3",
-            "timeout": 120.0,
-            "batch_size": 10,
+        "embedding_mode": "unsloth",
+        "unsloth": {
+            "model_path": "./models/bge-m3",
+            "device": "mps",
+            "max_seq_length": 512,
         },
     }
 

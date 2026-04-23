@@ -48,7 +48,7 @@ PDF → HybridPDFParser → Nodes → HybridIndexManager → HybridRAGEngine →
 ```python
 RAGConfig(
     # Embedding配置
-    embedding_mode="ollama",           # "api" 或 "ollama"
+    embedding_mode="unsloth",          # "api" 或 "unsloth"
     embed_dim=1024,                    # 向量维度 (BGE-M3=1024)
 
     # LLM Provider配置
@@ -93,7 +93,7 @@ astrbot_plugin_paperrag/
 ├── embedding_providers.py     # Embedding提供者
 ├── reference_processor.py     # 参考文献解析
 ├── milvus_manager.py          # Milvus管理器
-├── ollama_embedding.py        # Ollama Embedding
+├── unsloth_embedding.py      # Unsloth 本地 Embedding
 ├── llama_index_reranker.py    # 重排序
 ├── reranker.py                # 重排序封装
 ├── llama_cpp_vlm_provider.py  # Llama.cpp VLM本地推理

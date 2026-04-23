@@ -29,6 +29,10 @@ from pymilvus.exceptions import MilvusException
 from astrbot.api import logger
 
 
+_PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_DATA_DIR = _PLUGIN_ROOT / "data"
+
+
 class HybridIndexManager:
     """
     混合索引管理器（移除 BM25 版本）
@@ -104,8 +108,7 @@ class HybridIndexManager:
         elif self._uri:
             db_dir = os.path.dirname(self._uri) or "."
         else:
-            plugin_dir = Path(__file__).parent
-            db_dir = str(plugin_dir / "data")
+            db_dir = str(_DEFAULT_DATA_DIR)
 
         db_name = os.path.basename(self._lite_path) if self._lite_path else "milvus.db"
 
@@ -237,13 +240,14 @@ class HybridIndexManager:
                     logger.error(f"无法为 Milvus Lite 创建目录 '{db_dir}': {e}")
                     raise
 
+            self._prepare_lite_database_path(self._lite_path)
+
         self._connection_info["uri"] = self._lite_path
 
     def _configure_lite_default(self):
         """配置使用默认的 Milvus Lite 路径"""
         self._is_lite = True
-        plugin_dir = Path(__file__).parent
-        default_path = plugin_dir / "data" / "milvus_papers.db"
+        default_path = _DEFAULT_DATA_DIR / "milvus_papers.db"
         abs_path = str(default_path.resolve())
 
         logger.warning(f"使用默认 Milvus Lite 路径: '{abs_path}'")
@@ -252,7 +256,32 @@ class HybridIndexManager:
         if not db_dir.exists():
             os.makedirs(db_dir, exist_ok=True)
 
+        self._prepare_lite_database_path(str(default_path))
         self._connection_info["uri"] = str(default_path)
+
+    def _prepare_lite_database_path(self, db_path: str) -> None:
+        """只准备 Milvus Lite 的目录与路径，不预创建数据库文件。"""
+        path = Path(db_path).expanduser()
+        db_dir = path.parent
+
+        if not db_dir.exists():
+            raise PermissionError(f"Milvus Lite 数据库目录不存在: {db_dir}")
+        if not os.access(db_dir, os.W_OK | os.X_OK):
+            raise PermissionError(f"Milvus Lite 数据库目录不可写: {db_dir}")
+
+        if path.exists():
+            if path.is_dir():
+                raise PermissionError(f"Milvus Lite 数据库路径被目录占用: {path}")
+            if path.stat().st_size == 0:
+                logger.warning(f"Milvus Lite 检测到空数据库文件，删除后重建: {path}")
+                try:
+                    path.unlink()
+                except OSError as e:
+                    raise PermissionError(f"无法删除空数据库文件 {path}: {e}") from e
+                return
+            if not os.access(path, os.W_OK):
+                raise PermissionError(f"Milvus Lite 数据库文件不可写: {path}")
+            return
 
     def _configure_uri(self):
         """配置使用标准网络 URI 连接"""
@@ -385,7 +414,12 @@ class HybridIndexManager:
                 logger.info(f"✅ 集合 '{self._collection_name}' 创建成功 (索引: {index_type})")
 
         except Exception as e:
-            logger.error(f"集合初始化失败: {e}")
+            if self._is_lite:
+                logger.error(
+                    f"集合初始化失败: {e} (Milvus Lite 路径: {self._connection_info.get('uri')})"
+                )
+            else:
+                logger.error(f"集合初始化失败: {e}")
             raise
 
     async def insert_nodes(self, nodes: List[Any], embeddings: List[List[float]]) -> int:
@@ -399,8 +433,6 @@ class HybridIndexManager:
         Returns:
             插入的文档数量
         """
-        import json
-
         await self._ensure_collection()
 
         if len(nodes) != len(embeddings):
@@ -523,7 +555,6 @@ class HybridIndexManager:
             if results is None:
                 return []
 
-            import json
             documents = []
             results_first: Any = cast(Any, results[0])
             for hit in results_first:
@@ -601,7 +632,6 @@ class HybridIndexManager:
             if results is None or len(results) == 0:
                 return []
 
-            import json
             documents = []
             results_first: Any = cast(Any, results[0])
             for hit in results_first:
@@ -655,8 +685,6 @@ class HybridIndexManager:
         Returns:
             [{"text": str, "metadata": dict, "id": int}, ...]
         """
-        import json
-
         try:
             await self._ensure_collection()
             collection = cast(Collection, self._collection)
@@ -761,8 +789,6 @@ class HybridIndexManager:
         Returns:
             删除结果
         """
-        import json
-
         try:
             await self._ensure_collection()
 

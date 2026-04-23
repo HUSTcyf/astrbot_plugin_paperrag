@@ -1,44 +1,50 @@
-# Ollama 本地 Embedding 配置指南
+# Llama.cpp 本地 VLM 配置指南
 
-使用 Ollama 进行本地向量化，无需 API Key，完全免费、无限制、隐私保护。
+使用 Llama.cpp 进行本地多模态推理，支持 GGUF 格式模型 + mmproj 视觉编码器，无需 API Key，完全免费、无限制、隐私保护。
 
 ## 安装步骤
 
-### 1. 安装 Ollama
+### 1. 安装 llama-cpp-python
 
 ```bash
-# macOS/Linux
-curl -fsSL https://ollama.com/install.sh | sh
+# macOS (Metal GPU 加速)
+CMAKE_ARGS="-DGGML_METAL=on -DLLAMA_MTMD=on" pip install llama-cpp-python
 
-# 或通过 Homebrew (macOS)
-brew install ollama
+# Linux (CUDA GPU 加速)
+CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python
+
+# 仅 CPU
+pip install llama-cpp-python
 ```
 
-### 2. 拉取 Embedding 模型
+### 2. 下载模型文件
+
+推荐使用 Qwen2.5-VL（支持视觉功能）：
 
 ```bash
-# 推荐使用 bge-m3（支持中英文，效果好）
-ollama pull bge-m3
+# 创建模型目录
+mkdir -p ./models/Qwen3.5-9B-GGUF
 
-# 备选：nomic-embed-text（纯英文）
-ollama pull nomic-embed-text
+# 下载 GGUF 模型（Qwen3.5-9B，支持视觉）
+# 模型来源：HuggingFace Qwen 组织
+wget https://huggingface.co/Qwen/Qwen3.5-9B-UD-Q4_K_XL-GGUF/resolve/main/Qwen3.5-9B-UD-Q4_K_XL.gguf
+
+# 下载对应的 mmproj 视觉编码器
+wget https://huggingface.co/Qwen/Qwen3.5-9B-UD-Q4_K_XL-GGUF/resolve/main/mmproj-BF16.gguf
 ```
 
-### 3. 启动 Ollama 服务
+### 3. 验证安装
 
-```bash
-# 启动服务（默认端口 11434）
-ollama serve
+```python
+from llama_cpp import Llama
 
-# 或者在后台运行
-ollama serve &
-```
-
-### 4. 验证安装
-
-```bash
-# 测试 bge-m3 模型
-ollama run bge-m3 "Hello world"
+# 测试模型加载
+llm = Llama(
+    model_path="./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf",
+    n_ctx=4096,
+    n_gpu_layers=99,
+)
+print("Llama.cpp 模型加载成功")
 ```
 
 ## 插件配置
@@ -47,13 +53,14 @@ ollama run bge-m3 "Hello world"
 
 ```json
 {
-  "embedding_mode": "ollama",
-  "ollama": {
-    "base_url": "http://localhost:11434",
-    "model": "bge-m3",
-    "batch_size": 10,
-    "timeout": 120.0
-  }
+  "embedding_mode": "unsloth",
+  "multimodal_provider_id": "",
+  "llama_vlm_model_path": "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf",
+  "llama_vlm_mmproj_path": "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf",
+  "llama_vlm_n_ctx": 8192,
+  "llama_vlm_n_gpu_layers": 99,
+  "llama_vlm_max_tokens": 2560,
+  "llama_vlm_temperature": 0.7
 }
 ```
 
@@ -61,92 +68,78 @@ ollama run bge-m3 "Hello world"
 
 | 参数 | 说明 | 默认值 | 推荐值 |
 |------|------|--------|--------|
-| `base_url` | Ollama 服务地址 | `http://localhost:11434` | 默认即可 |
-| `model` | Embedding 模型名称 | `bge-m3` | `bge-m3`（推荐） |
-| `batch_size` | 并发批处理大小 | `10` | `10-20`（根据硬件调整） |
-| `timeout` | 请求超时（秒） | `120.0` | 默认 |
+| `llama_vlm_model_path` | GGUF 模型文件路径 | `./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf` | 根据实际路径调整 |
+| `llama_vlm_mmproj_path` | mmproj 视觉编码器路径 | `./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf` | 与模型配套 |
+| `llama_vlm_n_ctx` | 上下文窗口大小 | `8192` | Qwen3.5 支持 262144 |
+| `llama_vlm_n_gpu_layers` | GPU 加速层数 | `99` | `99`=全部加载到 GPU |
+| `llama_vlm_max_tokens` | 最大生成 Token 数 | `2560` | 根据需求调整 |
+| `llama_vlm_temperature` | 生成温度 | `0.7` | 较低=更确定性 |
 
 ## 性能优化
 
-### 批量大小调优
+### GPU 层数调优
 
-`batch_size` 控制同时处理的文档数量：
-- **内存充足**：设置为 `20` 或更高，加快索引速度
-- **内存有限**：设置为 `5-10`，避免 OOM
+`n_gpu_layers` 控制加载到 GPU 的层数：
 
-### GPU 加速（推荐）
+- **99 或 -1**：全部加载到 GPU（推荐 Apple Silicon）
+- **内存有限**：设置为 `33`（半量）或 `0`（仅 CPU）
+- **Windows CUDA**：建议 `99`
 
-Ollama 自动使用 GPU 加速。如需确认：
+### 上下文窗口大小
 
-```bash
-# 查看 GPU 使用情况
-ollama run bge-m3 "test" --verbose
-```
+较大的 `n_ctx` 支持更长上下文，但占用更多内存：
 
-### 多线程配置
+| n_ctx | 内存占用 | 适用场景 |
+|-------|----------|----------|
+| 4096 | ~8GB | 短文本问答 |
+| 8192 | ~12GB | 标准使用 |
+| 16384 | ~20GB | 长文档分析 |
+| 32768 | ~35GB | 超长上下文 |
 
-编辑 `~/.ollama/config.toml`：
+### 量化格式选择
 
-```toml
-# 限制并发请求数
-max_parallel = 4
-
-# 上下文大小
-num_ctx = 8192
-```
+| 量化格式 | 内存占用 | 质量损失 | 推荐场景 |
+|----------|----------|----------|----------|
+| Q4_K_XL | ~5.5GB | 最小 | 推荐使用 |
+| Q5_K_M | ~6.5GB | 几乎无 | 内存充足时 |
+| Q8_0 | ~9GB | 无 | 本地推理质量最高 |
 
 ## 常见问题
 
-### Q: 报错 `connection refused`
+### Q: 报错 `model format not supported`
 
-Ollama 服务未启动。执行：
-
-```bash
-ollama serve
-```
+确保使用正确的 GGUF 格式模型，mmproj 文件需要与模型配套。
 
 ### Q: 内存不足 (OOM)
 
-降低 `batch_size`：
+1. 降低 `n_gpu_layers`（从 99 → 33 → 0）
+2. 减小 `n_ctx`（从 8192 → 4096）
+3. 使用更小的量化格式（Q4_K_XL）
 
-```json
-{
-  "ollama": {
-    "batch_size": 5
-  }
-}
-```
+### Q: 视觉功能不工作
 
-### Q: 向量化速度慢
+1. 确认 `mmproj` 文件存在且路径正确
+2. 确认使用的是支持视觉的模型（如 Qwen2.5-VL）
 
-1. 确认 GPU 正在被使用
-2. 适当提高 `batch_size`
-3. 使用 `bge-m3` 而非 `nomic-embed-text`
+### Q: 生成速度慢
 
-### Q: 模型下载慢
-
-使用镜像或手动下载：
-
-```bash
-# 手动下载 bge-m3
-ollama pull bge-m3
-
-# 查看已下载模型
-ollama list
-```
+1. 确认 GPU 正在被使用（macOS Metal / CUDA）
+2. 降低 `n_ctx` 减少计算量
+3. 使用更小的量化格式
 
 ## 与 API 模式对比
 
-| 特性 | Ollama | API 模式 |
-|------|--------|----------|
+| 特性 | Llama.cpp | API 模式 |
+|------|-----------|----------|
 | 成本 | 免费 | 按量付费 |
 | 隐私 | 数据本地处理 | 数据发送到第三方 |
 | 速度 | 依赖本地硬件 | 依赖网络 |
 | 限制 | 无 | 有 RPM/TPM 限制 |
 | 稳定性 | 依赖本地服务 | 服务商保障 |
+| 视觉支持 | 需要 mmproj | 通常内置 |
 
 ## 相关文档
 
-- [Ollama 官网](https://ollama.com/)
-- [Ollama 模型库](https://ollama.com/library)
-- [bge-m3 模型](https://ollama.com/library/bge-m3)
+- [Llama.cpp 官网](https://github.com/ggerganov/llama.cpp)
+- [llama-cpp-python](https://github.com/abetlen/llama-cpp-python)
+- [Qwen 模型库](https://huggingface.co/Qwen)

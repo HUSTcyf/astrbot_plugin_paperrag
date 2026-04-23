@@ -15,6 +15,8 @@ from typing import Any, List, Optional, Dict
 
 from astrbot.api import logger
 
+_PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+
 
 class LLMResponse:
     """简化的 LLM 响应类"""
@@ -70,14 +72,26 @@ class LlamaCppVLMProvider:
         self._start_time: Optional[float] = None
         self._lock = asyncio.Lock()
 
+    def _resolve_path(self, path: str) -> str:
+        """将相对路径统一解析到插件根目录。"""
+        candidate = Path(path).expanduser()
+        if candidate.is_absolute():
+            return str(candidate.resolve())
+        return str((_PLUGIN_ROOT / candidate).resolve())
+
     async def initialize(self) -> None:
         """初始化 Llama 对象（支持 9B→4B 自动降级）"""
         if self._initialized:
             logger.info("[Llama.cpp-VLM] 已初始化")
             return
 
+        raw_model_path = self.model_path
+        raw_mmproj_path = self.mmproj_path
+        self.model_path = self._resolve_path(self.model_path)
+        self.mmproj_path = self._resolve_path(self.mmproj_path)
         logger.info("[Llama.cpp-VLM] 开始初始化...")
-        logger.info(f"  原始配置: {self.model_path}")
+        logger.info(f"  原始配置: model={raw_model_path}, mmproj={raw_mmproj_path}")
+        logger.info(f"  解析后路径: model={self.model_path}, mmproj={self.mmproj_path}")
         logger.info(f"  n_ctx: {self.n_ctx}, n_gpu_layers: {self.n_gpu_layers}")
 
         # 尝试初始化，9B 失败则降级到 4B
@@ -105,10 +119,7 @@ class LlamaCppVLMProvider:
 
     def _get_plugin_models_dir(self) -> Path:
         """获取插件的 models 目录"""
-        # __file__ = .../astrbot_plugin_paperrag/idea/llama_cpp_vlm_provider.py
-        # .parent = .../astrbot_plugin_paperrag/idea/
-        # .parent.parent = .../astrbot_plugin_paperrag/
-        return Path(__file__).parent.parent.resolve() / "models"
+        return _PLUGIN_ROOT / "models"
 
     async def _ensure_models_downloaded(self) -> None:
         """检查模型文件是否存在，不存在则自动下载（9B优先，4B备用）"""
@@ -335,13 +346,20 @@ class LlamaCppVLMProvider:
             loop = asyncio.get_event_loop()
             # 使用调用者传入的 max_tokens，若无则用实例默认值
             effective_max_tokens = kwargs.get('max_tokens', self.max_tokens)
-            logger.debug(f"[Llama.cpp-VLM] max_tokens: kwargs={kwargs.get('max_tokens')}, effective={effective_max_tokens}, self.max_tokens={self.max_tokens}")
+            # grammar 参数：支持 LlamaGrammar 对象或字符串（grammar 文件路径）
+            grammar_arg = kwargs.get('grammar')
+            if grammar_arg is not None and not hasattr(grammar_arg, '_grammar'):
+                # 如果是字符串路径，从文件加载 grammar
+                from llama_cpp import LlamaGrammar
+                grammar_arg = LlamaGrammar.from_file(grammar_arg)
+            logger.debug(f"[Llama.cpp-VLM] max_tokens: {effective_max_tokens}, grammar: {type(grammar_arg).__name__ if grammar_arg else None}")
             result = await loop.run_in_executor(
                 None,
                 lambda: llama.create_chat_completion(
                     messages=messages,
                     temperature=temp,
                     max_tokens=effective_max_tokens,
+                    grammar=grammar_arg,
                 )
             )
 
@@ -353,7 +371,7 @@ class LlamaCppVLMProvider:
 
             elapsed = time.time() - start_time
             logger.info(f"[Llama.cpp-VLM] ✅ 推理完成，耗时: {elapsed:.2f}秒")
-            logger.debug(f"[Llama.cpp-VLM] 响应: {response_text[:200]}...")
+            logger.debug(f"[Llama.cpp-VLM] 响应: {response_text}")
 
             return LLMResponse(
                 content=response_text,
@@ -462,14 +480,12 @@ def get_llama_cpp_vlm_provider() -> LlamaCppVLMProvider:
     if _vlm_provider_instance is None:
         # 未初始化时，使用默认路径创建实例
         logger.info("[Llama.cpp-VLM] 单例未初始化，创建默认实例")
-        from pathlib import Path
-        plugin_dir = Path(__file__).parent
-        model_path = str(plugin_dir / "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf")
-        mmproj_path = str(plugin_dir / "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf")
+        model_path = str(_PLUGIN_ROOT / "models" / "Qwen3.5-9B-GGUF" / "Qwen3.5-9B-UD-Q4_K_XL.gguf")
+        mmproj_path = str(_PLUGIN_ROOT / "models" / "Qwen3.5-9B-GGUF" / "mmproj-BF16.gguf")
         _vlm_provider_instance = LlamaCppVLMProvider(
             model_path=model_path,
             mmproj_path=mmproj_path,
-            n_ctx=8192,
+            n_ctx=16384,
             n_gpu_layers=99,
             max_tokens=25600,
             temperature=0.7,
@@ -503,10 +519,8 @@ def check_llama_cpp_vlm_available(
     Returns:
         True if both files exist, False otherwise
     """
-    from pathlib import Path
-    plugin_dir = Path(__file__).parent
-    model_full_path = str((plugin_dir / model_path).resolve())
-    mmproj_full_path = str((plugin_dir / mmproj_path).resolve())
+    model_full_path = str((_PLUGIN_ROOT / model_path).resolve()) if not os.path.isabs(model_path) else str(Path(model_path).resolve())
+    mmproj_full_path = str((_PLUGIN_ROOT / mmproj_path).resolve()) if not os.path.isabs(mmproj_path) else str(Path(mmproj_path).resolve())
 
     model_exists = os.path.exists(model_full_path)
     mmproj_exists = os.path.exists(mmproj_full_path)
@@ -526,7 +540,11 @@ def reset_llama_cpp_vlm_provider() -> None:
     global _vlm_provider_instance
 
     if _vlm_provider_instance is not None:
-        if hasattr(_vlm_provider_instance, '_llama'):
+        if hasattr(_vlm_provider_instance, '_llama') and _vlm_provider_instance._llama is not None:
+            try:
+                _vlm_provider_instance._llama.close()
+            except Exception as e:
+                logger.warning(f"[Llama.cpp-VLM] llama.close() 失败: {e}")
             _vlm_provider_instance._llama = None
         _vlm_provider_instance._initialized = False
         logger.debug("[Llama.cpp-VLM] Provider 单例已清理")

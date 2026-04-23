@@ -31,8 +31,8 @@ if TYPE_CHECKING:
 
 
 # Graph RAG 模块路径
-_PLUGIN_DIR = Path(__file__).parent.resolve()
-_DEFAULT_GRAPH_DIR = _PLUGIN_DIR / "data" / "graph_store"
+_PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_GRAPH_DIR = _PLUGIN_ROOT / "data" / "graph_store"
 
 
 @dataclass

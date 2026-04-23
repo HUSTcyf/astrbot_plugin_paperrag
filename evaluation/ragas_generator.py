@@ -210,7 +210,6 @@ class OpenAICompatibleLLM(BaseRagasLLM):
 
     def _call_api(self, prompt_text: str, temperature: float, max_tokens: int, stop: Optional[list]):
         """同步调用 API（受全局 Semaphore 限制并发）"""
-        import requests
         import threading
 
         # RPM 限制
@@ -504,7 +503,6 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings):
 
     def _post_embedding(self, texts: Union[str, List[str]]) -> List[List[float]]:
         """通用的 embedding API 调用（受全局 Semaphore 限制并发）"""
-        import requests
         import threading
 
         url = f"{self.api_base}/embeddings"
@@ -685,8 +683,6 @@ class MilvusDocumentLoader:
 
     def _get_paper_names(self) -> List[str]:
         """从 paper_doc_stats.json 读取论文名称列表"""
-        import os
-
         if not os.path.exists(self._paper_doc_stats_path):
             raise FileNotFoundError(
                 f"论文统计文件不存在: {self._paper_doc_stats_path}\n"
@@ -941,8 +937,6 @@ class RagasTestsetGenerator:
         embed_base_url: Optional[str] = None,
         embed_api_key: Optional[str] = None,
         embedding_mode: str = "api",
-        ollama_base_url: str = "http://localhost:11434",
-        ollama_embed_model: str = "bge-m3",
         language: str = "chinese",
         # Milvus 配置
         milvus_lite_path: str = "./data/milvus_papers.db",
@@ -963,9 +957,7 @@ class RagasTestsetGenerator:
             embedding_model: Embedding 模型
             embed_base_url: Embedding API URL
             embed_api_key: Embedding API Key
-            embedding_mode: Embedding 模式 ("api" 或 "ollama")
-            ollama_base_url: Ollama API 地址
-            ollama_embed_model: Ollama Embedding 模型名称
+            embedding_mode: Embedding 模式 ("api" 或 "unsloth")
             language: 生成语言（chinese/english）
             milvus_lite_path: Milvus Lite 数据库路径
             collection_name: Milvus 集合名称
@@ -1015,8 +1007,6 @@ class RagasTestsetGenerator:
             "base_url": embed_base_url,
             "api_key": embed_api_key,
             "mode": embedding_mode,
-            "ollama_base_url": ollama_base_url,
-            "ollama_embed_model": ollama_embed_model,
         }
 
         # 知识图谱（用于测试集生成）- 暂不预填充，让 ragas 自己管理
@@ -1066,16 +1056,9 @@ class RagasTestsetGenerator:
         if self._embed_model is None:
             embed_mode = self._embed_config.get("mode", "api")
 
-            if embed_mode == "ollama":
-                embed_api_base = f"{self._embed_config['ollama_base_url']}/v1"
-                print(f"🔧 正在连接 Ollama embedding: {embed_api_base}/{self._embed_config['ollama_embed_model']}")
-                self._embed_model = OpenAICompatibleEmbeddings(
-                    model=self._embed_config["ollama_embed_model"],
-                    api_base=embed_api_base,
-                    api_key="ollama",  # Ollama 不需要真实 key
-                    max_concurrent=self._max_concurrent,
-                )
-                print(f"✅ Ollama embedding 初始化成功")
+            if embed_mode == "unsloth":
+                # Unsloth 模式需要在外部处理，此处抛出错误提示
+                raise ValueError("Unsloth embedding 模式需要在外部系统初始化，请在 embedding_mode='api' 时使用 API 兼容接口")
             elif self._embed_config["base_url"]:
                 print(f"🔧 正在使用 OpenAI 兼容 embedding: {self._embed_config['base_url']}/{self._embed_config['model']}")
                 self._embed_model = OpenAICompatibleEmbeddings(
@@ -1085,7 +1068,7 @@ class RagasTestsetGenerator:
                     max_concurrent=self._max_concurrent,
                 )
             else:
-                raise ValueError("embed_base_url or ollama mode is required for embedding")
+                raise ValueError("embed_base_url is required for embedding")
         return self._embed_model
 
     def _filter_generated_questions(self, samples: List["EvalSample"]) -> List["EvalSample"]:
