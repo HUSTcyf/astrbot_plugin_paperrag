@@ -211,13 +211,6 @@
         "minimum": 10,
         "maximum": 1000
     },
-    "enable_grobid": {
-        "description": "启用 Grobid 参考文献解析（可选依赖）",
-        "type": "bool",
-        "hint": "Grobid 是专业的学术文献解析工具，可以更准确地提取参考文献信息（标题、作者、年份、DOI等）。启用后会自动启动 Grobid Docker 容器。首次使用需先下载镜像: docker pull grobid/grobid:0.8.2-full",
-        "obvious_hint": true,
-        "default": false
-    },
     "chunk_size": {
         "description": "文档分块目标大小（字符数）",
         "type": "int",

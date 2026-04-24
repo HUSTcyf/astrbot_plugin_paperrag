@@ -7,6 +7,10 @@
 ### 本版变化
 
 - `/paper abstract_build confirm [N]` 已退役，摘要入库统一走 `/paper add`、`/paper addf` 和 `/paper rebuild`
+- `main.py` 已拆分为插件壳与 `commands/` 功能域模块，命令装饰器集中在主插件入口以保证 AstrBot 正确注册
+- 新增 `/paper abstractstats -1` 与 `/paper reparse_zero_abstract confirm`，支持列出并批量补建无摘要论文
+- 摘要重解析改为非破坏式流程：不删除主论文统计，旧摘要向量清理未命中时仍继续写入新摘要向量
+- Graph 在线备份恢复修复节点属性、关系属性和关系端点映射；offline 目录备份明确需要手动恢复
 - Embedding 默认模式切换为 `unsloth`，不再保留 `ollama`
 - 检索配置已收口为 `enable_sparse_retrieval`、`enable_bm25`、`enable_multi_vector_rerank` 三组核心开关
 - ColBERT 持久化文件统一写入插件 `data/` 目录
@@ -127,6 +131,9 @@ cp ~/Downloads/*.pdf papers/
 | `/paper refstats [top_k] [dedup=0]` | 查看参考文献引用统计（需管理员） | `/paper refstats 20 dedup=1` |
 | `/paper refstats -1` | 列出无参考文献的论文 | `/paper refstats -1` |
 | `/paper reparse_zero_ref confirm` | 批量重新解析无参考文献的论文（需管理员） | `/paper reparse_zero_ref confirm` |
+| `/paper abstractstats [top_k]` | 查看摘要提取统计 | `/paper abstractstats 20` |
+| `/paper abstractstats -1` | 列出未成功提取摘要的论文 | `/paper abstractstats -1` |
+| `/paper reparse_zero_abstract confirm` | 批量重新提取无摘要论文并补建摘要向量（需管理员） | `/paper reparse_zero_abstract confirm` |
 | `/paper arxiv_add <关键词> [数量]` | 从arXiv搜索下载论文并添加（需管理员） | `/paper arxiv_add attention is all you need 3` |
 | `/paper arxiv_refs [top_k] [每篇数量]` | 下载高频引用论文（需管理员） | `/paper arxiv_refs 10 3` |
 | `/paper arxiv_sync confirm` | 同步MCP已下载论文到数据库（需管理员） | `/paper arxiv_sync confirm` |
@@ -135,9 +142,9 @@ cp ~/Downloads/*.pdf papers/
 | `/paper graph_stats` | 查看图谱统计信息 | `/paper graph_stats` |
 | `/paper graph_rebuild confirm` | 重建知识图谱（清空+重建） | `/paper graph_rebuild confirm` |
 | `/paper graph_clear confirm` | 清空知识图谱（需管理员） | `/paper graph_clear confirm` |
-| `/paper graph_backup [online\|offline]` | 备份图谱（需管理员） | `/paper graph_backup online` |
-| `/paper graph_backup_list` | 列出可用备份 | `/paper graph_backup_list` |
-| `/paper graph_restore [文件名]` | 恢复图谱备份（需管理员） | `/paper graph_restore neo4j_backup_xxx.json.gz` |
+| `/paper graph_backup [online\|offline]` | 备份图谱（需管理员；offline 目录需手动恢复） | `/paper graph_backup online` |
+| `/paper graph_backup_list` | 列出可用备份并标注恢复方式 | `/paper graph_backup_list` |
+| `/paper graph_restore [文件名]` | 恢复在线 JSON/GZ 图谱备份（需管理员） | `/paper graph_restore neo4j_backup_xxx.json.gz` |
 | `/paper graph_link [status\|create\|remove]` | 管理Neo4j符号链接 | `/paper graph_link status` |
 | `/idea tofeishu <研究主题> [folder_token]` | 将研究想法导出为飞书文档 | `/idea tofeishu 大语言模型研究` |
 

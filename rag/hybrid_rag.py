@@ -1606,6 +1606,7 @@ class HybridRAGEngine:
             "total": len(file_paths),
             "successful": 0,
             "failed": 0,
+            "chunks_added": 0,
             "errors": []
         }
 
@@ -1631,7 +1632,8 @@ class HybridRAGEngine:
                 embeddings = await embed_provider.get_embeddings(texts)
 
                 # 插入 Milvus
-                await index_manager.insert_nodes(nodes, embeddings)
+                chunks_inserted = await index_manager.insert_nodes(nodes, embeddings)
+                results["chunks_added"] += chunks_inserted
 
                 # 预计算并存储 ColBERT per-token vectors
                 if colbert_storage is not None:
@@ -1676,12 +1678,32 @@ class HybridRAGEngine:
                         paper_id = os.path.splitext(file_name)[0]
                         extracted_title = first_node.metadata.get("extracted_title") or ""
                         extracted_abstract = first_node.metadata.get("extracted_abstract") or ""
+                        abstract_metadata = {}
+                        for key in (
+                            "arxiv_url",
+                            "github_url",
+                            "doi_url",
+                            "resolution_source",
+                            "resolution_score",
+                            "matched_title",
+                            "matched_identifier",
+                            "title_source",
+                            "abstract_source",
+                        ):
+                            value = first_node.metadata.get(key)
+                            if value:
+                                abstract_metadata[key] = value
+                        if extracted_title:
+                            abstract_metadata.setdefault("extracted_title", extracted_title)
+                        if extracted_abstract:
+                            abstract_metadata.setdefault("extracted_abstract_chars", len(extracted_abstract))
                         await abstract_manager.index_paper(
                             pdf_path=file_path,
                             paper_id=paper_id,
                             file_name=file_name,
                             title=extracted_title,
                             abstract_text=extracted_abstract if extracted_abstract else None,
+                            metadata=abstract_metadata or None,
                         )
                         indexed = abstract_manager._abstract_cache.get(paper_id)  # type: ignore[attr-defined]
                         indexed_title = indexed.title if indexed else ""
@@ -1714,7 +1736,7 @@ class HybridRAGEngine:
         result = await self.add_papers([file_path], **kwargs)
         if result["failed"] > 0:
             return {"status": "error", "error": result["errors"][0]["error"] if result["errors"] else "Unknown error"}
-        return {"status": "success", "chunks_added": result["successful"]}
+        return {"status": "success", "chunks_added": result["chunks_added"]}
 
     async def delete_paper(self, file_name: str = "", file_path: str = "", **kwargs) -> Dict[str, Any]:
         """

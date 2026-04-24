@@ -15,7 +15,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Set, cast
+from typing import Dict, Any, List, Optional, Set, Tuple, cast
 from dataclasses import dataclass
 
 try:
@@ -271,6 +271,9 @@ class AbstractExtractor:
                 result = await self._parse_with_existing_parser(pdf_path)
             else:
                 # 使用默认的 PyMuPDF 解析
+                abstract = await self._extract_abstract_from_pymupdf_blocks(pdf_path)
+                if abstract and len(abstract) > 50:
+                    return abstract
                 result = await self._parse_with_pymupdf(pdf_path)
 
             if result:
@@ -328,6 +331,185 @@ class AbstractExtractor:
             logger.warning(f"PyMuPDF 解析失败: {e}")
             return None
 
+    async def _extract_abstract_from_pymupdf_blocks(self, pdf_path: str) -> Optional[str]:
+        """使用 PyMuPDF block 布局提取摘要。"""
+        try:
+            import pymupdf
+
+            doc = pymupdf.open(pdf_path)
+            blocks: List[Tuple[int, float, float, float, float, str]] = []
+            for page_num in range(min(len(doc), 5)):
+                page = cast(pymupdf.Page, doc[page_num])
+                for block in page.get_text("blocks"):
+                    if len(block) < 5:
+                        continue
+                    text = self._normalize_abstract_text(str(block[4]))
+                    if text:
+                        blocks.append((
+                            page_num,
+                            float(block[0]),
+                            float(block[1]),
+                            float(block[2]),
+                            float(block[3]),
+                            text,
+                        ))
+
+            doc.close()
+            return self._extract_abstract_from_blocks(blocks)
+
+        except Exception as e:
+            logger.warning(f"PyMuPDF block 摘要提取失败: {e}")
+            return None
+
+    def _extract_abstract_from_blocks(
+        self,
+        blocks: List[Tuple[int, float, float, float, float, str]],
+    ) -> Optional[str]:
+        """从 PyMuPDF blocks 中提取摘要，适配双栏、无 Abstract 标题和封面页。"""
+        if not blocks:
+            return None
+
+        explicit = self._extract_explicit_abstract_from_blocks(blocks)
+        if explicit:
+            return explicit
+
+        unlabeled = self._extract_unlabeled_abstract_from_blocks(blocks)
+        if unlabeled:
+            return unlabeled
+
+        return None
+
+    def _extract_explicit_abstract_from_blocks(
+        self,
+        blocks: List[Tuple[int, float, float, float, float, str]],
+    ) -> Optional[str]:
+        chunks: List[str] = []
+        in_abstract = False
+
+        for _page, _x0, _y0, _x1, _y1, text in blocks:
+            if not in_abstract:
+                if not self._starts_with_abstract(text):
+                    continue
+                in_abstract = True
+                stripped = self._strip_abstract_prefix(text)
+                if stripped:
+                    chunks.append(stripped)
+                continue
+
+            if self._is_abstract_end(text):
+                break
+            if not self._is_abstract_noise(text):
+                chunks.append(text)
+
+        candidate = self._clean_abstract_candidate(" ".join(chunks))
+        return candidate if self._is_valid_abstract(candidate) else None
+
+    def _extract_unlabeled_abstract_from_blocks(
+        self,
+        blocks: List[Tuple[int, float, float, float, float, str]],
+    ) -> Optional[str]:
+        page0_candidates: List[str] = []
+        any_page_candidates: List[str] = []
+
+        for page, _x0, _y0, _x1, _y1, text in blocks:
+            if self._is_abstract_end(text):
+                if page0_candidates or any_page_candidates:
+                    break
+                continue
+            if self._is_abstract_noise(text):
+                continue
+            if not self._looks_like_abstract_candidate(text):
+                continue
+            if page == 0:
+                page0_candidates.append(text)
+            any_page_candidates.append(text)
+
+        candidates = page0_candidates or any_page_candidates
+        if not candidates:
+            return None
+
+        candidate = self._clean_abstract_candidate(max(candidates, key=len))
+        return candidate if self._is_valid_abstract(candidate) else None
+
+    def _starts_with_abstract(self, text: str) -> bool:
+        return bool(re.match(r"^\s*(abstract|摘要|summary|概述)\s*(?:[:：.\-—–]\s*)?", text, re.IGNORECASE))
+
+    def _strip_abstract_prefix(self, text: str) -> str:
+        return re.sub(
+            r"^\s*(abstract|摘要|summary|概述)\s*(?:[:：.\-—–]\s*)?",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
+
+    def _is_abstract_end(self, text: str) -> bool:
+        line = text.strip()
+        if re.match(r"^(?:index terms|keywords?)\b", line, re.IGNORECASE):
+            return True
+        for pattern in self.INTRODUCTION_KEYWORDS:
+            if re.match(pattern, line, re.IGNORECASE):
+                return True
+        return bool(re.match(r"^(?:I\.?\s*)?INTRODUCTION\b|^1\s+INTRODUCTION\b", line, re.IGNORECASE))
+
+    def _is_abstract_noise(self, text: str) -> bool:
+        lowered = text.lower()
+        noise_patterns = [
+            r"^fig(?:ure)?\.?\s+\d+",
+            r"^table\s+\d+",
+            r"^ccs concepts\b",
+            r"^acm reference format\b",
+            r"^additional key words\b",
+            r"^authors['’] addresses\b",
+            r"^to cite this version\b",
+            r"^hal id\b",
+            r"^https?://",
+            r"^submitted on\b",
+            r"^distributed under\b",
+            r"^received\b",
+            r"^copyright\b",
+            r"^©",
+        ]
+        if any(re.match(pattern, lowered, re.IGNORECASE) for pattern in noise_patterns):
+            return True
+        return "hal is a multi-disciplinary open access archive" in lowered
+
+    def _looks_like_abstract_candidate(self, text: str) -> bool:
+        candidate = self._clean_abstract_candidate(text)
+        if len(candidate) < 180:
+            return False
+        if len(candidate.split()) < 25:
+            return False
+        if self._is_abstract_noise(candidate):
+            return False
+        cues = [
+            r"\bwe present\b",
+            r"\bwe introduce\b",
+            r"\bwe propose\b",
+            r"\bour method\b",
+            r"\bthis paper\b",
+            r"\bin this work\b",
+            r"\bradiance field methods\b",
+        ]
+        return any(re.search(pattern, candidate, re.IGNORECASE) for pattern in cues)
+
+    def _is_valid_abstract(self, text: Optional[str]) -> bool:
+        if not text:
+            return False
+        if len(text) < 50:
+            return False
+        return len(text.split()) >= 8
+
+    def _normalize_abstract_text(self, text: str) -> str:
+        text = re.sub(r"\s+", " ", text or "").strip()
+        text = re.sub(r"(?<=\w)- (?=\w)", "", text)
+        return text
+
+    def _clean_abstract_candidate(self, text: str) -> str:
+        text = self._normalize_abstract_text(text)
+        text = self._strip_abstract_prefix(text)
+        text = re.sub(r"\b(Index Terms|Keywords?)\s*[-—:：].*$", "", text, flags=re.IGNORECASE)
+        return text.strip(" -—–:：")
+
     def _extract_abstract_text(self, full_text: str) -> Optional[str]:
         """
         从完整文本中提取摘要部分
@@ -375,23 +557,19 @@ class AbstractExtractor:
             if not line:
                 continue
 
-            # 检查是否是正文开始
-            for pattern in self.INTRODUCTION_KEYWORDS:
-                if re.match(pattern, line, re.IGNORECASE):
-                    abstract_end = i
-                    break
-
-            if abstract_end >= 0:
+            if self._is_abstract_end(line):
+                abstract_end = i
                 break
 
         # 如果没找到结束符，取前几段
         if abstract_end < 0:
-            # 摘要通常在前2-3段
-            paragraph_count = 0
+            non_empty_count = 0
             for i in range(abstract_start, len(lines)):
-                if lines[i].strip():
-                    paragraph_count += 1
-                if paragraph_count >= 3:  # 最多3段
+                current = lines[i].strip()
+                if not current:
+                    continue
+                non_empty_count += 1
+                if non_empty_count >= 80:
                     abstract_end = i + 1
                     break
 
@@ -403,8 +581,7 @@ class AbstractExtractor:
         abstract_text = '\n'.join(line.strip() for line in abstract_lines if line.strip())
 
         # 清理：移除可能的 "Abstract:" 前缀
-        abstract_text = re.sub(r'^abstract:\s*', '', abstract_text, flags=re.IGNORECASE)
-        abstract_text = abstract_text.strip()
+        abstract_text = self._clean_abstract_candidate(abstract_text)
 
         return abstract_text if abstract_text else None
 
@@ -868,15 +1045,17 @@ class AbstractIndexManager:
         await self._ensure_collection()
 
         try:
-            extractor = AbstractExtractor()
             normalized_metadata = dict(metadata or {})
             normalized_metadata.setdefault("source_path", pdf_path)
             normalized_metadata.setdefault("source_kind", "pdf")
             normalized_metadata.setdefault("file_name", file_name)
             normalized_metadata.setdefault("paper_id", paper_id)
 
-            title_source = "provided" if title else ""
-            abstract_source = "provided" if abstract_text else ""
+            if not title:
+                title = str(normalized_metadata.get("extracted_title") or "")
+
+            title_source = str(normalized_metadata.get("title_source") or ("provided" if title else ""))
+            abstract_source = str(normalized_metadata.get("abstract_source") or ("provided" if abstract_text else ""))
             paper_beginning: Optional[str] = None
 
             def _is_placeholder(candidate: str) -> bool:
@@ -902,6 +1081,7 @@ class AbstractIndexManager:
             has_valid_abstract = bool(abstract_text and len(abstract_text) >= 50)
 
             if not has_valid_title or not has_valid_abstract:
+                extractor = AbstractExtractor()
                 # 本地 LLM 优先处理标题和摘要，规则提取只做兜底
                 if self._llm_client is not None:
                     paper_beginning = await self._extract_paper_beginning(pdf_path)
@@ -1196,6 +1376,32 @@ class AbstractIndexManager:
 
         except Exception as e:
             logger.error(f"❌ 删除摘要失败 {paper_id}: {e}")
+            return False
+
+    async def delete_paper_vectors_only(self, paper_id: str) -> bool:
+        """删除论文摘要向量，不更新摘要统计缓存。
+
+        用于重试补摘要前清理 Milvus 中可能残留的同 paper_id 向量，
+        避免 index_paper() 成功时重复插入；失败时保留 doc_stats JSON 不变。
+        """
+        await self._ensure_collection()
+
+        try:
+            loop = asyncio.get_event_loop()
+            collection = self._collection
+            if collection is None:
+                logger.error("❌ Collection 未初始化")
+                return False
+            await loop.run_in_executor(
+                None,
+                lambda: collection.delete(f'paper_id == "{paper_id}"')
+            )
+
+            logger.info(f"🧹 已清理摘要向量: {paper_id}")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ 清理摘要向量失败 {paper_id}: {e}")
             return False
 
     def clear(self) -> bool:
