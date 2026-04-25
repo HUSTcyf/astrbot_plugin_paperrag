@@ -1,19 +1,17 @@
-# 📚 Paper RAG Plugin v1.12.2 - 用户指南
+# 📚 Paper RAG Plugin v1.12.3 - 用户指南
 
 本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力（支持多模态VLM问答）。
 
-> **版本说明**：当前版本 v1.12.2，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
+> **版本说明**：当前版本 v1.12.3，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
 
 ### 本版变化
 
-- `/paper abstract_build confirm [N]` 已退役，摘要入库统一走 `/paper add`、`/paper addf` 和 `/paper rebuild`
-- `main.py` 已拆分为插件壳与 `commands/` 功能域模块，命令装饰器集中在主插件入口以保证 AstrBot 正确注册
-- 新增 `/paper abstractstats -1` 与 `/paper reparse_zero_abstract confirm`，支持列出并批量补建无摘要论文
-- 摘要重解析改为非破坏式流程：不删除主论文统计，旧摘要向量清理未命中时仍继续写入新摘要向量
-- Graph 在线备份恢复修复节点属性、关系属性和关系端点映射；offline 目录备份明确需要手动恢复
-- Embedding 默认模式切换为 `unsloth`，不再保留 `ollama`
-- 检索配置已收口为 `enable_sparse_retrieval`、`enable_bm25`、`enable_multi_vector_rerank` 三组核心开关
-- ColBERT 持久化文件统一写入插件 `data/` 目录
+- 修复摘要 ColBERT 向量从未成功生成/保存的关键 bug（摘要文本现在从 AbstractIndexManager 缓存获取）
+- ColBERT 存储路径重构：chunk 向量迁移至 `data/colbert_chunks/`，摘要向量在 `data/colbert_abstracts/`，两者独立存储和加载
+- ColBERT chunk_id 查找从 O(N) 线性扫描优化为 O(1) 字典查找
+- `/paper rebuild` 现在正确清理摘要和正文 ColBERT 存储，不再残留过期向量
+- 全面消除核心代码中的静默跳过，所有关键失败路径均有明确日志
+- ColBERT 向量生成不再依赖 retriever 初始化链路，改用 `get_embedding_model()` 直接调用
 
 ## 🏗️ 系统架构
 
