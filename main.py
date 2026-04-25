@@ -15,6 +15,8 @@ import os
 
 os.environ['GRPC_VERBOSITY'] = 'ERROR'
 os.environ['GLOG_minloglevel'] = '2'
+os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
+os.environ.setdefault('PYTORCH_MPS_HIGH_WATERMARK_RATIO', '0.0')
 
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import register

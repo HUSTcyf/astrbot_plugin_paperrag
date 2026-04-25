@@ -40,6 +40,14 @@ _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_DATA_DIR = _PLUGIN_ROOT / "data"
 
 
+def _is_mps_oom_error(error: Any) -> bool:
+    """Return True for PyTorch MPS out-of-memory style errors."""
+    text = str(error).lower()
+    return "mps backend out of memory" in text or (
+        "mps" in text and "out of memory" in text
+    )
+
+
 def is_placeholder_title(title: str) -> bool:
     """判断标题是否像文件名、arXiv 编号这类占位内容。"""
     if not title:
@@ -1286,6 +1294,7 @@ class AbstractIndexManager:
         await self._ensure_collection()
 
         try:
+            logger.info(f"[AbstractIndex] 摘要检索开始: top_k={top_k}, query_chars={len(query or '')}")
             # 生成查询向量
             query_vector = await self._embed_text(query)
 
@@ -1319,10 +1328,20 @@ class AbstractIndexManager:
                     "score": float(hit.score)
                 })
 
+            if papers:
+                logger.info(
+                    f"[AbstractIndex] 摘要检索完成: papers={len(papers)}, "
+                    f"score_range={papers[0]['score']:.6f}..{papers[-1]['score']:.6f}"
+                )
+            else:
+                logger.info("[AbstractIndex] 摘要检索完成: papers=0")
+
             return papers
 
         except Exception as e:
             logger.error(f"❌ 摘要检索失败: {e}")
+            if _is_mps_oom_error(e):
+                raise
             return []
 
     async def get_papers_by_ids(

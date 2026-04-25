@@ -217,7 +217,7 @@ class HybridPDFParser:
                     "tables_count": metadata.get("tables_count", 0),
                     "formulas_count": metadata.get("formulas_count", 0),
                     "multimodal_data": metadata.get("multimodal_data", {}),
-                    "raw_text": raw_text,  # 保存原始文本用于参考文献提取
+                    "raw_text": metadata.get("raw_text", raw_text),
                     "added_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
             )

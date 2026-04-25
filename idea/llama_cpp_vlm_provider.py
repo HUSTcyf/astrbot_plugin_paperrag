@@ -16,6 +16,7 @@ from typing import Any, List, Optional, Dict
 from astrbot.api import logger
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_LLAMA_VLM_N_CTX = int(os.environ.get("PAPERRAG_LLAMA_VLM_N_CTX", "16384"))
 
 
 class LLMResponse:
@@ -43,7 +44,7 @@ class LlamaCppVLMProvider:
         self,
         model_path: str = "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf",
         mmproj_path: str = "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf",
-        n_ctx: int = 8192,
+        n_ctx: Optional[int] = None,
         n_gpu_layers: int = 99,
         max_tokens: int = 25600,
         temperature: float = 0.7,
@@ -61,7 +62,7 @@ class LlamaCppVLMProvider:
         """
         self.model_path = model_path
         self.mmproj_path = mmproj_path
-        self.n_ctx = n_ctx
+        self.n_ctx = int(n_ctx or DEFAULT_LLAMA_VLM_N_CTX)
         self.n_gpu_layers = n_gpu_layers
         self.max_tokens = max_tokens
         self.temperature = temperature
@@ -430,7 +431,7 @@ _vlm_provider_instance: Optional[LlamaCppVLMProvider] = None
 def init_llama_cpp_vlm_provider(
     model_path: str,
     mmproj_path: str,
-    n_ctx: int = 8192,
+    n_ctx: Optional[int] = None,
     n_gpu_layers: int = 99,
     max_tokens: int = 25600,
     temperature: float = 0.7,
@@ -485,7 +486,7 @@ def get_llama_cpp_vlm_provider() -> LlamaCppVLMProvider:
         _vlm_provider_instance = LlamaCppVLMProvider(
             model_path=model_path,
             mmproj_path=mmproj_path,
-            n_ctx=16384,
+            n_ctx=DEFAULT_LLAMA_VLM_N_CTX,
             n_gpu_layers=99,
             max_tokens=25600,
             temperature=0.7,

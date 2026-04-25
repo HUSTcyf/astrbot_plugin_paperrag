@@ -1248,18 +1248,14 @@ class PDFParserAdvanced:
         # 2. PyMuPDF 提取完整文本（用于 chunks 和参考文献解析）
         pymupdf_text, _ = self._parse_with_pymupdf(pdf_path)
 
-        # 3. 构建增强文本（PyMuPDF 文本 + Docling 提取的表格/公式）
+        # 3. 构建增强文本（Docling 文本用于 chunking，已排除表格；PyMuPDF 仅用于参考文献）
         text_parts = []
 
-        # 添加 PyMuPDF 提取的文本
-        if pymupdf_text:
-            text_parts.append(pymupdf_text)
+        # 使用 Docling 提取的文本（已排除 TableItem，含 [Page N] 标记）
+        if extracted.text:
+            text_parts.append(extracted.text)
 
-        # 添加 Docling 表格 markdown
-        if extracted.tables:
-            for table in extracted.tables:
-                if table.markdown:
-                    text_parts.append(f"\n{table.markdown}\n")
+        # 表格 markdown 不再追加（已单独保存为 CSV/MD/PNG 文件）
 
         # 添加 Docling 公式
         if extracted.formulas:
@@ -1270,11 +1266,12 @@ class PDFParserAdvanced:
 
         metadata = {
             "file_name": extracted.file_name,
-            "total_pages": extracted.text.count('[Page ') if extracted.text else 0,
+            "total_pages": len(extracted.text.split('[Page ')) - 1 if extracted.text and '[Page ' in extracted.text else 0,
             "parser": "Docling-Multimodal",
             "images_count": len(extracted.images),
             "tables_count": len(extracted.tables),
             "formulas_count": len(extracted.formulas),
+            "raw_text": pymupdf_text,
             "multimodal_data": {
                 "images": [
                     {

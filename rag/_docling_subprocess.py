@@ -211,6 +211,8 @@ def main():
     table_counters = {}
     formula_counters = {}
 
+    current_page = 0
+
     for element, _level in result.document.iterate_items():
         if isinstance(element, PictureItem):
             page_no = element.prov[0].page_no
@@ -274,9 +276,18 @@ def main():
                 "bbox": [0, 0, 0, 0],
                 "type": "display",
             })
+        else:
+            # 文本项（段落、标题、列表等）— 排除表格
+            if hasattr(element, 'text') and element.text and element.text.strip():
+                if hasattr(element, 'prov') and element.prov:
+                    page_no = element.prov[0].page_no
+                    if page_no != current_page:
+                        text_parts.append(f"\n[Page {page_no}]")
+                        current_page = page_no
+                text_parts.append(element.text)
 
-    if result.document.texts:
-        text_parts.extend([t.text for t in result.document.texts])
+    # 不再使用 result.document.texts（可能包含表格文本）
+    # 文本已从 iterate_items 循环中收集（排除了 TableItem）
 
     result_json = json.dumps({
         "file_name": Path(pdf_path_arg).name,

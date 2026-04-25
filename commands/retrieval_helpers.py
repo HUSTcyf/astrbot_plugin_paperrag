@@ -236,7 +236,7 @@ class RetrievalHelpersMixin(PluginCoreBase):
                 vlm_provider = init_llama_cpp_vlm_provider(
                     model_path=str(model_path),
                     mmproj_path=str(mmproj_path),
-                    n_ctx=8192,
+                    n_ctx=self.config.get("llama_vlm_n_ctx", 16384),
                     n_gpu_layers=99,
                     max_tokens=25600,
                     temperature=0.3,
@@ -305,6 +305,165 @@ class RetrievalHelpersMixin(PluginCoreBase):
             logger.warning(f"[PaperRAG] VLM 文本压缩失败: {e}")
 
         return sources
+
+    def _build_rag_answer_prompt(self, query: str, sources: list) -> str:
+        """Build a grounded answer prompt from retrieved paper chunks."""
+        context_blocks = []
+        for i, source in enumerate(sources, 1):
+            metadata = source.get("metadata", {}) or {}
+            display_name = source.get("display_name") or metadata.get("file_name", "unknown")
+            chunk_index = metadata.get("chunk_index", 0)
+            score = source.get("score", 0.0)
+            text = source.get("text", "")
+            context_blocks.append(
+                f"[{i}] {display_name} (chunk #{chunk_index}, score={score:.3f})\n{text}"
+            )
+
+        context_text = "\n\n".join(context_blocks)
+        return f"""你是一个严谨的论文阅读助手。请只基于下面给出的本地论文片段回答用户问题。
+
+要求：
+1. 如果证据不足，请明确说明“不足以从当前检索片段得出结论”，不要编造。
+2. 回答要直接、结构清晰，优先总结方法、结论、实验或对比关系。
+3. 需要引用证据时使用 [1]、[2] 这样的编号，对应下方论文片段。
+4. 不要输出与论文片段无关的泛泛解释。
+
+用户问题：
+{query}
+
+检索到的论文片段：
+{context_text}
+
+请给出答案："""
+
+    def _extract_provider_text(self, response: Any) -> str:
+        """Normalize common AstrBot/LLM provider response shapes to text."""
+        if response is None:
+            return ""
+        if isinstance(response, str):
+            return response.strip()
+
+        result_chain_text = self._extract_message_chain_text(getattr(response, "result_chain", None))
+        if result_chain_text:
+            return result_chain_text
+
+        for attr in ("content", "text"):
+            value = getattr(response, attr, None)
+            if value:
+                return str(value).strip()
+
+        if isinstance(response, dict):
+            for key in ("content", "text", "answer", "message"):
+                value = response.get(key)
+                if value:
+                    value_text = self._extract_message_chain_text(value)
+                    return value_text or str(value).strip()
+            result_chain_text = self._extract_message_chain_text(response.get("result_chain"))
+            if result_chain_text:
+                return result_chain_text
+
+        raw_completion_text = self._extract_raw_completion_text(getattr(response, "raw_completion", None))
+        if raw_completion_text:
+            return raw_completion_text
+
+        return str(response).strip()
+
+    def _extract_message_chain_text(self, value: Any) -> str:
+        """Extract plain text from AstrBot MessageChain-like values."""
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+
+        chain = getattr(value, "chain", None)
+        if chain is None and isinstance(value, dict):
+            chain = value.get("chain")
+        if chain is None:
+            return ""
+
+        parts = []
+        for component in chain:
+            text = getattr(component, "text", None)
+            if text is None and isinstance(component, dict):
+                text = component.get("text")
+            if text:
+                parts.append(str(text))
+
+        return "\n".join(parts).strip()
+
+    def _extract_raw_completion_text(self, raw_completion: Any) -> str:
+        """Extract assistant content from OpenAI-compatible raw completion objects."""
+        if raw_completion is None:
+            return ""
+
+        choices = getattr(raw_completion, "choices", None)
+        if choices is None and isinstance(raw_completion, dict):
+            choices = raw_completion.get("choices")
+        if not choices:
+            return ""
+
+        first_choice = choices[0]
+        message = getattr(first_choice, "message", None)
+        if message is None and isinstance(first_choice, dict):
+            message = first_choice.get("message")
+        if message is None:
+            return ""
+
+        content = getattr(message, "content", None)
+        if content is None and isinstance(message, dict):
+            content = message.get("content")
+        return str(content).strip() if content else ""
+
+    async def _get_text_llm_provider(self) -> Any:
+        """Get the configured text LLM provider, falling back to the active session provider."""
+        engine = self._get_engine()
+        if engine is not None and hasattr(engine, "_ensure_llm_initialized"):
+            try:
+                return await engine._ensure_llm_initialized()
+            except Exception as e:
+                logger.warning(f"[PaperRAG] 配置文本 LLM 初始化失败，尝试当前会话 Provider: {e}")
+
+        try:
+            if self.context is not None and hasattr(self.context, "get_using_provider"):
+                provider = self.context.get_using_provider()
+                if provider:
+                    return provider
+                logger.warning("[PaperRAG] get_using_provider() 返回 None，无可用 Provider")
+            else:
+                logger.warning("[PaperRAG] context 不可用或无 get_using_provider 方法")
+        except Exception as e:
+            logger.warning(f"[PaperRAG] 获取当前会话 Provider 失败: {e}")
+
+        return None
+
+    async def _generate_rag_answer(self, query: str, sources: list) -> str:
+        """Generate a grounded RAG answer from retrieved sources."""
+        if not sources:
+            return "未找到可用于回答的本地论文片段。"
+
+        prompt = self._build_rag_answer_prompt(query, sources)
+        provider = await self._get_text_llm_provider()
+        if provider is None:
+            return "已完成检索，但未找到可用的文本 LLM Provider，因此无法生成回答。"
+
+        try:
+            if hasattr(provider, "text_chat"):
+                response = await provider.text_chat(
+                    prompt=prompt,
+                    contexts=[],
+                    temperature=0.2,
+                    max_tokens=2048,
+                )
+            elif hasattr(provider, "generate"):
+                response = await provider.generate(prompt)
+            else:
+                return "已完成检索，但当前 LLM Provider 不支持 text_chat/generate，无法生成回答。"
+
+            answer = self._extract_provider_text(response)
+            return answer or "LLM 未返回有效回答。"
+        except Exception as e:
+            logger.error(f"[PaperRAG] RAG回答生成失败: {e}")
+            return f"回答生成失败: {e}"
 
     def _format_retrieve_response(self, sources: list) -> str:
         output = "📚 **Document Search Results**\n\n"

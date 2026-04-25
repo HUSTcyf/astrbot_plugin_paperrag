@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import shutil
+import json
 import time
 import base64
 from typing import List, Dict, Tuple, Any, Optional, Union, cast
@@ -37,6 +38,30 @@ from astrbot.api import logger
 
 # 获取插件根目录，用于解析相对路径
 _PLUGIN_DIR = _plugin_root
+
+
+def _is_mps_oom_error(error: Any) -> bool:
+    """Return True for PyTorch MPS out-of-memory style errors."""
+    text = str(error).lower()
+    return "mps backend out of memory" in text or (
+        "mps" in text and "out of memory" in text
+    )
+
+
+def _clear_accelerator_cache() -> None:
+    """Best-effort cache cleanup after accelerator OOM."""
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as e:
+        logger.debug(f"[Memory] 清理加速器缓存失败: {e}")
 
 # 导入混合架构组件
 try:
@@ -151,6 +176,8 @@ class SparseRetriever(BaseRetriever):
         """获取 Unsloth embedding 模型"""
         if self._embedding_model is None:
             self._embedding_model = get_embedding_model()
+            if self._embedding_model is None:
+                logger.error("[PaperRAG] get_embedding_model() 返回 None，embedding 模型不可用")
         return self._embedding_model
 
     async def retrieve(self, query: str, top_k: int = 20) -> QueryResult:
@@ -385,6 +412,8 @@ class MultiVectorReranker:
         """获取 Unsloth embedding 模型"""
         if self._embedding_model is None:
             self._embedding_model = get_embedding_model()
+            if self._embedding_model is None:
+                logger.error("[PaperRAG] get_embedding_model() 返回 None，embedding 模型不可用")
         return self._embedding_model
 
     async def rerank(
@@ -403,20 +432,27 @@ class MultiVectorReranker:
             return QueryResult(nodes=[], scores=[])
 
         try:
-            model = self._get_embedding_model()
-
             # 提取文档文本和 chunk_id
-            doc_texts = [node.text for node in nodes]
-            chunk_ids = [node.metadata.get("chunk_id", f"chunk_{i}") for i, node in enumerate(nodes)]
+            chunk_ids = [self._resolve_node_chunk_id(node) for node in nodes]
+            has_stable_chunk_ids = any(chunk_ids)
 
             # 尝试使用预存储的 ColBERT vectors
-            if self._colbert_storage is not None and self._colbert_storage.is_loaded:
+            if self._colbert_storage is not None and self._colbert_storage.is_loaded and has_stable_chunk_ids:
                 reranked = self._colbert_rerank_stored(
                     query, nodes, chunk_ids, top_k=len(nodes)
                 )
+                if not reranked:
+                    logger.warning("[MultiVectorReranker] 预存 ColBERT 向量未匹配候选 chunks，保留原始顺序")
+                    reranked = [(i, scores[i] if i < len(scores) else 0.0) for i in range(len(nodes))]
             else:
-                # Fallback: 实时计算（标准 ColBERT 做法）
-                reranked = model.colbert_rerank(query, doc_texts, top_k=len(nodes))
+                if self._colbert_storage is not None and self._colbert_storage.is_loaded and not has_stable_chunk_ids:
+                    logger.info("[MultiVectorReranker] 候选无稳定 chunk_id，跳过实时 ColBERT rerank，保留原始顺序")
+                    reranked = [(i, scores[i] if i < len(scores) else 0.0) for i in range(len(nodes))]
+                else:
+                    model = self._get_embedding_model()
+                    doc_texts = [node.text for node in nodes]
+                    # Fallback: 实时计算（标准 ColBERT 做法）
+                    reranked = model.colbert_rerank(query, doc_texts, top_k=len(nodes))
 
             # 构建新的结果
             reranked_nodes = []
@@ -427,6 +463,13 @@ class MultiVectorReranker:
                     reranked_nodes.append(nodes[idx])
                     reranked_scores.append(score)
 
+            if reranked_scores:
+                logger.info(
+                    f"[MultiVectorReranker] rerank完成: candidates={len(nodes)}, "
+                    f"returned={min(top_k, len(reranked_nodes))}, "
+                    f"score_range={max(reranked_scores):.6f}..{min(reranked_scores):.6f}"
+                )
+
             return QueryResult(
                 nodes=reranked_nodes[:top_k],
                 scores=reranked_scores[:top_k]
@@ -436,11 +479,25 @@ class MultiVectorReranker:
             logger.error(f"[MultiVectorReranker] reranking 失败: {e}")
             return QueryResult(nodes=nodes[:top_k], scores=scores[:top_k])
 
+    def _resolve_node_chunk_id(self, node: Node) -> Optional[str]:
+        """Resolve the stable ColBERT chunk id for a retrieved node."""
+        metadata = node.metadata or {}
+        chunk_id = metadata.get("chunk_id")
+        if chunk_id:
+            return str(chunk_id)
+
+        file_path = metadata.get("file_path") or metadata.get("source_path")
+        chunk_index = metadata.get("chunk_index")
+        if file_path is None or chunk_index is None:
+            return None
+
+        return f"{file_path}_{chunk_index}"
+
     def _colbert_rerank_stored(
         self,
         query: str,
         nodes: List[Node],
-        chunk_ids: List[str],
+        chunk_ids: List[Optional[str]],
         top_k: int,
     ) -> List[Tuple[int, float]]:
         """
@@ -461,38 +518,43 @@ class MultiVectorReranker:
             return [(i, 0.0) for i in range(len(nodes))]
         query_arr = np.array(query_vectors, dtype=np.float32)
 
-        # 2. 构建 chunk_id → chunk_idx 的映射
-        id_to_idx = {cid: i for i, cid in enumerate(chunk_ids)}
         storage = self._colbert_storage
-
-        # 构建 chunk_id → chunk_idx 映射（用于快速查找）
-        id_to_chunk_idx: Dict[str, int] = {}
         assert storage is not None
-        for ci in range(len(storage._id_mapping)):
-            cid = storage._id_mapping[ci]["chunk_id"]
-            id_to_chunk_idx[cid] = ci
 
         # 3. 计算每个 chunk 的 MaxSim 分数
         chunk_maxsims: Dict[int, float] = {}
-        for chunk_id, node_idx in id_to_idx.items():
-            chunk_idx = id_to_chunk_idx.get(chunk_id)
+        matched_count = 0
+        for node_idx, chunk_id in enumerate(chunk_ids):
+            if not chunk_id:
+                continue
+            chunk_idx = storage.find_chunk_idx(chunk_id)
             if chunk_idx is None:
-                chunk_maxsims[node_idx] = 0.0
                 continue
 
             # MaxSim 计算
             doc_vectors = storage.get_chunk_token_vectors(chunk_idx)
             if doc_vectors is None:
-                chunk_maxsims[node_idx] = 0.0
                 continue
             doc_arr = np.array(doc_vectors, dtype=np.float32)
             # MaxSim: (M, 1024) @ (1024, N) = (M, N) → row sums → max
             sim_matrix = np.dot(query_arr, doc_arr.T)
             max_sim = float(np.max(sim_matrix, axis=1).sum())
             chunk_maxsims[node_idx] = max_sim
+            matched_count += 1
+
+        if matched_count == 0:
+            logger.warning(
+                f"[MultiVectorReranker] 预存 ColBERT chunk_id 匹配失败: "
+                f"candidates={len(nodes)}, storage_chunks={len(storage._id_mapping)}"
+            )
+            return []
 
         # 4. 排序
         sorted_indices = sorted(chunk_maxsims.keys(), key=lambda i: chunk_maxsims[i], reverse=True)
+        logger.info(
+            f"[MultiVectorReranker] 预存ColBERT匹配: matched={matched_count}/{len(nodes)}, "
+            f"storage_chunks={len(storage._id_mapping)}"
+        )
         return [(i, chunk_maxsims[i]) for i in sorted_indices[:top_k]]
 
 
@@ -539,12 +601,20 @@ class HybridRetriever(BaseRetriever):
         """混合检索：向量 + 稀疏权重 + BM25（按需）+ RRF 融合"""
 
         try:
+            logger.info(
+                f"[HybridRetriever] 单阶段检索开始: top_k={top_k}, "
+                f"vector_top_k={self._vector_top_k}, sparse={self._enable_sparse_retrieval}, "
+                f"sparse_top_k={self._sparse_top_k}, bm25={self._enable_bm25}, "
+                f"reranking={self._enable_reranking}"
+            )
+
             # 1. 稠密向量搜索
             query_embedding = await self._embed_provider.get_text_embedding(query)
             vector_results = await self._index_manager.search(
                 query_embedding=query_embedding,
                 top_k=self._vector_top_k
             )
+            logger.info(f"[HybridRetriever] dense召回: {len(vector_results)} chunks")
 
             # 2. 稀疏权重检索
             sparse_dict: Dict[str, float] = {}
@@ -556,11 +626,15 @@ class HybridRetriever(BaseRetriever):
                     node.text: score
                     for node, score in zip(sparse_results.nodes, sparse_results.scores)
                 }
+                logger.info(f"[HybridRetriever] sparse召回: {len(sparse_dict)} chunks")
+            else:
+                logger.info("[HybridRetriever] sparse召回已关闭")
 
             # 3. BM25 精确匹配（仅当查询需要精确匹配时）
             bm25_dict: Dict[str, float] = {}
-            if self._enable_bm25 and self._bm25_retriever.is_exact_match_query(query):
-                logger.debug(f"[HybridRetriever] 精确匹配查询，启动 BM25 检索: {query}")
+            use_bm25 = self._enable_bm25 and self._bm25_retriever.is_exact_match_query(query)
+            if use_bm25:
+                logger.info(f"[HybridRetriever] BM25精确匹配召回启动: top_k={self._bm25_top_k}")
                 bm25_result = await self._bm25_retriever.retrieve(
                     query, top_k=self._bm25_top_k
                 )
@@ -568,6 +642,11 @@ class HybridRetriever(BaseRetriever):
                     node.text: score
                     for node, score in zip(bm25_result.nodes, bm25_result.scores)
                 }
+                logger.info(f"[HybridRetriever] BM25召回: {len(bm25_dict)} chunks")
+            elif self._enable_bm25:
+                logger.info("[HybridRetriever] BM25未触发：查询未判定为精确匹配型")
+            else:
+                logger.info("[HybridRetriever] BM25已关闭")
 
             # 4. RRF 融合
             fused = self._rrf_fusion(
@@ -576,6 +655,13 @@ class HybridRetriever(BaseRetriever):
                 bm25_results=bm25_dict if bm25_dict else None,
                 top_k=top_k * 2 if self._enable_reranking else top_k,
             )
+            if fused:
+                logger.info(
+                    f"[HybridRetriever] RRF融合完成: {len(fused)} candidates, "
+                    f"score_range={fused[0].get('fused_score', 0.0):.6f}..{fused[-1].get('fused_score', 0.0):.6f}"
+                )
+            else:
+                logger.info("[HybridRetriever] RRF融合无结果")
 
             # 构建 Node 列表
             nodes = []
@@ -592,15 +678,39 @@ class HybridRetriever(BaseRetriever):
                 reranked = await self._reranker.rerank(
                     query, nodes, scores, top_k=top_k
                 )
-                logger.debug(
-                    f"[HybridRetriever] ColBERT reranking: {len(nodes)} -> {len(reranked.nodes)}"
-                )
+                if reranked.scores:
+                    logger.info(
+                        f"[HybridRetriever] ColBERT reranking完成: {len(nodes)} -> {len(reranked.nodes)}, "
+                        f"score_range={max(reranked.scores):.6f}..{min(reranked.scores):.6f}"
+                    )
+                else:
+                    logger.info(f"[HybridRetriever] ColBERT reranking完成: {len(nodes)} -> {len(reranked.nodes)}")
+                if reranked.scores and all(abs(score) < 1e-12 for score in reranked.scores):
+                    logger.warning(
+                        "[HybridRetriever] ColBERT reranking 分数全为0，通常表示候选 chunk_id 与预存向量未匹配"
+                    )
                 return reranked
 
-            return QueryResult(nodes=nodes[:top_k], scores=scores[:top_k])
+            result = QueryResult(nodes=nodes[:top_k], scores=scores[:top_k])
+            if result.scores:
+                logger.info(
+                    f"[HybridRetriever] 单阶段检索完成: results={len(result.nodes)}, "
+                    f"score_range={max(result.scores):.6f}..{min(result.scores):.6f}"
+                )
+            else:
+                logger.info("[HybridRetriever] 单阶段检索完成: results=0")
+
+            return result
 
         except Exception as e:
             logger.error(f"[HybridRetriever] 混合检索失败: {e}")
+            if _is_mps_oom_error(e):
+                _clear_accelerator_cache()
+                raise RuntimeError(
+                    "MPS 内存不足，已停止单阶段降级以避免继续放大内存压力。"
+                    "请重启 AstrBot 让 PYTORCH_MPS_HIGH_WATERMARK_RATIO 生效，"
+                    "或临时将 unsloth.device 设为 cpu / 关闭 enable_multi_vector_rerank。"
+                ) from e
             # 降级为纯向量检索
             fallback = VectorRetriever(self._index_manager, self._embed_provider)
             return await fallback.retrieve(query, top_k)
@@ -897,6 +1007,8 @@ class CragEvaluator:
                 response_text = response.content
             elif isinstance(response, dict):
                 response_text = response.get("content", "") or response.get("text", "")
+            else:
+                logger.warning(f"[CRAG] 评分响应格式无法识别: {type(response)}")
 
             import json, re
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
@@ -1010,6 +1122,8 @@ class CragCorrector:
                 rewritten = response.content.strip()
             elif isinstance(response, dict):
                 rewritten = response.get("content", "") or response.get("text", "")
+            else:
+                logger.warning(f"[CRAG] 查询重写响应格式无法识别: {type(response)}")
 
             if rewritten:
                 # 使用重写后的查询重新检索
@@ -1076,6 +1190,7 @@ class HybridRAGEngine:
         self._llm_client: Any = cast(Any, None)
         self._retriever: Union[VectorRetriever, HybridRetriever] = cast(Any, None)
         self._colbert_storage: Any = cast(Any, None)
+        self._abstract_colbert_storage: Any = cast(Any, None)
 
         # 初始化标志
         self._parser_initialized = False
@@ -1110,12 +1225,14 @@ class HybridRAGEngine:
                 mode=self.config.embedding_mode,
                 context=self.context,
                 provider_id=self.config.embedding_provider_id,
-                embed_batch_size=10
+                embed_batch_size=10,
+                **(self.config.unsloth_config or {}),
             )
 
-            # 初始化 Unsloth provider
             if hasattr(self._embed_provider, 'initialize'):
                 await self._embed_provider.initialize()
+            else:
+                logger.warning("[PaperRAG] Embedding provider 无 initialize 方法，跳过初始化")
 
             self._embed_provider_initialized = True
             logger.info(f"✅ Embedding Provider初始化完成: {self.config.embedding_mode}")
@@ -1143,27 +1260,48 @@ class HybridRAGEngine:
             return None
 
     async def _ensure_llm_initialized(self) -> Any:
-        """确保LLM Provider已初始化 - 使用配置的text_provider_id"""
+        """确保LLM Provider已初始化"""
         if self._llm_initialized:
             assert self._llm_client is not None
             return self._llm_client
 
         provider_id = self.config.text_provider_id
         if not provider_id:
-            # 使用当前会话的 Provider（云端）
+            # text_provider_id 未配置时，默认使用本地VLM
+            try:
+                from ..idea.llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
+                vlm_provider = get_llama_cpp_vlm_provider()
+                if vlm_provider and vlm_provider._initialized:
+                    self._llm_client = vlm_provider
+                    self._llm_initialized = True
+                    logger.info("✅ 使用本地VLM Provider (默认)")
+                    return self._llm_client
+                elif not vlm_provider or not vlm_provider._initialized:
+                    logger.warning("⚠️ 本地VLM未初始化，尝试初始化...")
+                    # 使用 _ensure_llm_provider_initialized 初始化
+                    initialized = await self._ensure_llm_provider_initialized()
+                    if initialized:
+                        self._llm_client = initialized
+                        self._llm_initialized = True
+                        logger.info("✅ 使用本地VLM Provider (初始化后)")
+                        return self._llm_client
+            except Exception as e:
+                logger.warning(f"⚠️ 获取本地VLM失败: {e}")
+
+            # 本地VLM不可用，使用当前会话的云端Provider
             try:
                 if self.context is not None:
                     self._llm_client = self.context.get_using_provider()
                     if self._llm_client:
-                        logger.info("✅ 使用当前会话的 LLM Provider (云端)")
+                        logger.info("✅ 使用当前会话的 LLM Provider (云端备用)")
                         self._llm_initialized = True
                         return self._llm_client
             except Exception as e:
-                logger.warning(f"⚠️ 获取当前Provider失败: {e}")
+                logger.warning(f"⚠️ 获取云端Provider失败: {e}")
 
             raise ValueError(
-                "未配置 text_provider_id，无法获取当前LLM Provider。"
-                "请在插件配置中设置 text_provider_id。"
+                "无法获取LLM Provider。"
+                "请在插件配置中设置 text_provider_id 或确保本地VLM可用。"
             )
 
         # 从 context 获取指定的 provider
@@ -1290,7 +1428,7 @@ class HybridRAGEngine:
             return self._colbert_storage
 
         from .colbert_storage import ColBERTStorage
-        data_dir = Path(__file__).parent.parent / "data"
+        data_dir = Path(__file__).parent.parent / "data" / "colbert_chunks"
         self._colbert_storage = ColBERTStorage(str(data_dir))
 
         if self._colbert_storage.load():
@@ -1299,6 +1437,22 @@ class HybridRAGEngine:
             logger.info("[ColBERTStorage] 未找到已有存储，将从头构建")
 
         return self._colbert_storage
+
+    def _ensure_abstract_colbert_storage_initialized(self) -> Any:
+        """确保摘要 ColBERT 存储已初始化"""
+        if self._abstract_colbert_storage is not None:
+            return self._abstract_colbert_storage
+
+        from .colbert_storage import ColBERTStorage
+        data_dir = Path(__file__).parent.parent / "data" / "colbert_abstracts"
+        self._abstract_colbert_storage = ColBERTStorage(str(data_dir))
+
+        if self._abstract_colbert_storage.load():
+            logger.info(f"[ColBERTStorage-Abstract] 已加载 {len(self._abstract_colbert_storage)} 个摘要")
+        else:
+            logger.info("[ColBERTStorage-Abstract] 未找到已有存储，将从头构建")
+
+        return self._abstract_colbert_storage
 
     def _ensure_index_manager_initialized(self) -> HybridIndexManager:
         """确保索引管理器已初始化"""
@@ -1416,6 +1570,138 @@ class HybridRAGEngine:
         assert self._retriever is not None
         return self._retriever
 
+    def _records_to_query_result(
+        self,
+        records: List[Dict[str, Any]],
+        top_k: int,
+    ) -> QueryResult:
+        """Convert raw search records into the common QueryResult shape."""
+        nodes = []
+        scores = []
+        for record in records[:top_k]:
+            nodes.append(Node(
+                text=record.get("text", ""),
+                metadata=record.get("metadata", {}) or {},
+            ))
+            scores.append(float(record.get("score", 0.0)))
+        return QueryResult(nodes=nodes, scores=scores)
+
+    def _query_result_to_records(self, result: QueryResult) -> List[Dict[str, Any]]:
+        """Convert QueryResult into CRAG-compatible records."""
+        records = []
+        for node, score in zip_longest(result.nodes, result.scores, fillvalue=0.0):
+            if not isinstance(node, Node):
+                continue
+            records.append({
+                "text": node.text,
+                "metadata": node.metadata or {},
+                "score": float(score or 0.0),
+            })
+        return records
+
+    async def _colbert_rerank_query_result(
+        self,
+        query: str,
+        result: QueryResult,
+        embed_provider: Any,
+        top_k: int,
+        stage_label: str,
+    ) -> QueryResult:
+        """Apply stored ColBERT MaxSim reranking to an existing candidate set."""
+        if not getattr(self.config, "enable_multi_vector_rerank", False):
+            logger.info(f"[{stage_label}] ColBERT rerank跳过: enable_multi_vector_rerank=false")
+            return QueryResult(nodes=result.nodes[:top_k], scores=result.scores[:top_k])
+
+        if len(result.nodes) <= 1:
+            logger.info(f"[{stage_label}] ColBERT rerank跳过: candidates={len(result.nodes)}")
+            return QueryResult(nodes=result.nodes[:top_k], scores=result.scores[:top_k])
+
+        try:
+            colbert_storage = self._ensure_colbert_storage_initialized()
+            if not getattr(colbert_storage, "is_loaded", False):
+                logger.info(f"[{stage_label}] ColBERT rerank跳过: 未找到预存多向量")
+                return QueryResult(nodes=result.nodes[:top_k], scores=result.scores[:top_k])
+
+            reranker = MultiVectorReranker(embed_provider)
+            reranker.set_colbert_storage(colbert_storage)
+
+            logger.info(
+                f"[{stage_label}] ColBERT chunk rerank开始: "
+                f"candidates={len(result.nodes)}, top_k={top_k}"
+            )
+            reranked = await reranker.rerank(
+                query=query,
+                nodes=result.nodes,
+                scores=result.scores,
+                top_k=top_k,
+            )
+            if reranked.scores:
+                logger.info(
+                    f"[{stage_label}] ColBERT chunk rerank完成: "
+                    f"{len(result.nodes)} -> {len(reranked.nodes)}, "
+                    f"score_range={max(reranked.scores):.6f}..{min(reranked.scores):.6f}"
+                )
+            else:
+                logger.info(f"[{stage_label}] ColBERT chunk rerank完成: results=0")
+            return reranked
+        except Exception as e:
+            logger.warning(f"[{stage_label}] ColBERT chunk rerank失败，保留原始顺序: {e}")
+            return QueryResult(nodes=result.nodes[:top_k], scores=result.scores[:top_k])
+
+    async def _apply_crag_quality_eval(
+        self,
+        query: str,
+        result: QueryResult,
+        index_manager: HybridIndexManager,
+        embed_provider: Any,
+        top_k: int,
+    ) -> QueryResult:
+        """Evaluate retrieval quality and optionally run corrective retrieval."""
+        if not getattr(self.config, "enable_crag_quality_eval", True):
+            logger.info("[CRAG] 质量评估跳过: enable_crag_quality_eval=false")
+            return result
+
+        records = self._query_result_to_records(result)
+        evaluator = CragEvaluator()
+        assessment = await evaluator.evaluate_retrieval_quality(query, records)
+        score = float(assessment.get("score", 0.0) or 0.0)
+        level = str(assessment.get("level", "medium"))
+        reasoning = assessment.get("reasoning", "")
+        logger.info(
+            f"[CRAG] 质量评估完成: level={level}, score={score:.3f}, "
+            f"results={len(records)}, reasoning={reasoning}"
+        )
+
+        if not getattr(self.config, "crag_enable_correction", False):
+            logger.info("[CRAG] 自动纠偏跳过: crag_enable_correction=false")
+            return result
+
+        min_score = float(getattr(self.config, "crag_min_score", 0.3) or 0.3)
+        if level != "low" and score >= min_score:
+            logger.info(f"[CRAG] 自动纠偏跳过: quality_ok (threshold={min_score:.3f})")
+            return result
+
+        try:
+            logger.info(
+                f"[CRAG] 自动纠偏启动: level={level}, score={score:.3f}, "
+                f"threshold={min_score:.3f}"
+            )
+            corrector = CragCorrector(index_manager, embed_provider, None)
+            corrected = await corrector.correct(
+                query=query,
+                level=level,
+                original_results=records,
+                missing_aspects=str(assessment.get("missing_aspects", "")),
+            )
+            if corrected:
+                logger.info(f"[CRAG] 自动纠偏完成: corrected_results={len(corrected)}")
+                return self._records_to_query_result(corrected, top_k=top_k)
+            logger.warning("[CRAG] 自动纠偏未返回结果，保留原始检索结果")
+        except Exception as e:
+            logger.warning(f"[CRAG] 自动纠偏失败，保留原始检索结果: {e}")
+
+        return result
+
     async def search(
         self,
         query: str,
@@ -1438,22 +1724,47 @@ class HybridRAGEngine:
         if top_k is None:
             top_k = self.config.top_k
 
-        # 确保组件已初始化
-        retriever = self._ensure_retriever_initialized()
+        # 确保组件已初始化。Retriever 依赖 embedding provider，搜索入口必须先初始化它。
+        embed_provider = await self._ensure_embed_provider_initialized()
+        logger.info(f"[HybridRAGEngine] Embedding Provider ready: {self.config.embedding_mode}")
 
         # 两阶段检索
         use_two_stage = getattr(self.config, 'enable_two_stage_retrieval', False)
+        retriever: Optional[Union[VectorRetriever, HybridRetriever]] = None
+        logger.info(
+            f"[HybridRAGEngine] search开始: mode={'two_stage' if use_two_stage else 'single_stage'}, "
+            f"top_k={top_k}, two_stage_enabled={use_two_stage}, "
+            f"two_stage_top_k={getattr(self.config, 'two_stage_top_k', 10)}, "
+            f"two_stage_rerank_k={getattr(self.config, 'two_stage_rerank_k', 5)}, "
+            f"reranking={getattr(self.config, 'enable_multi_vector_rerank', False)}, "
+            f"crag_eval={getattr(self.config, 'enable_crag_quality_eval', True)}, "
+            f"crag_correction={getattr(self.config, 'crag_enable_correction', False)}"
+        )
 
         if use_two_stage:
             await self._ensure_abstract_manager_initialized()
+            if self._abstract_manager is None:
+                logger.warning("[HybridRAGEngine] 两阶段检索已开启，但摘要索引不可用，将降级到单阶段检索")
 
         if use_two_stage and self._abstract_manager is not None:
             # ========== 两阶段检索 ==========
             # 阶段1: 摘要检索找到相关论文
             abstract_top_k = getattr(self.config, 'two_stage_top_k', 10)
-            abstract_results = await self._abstract_manager.search_by_abstract(
-                query, top_k=abstract_top_k
-            )
+            logger.info(f"[两阶段] 阶段1摘要检索开始: abstract_top_k={abstract_top_k}")
+            try:
+                abstract_results = await self._abstract_manager.search_by_abstract(
+                    query, top_k=abstract_top_k
+                )
+            except Exception as e:
+                if _is_mps_oom_error(e):
+                    _clear_accelerator_cache()
+                    raise RuntimeError(
+                        "MPS 内存不足，阶段1摘要检索无法生成查询向量。"
+                        "已停止降级到单阶段检索，避免触发更高内存占用。"
+                        "请重启 AstrBot 让 MPS high watermark 配置生效，"
+                        "或临时切换 unsloth.device=cpu。"
+                    ) from e
+                raise
 
             if abstract_results:
                 # 构建 paper_id 列表（支持 .pdf 后缀格式）
@@ -1465,82 +1776,151 @@ class HybridRAGEngine:
                             pid = pid + ".pdf"
                         paper_ids.append(pid)
 
-                logger.debug(f"[两阶段] 阶段1: 摘要检索找到 {len(abstract_results)} 篇候选论文")
+                top_abstract_score = abstract_results[0].get("score", 0.0)
+                bottom_abstract_score = abstract_results[-1].get("score", 0.0)
+                logger.info(
+                    f"[两阶段] 阶段1摘要检索完成: papers={len(abstract_results)}, "
+                    f"score_range={top_abstract_score:.6f}..{bottom_abstract_score:.6f}"
+                )
 
-                # 阶段1.5: Rerank 摘要（使用 MultiVectorReranker）
+                # 阶段1.5: Rerank 摘要（使用 ColBERT MaxSim）
                 two_stage_rerank_k = getattr(self.config, 'two_stage_rerank_k', 5)
+                abstract_colbert = self._ensure_abstract_colbert_storage_initialized()
                 reranked_paper_ids = paper_ids[:two_stage_rerank_k]
 
-                if (isinstance(retriever, HybridRetriever) and
-                    retriever._enable_reranking and
-                    len(abstract_results) >= 3):
+                if (abstract_colbert is not None
+                        and len(abstract_colbert) > 0
+                        and getattr(self.config, 'enable_multi_vector_rerank', False)):
                     try:
-                        rerank_candidates = []
-                        for r in abstract_results:
-                            abstract_text = r.get("abstract_text", "")
-                            title = r.get("title", "")
-                            paper_id = r.get("paper_id", "")
-                            rerank_candidates.append(Node(
-                                text=f"{title}\n{abstract_text}" if title else abstract_text,
-                                metadata={"paper_id": paper_id, "file_name": r.get("file_name", "")}
-                            ))
-
-                        scores_list = [r.get("score", 0.0) for r in abstract_results]
-                        reranked = await retriever._reranker.rerank(
-                            query=query,
-                            nodes=rerank_candidates,
-                            scores=scores_list,
-                            top_k=min(two_stage_rerank_k, len(rerank_candidates))
-                        )
-
-                        reranked_paper_ids = []
-                        for node in reranked.nodes:
-                            pid = node.metadata.get("paper_id", "")
-                            fname = node.metadata.get("file_name", "")
-                            if pid:
+                        model = get_embedding_model()
+                        if model:
+                            import numpy as np
+                            qv = model.get_multi_vector(query)
+                            if not qv:
+                                raise ValueError("get_multi_vector returned empty")
+                            query_vecs = np.array(qv, dtype=np.float32)
+                            scored = []
+                            for r in abstract_results:
+                                pid = r.get("paper_id", "")
+                                abstract_key = f"abstract_{pid}"
+                                chunk_idx = abstract_colbert.find_chunk_idx(abstract_key)
+                                if chunk_idx is not None:
+                                    doc_vecs = abstract_colbert.get_chunk_token_vectors(chunk_idx)
+                                    if doc_vecs is not None:
+                                        sim = np.dot(query_vecs, doc_vecs.T)
+                                        maxsim = float(np.sum(np.max(sim, axis=1)))
+                                        scored.append((pid, maxsim))
+                                    else:
+                                        scored.append((pid, r.get("score", 0.0)))
+                                else:
+                                    scored.append((pid, r.get("score", 0.0)))
+                            scored.sort(key=lambda x: x[1], reverse=True)
+                            reranked_paper_ids = []
+                            for s in scored[:two_stage_rerank_k]:
+                                pid = s[0]
                                 if not pid.lower().endswith(".pdf"):
                                     pid = pid + ".pdf"
                                 reranked_paper_ids.append(pid)
-                            elif fname:
-                                reranked_paper_ids.append(fname)
-
-                        logger.debug(f"[两阶段] 阶段1.5: Rerank完成 {len(paper_ids)} → {len(reranked_paper_ids)} 篇")
+                            score_str = f"{scored[0][1]:.4f}..{scored[min(len(scored)-1, two_stage_rerank_k-1)][1]:.4f}" if scored else "N/A"
+                            logger.info(
+                                f"[两阶段] 阶段1.5 ColBERT摘要rerank完成: "
+                                f"selected={len(reranked_paper_ids)}/{len(paper_ids)} papers, "
+                                f"score_range={score_str}"
+                            )
+                        else:
+                            logger.error(
+                                f"[两阶段] 阶段1.5摘要rerank跳过: embedding model 不可用，"
+                                f"无法生成 query ColBERT 向量，降级使用原始分数: "
+                                f"selected={len(reranked_paper_ids)}/{len(paper_ids)} papers"
+                            )
                     except Exception as e:
-                        logger.warning(f"[两阶段] Rerank失败，使用原始顺序: {e}")
+                        logger.warning(f"[两阶段] 阶段1.5摘要rerank失败: {e}，使用原始分数")
                         reranked_paper_ids = paper_ids[:two_stage_rerank_k]
+                        logger.info(
+                            f"[两阶段] 阶段1.5摘要rerank跳过（失败），"
+                            f"selected={len(reranked_paper_ids)}/{len(paper_ids)} papers"
+                        )
+                else:
+                    logger.info(
+                        f"[两阶段] 阶段1.5摘要rerank跳过: ColBERT未启用或无摘要向量，"
+                        f"selected={len(reranked_paper_ids)}/{len(paper_ids)} papers"
+                    )
 
                 # 阶段2: 在选中的论文内检索 chunks
                 index_manager = self._ensure_index_manager_initialized()
-                embed_provider = await self._ensure_embed_provider_initialized()
-                query_embedding = await embed_provider.get_text_embedding(query)
+                try:
+                    query_embedding = await embed_provider.get_text_embedding(query)
+                except Exception as e:
+                    if _is_mps_oom_error(e):
+                        _clear_accelerator_cache()
+                        raise RuntimeError(
+                            "MPS 内存不足，阶段2论文内检索无法生成查询向量。"
+                            "请重启 AstrBot 让 MPS high watermark 配置生效，"
+                            "或临时切换 unsloth.device=cpu。"
+                        ) from e
+                    raise
+                stage2_candidate_k = top_k
+                if getattr(self.config, 'enable_multi_vector_rerank', False):
+                    stage2_candidate_k = max(top_k * 2, top_k)
 
+                logger.info(
+                    f"[两阶段] 阶段2论文内chunk检索开始: "
+                    f"papers={len(reranked_paper_ids)}, candidate_k={stage2_candidate_k}, final_top_k={top_k}"
+                )
                 chunk_results = await index_manager.search_with_paper_filter(
                     query_embedding=query_embedding,
                     paper_ids=reranked_paper_ids,
-                    top_k=top_k
+                    top_k=stage2_candidate_k
                 )
 
-                logger.debug(f"[两阶段] 阶段2: 在 {len(reranked_paper_ids)} 篇论文内检索到 {len(chunk_results)} 个 chunks")
+                logger.info(f"[两阶段] 阶段2论文内chunk检索完成: chunks={len(chunk_results)}")
 
                 if chunk_results:
-                    nodes = []
-                    scores = []
-                    for r in chunk_results:
-                        nodes.append(Node(
-                            text=r.get("text", ""),
-                            metadata=r.get("metadata", {})
-                        ))
-                        scores.append(r.get("score", 0.0))
-                    result = QueryResult(nodes=nodes, scores=scores)
+                    result = self._records_to_query_result(
+                        chunk_results,
+                        top_k=len(chunk_results),
+                    )
+                    # 阶段2.5: 对候选 chunks 做 ColBERT MaxSim 重排。
+                    result = await self._colbert_rerank_query_result(
+                        query=query,
+                        result=result,
+                        embed_provider=embed_provider,
+                        top_k=top_k,
+                        stage_label="两阶段 阶段2.5",
+                    )
                 else:
+                    logger.warning("[两阶段] 阶段2论文内chunk检索无结果，返回空")
                     result = QueryResult(nodes=[], scores=[])
             else:
                 # 摘要检索无结果，降级到普通检索
-                logger.debug("[两阶段] 阶段1无结果，降级到普通检索")
+                logger.warning("[两阶段] 阶段1摘要检索无结果，降级到单阶段检索")
+                retriever = self._ensure_retriever_initialized()
                 result = await retriever.retrieve(query, top_k=top_k)
         else:
             # 普通单阶段检索
+            if use_two_stage:
+                logger.warning("[HybridRAGEngine] 两阶段检索未执行，降级到单阶段检索")
+            else:
+                logger.info("[HybridRAGEngine] 两阶段检索未开启，执行单阶段检索")
+            retriever = self._ensure_retriever_initialized()
             result = await retriever.retrieve(query, top_k=top_k)
+
+        index_manager_for_crag = self._ensure_index_manager_initialized()
+        result = await self._apply_crag_quality_eval(
+            query=query,
+            result=result,
+            index_manager=index_manager_for_crag,
+            embed_provider=embed_provider,
+            top_k=top_k,
+        )
+
+        if result.scores:
+            logger.info(
+                f"[HybridRAGEngine] search完成: results={len(result.nodes)}, "
+                f"score_range={max(result.scores):.6f}..{min(result.scores):.6f}"
+            )
+        else:
+            logger.info("[HybridRAGEngine] search完成: results=0")
 
         return result
 
@@ -1567,6 +1947,8 @@ class HybridRAGEngine:
             reranker = getattr(retriever, '_reranker', None)
             if reranker is not None:
                 reranker.set_colbert_storage(colbert_storage)
+            else:
+                logger.warning("[PaperRAG] HybridRetriever 无 _reranker，ColBERT storage 未绑定")
 
         # 如果启用了 LLM 参考文献解析且没有显式提供 LLM config，
         # 则自动获取配置的 text_provider_id 并构建 config
@@ -1637,8 +2019,7 @@ class HybridRAGEngine:
 
                 # 预计算并存储 ColBERT per-token vectors
                 if colbert_storage is not None:
-                    reranker = getattr(self._retriever, '_reranker', None)
-                    model = reranker._get_embedding_model() if reranker else None
+                    model = get_embedding_model()
                     chunk_vectors = []
                     chunk_ids = []
                     if model is None:
@@ -1654,6 +2035,8 @@ class HybridRAGEngine:
                                 chunk_vectors.append(np.array(vec, dtype=np.float32))
                                 chunk_id = node.metadata.get("chunk_id", f"{file_path}_{i}")
                                 chunk_ids.append(chunk_id)
+                            else:
+                                logger.warning(f"[ColBERTStorage] get_multi_vector 返回空，跳过 chunk {i}: {file_path}")
                         if chunk_vectors:
                             colbert_storage.add_chunks(chunk_vectors, chunk_ids)
                             logger.debug(f"[ColBERTStorage] 为 {len(chunk_vectors)} 个 chunks 存储了 per-token vectors")
@@ -1708,6 +2091,33 @@ class HybridRAGEngine:
                         indexed = abstract_manager._abstract_cache.get(paper_id)  # type: ignore[attr-defined]
                         indexed_title = indexed.title if indexed else ""
                         logger.info(f"📄 已索引摘要: {indexed_title or file_name}")
+
+                        # 为摘要生成 ColBERT per-token vectors
+                        # 优先从 abstract_manager 缓存获取（可能来自 arXiv 等外部源），
+                        # 而非 chunk metadata（PDF 解析阶段不一定能提取到 abstract）
+                        indexed_abstract_text = getattr(indexed, "abstract_text", "") or "" if indexed else ""
+                        abstract_text_full = f"{indexed_title}\n\n{indexed_abstract_text}" if indexed_title and indexed_abstract_text else (indexed_abstract_text or extracted_abstract or "")
+                        if abstract_text_full.strip():
+                            try:
+                                abstract_colbert = self._ensure_abstract_colbert_storage_initialized()
+                                model = get_embedding_model()
+                                if model:
+                                    vec = model.get_multi_vector(abstract_text_full)
+                                    if vec:
+                                        import numpy as np
+                                        abstract_colbert.add_chunks(
+                                            [np.array(vec, dtype=np.float32)],
+                                            [f"abstract_{paper_id}"],
+                                        )
+                                        logger.debug(f"[ColBERTStorage-Abstract] 已存储摘要向量: {paper_id}")
+                                    else:
+                                        logger.warning(f"[ColBERTStorage-Abstract] get_multi_vector 返回空，跳过摘要向量: {paper_id}")
+                                else:
+                                    logger.error(f"[ColBERTStorage-Abstract] embedding model 不可用，无法生成摘要 ColBERT 向量: {paper_id}")
+                            except Exception as e:
+                                logger.warning(f"⚠️ 摘要ColBERT向量生成失败: {e}")
+                        else:
+                            logger.warning(f"[ColBERTStorage-Abstract] 摘要文本为空，跳过向量生成: {paper_id}")
                 except Exception as e:
                     logger.warning(f"⚠️ 摘要索引失败: {e}")
 
@@ -1720,6 +2130,9 @@ class HybridRAGEngine:
         if colbert_storage is not None and results["successful"] > 0:
             colbert_storage.save()
             logger.info(f"[ColBERTStorage] 已保存 {len(colbert_storage)} 个 chunks 的 per-token vectors")
+        if self._abstract_colbert_storage is not None and len(self._abstract_colbert_storage) > 0:
+            self._abstract_colbert_storage.save()
+            logger.info(f"[ColBERTStorage-Abstract] 已保存 {len(self._abstract_colbert_storage)} 个摘要的 per-token vectors")
 
         return results
 
@@ -1774,6 +2187,16 @@ class HybridRAGEngine:
             except Exception as e:
                 logger.warning(f"⚠️ 删除摘要索引失败: {e}")
 
+            # 删除摘要 ColBERT 向量
+            try:
+                paper_id = os.path.splitext(os.path.basename(prefix))[0]
+                abstract_colbert = self._ensure_abstract_colbert_storage_initialized()
+                if abstract_colbert is not None and len(abstract_colbert) > 0:
+                    abstract_colbert.delete_by_file_prefix(f"abstract_{paper_id}")
+                    abstract_colbert.save()
+            except Exception as e:
+                logger.warning(f"⚠️ 删除摘要ColBERT向量失败: {e}")
+
             return {
                 "status": "success",
                 "deleted_count": result.get("deleted_count", 0),
@@ -1796,6 +2219,14 @@ class HybridRAGEngine:
             # 同时清空 ColBERT 存储
             colbert_storage = self._ensure_colbert_storage_initialized()
             colbert_storage.clear_storage()
+            self._colbert_storage = None
+
+            # 清理旧路径残留（data/ 根目录下的 colbert_* 文件）
+            plugin_data_dir = Path(__file__).parent.parent / "data"
+            for stale_name in ("colbert_doc_vectors.npy", "colbert_faiss_index.bin", "colbert_id_mapping.json"):
+                stale_file = plugin_data_dir / stale_name
+                if stale_file.exists():
+                    stale_file.unlink()
 
             # 刷新 BM25 索引
             bm25_retriever = getattr(self._retriever, '_bm25_retriever', None)
@@ -1812,6 +2243,20 @@ class HybridRAGEngine:
                     logger.info("🗑️ 摘要索引已清空")
             except Exception as e:
                 logger.warning(f"⚠️ 清空摘要索引失败: {e}")
+
+            # 清空摘要 ColBERT 存储
+            try:
+                if self._abstract_colbert_storage is not None:
+                    self._abstract_colbert_storage.clear_storage()
+                    self._abstract_colbert_storage = None
+                else:
+                    # Storage was never initialized — clean stale files on disk if any
+                    stale_dir = Path(__file__).parent.parent / "data" / "colbert_abstracts"
+                    if stale_dir.exists():
+                        shutil.rmtree(stale_dir)
+                logger.info("🗑️ 摘要 ColBERT 存储已清空")
+            except Exception as e:
+                logger.warning(f"⚠️ 清空摘要 ColBERT 存储失败: {e}")
 
             # 清理物理文件：figures、tables
             plugin_data_dir = Path(__file__).parent.parent / "data"

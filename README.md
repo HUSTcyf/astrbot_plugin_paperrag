@@ -25,11 +25,11 @@ PaperRAG 是一个基于两阶段检索的学术论文问答系统，其架构�
 
 1. **Stage 1 - 摘要索引**：`AbstractIndexManager` 通过 `LocalGGUFClient`（Qwen3.5-9B GGUF 模型）提取论文摘要，或回退到基于关键词的规则提取。摘要向量存储在独立的 Milvus collection (`paper_abstracts`)，查询时先通过摘要匹配快速过滤出相关论文。
 
-2. **Stage 2 - Chunk 检索**：`HybridRAGEngine` 在 Stage 1 筛选出的论文集内执行混合检索：
+2. **Stage 2 - Chunk 检索**：`HybridRAGEngine` 在 Stage 1 筛选出的论文集内执行论文内 chunk 检索：
    - **向量检索**：基于 cosine 相似度（BGE-M3 稠密向量 1024维）
-   - **稀疏权重检索**：BGE-M3 稀疏权重通过 ABSPEC 公式计算关键词相似度
-   - **RRF 融合**：双路分数通过 Reciprocal Rank Fusion 融合 (k=60)
-   - **可选重排序**：通过 ColBERT 多向量 MaxSim Late Interaction 重排
+   - **论文过滤**：只在摘要阶段命中的论文范围内召回候选 chunk
+   - **Stage 2.5 可选重排序**：通过 ColBERT 多向量 MaxSim Late Interaction 对候选 chunk 重排
+   - **CRAG 质量评估**：检索结束后输出轻量质量评分；自动纠偏默认关闭，可按需开启
 
 **知识图谱增强**：`GraphRAGEngine` 通过 `MultimodalGraphBuilder` 从 Chunk 中提取知识三元组（实体-关系-实体），支持 MemoryGraphStore（JSON 持久化）和 Neo4j 两种存储后端，支持局部遍历和全局遍历。
 
@@ -387,6 +387,7 @@ API 配置从 `evaluation/freeapi.json` 读取，包含：
 | `unsloth.model_path` | BGE-M3模型路径 | `./models/bge-m3` | 默认 |
 | `unsloth.device` | 运行设备 | `mps` | `mps`（Apple Silicon）/ `cuda`（NVIDIA）/ `cpu` |
 | `unsloth.max_seq_length` | 最大序列长度 | `512` | 默认 |
+| `unsloth.mps_high_watermark_ratio` | PyTorch MPS 内存高水位 | `0.0` | 内存紧张用 `0.0`；保守可用 `1.7`/`2.0` |
 
 > 🦙 **Unsloth BGE-M3 配置指南**：[OLLAMA_GUIDE.md](docs/OLLAMA_GUIDE.md)（BGE-M3 部分）
 
@@ -399,6 +400,9 @@ API 配置从 `evaluation/freeapi.json` 读取，包含：
 | `enable_sparse_retrieval` | 启用稀疏权重检索(ABSPEC) | `true` | ✅ |
 | `sparse_top_k` | 稀疏检索召回数量 | `20` | `20-50` |
 | `hybrid_alpha` | RRF 融合权重 | `0.5` | `0.5`（平等权重） |
+| `enable_crag_quality_eval` | 启用 CRAG 检索质量评估日志 | `true` | ✅ |
+| `crag_enable_correction` | 低质量结果自动纠偏重检索 | `false` | 调试稳定后按需开启 |
+| `crag_min_score` | CRAG 自动纠偏触发阈值 | `0.3` | `0.3` |
 
 > 💡 **Embedding Provider 说明**：插件使用 Unsloth BGE-M3 本地加载，支持稠密向量、稀疏权重、多向量三种输出。
 
@@ -747,6 +751,11 @@ ls models/bge-m3/
 - 检查macOS版本 ≥ 12.3
 - 更新PyTorch: `pip install --upgrade torch`
 
+**MPS 内存不足**：
+- `unsloth.mps_high_watermark_ratio` 默认设为 `0.0`，禁用 PyTorch MPS 私有上限，让 macOS 统一内存和交换分区接管
+- 修改该配置或环境变量后需要重启 AstrBot 才能确保在 torch/MPS 初始化前生效
+- 如果仍然 OOM，可临时将 `unsloth.device` 改为 `cpu`，或关闭 `enable_multi_vector_rerank`
+
 ### Q7: 批量请求超过100个文本错误
 
 **症状**: `at most 100 requests can be in one batch`
@@ -1008,6 +1017,8 @@ evaluation_output/
 **技术方案**：
 - 第一阶段：使用摘要向量匹配最相关的论文
 - 第二阶段：在匹配的论文范围内检索具体内容
+- 阶段 2.5：开启 `enable_multi_vector_rerank` 后，对第二阶段候选 chunk 做 ColBERT MaxSim 重排
+- 最终阶段：CRAG 质量评估输出 `level/score/reasoning` 日志，便于判断检索结果是否可靠
 - 支持检查点机制，中断后可恢复
 
 **使用方式**：

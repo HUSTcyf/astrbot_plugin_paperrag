@@ -67,6 +67,42 @@ class PluginCoreBase(Star):
 
         logger.info("📚 Document RAG Plugin initialized (支持PDF/Word/TXT/HTML)")
 
+    def _configure_mps_memory(self) -> None:
+        """Configure PyTorch MPS memory behavior before torch is imported.
+
+        Apple Silicon uses unified memory. Setting the high watermark to 0.0
+        disables PyTorch's private upper limit and lets macOS memory pressure /
+        swap decide. This must happen before torch initializes MPS to be fully
+        effective.
+        """
+        unsloth_config = self.config.get("unsloth", {}) if isinstance(self.config, dict) else {}
+        device = str(unsloth_config.get("device", "mps")).lower()
+        if device != "mps":
+            return
+
+        ratio = unsloth_config.get("mps_high_watermark_ratio", "0.0")
+        if ratio is None:
+            return
+
+        ratio_text = str(ratio).strip()
+        if not ratio_text:
+            return
+
+        existing = os.environ.get("PYTORCH_MPS_HIGH_WATERMARK_RATIO")
+        if existing and existing != ratio_text:
+            logger.info(
+                "[MPS] 保留已有 PYTORCH_MPS_HIGH_WATERMARK_RATIO="
+                f"{existing}，插件配置值 {ratio_text} 未覆盖"
+            )
+            return
+
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", ratio_text)
+        logger.info(
+            f"[MPS] PYTORCH_MPS_HIGH_WATERMARK_RATIO={os.environ.get('PYTORCH_MPS_HIGH_WATERMARK_RATIO')} "
+            "(需在 torch/MPS 初始化前设置；修改后建议重启 AstrBot)"
+        )
+
     def _scan_documents(self, directory: str) -> List[Any]:
         """扫描目录中的支持文档文件"""
         papers_dir = directory or self.config.get("papers_dir", "./papers")
@@ -139,7 +175,7 @@ class PluginCoreBase(Star):
             vlm_provider = init_llama_cpp_vlm_provider(
                 model_path=str(model_path),
                 mmproj_path=str(mmproj_path),
-                n_ctx=8192,
+                n_ctx=self.config.get("llama_vlm_n_ctx", 16384),
                 n_gpu_layers=99,
                 max_tokens=25600,
                 temperature=0.0,
@@ -160,21 +196,42 @@ class PluginCoreBase(Star):
     async def _llm_direct_answer(self, query: str) -> str:
         """由LLM直接回答问题（不经过RAG）"""
         try:
-            provider_manager = getattr(self.context, "provider_manager", None)
-            if not provider_manager:
-                return ""
-            llm_provider = provider_manager.get_provider(None)
-            if llm_provider:
-                response = await llm_provider.generate(query)
-                return response.text.strip() if hasattr(response, "text") else str(response)
+            text_provider_id = self.config.get("text_provider_id", "")
+
+            if text_provider_id:
+                provider_manager = getattr(self.context, "provider_manager", None)
+                if not provider_manager:
+                    logger.error("[_llm_direct_answer] provider_manager 不可用，无法获取云端 LLM")
+                else:
+                    llm_provider = provider_manager.get_provider(text_provider_id)
+                    if not llm_provider:
+                        llm_provider = provider_manager.get_provider(None)
+                    if not llm_provider:
+                        logger.error(f"[_llm_direct_answer] 无法获取 LLM Provider (id={text_provider_id})")
+                    else:
+                        response = await llm_provider.generate(query)
+                        return response.text.strip() if hasattr(response, "text") else str(response)
+            else:
+                vlm_provider = await self._get_vlm_provider_async()
+                if not vlm_provider:
+                    logger.error("[_llm_direct_answer] 本地 VLM Provider 不可用")
+                else:
+                    response = await vlm_provider.text_chat(prompt=query, temperature=0.7)
+                    if hasattr(response, 'content'):
+                        return response.content.strip()
+                    else:
+                        logger.warning(f"[_llm_direct_answer] VLM 响应格式无法识别: {type(response)}")
+
         except Exception as e:
-            logger.warning(f"[_llm_direct_answer] LLM回答失败: {e}")
+            logger.warning(f"[_llm_direct_answer] 回答失败: {e}")
         return ""
 
     def _get_engine(self) -> Optional["HybridRAGEngine"]:
         """获取RAG引擎（单例模式，带缓存）"""
         if self._engine is None and not self._config_valid:
             try:
+                self._configure_mps_memory()
+
                 raw_embedding_mode = self.config.get("embedding_mode", "unsloth")
                 if raw_embedding_mode == "api":
                     embedding_mode = "astrbot"
@@ -189,11 +246,12 @@ class PluginCoreBase(Star):
                     compress_provider_id=self.config.get("compress_provider_id", ""),
                     text_provider_id=self.config.get("text_provider_id", ""),
                     multimodal_provider_id=self.config.get("multimodal_provider_id", ""),
+                    unsloth_config=self.config.get("unsloth", {}),
                     llama_vlm_model_path=self.config.get("llama_vlm_model_path", "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf"),
                     llama_vlm_mmproj_path=self.config.get("llama_vlm_mmproj_path", "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf"),
                     llama_vlm_max_tokens=self.config.get("llama_vlm_max_tokens", 25600),
                     llama_vlm_temperature=self.config.get("llama_vlm_temperature", 0.7),
-                    llama_vlm_n_ctx=self.config.get("llama_vlm_n_ctx", 8192),
+                    llama_vlm_n_ctx=self.config.get("llama_vlm_n_ctx", 16384),
                     llama_vlm_n_gpu_layers=self.config.get("llama_vlm_n_gpu_layers", 99),
                     milvus_lite_path=self.config.get("milvus_lite_path", ""),
                     address=self.config.get("address", ""),
@@ -217,6 +275,12 @@ class PluginCoreBase(Star):
                     hybrid_rrf_k=self.config.get("hybrid_rrf_k", 60),
                     enable_bm25=self.config.get("enable_bm25", True),
                     bm25_top_k=self.config.get("bm25_top_k", 20),
+                    enable_two_stage_retrieval=bool(self.config.get("enable_two_stage_retrieval", False)),
+                    two_stage_top_k=self.config.get("two_stage_top_k") or 10,
+                    two_stage_rerank_k=self.config.get("two_stage_rerank_k") or 5,
+                    enable_crag_quality_eval=self.config.get("enable_crag_quality_eval", True),
+                    crag_enable_correction=self.config.get("crag_enable_correction", False),
+                    crag_min_score=self.config.get("crag_min_score", 0.3),
                     enable_llm_reference_parsing=self.config.get("enable_llm_reference_parsing", True),
                     freeapi_url=self.config.get("freeapi_url", ""),
                     freeapi_key=self.config.get("freeapi_key", ""),

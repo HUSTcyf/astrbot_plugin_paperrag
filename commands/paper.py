@@ -163,6 +163,8 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             yield event.plain_result("📚 Usage: /paper search [question]\nExample: /paper search What are the key innovations of 3D Gaussian Splatting")
             return
 
+        mode = (mode or "rag").strip().lower()
+
         # 获取引擎
         engine = self._get_engine()
         if not engine:
@@ -229,8 +231,13 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             # 使用本地 VLM 重新排版 chunks 文本
             sources = await self._compact_chunk_texts_with_vlm(sources)
 
-            # Format output
-            output = self._format_retrieve_response(sources)
+            # Format output. Only explicit retrieve mode returns raw chunks;
+            # the default /paper search path should generate a grounded answer.
+            if actual_mode == "retrieve":
+                output = self._format_retrieve_response(sources)
+            else:
+                answer = await self._generate_rag_answer(query, sources)
+                output = self._format_rag_response(answer, sources)
 
             # Cache response
             self._set_cached_response(cache_key, output)

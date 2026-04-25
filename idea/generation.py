@@ -688,11 +688,12 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
 
         try:
             logger.info("[IdeaEngine] 使用 VLM 生成详细初始周报草稿...")
+            max_tokens_vlm = self.config.get("llama_vlm_max_tokens", 25600) if hasattr(self, 'config') else 25600
             draft = await self._vlm_chat_with_progress(
                 vlm_provider,
                 prompt=prompt,
                 temperature=0.7,
-                max_tokens=8192,
+                max_tokens=max_tokens_vlm,
                 task_name="VLM生成初始周报草稿"
             )
 

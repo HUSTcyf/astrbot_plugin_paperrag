@@ -5,15 +5,14 @@ ColBERT 标准存储模块
 - 索引时：预计算所有文档的 per-token vectors，存入 FAISS
 - 查询时：只算 query tokens，用 FAISS 召回 → MaxSim 重排
 
-存储结构：
-- data/colbert_doc_vectors.npy: (N_chunks, max_tokens, 1024) float32
-- data/colbert_faiss_index.bin: FAISS IndexFlatIP
-- data/colbert_id_mapping.json: [{"chunk_id": ..., "n_tokens": ...}, ...]
+存储结构（由 storage_dir 参数决定具体目录）：
+- {storage_dir}/colbert_doc_vectors.npy: (N_chunks, max_tokens, 1024) float32
+- {storage_dir}/colbert_faiss_index.bin: FAISS IndexFlatIP
+- {storage_dir}/colbert_id_mapping.json: [{"chunk_id": ..., "n_tokens": ...}, ...]
 """
 
 import json
 import os
-import pickle
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
@@ -44,8 +43,10 @@ class ColBERTStorage:
 
         self._doc_vectors: Optional[np.ndarray] = None  # (N, max_tokens, 1024)
         self._id_mapping: List[Dict[str, Any]] = []  # [{"chunk_id": str, "n_tokens": int}, ...]
+        self._chunk_id_to_idx: Dict[str, int] = {}  # chunk_id -> chunk_idx for O(1) lookup
         self._index: Optional[faiss.Index] = None
         self._is_loaded = False
+        self._doc_vectors_mmap = False
 
         self.EMBEDDING_DIM = 1024
         self.MAX_TOKENS_PER_CHUNK = 512  # 每个 chunk 最多存 512 tokens（匹配 BGE-M3 max_seq_length）
@@ -85,8 +86,13 @@ class ColBERTStorage:
                 dtype=np.float32
             )
             self._id_mapping = []
+            self._chunk_id_to_idx = {}
             self._index = None
         else:
+            if self._doc_vectors_mmap and self._id_mapping and self._index is None:
+                if not self._ensure_faiss_index_loaded():
+                    raise RuntimeError("[ColBERTStorage] 扩展已有存储前无法加载 FAISS 索引")
+
             # 扩展
             old_n = self._doc_vectors.shape[0]
             new_n = old_n + n_new
@@ -96,6 +102,7 @@ class ColBERTStorage:
             )
             new_vectors[:old_n] = self._doc_vectors
             self._doc_vectors = new_vectors
+            self._doc_vectors_mmap = False
 
         # 填充数据
         all_vectors = []  # 用于 FAISS
@@ -124,6 +131,7 @@ class ColBERTStorage:
                 "chunk_idx": chunk_idx,
                 "deleted": False,
             })
+            self._chunk_id_to_idx[chunk_id] = chunk_idx
 
             # 收集 FAISS 数据
             for t in range(n_tokens):
@@ -159,8 +167,13 @@ class ColBERTStorage:
             logger.info(f"[ColBERTStorage] 已保存 ID 映射: {self.id_mapping_path}")
 
     def load(self) -> bool:
-        """从磁盘加载"""
-        paths = [self.doc_vectors_path, self.faiss_index_path, self.id_mapping_path]
+        """从磁盘加载。
+
+        默认只 mmap 映射 doc_vectors 并读取 id_mapping；FAISS 索引按需懒加载。
+        rerank 候选 chunks 时只需要按 chunk_idx 读取对应 token vectors，
+        不需要把全库 FAISS index 常驻内存。
+        """
+        paths = [self.doc_vectors_path, self.id_mapping_path]
         exists_flags = [p.exists() for p in paths]
 
         if not all(exists_flags):
@@ -171,22 +184,48 @@ class ColBERTStorage:
             return False
 
         try:
-            self._doc_vectors = np.load(self.doc_vectors_path)
+            self._doc_vectors = np.load(self.doc_vectors_path, mmap_mode="r")
             assert self._doc_vectors is not None
-            logger.info(f"[ColBERTStorage] 已加载 doc_vectors: {self._doc_vectors.shape}")
-
-            self._index = faiss.read_index(str(self.faiss_index_path))
-            assert self._index is not None
-            logger.info(f"[ColBERTStorage] 已加载 FAISS 索引: {self._index.ntotal} vectors")
+            self._doc_vectors_mmap = True
+            logger.info(f"[ColBERTStorage] 已映射 doc_vectors: {self._doc_vectors.shape} (mmap)")
 
             with open(self.id_mapping_path, "r", encoding="utf-8") as f:
                 self._id_mapping = json.load(f)
+            self._chunk_id_to_idx = {
+                entry["chunk_id"]: entry["chunk_idx"]
+                for entry in self._id_mapping
+                if not entry.get("deleted", False)
+            }
             logger.info(f"[ColBERTStorage] 已加载 ID 映射: {len(self._id_mapping)} chunks")
+
+            self._index = None
+            if self.faiss_index_path.exists():
+                logger.info("[ColBERTStorage] FAISS 索引按需懒加载")
+            else:
+                logger.warning("[ColBERTStorage] 未找到 FAISS 索引文件，ColBERTStorage.search 将不可用")
 
             self._is_loaded = True
             return True
         except Exception as e:
             logger.error(f"[ColBERTStorage] 加载失败: {e}")
+            return False
+
+    def _ensure_faiss_index_loaded(self) -> bool:
+        """按需加载 FAISS 索引。"""
+        if self._index is not None:
+            return True
+        if not self.faiss_index_path.exists():
+            logger.warning("[ColBERTStorage] FAISS 索引文件不存在")
+            return False
+
+        try:
+            self._index = faiss.read_index(str(self.faiss_index_path))
+            assert self._index is not None
+            logger.info(f"[ColBERTStorage] 已懒加载 FAISS 索引: {self._index.ntotal} vectors")
+            return True
+        except Exception as e:
+            logger.error(f"[ColBERTStorage] FAISS 索引懒加载失败: {e}")
+            self._index = None
             return False
 
     def maxsim_score(
@@ -238,8 +277,12 @@ class ColBERTStorage:
         Returns:
             [(chunk_id, score), ...] 按分数降序
         """
-        if self._index is None or self._doc_vectors is None:
-            logger.warning("[ColBERTStorage] 未加载索引")
+        if self._doc_vectors is None:
+            logger.warning("[ColBERTStorage] 未加载 doc_vectors")
+            return []
+
+        if not self._ensure_faiss_index_loaded():
+            logger.warning("[ColBERTStorage] 未加载 FAISS 索引")
             return []
 
         n_chunks = len(self._id_mapping)
@@ -303,6 +346,15 @@ class ColBERTStorage:
     def is_loaded(self) -> bool:
         return self._is_loaded
 
+    def find_chunk_idx(self, chunk_id: str) -> Optional[int]:
+        """O(1) lookup of chunk_idx by chunk_id. Returns None if not found or deleted."""
+        idx = self._chunk_id_to_idx.get(chunk_id)
+        if idx is None:
+            return None
+        if idx < len(self._id_mapping) and not self._id_mapping[idx].get("deleted", False):
+            return idx
+        return None
+
     def delete_by_file_prefix(self, file_prefix: str) -> int:
         """
         根据文件名前缀标记删除 chunks
@@ -320,6 +372,7 @@ class ColBERTStorage:
             chunk_id = item.get("chunk_id", "")
             if chunk_id.startswith(file_prefix) or file_prefix in chunk_id:
                 item["deleted"] = True
+                self._chunk_id_to_idx.pop(chunk_id, None)
                 count += 1
         if count > 0:
             logger.info(f"[ColBERTStorage] 标记删除 {count} 个 chunks (prefix={file_prefix})")
@@ -331,8 +384,10 @@ class ColBERTStorage:
         """
         self._doc_vectors = None
         self._id_mapping = []
+        self._chunk_id_to_idx = {}
         self._index = None
         self._is_loaded = False
+        self._doc_vectors_mmap = False
 
         for p in [self.doc_vectors_path, self.faiss_index_path, self.id_mapping_path]:
             if p.exists():

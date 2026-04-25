@@ -365,6 +365,12 @@
                 "minimum": 128,
                 "maximum": 1024,
                 "hint": "最大序列长度，默认512"
+            },
+            "mps_high_watermark_ratio": {
+                "description": "MPS 内存高水位比例",
+                "type": "string",
+                "default": "0.0",
+                "hint": "Apple Silicon 专用。0.0 表示禁用 PyTorch MPS 私有上限，让 macOS 统一内存/交换分区接管；如需更保守可设为 1.7 或 2.0。修改后请重启 AstrBot。"
             }
         }
     },
@@ -487,6 +493,34 @@
         "default": 5,
         "minimum": 1,
         "maximum": 20
+    },
+    "two_stage_rerank_k": {
+        "description": "两阶段检索：摘要重排后进入第二阶段的论文数量",
+        "type": "int",
+        "hint": "第一阶段摘要检索结果经可选 rerank 后，保留多少篇论文进入 chunk 检索",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 20
+    },
+    "enable_crag_quality_eval": {
+        "description": "启用 CRAG 检索质量评估",
+        "type": "bool",
+        "hint": "启用后，每次检索完成会对返回 chunks 做轻量质量评估并输出日志，帮助判断结果是否足以回答问题。默认只评估，不自动改写或重搜。",
+        "default": true
+    },
+    "crag_enable_correction": {
+        "description": "启用 CRAG 自动纠偏重检索",
+        "type": "bool",
+        "hint": "启用后，当 CRAG 评估为低质量或低于阈值时，会尝试自动重检索。可能增加耗时，建议调试稳定后再开启。",
+        "default": false
+    },
+    "crag_min_score": {
+        "description": "CRAG 自动纠偏触发阈值",
+        "type": "float",
+        "hint": "当 CRAG 质量分低于该值时，如果已启用自动纠偏，会触发重检索。",
+        "default": 0.3,
+        "minimum": 0.0,
+        "maximum": 1.0
     },
     "feishu_table_format": {
         "description": "飞书文档表格格式",

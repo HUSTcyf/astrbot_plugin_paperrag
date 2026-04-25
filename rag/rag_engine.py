@@ -33,9 +33,9 @@ class RAGConfig:
     # Llama.cpp VLM配置（当multimodal_provider_id为空时使用）
     llama_vlm_model_path: str = "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf"
     llama_vlm_mmproj_path: str = "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf"
-    llama_vlm_max_tokens: int = 2560
+    llama_vlm_max_tokens: int = 25600
     llama_vlm_temperature: float = 0.7
-    llama_vlm_n_ctx: int = 4096
+    llama_vlm_n_ctx: int = 16384
     llama_vlm_n_gpu_layers: int = 99
 
     # Unsloth Embedding配置
@@ -104,6 +104,12 @@ class RAGConfig:
     enable_two_stage_retrieval: bool = False
     two_stage_top_k: int = 10
     two_stage_rerank_k: int = 5
+
+    # CRAG 质量评估配置
+    enable_crag_quality_eval: bool = True
+    crag_enable_correction: bool = False
+    crag_min_score: float = 0.3
+
     graph_multimodal_enabled: bool = True
     graph_max_images_per_chunk: int = 1
     graph_extract_image_entities: bool = True
