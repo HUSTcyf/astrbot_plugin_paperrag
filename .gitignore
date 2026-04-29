@@ -215,6 +215,7 @@ datasets/test_figures_and_tables
 evaluation/freeapi.json
 *.ipynb
 *.tgz
+*.zip
 *.code-workspace
 .DS_Store
 .planning/
