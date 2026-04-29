@@ -79,12 +79,18 @@ class RAGQueryWrapper:
     统一 HybridRAGEngine 和标准 llama-index QueryEngine 的接口
     """
 
-    def __init__(self, query_engine: Any):
+    def __init__(self, query_engine: Any, llm_model: str = "", llm_base_url: str = "", llm_api_key: str = ""):
         """
         Args:
             query_engine: HybridRAGEngine 实例或 llama-index QueryEngine 实例
+            llm_model: LLM 模型名称（用于 hybrid 路径的 answer 生成）
+            llm_base_url: LLM API 基础 URL
+            llm_api_key: LLM API Key
         """
         self._engine = query_engine
+        self._llm_model = llm_model
+        self._llm_base_url = llm_base_url
+        self._llm_api_key = llm_api_key
 
         # 检测引擎类型
         self._is_hybrid = hasattr(query_engine, "search")
@@ -97,14 +103,47 @@ class RAGQueryWrapper:
         执行异步查询
 
         Returns:
-            包含 response 和 source_nodes 的字典
+            包含 sources、answer、images 的字典
         """
         if self._is_hybrid:
-            # HybridRAGEngine
-            result = await self._engine.search(query, mode="rag", force_english=force_english)
-            if result.get("type") == "error":
-                raise ValueError(result.get("message", "Unknown error"))
-            return result
+            # HybridRAGEngine — search() 返回 QueryResult 对象
+            result = await self._engine.search(query)
+
+            nodes = getattr(result, "nodes", [])
+            scores = getattr(result, "scores", [1.0] * len(nodes))
+
+            source_nodes = []
+            for i, node in enumerate(nodes):
+                source_nodes.append({
+                    "text": getattr(node, "text", ""),
+                    "metadata": getattr(node, "metadata", {}),
+                    "score": scores[i] if i < len(scores) else 0.0,
+                })
+
+            # 从检索结果中生成 answer（复用 OpenAICompatibleLLM）
+            context_texts = [n["text"] for n in source_nodes if n["text"]]
+            answer = ""
+            if context_texts and self._llm_base_url:
+                context_block = "\n\n".join(context_texts[:5])
+                prompt = (
+                    "You are a research paper assistant. "
+                    "Answer the question based ONLY on the provided paper excerpts.\n\n"
+                    "Rules:\n"
+                    "- Answer in 3-6 sentences. Be specific and direct.\n"
+                    "- Include specific numbers, metrics, method names, and dataset names from the excerpts.\n"
+                    "- Do NOT add information beyond the excerpts.\n"
+                    "- Do NOT provide generic background or generalizations.\n\n"
+                    f"Paper excerpts:\n{context_block}\n\n"
+                    f"Question: {query}\n\nAnswer:"
+                )
+                answer = await self._generate_answer(prompt)
+
+            return {
+                "response": answer,
+                "answer": answer,
+                "sources": source_nodes,
+                "images": [],
+            }
         else:
             # llama-index QueryEngine
             if hasattr(self._engine, "aquery"):
@@ -112,7 +151,6 @@ class RAGQueryWrapper:
             else:
                 response = self._engine.query(query)
 
-            # 转换为统一格式
             source_nodes = []
             if hasattr(response, "source_nodes"):
                 for node in response.source_nodes:
@@ -120,10 +158,40 @@ class RAGQueryWrapper:
             elif hasattr(response, "nodes"):
                 source_nodes = response.nodes
 
+            answer = getattr(response, "response", str(response))
             return {
-                "response": getattr(response, "response", str(response)),
+                "response": answer,
+                "answer": answer,
                 "source_nodes": source_nodes,
+                "images": [],
             }
+
+    async def _generate_answer(self, prompt: str) -> str:
+        """复用 OpenAICompatibleLLM 生成 answer"""
+        from .ragas_generator import OpenAICompatibleLLM
+        from langchain_core.prompt_values import StringPromptValue
+
+        llm = OpenAICompatibleLLM(
+            model=self._llm_model or "gpt-4o-mini",
+            api_base=self._llm_base_url,
+            api_key=self._llm_api_key or "sk-placeholder",
+            temperature=0.2,
+            max_tokens=1024,
+        )
+        try:
+            llm_result = await llm.agenerate_text(StringPromptValue(text=prompt))
+            text = llm_result.generations[0][0].text
+            # OpenAICompatibleLLM 可能返回 JSON 包装
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict) and "text" in parsed:
+                    return parsed["text"]
+            except (json.JSONDecodeError, TypeError):
+                pass
+            return text
+        except Exception as e:
+            logger.warning(f"[RAGQueryWrapper] LLM answer 生成失败: {e}")
+            return ""
 
 
 # ============================================================================
@@ -346,8 +414,13 @@ class RagasEvaluator:
         samples = generator.load_testset(testset_path)
         print(f"加载测试集: {len(samples)} 个样本")
 
-        # 包装查询引擎
-        rag_wrapper = RAGQueryWrapper(query_engine)
+        # 包装查询引擎（传入 LLM 配置用于 hybrid 路径的 answer 生成）
+        rag_wrapper = RAGQueryWrapper(
+            query_engine,
+            llm_model=self._llm_config["model"],
+            llm_base_url=self._llm_config["base_url"],
+            llm_api_key=self._llm_config["api_key"],
+        )
 
         # 准备数据
         questions = []
@@ -445,6 +518,40 @@ class RagasEvaluator:
 
         # 转换为 DataFrame
         scores_df = cast(EvaluationDataset, evaluation_result).to_pandas()
+
+        # 对缺失值（NaN）重试一次
+        nan_mask = scores_df.isna().any(axis=1)
+        if bool(nan_mask.any()):
+            nan_count = int(nan_mask.sum())
+            nan_indices = [i for i in range(len(nan_mask)) if bool(nan_mask.iloc[i])]
+            print(f"\n⚠️ {nan_count} 个样本存在 NaN 指标值，正在重试...")
+            try:
+                from datasets import Dataset as HFDataset
+                full_dict = ragas_dataset.to_dict()
+                retry_dict = {
+                    k: [v[i] for i in nan_indices]
+                    for k, v in full_dict.items()
+                }
+                retry_dataset = HFDataset.from_dict(retry_dict)
+                retry_result = evaluate(
+                    dataset=retry_dataset,
+                    metrics=self._get_ragas_metrics(),
+                    llm=cast(BaseRagasLLM, self._get_llm()),
+                    embeddings=cast(BaseRagasEmbedding, self._get_embed_model_with_legacy()),
+                    run_config=RunConfig(max_workers=max_concurrent, timeout=180),
+                )
+                retry_df = cast(EvaluationDataset, retry_result).to_pandas()
+                for col in retry_df.columns:
+                    if col not in scores_df.columns:
+                        continue
+                    for local_i, global_i in enumerate(nan_indices):
+                        val = scores_df.at[global_i, col]
+                        if isinstance(val, float) and pd.isna(val):
+                            scores_df.at[global_i, col] = retry_df.at[local_i, col]
+                filled = int(sum(1 for i in nan_indices if not bool(scores_df.iloc[i].isna().any())))
+                print(f"✅ 重试完成: {filled}/{nan_count} 个样本已填充")
+            except Exception as e:
+                logger.warning(f"NaN 重试失败: {e}")
 
         # 添加元数据列
         scores_df["latency_ms"] = latencies
@@ -564,15 +671,15 @@ class RagasEvaluator:
 
             # 提取上下文文本（包含多模态信息）
             contexts = []
-            source_nodes = result.get("sources", [])
+            source_nodes = result.get("sources", result.get("source_nodes", []))
 
             for node in source_nodes:
-                if hasattr(node, "text"):
-                    text = node.text
-                    node_metadata = getattr(node, "metadata", {}) if hasattr(node, "metadata") else {}
-                elif isinstance(node, dict):
+                if isinstance(node, dict):
                     text = node.get("text", "")
                     node_metadata = node.get("metadata", {})
+                elif hasattr(node, "text"):
+                    text = node.text
+                    node_metadata = getattr(node, "metadata", {}) if hasattr(node, "metadata") else {}
                 else:
                     text = str(node)
                     node_metadata = {}
@@ -599,13 +706,16 @@ class RagasEvaluator:
             # 获取使用的图片列表（从检索结果中提取，与原始问题类型无关）
             used_images = result.get("images", [])
             if not used_images:
-                # 从 sources 中提取图片路径
                 used_images = []
                 for node in source_nodes:
-                    if hasattr(node, "metadata"):
+                    if isinstance(node, dict):
+                        img = node.get("metadata", {}).get("image_path", "")
+                    elif hasattr(node, "metadata"):
                         img = node.metadata.get("image_path", "")
-                        if img and img not in used_images:
-                            used_images.append(img)
+                    else:
+                        continue
+                    if img and img not in used_images:
+                        used_images.append(img)
 
             return {
                 "question": sample.question,

@@ -173,7 +173,7 @@
         "description": "相似度阈值",
         "type": "float",
         "hint": "仅返回相似度高于此阈值的文档片段（0-1之间，值越高越严格）",
-        "default": 0.3,
+        "default": 0.5,
         "minimum": 0,
         "maximum": 1
     },
@@ -518,7 +518,7 @@
         "description": "CRAG 自动纠偏触发阈值",
         "type": "float",
         "hint": "当 CRAG 质量分低于该值时，如果已启用自动纠偏，会触发重检索。",
-        "default": 0.3,
+        "default": 0.5,
         "minimum": 0.0,
         "maximum": 1.0
     },

@@ -93,13 +93,15 @@ except ImportError:
 LLAMA_CPP_VLM_AVAILABLE = False
 LLAMA_CPP_VLM_IMPORT_ERROR = None
 try:
-    from ..idea.llama_cpp_vlm_provider import LlamaCppVLMProvider
+    try:
+        from idea.llama_cpp_vlm_provider import LlamaCppVLMProvider
+    except ImportError:
+        from ..idea.llama_cpp_vlm_provider import LlamaCppVLMProvider
     LLAMA_CPP_VLM_AVAILABLE = True
     logger.info("[Llama.cpp-VLM] Llama.cpp VLM Provider 已加载")
 except ImportError as e:
     LLAMA_CPP_VLM_IMPORT_ERROR = e
     logger.warning(f"[Llama.cpp-VLM] Llama.cpp VLM Provider 导入失败: {e}")
-    logger.warning("[Llama.cpp-VLM] 请确保已安装llama-cpp-python")
 
 
 class QueryResult:
@@ -1013,7 +1015,22 @@ class CragEvaluator:
             import json, re
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
-                result = json.loads(json_match.group(0))
+                raw_json = json_match.group(0)
+                # Sanitize common LLM JSON issues: Chinese quotes, unescaped newlines
+                raw_json = raw_json.replace('“', '"').replace('”', '"')
+                raw_json = raw_json.replace('‘', "'").replace('’', "'")
+                raw_json = re.sub(r'[\x00-\x1f]', ' ', raw_json)
+                try:
+                    result = json.loads(raw_json)
+                except json.JSONDecodeError:
+                    # Fallback: extract key values with regex
+                    result = {}
+                    score_m = re.search(r'"?score"?\s*:\s*([0-9.]+)', raw_json)
+                    level_m = re.search(r'"?level"?\s*:\s*"?(\w+)"?', raw_json)
+                    if score_m:
+                        result["score"] = float(score_m.group(1))
+                    if level_m:
+                        result["level"] = level_m.group(1)
                 score = float(result.get("score", 0.5))
                 level = result.get("level", "medium")
                 if level not in ["high", "medium", "low"]:
@@ -1041,8 +1058,13 @@ class CragEvaluator:
         if not results:
             return {"score": 0.0, "level": "low", "reasoning": "无检索结果", "missing_aspects": ""}
 
-        top_result = results[0]
-        avg_score = sum(r.get("score", 0.0) for r in results) / len(results)
+        # Normalize scores: RRF scores are 0.001-0.02, cosine similarity is 0-1
+        max_raw_score = max(r.get("score", 0.0) for r in results)
+        if max_raw_score > 0 and max_raw_score < 0.1:
+            normalized = [r.get("score", 0.0) / max_raw_score for r in results]
+        else:
+            normalized = [min(r.get("score", 0.0), 1.0) for r in results]
+        avg_score = sum(normalized) / len(normalized)
 
         coverage_scores = []
         for r in results[:3]:
@@ -1052,21 +1074,20 @@ class CragEvaluator:
             coverage_scores.append(coverage)
 
         avg_coverage = sum(coverage_scores) / len(coverage_scores) if coverage_scores else 0.0
-        score = 0.4 * min(avg_score * 2, 1.0) + 0.4 * avg_coverage + 0.2 * (coverage_scores[0] if coverage_scores else 0.5)
+        score = 0.3 * min(avg_score, 1.0) + 0.5 * avg_coverage + 0.2 * (coverage_scores[0] if coverage_scores else 0.5)
 
-        top1_text = top_result.get("text", "").lower()
-        top1_coverage = len(query_terms & set(top1_text.split())) / max(len(query_terms), 1)
-        if top1_coverage < 0.1 and avg_score < 0.3:
+        top1_coverage = coverage_scores[0] if coverage_scores else 0.0
+        if top1_coverage < 0.1 and avg_coverage < 0.15:
             score *= 0.5
             reasoning = "Top结果与查询相关性低"
         elif score > 0.6:
             reasoning = "检索结果与查询高度相关"
-        elif score > 0.3:
+        elif score > 0.4:
             reasoning = "检索结果与查询中等相关"
         else:
             reasoning = "检索结果与查询相关性低"
 
-        level = "high" if score >= 0.6 else "medium" if score >= 0.3 else "low"
+        level = "high" if score >= 0.6 else "medium" if score >= 0.4 else "low"
 
         return {"score": min(score, 1.0), "level": level, "reasoning": reasoning, "missing_aspects": ""}
 
@@ -1084,25 +1105,29 @@ class CragCorrector:
         query: str,
         level: str,
         original_results: List[Dict[str, Any]],
-        missing_aspects: str = ""
+        missing_aspects: str = "",
+        paper_ids: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """根据评估等级执行修正策略"""
         if level == "high":
             return original_results
 
         if level == "medium":
-            # 中等相关性：尝试使用不同查询重检
-            return await self._retry_with_rewrite(query, original_results)
+            return await self._retry_with_rewrite(query, original_results, paper_ids=paper_ids)
 
-        # 低相关性：降级到全文检索
-        return await self._fulltext_fallback(query)
+        return await self._fulltext_fallback(query, paper_ids=paper_ids)
 
     async def _retry_with_rewrite(
         self,
         query: str,
-        original_results: List[Dict[str, Any]]
+        original_results: List[Dict[str, Any]],
+        paper_ids: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """使用重写查询重试"""
+        if self._llm_provider is None:
+            logger.info("[CRAG] 查询重写跳过: LLM Provider 不可用")
+            return original_results
+
         rewrite_prompt = f"""将以下查询重写为不同的表述：
 
 原始查询：{query}
@@ -1126,12 +1151,18 @@ class CragCorrector:
                 logger.warning(f"[CRAG] 查询重写响应格式无法识别: {type(response)}")
 
             if rewritten:
-                # 使用重写后的查询重新检索
                 query_embedding = await self._embed_provider.get_text_embedding(rewritten)
-                new_results = await self._index_manager.search(
-                    query_embedding=query_embedding,
-                    top_k=10
-                )
+                if paper_ids:
+                    new_results = await self._index_manager.search_with_paper_filter(
+                        query_embedding=query_embedding,
+                        paper_ids=paper_ids,
+                        top_k=10
+                    )
+                else:
+                    new_results = await self._index_manager.search(
+                        query_embedding=query_embedding,
+                        top_k=10
+                    )
                 if new_results:
                     logger.info(f"[CRAG] 查询重写: '{query}' -> '{rewritten}'")
                     return new_results
@@ -1140,15 +1171,23 @@ class CragCorrector:
 
         return original_results
 
-    async def _fulltext_fallback(self, query: str) -> List[Dict[str, Any]]:
+    async def _fulltext_fallback(self, query: str, paper_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """全文检索降级"""
         try:
             query_embedding = await self._embed_provider.get_text_embedding(query)
-            results = await self._index_manager.search(
-                query_embedding=query_embedding,
-                top_k=20
-            )
-            logger.info(f"[CRAG] 降级到全文检索，返回 {len(results)} 个结果")
+            if paper_ids:
+                results = await self._index_manager.search_with_paper_filter(
+                    query_embedding=query_embedding,
+                    paper_ids=paper_ids,
+                    top_k=20
+                )
+                logger.info(f"[CRAG] 论文内扩大检索，返回 {len(results)} 个结果")
+            else:
+                results = await self._index_manager.search(
+                    query_embedding=query_embedding,
+                    top_k=20
+                )
+                logger.info(f"[CRAG] 降级到全文检索，返回 {len(results)} 个结果")
             return results
         except Exception as e:
             logger.error(f"[CRAG] 全文检索失败: {e}")
@@ -1260,16 +1299,23 @@ class HybridRAGEngine:
             return None
 
     async def _ensure_llm_initialized(self) -> Any:
-        """确保LLM Provider已初始化"""
+        """确保LLM Provider已初始化（单例，失败后标记避免重复加载）"""
         if self._llm_initialized:
             assert self._llm_client is not None
             return self._llm_client
+
+        # 如果之前已尝试过且失败，不再重复
+        if getattr(self, '_llm_init_failed', False):
+            raise ValueError("LLM Provider 初始化之前已失败，不再重试")
 
         provider_id = self.config.text_provider_id
         if not provider_id:
             # text_provider_id 未配置时，默认使用本地VLM
             try:
-                from ..idea.llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
+                try:
+                    from idea.llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
+                except ImportError:
+                    from ..idea.llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
                 vlm_provider = get_llama_cpp_vlm_provider()
                 if vlm_provider and vlm_provider._initialized:
                     self._llm_client = vlm_provider
@@ -1549,6 +1595,7 @@ class HybridRAGEngine:
             bm25_top_k=self.config.bm25_top_k,
         )
         self._retriever_initialized = True
+        self._bm25_retriever = self._retriever._bm25_retriever
 
         # 绑定 ColBERT 存储到 reranker
         if self.config.enable_multi_vector_rerank and hasattr(self._retriever, '_reranker'):
@@ -1569,6 +1616,55 @@ class HybridRAGEngine:
 
         assert self._retriever is not None
         return self._retriever
+
+    def _get_bm25_retriever(self):
+        """Lazily get BM25 retriever from HybridRetriever."""
+        if hasattr(self, '_bm25_retriever') and self._bm25_retriever is not None:
+            return self._bm25_retriever
+        retriever = self._ensure_retriever_initialized()
+        return getattr(retriever, '_bm25_retriever', None)
+
+    @staticmethod
+    def _stage2_rrf_fusion(
+        dense_results: List[Dict[str, Any]],
+        bm25_results: List[Dict[str, Any]],
+        top_k: int = 10,
+        rrf_k: int = 60,
+        alpha_dense: float = 0.7,
+    ) -> List[Dict[str, Any]]:
+        """Two-way RRF fusion for Stage 2: dense + BM25 within selected papers."""
+        dense_rank = {r["text"]: i + 1 for i, r in enumerate(dense_results)}
+        bm25_rank = {r["text"]: i + 1 for i, r in enumerate(bm25_results)}
+        alpha_bm25 = 1.0 - alpha_dense
+
+        all_texts = set(dense_rank.keys()) | set(bm25_rank.keys())
+        n_dense = len(dense_results)
+        n_bm25 = len(bm25_results)
+
+        text_to_meta: Dict[str, Dict] = {}
+        for r in dense_results:
+            text_to_meta[r["text"]] = r.get("metadata", {})
+        for r in bm25_results:
+            text_to_meta.setdefault(r["text"], r.get("metadata", {}))
+
+        scores: Dict[str, float] = {}
+        for text in all_texts:
+            dr = dense_rank.get(text, n_dense + 1)
+            br = bm25_rank.get(text, n_bm25 + 1)
+            scores[text] = (
+                alpha_dense * (1.0 / (rrf_k + dr))
+                + alpha_bm25 * (1.0 / (rrf_k + br))
+            )
+
+        fused = []
+        for text, score in sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]:
+            fused.append({
+                "text": text,
+                "metadata": text_to_meta.get(text, {}),
+                "score": score,
+                "fused_score": score,
+            })
+        return fused
 
     def _records_to_query_result(
         self,
@@ -1655,6 +1751,7 @@ class HybridRAGEngine:
         index_manager: HybridIndexManager,
         embed_provider: Any,
         top_k: int,
+        paper_ids: Optional[List[str]] = None,
     ) -> QueryResult:
         """Evaluate retrieval quality and optionally run corrective retrieval."""
         if not getattr(self.config, "enable_crag_quality_eval", True):
@@ -1662,7 +1759,22 @@ class HybridRAGEngine:
             return result
 
         records = self._query_result_to_records(result)
-        evaluator = CragEvaluator()
+
+        # 获取 LLM provider（用于 CRAG 评估和查询重写）
+        llm_provider = None
+        if self._llm_initialized:
+            llm_provider = self._llm_client
+        else:
+            try:
+                llm_provider = await self._ensure_llm_initialized()
+            except Exception as e:
+                logger.debug(f"[CRAG] LLM Provider 不可用，使用规则评估: {e}")
+                # 标记失败，避免后续每次搜索都重新尝试加载 VLM
+                self._llm_initialized = False
+                self._llm_client = None
+                self._llm_init_failed = True
+
+        evaluator = CragEvaluator(llm_provider=llm_provider)
         assessment = await evaluator.evaluate_retrieval_quality(query, records)
         score = float(assessment.get("score", 0.0) or 0.0)
         level = str(assessment.get("level", "medium"))
@@ -1676,7 +1788,7 @@ class HybridRAGEngine:
             logger.info("[CRAG] 自动纠偏跳过: crag_enable_correction=false")
             return result
 
-        min_score = float(getattr(self.config, "crag_min_score", 0.3) or 0.3)
+        min_score = float(getattr(self.config, "crag_min_score", 0.5) or 0.5)
         if level != "low" and score >= min_score:
             logger.info(f"[CRAG] 自动纠偏跳过: quality_ok (threshold={min_score:.3f})")
             return result
@@ -1686,12 +1798,13 @@ class HybridRAGEngine:
                 f"[CRAG] 自动纠偏启动: level={level}, score={score:.3f}, "
                 f"threshold={min_score:.3f}"
             )
-            corrector = CragCorrector(index_manager, embed_provider, None)
+            corrector = CragCorrector(index_manager, embed_provider, llm_provider)
             corrected = await corrector.correct(
                 query=query,
                 level=level,
                 original_results=records,
                 missing_aspects=str(assessment.get("missing_aspects", "")),
+                paper_ids=paper_ids,
             )
             if corrected:
                 logger.info(f"[CRAG] 自动纠偏完成: corrected_results={len(corrected)}")
@@ -1731,6 +1844,7 @@ class HybridRAGEngine:
         # 两阶段检索
         use_two_stage = getattr(self.config, 'enable_two_stage_retrieval', False)
         retriever: Optional[Union[VectorRetriever, HybridRetriever]] = None
+        paper_ids_for_crag: Optional[List[str]] = None
         logger.info(
             f"[HybridRAGEngine] search开始: mode={'two_stage' if use_two_stage else 'single_stage'}, "
             f"top_k={top_k}, two_stage_enabled={use_two_stage}, "
@@ -1749,7 +1863,7 @@ class HybridRAGEngine:
         if use_two_stage and self._abstract_manager is not None:
             # ========== 两阶段检索 ==========
             # 阶段1: 摘要检索找到相关论文
-            abstract_top_k = getattr(self.config, 'two_stage_top_k', 10)
+            abstract_top_k = 20
             logger.info(f"[两阶段] 阶段1摘要检索开始: abstract_top_k={abstract_top_k}")
             try:
                 abstract_results = await self._abstract_manager.search_by_abstract(
@@ -1784,7 +1898,7 @@ class HybridRAGEngine:
                 )
 
                 # 阶段1.5: Rerank 摘要（使用 ColBERT MaxSim）
-                two_stage_rerank_k = getattr(self.config, 'two_stage_rerank_k', 5)
+                two_stage_rerank_k = 8
                 abstract_colbert = self._ensure_abstract_colbert_storage_initialized()
                 reranked_paper_ids = paper_ids[:two_stage_rerank_k]
 
@@ -1847,6 +1961,7 @@ class HybridRAGEngine:
                     )
 
                 # 阶段2: 在选中的论文内检索 chunks
+                paper_ids_for_crag = reranked_paper_ids
                 index_manager = self._ensure_index_manager_initialized()
                 try:
                     query_embedding = await embed_provider.get_text_embedding(query)
@@ -1872,6 +1987,29 @@ class HybridRAGEngine:
                     paper_ids=reranked_paper_ids,
                     top_k=stage2_candidate_k
                 )
+
+                logger.info(f"[两阶段] 阶段2 dense检索完成: chunks={len(chunk_results)}")
+
+                # 阶段2 BM25: 论文内精确匹配检索
+                paper_id_set = set(reranked_paper_ids)
+                if getattr(self.config, 'enable_bm25', True):
+                    bm25_retriever = self._get_bm25_retriever()
+                    if bm25_retriever and bm25_retriever.is_exact_match_query(query):
+                        try:
+                            bm25_raw = await bm25_retriever.retrieve(query, top_k=self.config.bm25_top_k)
+                            bm25_filtered = [
+                                {"text": n.text, "metadata": n.metadata or {}, "score": float(s)}
+                                for n, s in zip(bm25_raw.nodes, bm25_raw.scores)
+                                if (n.metadata or {}).get("file_name", "") in paper_id_set
+                            ]
+                            if bm25_filtered:
+                                logger.info(f"[两阶段] 阶段2 BM25论文内召回: {len(bm25_filtered)} chunks")
+                                chunk_results = self._stage2_rrf_fusion(
+                                    chunk_results, bm25_filtered, top_k=stage2_candidate_k
+                                )
+                                logger.info(f"[两阶段] 阶段2 RRF融合完成: {len(chunk_results)} chunks")
+                        except Exception as e:
+                            logger.warning(f"[两阶段] 阶段2 BM25检索失败: {e}")
 
                 logger.info(f"[两阶段] 阶段2论文内chunk检索完成: chunks={len(chunk_results)}")
 
@@ -1912,6 +2050,7 @@ class HybridRAGEngine:
             index_manager=index_manager_for_crag,
             embed_provider=embed_provider,
             top_k=top_k,
+            paper_ids=paper_ids_for_crag,
         )
 
         if result.scores:

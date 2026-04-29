@@ -51,7 +51,7 @@ class RAGConfig:
     # 检索配置
     embed_dim: int = 768
     top_k: int = 5
-    similarity_cutoff: float = 0.3
+    similarity_cutoff: float = 0.5
 
     # 论文目录
     papers_dir: str = "./papers"
@@ -108,7 +108,7 @@ class RAGConfig:
     # CRAG 质量评估配置
     enable_crag_quality_eval: bool = True
     crag_enable_correction: bool = False
-    crag_min_score: float = 0.3
+    crag_min_score: float = 0.5
 
     graph_multimodal_enabled: bool = True
     graph_max_images_per_chunk: int = 1

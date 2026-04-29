@@ -62,7 +62,7 @@ def create_index_manager() -> Any:
     rag_config = config.get("rag_config", {})
     milvus_config = rag_config.get("milvus", {})
 
-    from ..rag.hybrid_index import HybridIndexManager
+    from rag.hybrid_index import HybridIndexManager
 
     return HybridIndexManager(
         collection_name=rag_config.get("collection_name", "paper_embeddings"),
@@ -626,6 +626,10 @@ async def generate_multimodal_testset(
     llm_model: str = "gpt-4o-mini",
     llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
     llm_api_key: str = "",
+    embedding_model: str = "text-embedding-v4",
+    embed_base_url: str = "",
+    embed_api_key: str = "",
+    embedding_mode: str = "api",
     max_rpm: int = 96,
     context_before: int = 1,
     context_after: int = 1,
@@ -697,10 +701,10 @@ async def generate_multimodal_testset(
         llm_model=llm_model,
         llm_base_url=llm_base_url,
         llm_api_key=llm_api_key,
-        embedding_model="text-embedding-v3",
-        embed_base_url=llm_base_url,
-        embed_api_key=llm_api_key,
-        embedding_mode="api",
+        embedding_model=embedding_model,
+        embed_base_url=embed_base_url,
+        embed_api_key=embed_api_key,
+        embedding_mode=embedding_mode,
         max_rpm=max_rpm,
     )
 
@@ -822,7 +826,7 @@ async def generate_multimodal_testset(
     try:
         output_path_obj = Path(output_path).resolve()
         expected_dir = Path(__file__).parent.parent.joinpath("results").resolve()
-        if not str(output_path_obj).startswith(str(expected_dir)):
+        if not output_path_obj.is_relative_to(expected_dir):
             raise ValueError(f"Output path must be within {expected_dir}")
     except Exception as e:
         print(f"⚠️ 路径验证失败: {e}")
@@ -860,7 +864,7 @@ async def generate_testset_from_documents(
     llm_model: str = "gpt-4o-mini",
     llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
     llm_api_key: str = "",
-    embedding_model: str = "text-embedding-v3",
+    embedding_model: str = "text-embedding-v4",
     embed_base_url: str = "",  # 强制留空，使用 freeapi_url
     embed_api_key: str = "",
     embedding_mode: str = "api",
@@ -906,7 +910,7 @@ async def run_evaluation(
     llm_model: str = "gpt-4o-mini",
     llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
     llm_api_key: str = "",
-    embedding_model: str = "text-embedding-v3",
+    embedding_model: str = "text-embedding-v4",
     embed_base_url: str = "",  # 强制留空，使用 freeapi_url
     embed_api_key: str = "",
     embedding_mode: str = "api",
@@ -947,7 +951,7 @@ async def run_evaluation_from_raw_answers(
     llm_model: str = "gpt-4o-mini",
     llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
     llm_api_key: str = "",
-    embedding_model: str = "text-embedding-v3",
+    embedding_model: str = "text-embedding-v4",
     embed_base_url: str = "",  # 强制留空，使用 freeapi_url
     embed_api_key: str = "",
     embedding_mode: str = "api",
@@ -1022,11 +1026,12 @@ def generate_reports(
 async def run_full_pipeline(
     output_dir: str = "results",
     test_size: int = 50,
+    multimodal_test_size: int = 0,
     max_concurrent: int = 5,
     llm_model: str = "gpt-4o-mini",
     llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
     llm_api_key: str = "",
-    embedding_model: str = "text-embedding-v3",
+    embedding_model: str = "text-embedding-v4",
     embed_base_url: str = "",  # 强制留空，使用 freeapi_url
     embed_api_key: str = "",
     embedding_mode: str = "api",
@@ -1038,6 +1043,8 @@ async def run_full_pipeline(
     existing_chunks_path: str = "results/milvus_chunks.json",
     eval_embedding_mode: str = "api",
     top_k: int | None = None,
+    multimodal_context_before: int = 1,
+    multimodal_context_after: int = 1,
 ) -> dict:
     """
     完整评测流程
@@ -1087,13 +1094,31 @@ async def run_full_pipeline(
         max_rpm=max_rpm,
     )
 
+    # ========== 步骤 2.5: 生成多模态测试集（追加到同一文件） ==========
+    if multimodal_test_size > 0:
+        await generate_multimodal_testset(
+            chunks=chunks,
+            test_size=multimodal_test_size,
+            output_path=testset_path,
+            llm_model=llm_model,
+            llm_base_url=llm_base_url,
+            llm_api_key=llm_api_key,
+            embedding_model=embedding_model,
+            embed_base_url=embed_base_url,
+            embed_api_key=embed_api_key,
+            embedding_mode=embedding_mode,
+            max_rpm=max_rpm,
+            context_before=multimodal_context_before,
+            context_after=multimodal_context_after,
+        )
+
     # ========== 步骤 3: 创建 RAG 查询引擎 ==========
     print(f"\n{'='*60}")
     print("🔧 步骤 3/4: 初始化 HybridRAG 引擎")
     print("=" * 60)
 
     # 使用插件现有配置创建引擎
-    from ..rag.rag_engine import create_rag_engine, RAGConfig
+    from rag.rag_engine import create_rag_engine, RAGConfig
 
     plugin_dir = Path(__file__).parent.parent
     config_path = plugin_dir.parent.parent / "config" / "astrbot_plugin_paperrag_config.json"
@@ -1112,7 +1137,7 @@ async def run_full_pipeline(
         collection_name=rag_cfg.get("collection_name", "paper_embeddings"),
         embed_dim=rag_cfg.get("embed_dim", 1024),
         top_k=top_k if top_k is not None else rag_cfg.get("top_k", 5),
-        similarity_cutoff=rag_cfg.get("similarity_cutoff", 0.3),
+        similarity_cutoff=rag_cfg.get("similarity_cutoff", 0.5),
         chunk_size=rag_cfg.get("chunk_size", 512),
         min_chunk_size=rag_cfg.get("min_chunk_size", 100),
         use_semantic_chunking=rag_cfg.get("use_semantic_chunking", True),
@@ -1124,6 +1149,9 @@ async def run_full_pipeline(
         enable_bm25=rag_cfg.get("enable_bm25", True),
         bm25_top_k=rag_cfg.get("bm25_top_k", 20),
         enable_two_stage_retrieval=rag_cfg.get("enable_two_stage_retrieval", False),
+        enable_crag_quality_eval=rag_cfg.get("enable_crag_quality_eval", True),
+        crag_enable_correction=rag_cfg.get("crag_enable_correction", True),
+        crag_min_score=rag_cfg.get("crag_min_score", 0.5),
     )
 
     # context 需要从 AstrBot 传入，这里用 None（引擎会跳过LLM初始化用于检索模式）
@@ -1225,7 +1253,7 @@ def main():
     # 测试集配置
     parser.add_argument("--test-size", type=int, default=50, help="生成测试问题数量")
     parser.add_argument("--top-k", type=int, default=None, help="检索时返回的 top_k（覆盖配置文件）")
-    parser.add_argument("--multimodal-test-size", type=int, default=20, help="多模态测试问题数量")
+    parser.add_argument("--multimodal-test-size", type=int, default=0, help="多模态测试问题数量（默认0，需显式指定）")
     parser.add_argument("--multimodal-context-before", type=int, default=1, help="多模态 chunk 前面的上下文 chunks 数量")
     parser.add_argument("--multimodal-context-after", type=int, default=1, help="多模态 chunk 后面的上下文 chunks 数量")
 
@@ -1240,7 +1268,7 @@ def main():
     parser.add_argument("--eval-llm-api-key", default="", help="评估用 LLM API Key")
 
     # Embedding 配置
-    parser.add_argument("--embedding-model", default="text-embedding-v3", help="Embedding 模型名称")
+    parser.add_argument("--embedding-model", default="text-embedding-v4", help="Embedding 模型名称")
     parser.add_argument("--embed-base-url", default="", help="Embedding API 基础 URL（使用 freeapi_url）")
     parser.add_argument("--embed-api-key", default="", help="Embedding API Key")
     parser.add_argument(
@@ -1271,6 +1299,7 @@ def main():
     parser.add_argument("--existing-chunks-path", default="results/milvus_chunks.json", help="已有 chunks 文件路径")
     parser.add_argument("--skip-rag", action="store_true", help="跳过 RAG 推理，直接从 raw_answers.json 读取已有结果进行评估")
     parser.add_argument("--raw-answers-path", default="results/raw_answers.json", help="raw_answers.json 路径（用于 --skip-rag）")
+    parser.add_argument("--testset-path", default=None, help="指定测试集路径（覆盖默认 testset.json）")
 
     args = parser.parse_args()
 
@@ -1289,6 +1318,8 @@ def main():
         if config_freeapi_key and not llm_api_key:
             llm_api_key = config_freeapi_key
             print(f"✅ 已从插件配置加载 freeapi key")
+        if config_freeapi_key and not embed_api_key:
+            embed_api_key = config_freeapi_key
         if config_freeapi_url:
             llm_base_url = config_freeapi_url + "/v1/"
             # freeapi 同时用于 LLM 和 Embedding
@@ -1322,6 +1353,7 @@ def main():
         asyncio.run(run_full_pipeline(
             output_dir=args.output_dir,
             test_size=args.test_size,
+            multimodal_test_size=args.multimodal_test_size,
             max_concurrent=args.max_concurrent,
             llm_model=args.llm_model,
             llm_base_url=llm_base_url,
@@ -1338,6 +1370,8 @@ def main():
             existing_chunks_path=args.existing_chunks_path,
             eval_embedding_mode=args.eval_embedding_mode,
             top_k=args.top_k,
+            multimodal_context_before=args.multimodal_context_before,
+            multimodal_context_after=args.multimodal_context_after,
         ))
 
     elif args.step == "extract":
@@ -1358,18 +1392,40 @@ def main():
         with open(chunks_path, "r", encoding="utf-8") as f:
             chunks = json.load(f)
         documents = chunks_to_documents(chunks, include_multimodal=True)
-        asyncio.run(generate_testset_from_documents(
-            documents=documents,
-            test_size=args.test_size,
-            llm_model=args.llm_model,
-            llm_base_url=llm_base_url,
-            llm_api_key=llm_api_key,
-            embedding_model=args.embedding_model,
-            embed_base_url=embed_base_url,
-            embed_api_key=embed_api_key,
-            embedding_mode=args.embedding_mode,
-            max_rpm=args.max_rpm,
-        ))
+        testset_path = str(Path(args.output_dir) / "testset.json")
+
+        async def _generate_step():
+            await generate_testset_from_documents(
+                documents=documents,
+                test_size=args.test_size,
+                output_path=testset_path,
+                llm_model=args.llm_model,
+                llm_base_url=llm_base_url,
+                llm_api_key=llm_api_key,
+                embedding_model=args.embedding_model,
+                embed_base_url=embed_base_url,
+                embed_api_key=embed_api_key,
+                embedding_mode=args.embedding_mode,
+                max_rpm=args.max_rpm,
+            )
+            if args.multimodal_test_size > 0:
+                await generate_multimodal_testset(
+                    chunks=chunks,
+                    test_size=args.multimodal_test_size,
+                    output_path=testset_path,
+                    llm_model=args.llm_model,
+                    llm_base_url=llm_base_url,
+                    llm_api_key=llm_api_key,
+                    embedding_model=args.embedding_model,
+                    embed_base_url=embed_base_url,
+                    embed_api_key=embed_api_key,
+                    embedding_mode=args.embedding_mode,
+                    max_rpm=args.max_rpm,
+                    context_before=args.multimodal_context_before,
+                    context_after=args.multimodal_context_after,
+                )
+
+        asyncio.run(_generate_step())
 
     elif args.step == "evaluate":
         # ========== 仅执行评估（使用已有测试集）==========
@@ -1403,7 +1459,7 @@ def main():
             ))
         else:
             # 正常流程：RAG 推理 + 评估
-            testset_path = str(Path(args.output_dir) / "testset.json")
+            testset_path = args.testset_path if args.testset_path else str(Path(args.output_dir) / "testset.json")
 
             if not Path(testset_path).exists():
                 print(f"❌ 测试集不存在: {testset_path}")
@@ -1411,10 +1467,9 @@ def main():
                 return
 
             print(f"✅ 使用已有测试集: {testset_path}")
-            print(f"   测试问题数量: {args.test_size}")
 
             # 创建 RAG 引擎
-            from ..rag.rag_engine import create_rag_engine, RAGConfig
+            from rag.rag_engine import create_rag_engine, RAGConfig
 
             plugin_dir = Path(__file__).parent.parent
             config_path = plugin_dir.parent.parent / "config" / "astrbot_plugin_paperrag_config.json"
@@ -1426,7 +1481,7 @@ def main():
                 rag_cfg = {}
 
             config = RAGConfig(
-                embedding_mode=args.embedding_mode,
+                embedding_mode=rag_cfg.get("embedding_mode", "unsloth"),
                 embedding_provider_id=rag_cfg.get("embedding_provider_id", ""),
                 compress_provider_id=rag_cfg.get("compress_provider_id", ""),
                 text_provider_id=rag_cfg.get("text_provider_id", ""),
@@ -1436,7 +1491,7 @@ def main():
                 collection_name=rag_cfg.get("collection_name", "paper_embeddings"),
                 embed_dim=rag_cfg.get("embed_dim", 1024),
                 top_k=args.top_k if args.top_k is not None else rag_cfg.get("top_k", 5),
-                similarity_cutoff=rag_cfg.get("similarity_cutoff", 0.3),
+                similarity_cutoff=rag_cfg.get("similarity_cutoff", 0.5),
                 chunk_size=rag_cfg.get("chunk_size", 512),
                 min_chunk_size=rag_cfg.get("min_chunk_size", 100),
                 use_semantic_chunking=rag_cfg.get("use_semantic_chunking", True),
@@ -1448,6 +1503,9 @@ def main():
                 enable_bm25=rag_cfg.get("enable_bm25", True),
                 bm25_top_k=rag_cfg.get("bm25_top_k", 20),
                 enable_two_stage_retrieval=rag_cfg.get("enable_two_stage_retrieval", False),
+                enable_crag_quality_eval=rag_cfg.get("enable_crag_quality_eval", True),
+                crag_enable_correction=rag_cfg.get("crag_enable_correction", True),
+                crag_min_score=rag_cfg.get("crag_min_score", 0.5),
             )
 
             # Fake context for engine
@@ -1510,6 +1568,10 @@ def main():
             llm_model=args.llm_model,
             llm_base_url=llm_base_url,
             llm_api_key=llm_api_key,
+            embedding_model=args.embedding_model,
+            embed_base_url=embed_base_url,
+            embed_api_key=embed_api_key,
+            embedding_mode=args.embedding_mode,
             max_rpm=args.max_rpm,
             context_before=args.multimodal_context_before,
             context_after=args.multimodal_context_after,

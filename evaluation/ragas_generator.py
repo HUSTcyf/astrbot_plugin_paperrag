@@ -923,6 +923,8 @@ class MilvusDocumentLoader:
 
 # ============================================================================
 # 测试集生成器
+
+
 # ============================================================================
 
 class RagasTestsetGenerator:
@@ -1157,6 +1159,18 @@ class RagasTestsetGenerator:
 
         # 生成测试集
         print("正在调用 LLM 生成问答对（可能需要几分钟）...")
+
+        # 容错：HeadlinesExtractor 失败时 headlines 属性为 None，
+        # 原版 HeadlineSplitter 会抛 ValueError，此处 patch 为安全返回
+        from ragas.testset.transforms.splitters import HeadlineSplitter
+        _orig_split = HeadlineSplitter.split
+        async def _safe_split(self, node):
+            if node.get_property("headlines") is None:
+                logger.warning("[PaperRAG] headlines 为空，跳过标题分割")
+                return [node], []
+            return await _orig_split(self, node)
+        HeadlineSplitter.split = _safe_split
+
         try:
             testset = generator.generate_with_llamaindex_docs(
                 documents=documents,
@@ -1169,6 +1183,8 @@ class RagasTestsetGenerator:
             print(f"⚠️ 测试集生成过程中出现错误: {e}")
             print("   尝试继续处理已生成的样本...")
             testset = None
+        finally:
+            HeadlineSplitter.split = _orig_split
 
         # 转换为标准格式
         from ragas.testset.synthesizers.testset_schema import Testset
