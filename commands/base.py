@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import gc
 import os
 from pathlib import Path
@@ -62,8 +63,16 @@ class PluginCoreBase(Star):
         self._engine = None
         self._config_valid = False
 
+        # Graph RAG 引擎（懒加载，缓存复用）
+        self._graph_engine = None
+
         # 后台服务线程追踪
         self._neo4j_thread = None
+
+        # 并发安全锁
+        self._engine_lock = threading.Lock()  # 保护 _get_engine 初始化
+        self._auto_build_lock = asyncio.Lock()  # 保护 _papers_since_graph_build 计数
+        self._response_cache_lock = threading.Lock()  # 保护 _response_cache（sync 方法访问）
 
         logger.info("📚 Document RAG Plugin initialized (支持PDF/Word/TXT/HTML)")
 
@@ -121,13 +130,13 @@ class PluginCoreBase(Star):
         multimodal_config = graph_rag_config.get("multimodal_extraction", {})
         return GraphRAGConfig(
             enable_graph_rag=True,
-            storage_type=graph_rag_config.get("storage_type", "memory"),
+            storage_type=graph_rag_config.get("storage_type", "neo4j"),
             neo4j_uri=graph_rag_config.get("neo4j_uri", "bolt://localhost:7687"),
             neo4j_user=graph_rag_config.get("neo4j_user", "neo4j"),
             neo4j_password=graph_rag_config.get("neo4j_password", ""),
             max_triplets_per_chunk=graph_rag_config.get("max_triplets_per_chunk", 5),
             graph_retrieval_top_k=graph_rag_config.get("graph_retrieval_top_k", 5),
-            hybrid_alpha=graph_rag_config.get("hybrid_alpha", 0.5),
+            graph_rrf_weight=graph_rag_config.get("graph_rrf_weight", 0.2),
             auto_build=graph_rag_config.get("auto_build", False),
             auto_build_threshold=graph_rag_config.get("auto_build_threshold", 10),
             multimodal_enabled=multimodal_config.get("enabled", True),
@@ -212,7 +221,8 @@ class PluginCoreBase(Star):
                         response = await llm_provider.generate(query)
                         return response.text.strip() if hasattr(response, "text") else str(response)
             else:
-                vlm_provider = await self._get_vlm_provider_async()
+                from ..idea.llama_cpp_vlm_provider import get_cached_llama_cpp_provider
+                vlm_provider = get_cached_llama_cpp_provider()
                 if not vlm_provider:
                     logger.error("[_llm_direct_answer] 本地 VLM Provider 不可用")
                 else:
@@ -229,89 +239,122 @@ class PluginCoreBase(Star):
     def _get_engine(self) -> Optional["HybridRAGEngine"]:
         """获取RAG引擎（单例模式，带缓存）"""
         if self._engine is None and not self._config_valid:
-            try:
-                self._configure_mps_memory()
+            with self._engine_lock:
+                # 双重检查
+                if self._engine is None:
+                    return self._create_engine_inner()
+        return self._engine
 
-                raw_embedding_mode = self.config.get("embedding_mode", "unsloth")
-                if raw_embedding_mode == "api":
-                    embedding_mode = "astrbot"
-                elif raw_embedding_mode == "ollama":
-                    embedding_mode = "unsloth"
-                else:
-                    embedding_mode = raw_embedding_mode
+    def _create_engine_inner(self) -> Optional["HybridRAGEngine"]:
+        """创建 RAG 引擎（仅在持有 _engine_lock 时调用）"""
+        try:
+            self._configure_mps_memory()
 
-                rag_config = RAGConfig(
-                    embedding_mode=embedding_mode,
-                    embedding_provider_id=self.config.get("embedding_provider_id", ""),
-                    compress_provider_id=self.config.get("compress_provider_id", ""),
-                    text_provider_id=self.config.get("text_provider_id", ""),
-                    multimodal_provider_id=self.config.get("multimodal_provider_id", ""),
-                    unsloth_config=self.config.get("unsloth", {}),
-                    llama_vlm_model_path=self.config.get("llama_vlm_model_path", "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf"),
-                    llama_vlm_mmproj_path=self.config.get("llama_vlm_mmproj_path", "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf"),
-                    llama_vlm_max_tokens=self.config.get("llama_vlm_max_tokens", 25600),
-                    llama_vlm_temperature=self.config.get("llama_vlm_temperature", 0.7),
-                    llama_vlm_n_ctx=self.config.get("llama_vlm_n_ctx", 16384),
-                    llama_vlm_n_gpu_layers=self.config.get("llama_vlm_n_gpu_layers", 99),
-                    milvus_lite_path=self.config.get("milvus_lite_path", ""),
-                    address=self.config.get("address", ""),
-                    db_name=self.config.get("db_name", "default"),
-                    authentication=self.config.get("authentication", {}),
-                    collection_name=self.config.get("collection_name", "paper_embeddings"),
-                    embed_dim=self.config.get("embed_dim", 768),
-                    top_k=self.config.get("top_k", 5),
-                    similarity_cutoff=self.config.get("similarity_cutoff", 0.3),
-                    papers_dir=self.config.get("papers_dir", "./papers"),
-                    chunk_size=self.config.get("chunk_size", 512),
-                    chunk_overlap=self.config.get("chunk_overlap", 0),
-                    min_chunk_size=self.config.get("min_chunk_size", 100),
-                    use_semantic_chunking=self.config.get("use_semantic_chunking", True),
-                    enable_multimodal=self.config.get("multimodal", {}).get("enabled", True),
-                    figures_dir=self.config.get("figures_dir", ""),
-                    enable_sparse_retrieval=self.config.get("enable_sparse_retrieval", True),
-                    enable_multi_vector_rerank=self.config.get("enable_multi_vector_rerank", False),
-                    sparse_top_k=self.config.get("sparse_top_k", 20),
-                    hybrid_alpha=self.config.get("hybrid_alpha", 0.5),
-                    hybrid_rrf_k=self.config.get("hybrid_rrf_k", 60),
-                    enable_bm25=self.config.get("enable_bm25", True),
-                    bm25_top_k=self.config.get("bm25_top_k", 20),
-                    enable_two_stage_retrieval=bool(self.config.get("enable_two_stage_retrieval", False)),
-                    two_stage_top_k=self.config.get("two_stage_top_k") or 10,
-                    two_stage_rerank_k=self.config.get("two_stage_rerank_k") or 5,
-                    enable_crag_quality_eval=self.config.get("enable_crag_quality_eval", True),
-                    crag_enable_correction=self.config.get("crag_enable_correction", False),
-                    crag_min_score=self.config.get("crag_min_score", 0.3),
-                    enable_llm_reference_parsing=self.config.get("enable_llm_reference_parsing", True),
-                    freeapi_url=self.config.get("freeapi_url", ""),
-                    freeapi_key=self.config.get("freeapi_key", ""),
-                    core_api_key=self.config.get("core_api_key", ""),
-                    use_arxiv_api=self.config.get("use_arxiv_api", True),
-                    enable_graph_rag=self.config.get("enable_graph_rag", False),
-                    graph_storage_type=self.config.get("graph_rag", {}).get("storage_type", "memory"),
-                    graph_neo4j_uri=self.config.get("graph_rag", {}).get("neo4j_uri", "bolt://localhost:7687"),
-                    graph_neo4j_user=self.config.get("graph_rag", {}).get("neo4j_user", "neo4j"),
-                    graph_neo4j_password=self.config.get("graph_rag", {}).get("neo4j_password", ""),
-                    graph_max_triplets_per_chunk=self.config.get("graph_rag", {}).get("max_triplets_per_chunk", 5),
-                    graph_retrieval_top_k=self.config.get("graph_rag", {}).get("graph_retrieval_top_k", 5),
-                    graph_hybrid_alpha=self.config.get("graph_rag", {}).get("hybrid_alpha", 0.5),
-                    graph_auto_build=self.config.get("graph_rag", {}).get("auto_build", False),
-                    graph_auto_build_threshold=self.config.get("graph_rag", {}).get("auto_build_threshold", 10),
-                )
+            raw_embedding_mode = self.config.get("embedding_mode", "unsloth")
+            if raw_embedding_mode == "api":
+                embedding_mode = "astrbot"
+            elif raw_embedding_mode == "ollama":
+                embedding_mode = "unsloth"
+            else:
+                embedding_mode = raw_embedding_mode
 
-                valid, error_msg = rag_config.validate()
-                if not valid:
-                    logger.error(f"❌ RAG配置无效: {error_msg}")
-                    self._config_valid = False
-                    return None
+            rag_config = RAGConfig(
+                embedding_mode=embedding_mode,
+                embedding_provider_id=self.config.get("embedding_provider_id", ""),
+                compress_provider_id=self.config.get("compress_provider_id", ""),
+                text_provider_id=self.config.get("text_provider_id", ""),
+                multimodal_provider_id=self.config.get("multimodal_provider_id", ""),
+                unsloth_config=self.config.get("unsloth", {}),
+                llama_vlm_model_path=self.config.get("llama_vlm_model_path", "./models/Qwen3.5-9B-GGUF/Qwen3.5-9B-UD-Q4_K_XL.gguf"),
+                llama_vlm_mmproj_path=self.config.get("llama_vlm_mmproj_path", "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf"),
+                llama_vlm_max_tokens=self.config.get("llama_vlm_max_tokens", 25600),
+                llama_vlm_temperature=self.config.get("llama_vlm_temperature", 0.7),
+                llama_vlm_n_ctx=self.config.get("llama_vlm_n_ctx", 16384),
+                llama_vlm_n_gpu_layers=self.config.get("llama_vlm_n_gpu_layers", 99),
+                milvus_lite_path=self.config.get("milvus_lite_path", ""),
+                address=self.config.get("address", ""),
+                db_name=self.config.get("db_name", "default"),
+                authentication=self.config.get("authentication", {}),
+                collection_name=self.config.get("collection_name", "paper_embeddings"),
+                embed_dim=self.config.get("embed_dim", 768),
+                top_k=self.config.get("top_k", 5),
+                similarity_cutoff=self.config.get("similarity_cutoff", 0.3),
+                papers_dir=self.config.get("papers_dir", "./papers"),
+                chunk_size=self.config.get("chunk_size", 512),
+                chunk_overlap=self.config.get("chunk_overlap", 0),
+                min_chunk_size=self.config.get("min_chunk_size", 100),
+                use_semantic_chunking=self.config.get("use_semantic_chunking", True),
+                enable_multimodal=self.config.get("multimodal", {}).get("enabled", True),
+                figures_dir=self.config.get("figures_dir", ""),
+                enable_sparse_retrieval=self.config.get("enable_sparse_retrieval", True),
+                enable_multi_vector_rerank=self.config.get("enable_multi_vector_rerank", False),
+                sparse_top_k=self.config.get("sparse_top_k", 20),
+                hybrid_alpha=self.config.get("hybrid_alpha", 0.5),
+                hybrid_rrf_k=self.config.get("hybrid_rrf_k", 60),
+                enable_bm25=self.config.get("enable_bm25", True),
+                bm25_top_k=self.config.get("bm25_top_k", 20),
+                enable_two_stage_retrieval=bool(self.config.get("enable_two_stage_retrieval", False)),
+                two_stage_top_k=self.config.get("two_stage_top_k") or 10,
+                two_stage_rerank_k=self.config.get("two_stage_rerank_k") or 5,
+                enable_crag_quality_eval=self.config.get("enable_crag_quality_eval", True),
+                crag_enable_correction=self.config.get("crag_enable_correction", False),
+                crag_min_score=self.config.get("crag_min_score", 0.3),
+                enable_llm_reference_parsing=self.config.get("enable_llm_reference_parsing", True),
+                freeapi_url=self.config.get("freeapi_url", ""),
+                freeapi_key=self.config.get("freeapi_key", ""),
+                core_api_key=self.config.get("core_api_key", ""),
+                use_arxiv_api=self.config.get("use_arxiv_api", True),
+                enable_graph_rag=self.config.get("enable_graph_rag", False),
+                graph_storage_type=self.config.get("graph_rag", {}).get("storage_type", "neo4j"),
+                graph_neo4j_uri=self.config.get("graph_rag", {}).get("neo4j_uri", "bolt://localhost:7687"),
+                graph_neo4j_user=self.config.get("graph_rag", {}).get("neo4j_user", "neo4j"),
+                graph_neo4j_password=self.config.get("graph_rag", {}).get("neo4j_password", ""),
+                graph_max_triplets_per_chunk=self.config.get("graph_rag", {}).get("max_triplets_per_chunk", 5),
+                graph_retrieval_top_k=self.config.get("graph_rag", {}).get("graph_retrieval_top_k", 5),
+                graph_rrf_weight=self.config.get("graph_rag", {}).get("graph_rrf_weight", 0.2),
+                graph_auto_build=self.config.get("graph_rag", {}).get("auto_build", False),
+                graph_auto_build_threshold=self.config.get("graph_rag", {}).get("auto_build_threshold", 10),
+            )
 
-                self._engine = create_rag_engine(rag_config, self.context)
-                self._config_valid = True
-            except Exception as e:
-                logger.error(f"❌ RAG引擎初始化失败: {e}")
+            valid, error_msg = rag_config.validate()
+            if not valid:
+                logger.error(f"❌ RAG配置无效: {error_msg}")
                 self._config_valid = False
                 return None
 
-        return self._engine
+            self._engine = create_rag_engine(rag_config, self.context)
+            self._config_valid = True
+        except Exception as e:
+            logger.error(f"❌ RAG引擎初始化失败: {e}")
+            self._config_valid = False
+            return None
+
+    async def _get_graph_engine(self):
+        """获取 GraphRAGEngine（单例模式，带缓存）"""
+        if self._graph_engine is not None and self._graph_engine._initialized:
+            return self._graph_engine
+
+        base_engine = self._get_engine()
+        if not base_engine:
+            logger.warning("[PaperRAG] 基础引擎未就绪，无法创建 Graph RAG 引擎")
+            return None
+
+        try:
+            from ..graphrag.graph_rag_engine import GraphRAGEngine
+            graph_config = self._create_graph_rag_config()
+            engine_instance = GraphRAGEngine(graph_config, base_engine, self.context)
+            await engine_instance.initialize()
+            if not engine_instance._initialized:
+                logger.warning("[PaperRAG] Graph RAG 引擎初始化未完成")
+                return None
+            self._graph_engine = engine_instance
+            return self._graph_engine
+        except Exception as e:
+            logger.error(f"[PaperRAG] Graph RAG 引擎创建失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self._graph_engine = None
+            return None
 
     def _get_cache_key(self, query: str, mode: str, top_k: int) -> str:
         return f"{query}|{mode}|{top_k}"
@@ -322,12 +365,13 @@ class PluginCoreBase(Star):
 
         import time
 
-        if cache_key in self._response_cache:
-            cached_data, timestamp = self._response_cache[cache_key]
-            if time.time() - timestamp < self.cache_ttl:
-                logger.debug(f"📦 使用缓存: {cache_key[:50]}...")
-                return cached_data
-            del self._response_cache[cache_key]
+        with self._response_cache_lock:
+            if cache_key in self._response_cache:
+                cached_data, timestamp = self._response_cache[cache_key]
+                if time.time() - timestamp < self.cache_ttl:
+                    logger.debug(f"📦 使用缓存: {cache_key[:50]}...")
+                    return cached_data
+                del self._response_cache[cache_key]
 
         return None
 
@@ -337,11 +381,12 @@ class PluginCoreBase(Star):
 
         import time
 
-        if len(self._response_cache) >= self.cache_max_size:
-            oldest_key = min(self._response_cache.keys(), key=lambda k: self._response_cache[k][1])
-            del self._response_cache[oldest_key]
+        with self._response_cache_lock:
+            if len(self._response_cache) >= self.cache_max_size:
+                oldest_key = min(self._response_cache.keys(), key=lambda k: self._response_cache[k][1])
+                del self._response_cache[oldest_key]
 
-        self._response_cache[cache_key] = (response, time.time())
+            self._response_cache[cache_key] = (response, time.time())
 
     async def _maybe_trigger_graph_auto_build(self, papers_added: int = 1) -> bool:
         if not self.config.get("enable_graph_rag", False):
@@ -351,28 +396,30 @@ class PluginCoreBase(Star):
         if not auto_build:
             return False
 
-        self._papers_since_graph_build += papers_added
-        threshold = self.config.get("graph_rag", {}).get("auto_build_threshold", 10)
+        async with self._auto_build_lock:
+            self._papers_since_graph_build += papers_added
+            threshold = self.config.get("graph_rag", {}).get("auto_build_threshold", 10)
 
-        if self._papers_since_graph_build >= threshold:
-            logger.info(f"📚 自动构建知识图谱（已添加 {self._papers_since_graph_build} 篇论文）")
-            self._papers_since_graph_build = 0
+            if self._papers_since_graph_build >= threshold:
+                logger.info(f"📚 自动构建知识图谱（已添加 {self._papers_since_graph_build} 篇论文）")
+                self._papers_since_graph_build = 0
 
-            try:
-                engine = self._get_engine()
-                if not engine:
+                try:
+                    engine = self._get_engine()
+                    if not engine:
+                        return False
+
+                    asyncio.create_task(self._run_graph_build_in_background(engine))
+                    return True
+                except Exception as e:
+                    logger.error(f"自动构建知识图谱失败: {e}")
                     return False
 
-                asyncio.create_task(self._run_graph_build_in_background(engine))
-                return True
-            except Exception as e:
-                logger.error(f"自动构建知识图谱失败: {e}")
-                return False
-
-        return False
+            return False
 
     async def _run_graph_build_in_background(self, engine):
-        raise NotImplementedError
+        """子类覆盖此方法执行后台图谱构建。基类提供空实现防止未覆盖时崩溃。"""
+        pass
 
     async def terminate(self):
         logger.info("📚 Document RAG Plugin is unloading...")
@@ -385,7 +432,8 @@ class PluginCoreBase(Star):
             except Exception as e:
                 logger.warning(f"注销LLM工具时出现警告: {e}")
 
-        self._response_cache.clear()
+        with self._response_cache_lock:
+            self._response_cache.clear()
 
         try:
             from ..idea.llama_cpp_vlm_provider import reset_llama_cpp_vlm_provider

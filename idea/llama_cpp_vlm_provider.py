@@ -302,8 +302,9 @@ class LlamaCppVLMProvider:
         Returns:
             LLMResponse 对象
         """
-        if not self._initialized:
-            await self.initialize()
+        async with self._lock:
+            if not self._initialized:
+                await self.initialize()
 
         temp = temperature if temperature is not None else self.temperature
 
@@ -312,88 +313,96 @@ class LlamaCppVLMProvider:
 
         start_time = time.time()
 
-        try:
-            # 处理图片（支持多张）
-            image_paths = []
-            if image_urls is not None:
-                for img_url in image_urls:
-                    img_path = Path(img_url)
-                    if img_path.exists():
-                        resolved = str(img_path.resolve())
-                        # 添加 file:// 前缀（urllib 需要 scheme 才能处理本地文件）
-                        image_paths.append(f"file://{resolved}")
-                        logger.debug(f"[Llama.cpp-VLM] 添加图片: file://{resolved}")
-                    else:
-                        logger.warning(f"[Llama.cpp-VLM] 图片不存在: {img_path}")
+        # 使用锁防止并发调用 llama 实例
+        async with self._lock:
+            try:
+                # 处理图片（支持多张）
+                image_paths = []
+                if image_urls is not None:
+                    for img_url in image_urls:
+                        img_path = Path(img_url)
+                        if img_path.exists():
+                            resolved = str(img_path.resolve())
+                            # 添加 file:// 前缀（urllib 需要 scheme 才能处理本地文件）
+                            image_paths.append(f"file://{resolved}")
+                            logger.debug(f"[Llama.cpp-VLM] 添加图片: file://{resolved}")
+                        else:
+                            logger.warning(f"[Llama.cpp-VLM] 图片不存在: {img_path}")
 
-            # 构建消息
-            if image_paths:
-                content = [
-                    {"type": "image_url", "image_url": {"url": path}} for path in image_paths
-                ]
-                content.append({"type": "text", "text": prompt or "Describe this image."})
-            else:
-                content = prompt or "Describe this image."
+                # 构建消息
+                if image_paths:
+                    content = [
+                        {"type": "image_url", "image_url": {"url": path}} for path in image_paths
+                    ]
+                    content.append({"type": "text", "text": prompt or "Describe this image."})
+                else:
+                    content = prompt or "Describe this image."
 
-            # 添加系统消息（如果提供了 system_prompt）
-            messages = []
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.append({"role": "user", "content": content})
+                # 添加系统消息（如果提供了 system_prompt）
+                messages = []
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": content})
 
-            # 在线程池中执行推理
-            assert self._llama is not None, "Llama 未初始化"
-            llama = self._llama
-            loop = asyncio.get_event_loop()
-            # 使用调用者传入的 max_tokens，若无则用实例默认值
-            effective_max_tokens = kwargs.get('max_tokens', self.max_tokens)
-            # grammar 参数：支持 LlamaGrammar 对象或字符串（grammar 文件路径）
-            grammar_arg = kwargs.get('grammar')
-            if grammar_arg is not None and not hasattr(grammar_arg, '_grammar'):
-                # 如果是字符串路径，从文件加载 grammar
-                from llama_cpp import LlamaGrammar
-                grammar_arg = LlamaGrammar.from_file(grammar_arg)
-            logger.debug(f"[Llama.cpp-VLM] max_tokens: {effective_max_tokens}, grammar: {type(grammar_arg).__name__ if grammar_arg else None}")
-            result = await loop.run_in_executor(
-                None,
-                lambda: llama.create_chat_completion(
-                    messages=messages,
-                    temperature=temp,
-                    max_tokens=effective_max_tokens,
-                    grammar=grammar_arg,
+                # 在线程池中执行推理
+                assert self._llama is not None, "Llama 未初始化"
+                llama = self._llama
+                loop = asyncio.get_event_loop()
+                # 使用调用者传入的 max_tokens，若无则用实例默认值
+                effective_max_tokens = kwargs.get('max_tokens', self.max_tokens)
+                # grammar 参数：支持 LlamaGrammar 对象或字符串（grammar 文件路径）
+                grammar_arg = kwargs.get('grammar')
+                if grammar_arg is not None and not hasattr(grammar_arg, '_grammar'):
+                    # 如果是字符串路径，从文件加载 grammar
+                    from llama_cpp import LlamaGrammar
+                    grammar_arg = LlamaGrammar.from_file(grammar_arg)
+                logger.debug(f"[Llama.cpp-VLM] max_tokens: {effective_max_tokens}, grammar: {type(grammar_arg).__name__ if grammar_arg else None}")
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: llama.create_chat_completion(
+                        messages=messages,
+                        temperature=temp,
+                        max_tokens=effective_max_tokens,
+                        grammar=grammar_arg,
+                    )
                 )
-            )
 
-            # 解析响应
-            if not isinstance(result, dict) or "choices" not in result or not result["choices"]:
-                logger.error(f"[Llama.cpp-VLM] 响应结构异常: {type(result)}, keys: {result.keys() if isinstance(result, dict) else 'N/A'}")
-                raise ValueError(f"Unexpected LLM response structure: {type(result)}")
-            response_text = result["choices"][0]["message"]["content"]
+                # 解析响应
+                if not isinstance(result, dict) or "choices" not in result or not result["choices"]:
+                    logger.error(f"[Llama.cpp-VLM] 响应结构异常: {type(result)}, keys: {result.keys() if isinstance(result, dict) else 'N/A'}")
+                    raise ValueError(f"Unexpected LLM response structure: {type(result)}")
+                response_text = result["choices"][0]["message"]["content"]
 
-            elapsed = time.time() - start_time
-            logger.info(f"[Llama.cpp-VLM] ✅ 推理完成，耗时: {elapsed:.2f}秒")
-            logger.debug(f"[Llama.cpp-VLM] 响应: {response_text}")
+                elapsed = time.time() - start_time
+                logger.info(f"[Llama.cpp-VLM] ✅ 推理完成，耗时: {elapsed:.2f}秒")
+                logger.debug(f"[Llama.cpp-VLM] 响应: {response_text}")
 
-            return LLMResponse(
-                content=response_text,
-                model=os.path.basename(self.model_path),
-            )
+                return LLMResponse(
+                    content=response_text,
+                    model=os.path.basename(self.model_path),
+                )
 
-        except Exception as e:
-            elapsed = time.time() - start_time
-            logger.error(f"[Llama.cpp-VLM] ❌ 推理失败，耗时: {elapsed:.2f}秒，错误: {e}")
-            import traceback
-            logger.error(f"[Llama.cpp-VLM] 详细错误: {traceback.format_exc()}")
+            except Exception as e:
+                elapsed = time.time() - start_time
+                logger.error(f"[Llama.cpp-VLM] ❌ 推理失败，耗时: {elapsed:.2f}秒，错误: {e}")
+                import traceback
+                logger.error(f"[Llama.cpp-VLM] 详细错误: {traceback.format_exc()}")
 
-            # 尝试重置模型
-            await self._try_recover()
-            raise
+                # 尝试重置模型
+                await self._try_recover()
+                raise
 
     async def _try_recover(self) -> None:
         """尝试恢复模型（如果加载失败）"""
         logger.info("[Llama.cpp-VLM] 尝试恢复模型...")
         try:
-            self._llama = None
+            # 必须显式 close 旧模型以释放 GPU 内存（KV cache 等）
+            if self._llama is not None:
+                try:
+                    self._llama.close()
+                except Exception:
+                    pass
+                self._llama = None
             self._initialized = False
             await self.initialize()
         except Exception as e:
@@ -436,9 +445,13 @@ def init_llama_cpp_vlm_provider(
     max_tokens: int = 25600,
     temperature: float = 0.7,
     n_parallel: int = 1,
+    force_reinit: bool = False,
 ) -> LlamaCppVLMProvider:
     """
-    初始化 Llama.cpp VLM Provider 单例（应用启动时调用一次）
+    初始化 Llama.cpp VLM Provider 单例
+
+    如果已存在初始化好的实例（_initialized=True），且 force_reinit=False，
+    则直接返回现有实例，不重新加载模型。
 
     Args:
         model_path: GGUF 模型文件路径
@@ -448,11 +461,18 @@ def init_llama_cpp_vlm_provider(
         max_tokens: 最大 token 数
         temperature: 温度
         n_parallel: 并行数
+        force_reinit: 是否强制重新初始化
 
     Returns:
         LlamaCppVLMProvider 实例
     """
     global _vlm_provider_instance
+
+    # 复用现有实例（已初始化且不强制重新初始化）
+    if _vlm_provider_instance is not None and not force_reinit:
+        if getattr(_vlm_provider_instance, '_initialized', False):
+            logger.info(f"[Llama.cpp-VLM] 复用已有 Provider 实例: {_vlm_provider_instance.model_path}")
+            return _vlm_provider_instance
 
     logger.info(f"[Llama.cpp-VLM] 初始化 Provider: model={model_path}")
     _vlm_provider_instance = LlamaCppVLMProvider(

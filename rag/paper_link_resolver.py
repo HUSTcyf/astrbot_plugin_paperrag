@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import httpx
+
 try:
     from astrbot.api import logger
 except Exception:  # pragma: no cover - standalone / test fallback
@@ -434,31 +436,33 @@ class PaperLinkResolver:
                 import fitz as pymupdf
 
             doc = pymupdf.open(pdf_path)
-            metadata = doc.metadata or {}
-            probe.metadata_title = self._clean_scalar(metadata.get("title", ""))
-            probe.metadata_author = self._clean_scalar(metadata.get("author", ""))
-            probe.metadata_subject = self._clean_scalar(metadata.get("subject", ""))
-            probe.metadata_doi = self._clean_scalar(metadata.get("doi", ""))
-            probe.metadata_arxiv_id = self._clean_scalar(metadata.get("arxiv_id", metadata.get("arxivId", "")))
+            try:
+                metadata = doc.metadata or {}
+                probe.metadata_title = self._clean_scalar(metadata.get("title", ""))
+                probe.metadata_author = self._clean_scalar(metadata.get("author", ""))
+                probe.metadata_subject = self._clean_scalar(metadata.get("subject", ""))
+                probe.metadata_doi = self._clean_scalar(metadata.get("doi", ""))
+                probe.metadata_arxiv_id = self._clean_scalar(metadata.get("arxiv_id", metadata.get("arxivId", "")))
 
-            page_text = ""
-            if len(doc) > 0:
-                page = doc[0]
-                page_text = page.get_text() or ""
-                probe.first_page_text = page_text[:max_chars]
-                probe.title_candidates = self._extract_title_candidates_from_text(probe.first_page_text)
-                layout_title = self._extract_title_from_layout(page)
-                if layout_title and (not probe.title_candidates or len(layout_title) >= len(probe.title_candidates[0])):
-                    probe.title_candidates = [layout_title]
-                    probe.first_page_title = layout_title
-                elif probe.title_candidates:
-                    probe.first_page_title = probe.title_candidates[0]
-                probe.first_page_author = self._extract_first_author_like_line(
-                    probe.first_page_text,
-                    probe.first_page_title,
-                )
+                page_text = ""
+                if len(doc) > 0:
+                    page = doc[0]
+                    page_text = page.get_text() or ""
+                    probe.first_page_text = page_text[:max_chars]
+                    probe.title_candidates = self._extract_title_candidates_from_text(probe.first_page_text)
+                    layout_title = self._extract_title_from_layout(page)
+                    if layout_title and (not probe.title_candidates or len(layout_title) >= len(probe.title_candidates[0])):
+                        probe.title_candidates = [layout_title]
+                        probe.first_page_title = layout_title
+                    elif probe.title_candidates:
+                        probe.first_page_title = probe.title_candidates[0]
+                    probe.first_page_author = self._extract_first_author_like_line(
+                        probe.first_page_text,
+                        probe.first_page_title,
+                    )
 
-            doc.close()
+            finally:
+                doc.close()
 
             combined_text = "\n".join(
                 part for part in [
@@ -745,8 +749,6 @@ class PaperLinkResolver:
             return []
 
         try:
-            import httpx
-
             query = (title or "").strip()
             if not query:
                 return []
@@ -770,7 +772,7 @@ class PaperLinkResolver:
                 normalized = [self._work_from_crossref_item(item) for item in items if isinstance(item, dict)]
                 return self._dedupe_works(normalized)
         except Exception as e:
-            logger.debug(f"  → Crossref 标题搜索失败: {e}")
+            logger.warning(f"  → Crossref 标题搜索失败: {e}")
             return []
 
     async def _search_core_candidates(self, title: str, limit: int = 5, author_hint: str = "") -> List[Dict[str, Any]]:
@@ -779,8 +781,6 @@ class PaperLinkResolver:
             return []
 
         try:
-            import httpx
-
             queries = []
             cleaned = self._clean_core_query(title)
             if cleaned:
@@ -810,7 +810,7 @@ class PaperLinkResolver:
 
             return self._dedupe_works(results)
         except Exception as e:
-            logger.debug(f"  → CORE API 标题搜索失败: {e}")
+            logger.warning(f"  → CORE API 标题搜索失败: {e}")
             return []
 
     async def _search_openalex_candidates(self, title: str, limit: int = 5, author_hint: str = "") -> List[Dict[str, Any]]:
@@ -859,7 +859,7 @@ class PaperLinkResolver:
                 })
             return self._dedupe_works(normalized)
         except Exception as e:
-            logger.debug(f"  → OpenAlex 标题搜索失败: {e}")
+            logger.warning(f"  → OpenAlex 标题搜索失败: {e}")
             return []
 
     async def _search_arxiv_library_candidates(self, title: str, limit: int = 5, author_hint: str = "") -> List[Dict[str, Any]]:
@@ -889,7 +889,7 @@ class PaperLinkResolver:
                 })
             return normalized
         except Exception as e:
-            logger.debug(f"  → arXiv library 标题搜索失败: {e}")
+            logger.warning(f"  → arXiv library 标题搜索失败: {e}")
             return []
 
     def _build_direct_resolution(self, probe: PdfProbe, source: str) -> LinkResolution:

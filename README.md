@@ -1,17 +1,18 @@
-# 📚 Paper RAG Plugin v1.12.3 - 用户指南
+# 📚 Paper RAG Plugin v1.12.4 - 用户指南
 
 本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力（支持多模态VLM问答）。
 
-> **版本说明**：当前版本 v1.12.3，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
+> **版本说明**：当前版本 v1.12.4，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
 
 ### 本版变化
 
-- 修复摘要 ColBERT 向量从未成功生成/保存的关键 bug（摘要文本现在从 AbstractIndexManager 缓存获取）
-- ColBERT 存储路径重构：chunk 向量迁移至 `data/colbert_chunks/`，摘要向量在 `data/colbert_abstracts/`，两者独立存储和加载
-- ColBERT chunk_id 查找从 O(N) 线性扫描优化为 O(1) 字典查找
-- `/paper rebuild` 现在正确清理摘要和正文 ColBERT 存储，不再残留过期向量
-- 全面消除核心代码中的静默跳过，所有关键失败路径均有明确日志
-- ColBERT 向量生成不再依赖 retriever 初始化链路，改用 `get_embedding_model()` 直接调用
+- **图谱检索融入 RRF 四通道融合**：Graph RAG 作为第四通道（Graph Channel）融入 HybridRetriever，通过 chunk_id boost 增强已召回向量
+- **Neo4j 专属化**：移除 MemoryGraphStore，统一使用 Neo4j 存储后端，直接 Cypher MERGE 写入实体
+- **图谱构建增强**：GBNF grammar 约束 LLM 输出、figure_id 跨论文唯一、表格实体抽取
+- **VLM Provider 线程安全**：推理/初始化用 asyncio.Lock 保护，单例复用无需重载模型
+- **安全修复**：移除工具脚本中的硬编码 Neo4j 密码，改从配置文件读取
+- **Idea Engine**：MCP 进程持久化、`__getattr__` 兼容 getattr 惯用模式、rerank 失败梯度赋值
+- **Code Review 修复**：20/20 全部通过，详见 [CHANGELOG](docs/changelog/1.12.4.md)
 
 ## 🏗️ 系统架构
 

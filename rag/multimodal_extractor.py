@@ -319,7 +319,7 @@ class MultimodalPDFExtractor:
         finally:
             try:
                 doc.close()
-            except:
+            except Exception:
                 pass
 
     def _extract_images_from_page(self, page, page_num: int, page_text: str, minwh: int = 10) -> List[ExtractedImage]:
@@ -364,7 +364,7 @@ class MultimodalPDFExtractor:
                         bbox = img_rects[0]
                     else:
                         bbox = (0, 0, 0, 0)
-                except:
+                except Exception:
                     bbox = (0, 0, 0, 0)
 
                 # 查找图注（Figure X）
@@ -1315,26 +1315,27 @@ class PDFParserAdvanced:
     def _parse_with_pymupdf(self, pdf_path: str) -> tuple[str, Dict[str, Any]]:
         """使用 PyMuPDF 解析（结构化提取，过滤行号）"""
         doc = fitz.open(pdf_path)
-        text_parts = []
-        metadata = {
-            "file_name": str(Path(pdf_path).name),
-            "total_pages": len(doc),
-            "parser": "PyMuPDF"
-        }
+        try:
+            text_parts = []
+            metadata = {
+                "file_name": str(Path(pdf_path).name),
+                "total_pages": len(doc),
+                "parser": "PyMuPDF"
+            }
 
-        for page_num, page in enumerate(cast(Any, doc), 1):
-            page_text = self._extract_text_without_line_numbers(page)
-            if page_text.strip():
-                text_parts.append(f"\n[Page {page_num}]\n{page_text}")
+            for page_num, page in enumerate(cast(Any, doc), 1):
+                page_text = self._extract_text_without_line_numbers(page)
+                if page_text.strip():
+                    text_parts.append(f"\n[Page {page_num}]\n{page_text}")
 
-            image_list = page.get_images()
-            if image_list:
-                metadata["total_images"] = metadata.get("total_images", 0) + len(image_list)
+                image_list = page.get_images()
+                if image_list:
+                    metadata["total_images"] = metadata.get("total_images", 0) + len(image_list)
 
-        doc.close()
-
-        full_text = '\n'.join(text_parts)
-        return full_text, metadata
+            full_text = '\n'.join(text_parts)
+            return full_text, metadata
+        finally:
+            doc.close()
 
     def _extract_text_without_line_numbers(self, page: fitz.Page) -> str:
         """

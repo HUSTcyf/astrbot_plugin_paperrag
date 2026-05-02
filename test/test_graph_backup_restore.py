@@ -30,13 +30,22 @@ class FakeSession:
         self.calls.append((query, params))
         return types.SimpleNamespace(data=lambda: [])
 
+    def begin_transaction(self):
+        return self
+
+    def rollback(self):
+        pass
+
+    def commit(self):
+        pass
+
 
 class FakeDriver:
     def __init__(self, session):
         self._session = session
         self.closed = False
 
-    def session(self):
+    def session(self, database=None):
         return self._session
 
     def close(self):
@@ -51,7 +60,7 @@ def _install_neo4j_stub(session):
         def driver(*args, **kwargs):
             return fake_driver
 
-    sys.modules["neo4j"] = types.SimpleNamespace(GraphDatabase=FakeGraphDatabase)
+    sys.modules["neo4j"] = types.SimpleNamespace(GraphDatabase=FakeGraphDatabase)  # type: ignore[assignment]
     return fake_driver
 
 

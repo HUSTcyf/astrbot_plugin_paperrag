@@ -584,6 +584,8 @@ class HybridRetriever(BaseRetriever):
         rerank_top_k: int = 5,
         enable_bm25: bool = True,
         bm25_top_k: int = 20,
+        graph_retriever: Any = None,
+        graph_weight: float = 0.2,
     ):
         super().__init__(index_manager, embed_provider)
         self._enable_sparse_retrieval = enable_sparse_retrieval
@@ -595,6 +597,8 @@ class HybridRetriever(BaseRetriever):
         self._rerank_top_k = rerank_top_k
         self._enable_bm25 = enable_bm25
         self._bm25_top_k = bm25_top_k
+        self._graph_retriever = graph_retriever
+        self._graph_weight = graph_weight
         self._sparse_retriever = SparseRetriever(index_manager, embed_provider)
         self._bm25_retriever = BM25Retriever(index_manager)
         self._reranker = MultiVectorReranker(embed_provider)
@@ -650,11 +654,39 @@ class HybridRetriever(BaseRetriever):
             else:
                 logger.info("[HybridRetriever] BM25已关闭")
 
-            # 4. RRF 融合
+            # 4. 图谱检索（第四通道）—— 基于 chunk_id 融合而非文本匹配
+            # Graph channel boosts chunks that are related to retrieved graph entities.
+            # Each item: {"text": ..., "metadata": {"chunk_id": ..., "file_name": ..., ...}}
+            graph_chunk_boost: Dict[str, float] = {}
+            if self._graph_retriever:
+                try:
+                    graph_result = await self._graph_retriever.retrieve(query)
+                    for node_with_score in graph_result:
+                        node = node_with_score.node
+                        # node.metadata contains chunk_id / file_name from graph store
+                        node_meta = getattr(node, 'properties', {}) or {}
+                        chunk_id = node_meta.get('chunk_id') or node_meta.get('source_chunk_id')
+                        if not chunk_id:
+                            # Fallback: see if node.name or content references a chunk_id pattern
+                            name = getattr(node, 'name', '') or str(node)
+                            if not chunk_id:
+                                # Skip nodes without any chunk grounding - they can't boost grounded results
+                                continue
+                        if chunk_id:
+                            graph_chunk_boost[chunk_id] = max(
+                                graph_chunk_boost.get(chunk_id, 0.0),
+                                node_with_score.score
+                            )
+                    logger.info(f"[HybridRetriever] graph召回: {len(graph_chunk_boost)} grounded chunks")
+                except Exception as e:
+                    logger.warning(f"[HybridRetriever] 图谱检索失败: {e}")
+
+            # 5. RRF 融合
             fused = self._rrf_fusion(
                 vector_results=vector_results,
                 sparse_results=sparse_dict,
                 bm25_results=bm25_dict if bm25_dict else None,
+                graph_chunk_boost=graph_chunk_boost if graph_chunk_boost else None,
                 top_k=top_k * 2 if self._enable_reranking else top_k,
             )
             if fused:
@@ -691,9 +723,36 @@ class HybridRetriever(BaseRetriever):
                     logger.warning(
                         "[HybridRetriever] ColBERT reranking 分数全为0，通常表示候选 chunk_id 与预存向量未匹配"
                     )
+                # Provenance guard: filter out pure graph-only nodes (no file_name, no chunk_id)
+                # Must run even after reranking — without this, ungrounded graph-only entries survive
+                # into the final answer, reintroducing the exact issue this guard was added to prevent.
+                if graph_chunk_boost:
+                    graph_nodes = []
+                    graph_scores = []
+                    for n, s in zip(reranked.nodes, reranked.scores):
+                        meta = n.metadata or {}
+                        if meta.get('file_name') or meta.get('chunk_id'):
+                            graph_nodes.append(n)
+                            graph_scores.append(s)
+                        else:
+                            logger.debug(f"[HybridRetriever] [post-rerank] 过滤无出处图谱节点: {n.text[:50]}...")
+                    reranked = QueryResult(nodes=graph_nodes, scores=graph_scores)
                 return reranked
 
             result = QueryResult(nodes=nodes[:top_k], scores=scores[:top_k])
+            # Provenance guard: filter out pure graph-only nodes (no file_name, no chunk_id)
+            # Graph-only entries have no document grounding - they assist recall but must not
+            # become ungrounded evidence in the final answer.
+            grounded_nodes = []
+            grounded_scores = []
+            for n, s in zip(result.nodes, result.scores):
+                meta = n.metadata or {}
+                if meta.get('file_name') or meta.get('chunk_id'):
+                    grounded_nodes.append(n)
+                    grounded_scores.append(s)
+                else:
+                    logger.debug(f"[HybridRetriever] 过滤无出处图谱节点: {n.text[:50]}...")
+            result = QueryResult(nodes=grounded_nodes, scores=grounded_scores)
             if result.scores:
                 logger.info(
                     f"[HybridRetriever] 单阶段检索完成: results={len(result.nodes)}, "
@@ -717,37 +776,71 @@ class HybridRetriever(BaseRetriever):
             fallback = VectorRetriever(self._index_manager, self._embed_provider)
             return await fallback.retrieve(query, top_k)
 
+    def _graph_node_to_text(self, node: Any) -> str:
+        """将图谱节点转换为可融合的文本表示"""
+        try:
+            node_type = getattr(node, 'type', '') or getattr(node, 'node_type', '')
+            if node_type == "entity" or 'entity' in node_type.lower():
+                name = getattr(node, 'name', '') or str(node)
+                label = node.properties.get('label', '') if hasattr(node, 'properties') else ''
+                desc = node.content or (node.properties.get('description', '') if hasattr(node, 'properties') else '')
+                return f"{name} ({label}): {desc}" if label else f"{name}: {desc}"
+            elif node_type == "relationship" or 'relation' in node_type.lower():
+                src = getattr(node, 'source_node', '') or getattr(node, 'source_id', '')
+                tgt = getattr(node, 'target_node', '') or getattr(node, 'target_id', '')
+                rel = getattr(node, 'text', '') or getattr(node, 'label', '')
+                return f"{src} --{rel}--> {tgt}"
+            return node.content if hasattr(node, 'content') else str(node)
+        except Exception:
+            return str(node)
+
     def _rrf_fusion(
         self,
         vector_results: List[Dict[str, Any]],
         sparse_results: Dict[str, float],
         bm25_results: Dict[str, float] | None = None,
+        graph_chunk_boost: Dict[str, float] | None = None,
         top_k: int = 10,
     ) -> List[Dict[str, Any]]:
         """
         RRF (Reciprocal Rank Fusion) 分数融合
 
-        支持两路或三路融合：
+        支持两路、三路或四路融合：
         - 两路：向量 + 稀疏权重
         - 三路：向量 + 稀疏权重 + BM25（当需要精确匹配时）
+        - 四路：向量 + 稀疏权重 + BM25 + 图谱（第四通道通过 chunk_id 增强）
 
-        RRF score = Σ α_v * 1/(k + v_rank) + α_s * 1/(k + s_rank) + α_b * 1/(k + b_rank)
+        图谱通道：将图谱实体匹配的 chunk_id 映射到向量候选上，通过 boost 实现融合。
+        与其他通道按文本排名的 RRF 不同，图谱通道按 chunk_id 直接增强已召回的向量 chunks。
+
+        RRF score = Σ α_v * 1/(k + v_rank) + α_s * 1/(k + s_rank) + α_b * 1/(k + b_rank) + α_g * boost_score
 
         Args:
             vector_results: 向量检索结果
             sparse_results: 稀疏权重检索结果 {text: score}
             bm25_results: BM25 检索结果 {text: score}（可选）
+            graph_chunk_boost: 图谱检索结果 {chunk_id: boost_score}（可选）
             top_k: 返回结果数量
 
         Returns:
             融合排序后的结果列表
         """
         has_bm25 = bm25_results is not None and len(bm25_results) > 0
+        has_graph = graph_chunk_boost is not None and len(graph_chunk_boost) > 0
 
         # 构建 text -> vector_rank 映射
         vector_rank_map: Dict[str, int] = {}
         for i, item in enumerate(vector_results):
             vector_rank_map[item["text"]] = i + 1
+
+        # 构建 chunk_id -> text 映射（用于图谱增强）
+        chunk_id_to_text: Dict[str, str] = {}
+        if has_graph:
+            for item in vector_results:
+                meta = item.get("metadata", {})
+                cid = meta.get("chunk_id") or meta.get("source_chunk_id")
+                if cid and cid in graph_chunk_boost:
+                    chunk_id_to_text[cid] = item["text"]
 
         # 稀疏结果按分数排序并分配 rank
         sorted_sparse = sorted(sparse_results.items(), key=lambda x: x[1], reverse=True)
@@ -763,7 +856,7 @@ class HybridRetriever(BaseRetriever):
             for i, (text, _) in enumerate(sorted_bm25):
                 bm25_rank_map[text] = i + 1
 
-        # 合并所有文本
+        # 所有文本：向量 + 稀疏 + BM25（图谱增强不引入新文本）
         all_texts = set(vector_rank_map.keys()) | set(sparse_rank_map.keys())
         if has_bm25:
             all_texts |= set(bm25_rank_map.keys())
@@ -775,16 +868,16 @@ class HybridRetriever(BaseRetriever):
         n_bm25 = len(sorted_bm25) if has_bm25 else 0
 
         # 计算归一化权重
+        remaining = 1.0 - self._graph_weight
         if has_bm25:
-            # 三路融合：向量 0.4, 稀疏 0.4, BM25 0.2
-            alpha_v = 0.4
-            alpha_s = 0.4
-            alpha_b = 0.2
+            alpha_v = remaining * 0.4
+            alpha_s = remaining * 0.4
+            alpha_b = remaining * 0.2
         else:
-            # 两路融合：向量 α, 稀疏 (1-α)
-            alpha_v = self._alpha
-            alpha_s = 1 - self._alpha
+            alpha_v = remaining * self._alpha
+            alpha_s = remaining * (1 - self._alpha)
             alpha_b = 0.0
+        alpha_g = self._graph_weight
 
         for text in all_texts:
             v_rank = vector_rank_map.get(text, n_vector + 1)
@@ -793,13 +886,20 @@ class HybridRetriever(BaseRetriever):
             # RRF 公式
             v_rrf = alpha_v * (1.0 / (self._rrf_k + v_rank)) if alpha_v > 0 else 0
             s_rrf = alpha_s * (1.0 / (self._rrf_k + s_rank)) if alpha_s > 0 else 0
+            rrf_scores[text] = v_rrf + s_rrf
 
             if has_bm25:
                 b_rank = bm25_rank_map.get(text, n_bm25 + 1)
                 b_rrf = alpha_b * (1.0 / (self._rrf_k + b_rank))
-                rrf_scores[text] = v_rrf + s_rrf + b_rrf
-            else:
-                rrf_scores[text] = v_rrf + s_rrf
+                rrf_scores[text] += b_rrf
+
+            # 图谱增强：直接加到 RRF 分数上（图谱分数已经是 0-1 归一化的boost）
+            if has_graph and text in chunk_id_to_text:
+                cid = next(ck for ck, t in chunk_id_to_text.items() if t == text)
+                boost = graph_chunk_boost[cid]  # type: ignore[arg-type]
+                g_rrf = alpha_g * boost
+                rrf_scores[text] += g_rrf
+                logger.debug(f"[HybridRetriever] graph boost: chunk_id={cid}, text={text[:40]}, boost={boost:.4f}, added_rrf={g_rrf:.6f}")
 
         # 按分数降序排列
         sorted_texts = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
@@ -1031,6 +1131,9 @@ class CragEvaluator:
                         result["score"] = float(score_m.group(1))
                     if level_m:
                         result["level"] = level_m.group(1)
+                    if not result:
+                        logger.error(f"[CRAG] LLM响应格式完全错误，JSON和正则提取均失败。原始响应: {raw_json}")
+                        return self._evaluate_by_rules(query, results)
                 score = float(result.get("score", 0.5))
                 level = result.get("level", "medium")
                 if level not in ["high", "medium", "low"]:
@@ -1568,8 +1671,8 @@ class HybridRAGEngine:
             self._abstract_manager = None
             return None
 
-    def _ensure_retriever_initialized(self) -> Union[VectorRetriever, HybridRetriever]:
-        """确保检索器已初始化"""
+    async def _ensure_retriever_initialized(self) -> Union[VectorRetriever, HybridRetriever]:
+        """确保检索器已初始化（异步以支持图谱检索器连接）"""
         if self._retriever_initialized:
             assert self._retriever is not None
             return self._retriever
@@ -1593,7 +1696,24 @@ class HybridRAGEngine:
             rerank_top_k=self.config.top_k,
             enable_bm25=self.config.enable_bm25,
             bm25_top_k=self.config.bm25_top_k,
+            graph_retriever=None,
+            graph_weight=getattr(self.config, 'graph_rrf_weight', 0.2),
         )
+
+        # 如果启用了 Graph RAG，连接图谱检索器作为第四通道
+        if getattr(self.config, 'enable_graph_rag', False):
+            try:
+                from ..graphrag.graph_rag_engine import GraphRAGConfig, create_graph_rag_engine
+                graph_config = GraphRAGConfig.from_rag_config(self.config)
+                graph_engine = create_graph_rag_engine(graph_config, self, self.context)
+                pg_retriever = await graph_engine.get_retriever()
+                if pg_retriever:
+                    self._retriever._graph_retriever = pg_retriever
+                    self._retriever._graph_weight = getattr(self.config, 'graph_rrf_weight', 0.2)
+                    logger.info(f"[HybridRAGEngine] 图谱检索器已连接，权重={self._retriever._graph_weight}")
+            except Exception as e:
+                logger.warning(f"[HybridRAGEngine] 图谱检索器连接失败: {e}")
+
         self._retriever_initialized = True
         self._bm25_retriever = self._retriever._bm25_retriever
 
@@ -1617,11 +1737,11 @@ class HybridRAGEngine:
         assert self._retriever is not None
         return self._retriever
 
-    def _get_bm25_retriever(self):
+    async def _get_bm25_retriever(self):
         """Lazily get BM25 retriever from HybridRetriever."""
         if hasattr(self, '_bm25_retriever') and self._bm25_retriever is not None:
             return self._bm25_retriever
-        retriever = self._ensure_retriever_initialized()
+        retriever = await self._ensure_retriever_initialized()
         return getattr(retriever, '_bm25_retriever', None)
 
     @staticmethod
@@ -1820,6 +1940,7 @@ class HybridRAGEngine:
         query: str,
         top_k: Optional[int] = None,
         filters: Optional[Dict[str, Any]] = None,
+        mode: str = "rag",
         **kwargs
     ) -> QueryResult:
         """
@@ -1829,6 +1950,7 @@ class HybridRAGEngine:
             query: 查询文本
             top_k: 返回结果数量
             filters: 过滤条件
+            mode: 检索模式 ("rag", "retrieve", "graph_local", "graph_global", "hybrid")
             **kwargs: 其他参数
 
         Returns:
@@ -1836,6 +1958,17 @@ class HybridRAGEngine:
         """
         if top_k is None:
             top_k = self.config.top_k
+
+        # Map graph modes to supported paths (graceful degradation, no ValueError crashes)
+        actual_mode = mode
+        if mode == "graph_global":
+            # graph_global: global context, heavy entity aggregation → use retrieve (no generation)
+            actual_mode = "retrieve"
+            logger.info("[HybridRAGEngine] graph_global → retrieve (pure retrieval, no generation)")
+        elif mode == "graph_local":
+            # graph_local: local neighborhood → use rag (retrieval + generation)
+            actual_mode = "rag"
+            logger.info("[HybridRAGEngine] graph_local → rag (retrieval + generation)")
 
         # 确保组件已初始化。Retriever 依赖 embedding provider，搜索入口必须先初始化它。
         embed_provider = await self._ensure_embed_provider_initialized()
@@ -1846,7 +1979,7 @@ class HybridRAGEngine:
         retriever: Optional[Union[VectorRetriever, HybridRetriever]] = None
         paper_ids_for_crag: Optional[List[str]] = None
         logger.info(
-            f"[HybridRAGEngine] search开始: mode={'two_stage' if use_two_stage else 'single_stage'}, "
+            f"[HybridRAGEngine] search开始: mode={mode}, retrieval={'two_stage' if use_two_stage else 'single_stage'}, "
             f"top_k={top_k}, two_stage_enabled={use_two_stage}, "
             f"two_stage_top_k={getattr(self.config, 'two_stage_top_k', 10)}, "
             f"two_stage_rerank_k={getattr(self.config, 'two_stage_rerank_k', 5)}, "
@@ -1993,7 +2126,7 @@ class HybridRAGEngine:
                 # 阶段2 BM25: 论文内精确匹配检索
                 paper_id_set = set(reranked_paper_ids)
                 if getattr(self.config, 'enable_bm25', True):
-                    bm25_retriever = self._get_bm25_retriever()
+                    bm25_retriever = await self._get_bm25_retriever()
                     if bm25_retriever and bm25_retriever.is_exact_match_query(query):
                         try:
                             bm25_raw = await bm25_retriever.retrieve(query, top_k=self.config.bm25_top_k)
@@ -2032,7 +2165,7 @@ class HybridRAGEngine:
             else:
                 # 摘要检索无结果，降级到普通检索
                 logger.warning("[两阶段] 阶段1摘要检索无结果，降级到单阶段检索")
-                retriever = self._ensure_retriever_initialized()
+                retriever = await self._ensure_retriever_initialized()
                 result = await retriever.retrieve(query, top_k=top_k)
         else:
             # 普通单阶段检索
@@ -2040,7 +2173,7 @@ class HybridRAGEngine:
                 logger.warning("[HybridRAGEngine] 两阶段检索未执行，降级到单阶段检索")
             else:
                 logger.info("[HybridRAGEngine] 两阶段检索未开启，执行单阶段检索")
-            retriever = self._ensure_retriever_initialized()
+            retriever = await self._ensure_retriever_initialized()
             result = await retriever.retrieve(query, top_k=top_k)
 
         index_manager_for_crag = self._ensure_index_manager_initialized()
@@ -2081,7 +2214,7 @@ class HybridRAGEngine:
             colbert_storage = self._ensure_colbert_storage_initialized()
             # 首次仅做入库时，retriever 可能尚未初始化；这里强制初始化，
             # 以便 reranker 和 ColBERT storage 能正常绑定并写盘。
-            retriever = self._ensure_retriever_initialized()
+            retriever = await self._ensure_retriever_initialized()
             # 如果 reranker 已初始化，绑定新 storage
             reranker = getattr(retriever, '_reranker', None)
             if reranker is not None:

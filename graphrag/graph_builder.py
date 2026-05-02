@@ -22,6 +22,9 @@ Graph Builder - 多模态知识图谱构建器
 import json
 import asyncio
 import os
+import re
+import hashlib
+import traceback
 import concurrent.futures
 from typing import Dict, Any, List, Optional, Union, TYPE_CHECKING
 from pathlib import Path
@@ -30,10 +33,11 @@ from dataclasses import dataclass, field
 from astrbot.api import logger
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+_GRAMMAR_DIR = Path(__file__).resolve().parent
 
 # 延迟导入避免循环依赖
 if TYPE_CHECKING:
-    from .graph_rag_engine import MemoryGraphStore, GraphRAGConfig
+    from .graph_rag_engine import SimplePropertyGraphStoreAdapter, GraphRAGConfig
 
 
 # ============================================================================
@@ -224,7 +228,11 @@ class LocalLLMProvider:
                     # create_chat_completion 返回格式: choices[0].message.content
                     logger.info(f"[Graph-LLM] create_chat_completion result keys: {result.keys() if isinstance(result, dict) else type(result)}")
                     logger.info(f"[Graph-LLM] choices: {result.get('choices') if isinstance(result, dict) else 'N/A'}")
-                    raw_content = result["choices"][0]["message"]["content"]
+                    try:
+                        raw_content = result["choices"][0]["message"]["content"]
+                    except (KeyError, IndexError, TypeError) as e:
+                        logger.error(f"[Graph-LLM] LLM响应格式异常(vision): {e}, result keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
+                        return ""
                     logger.info(f"[Graph-LLM] 原始响应类型: {type(raw_content)}")
                     return raw_content.strip() if raw_content else ""
                 else:
@@ -232,12 +240,15 @@ class LocalLLMProvider:
                     # __call__ 返回格式: choices[0].text
                     logger.info(f"[Graph-LLM] __call__ result keys: {result.keys() if isinstance(result, dict) else type(result)}")
                     logger.info(f"[Graph-LLM] choices: {result.get('choices') if isinstance(result, dict) else 'N/A'}")
-                    raw_text = result["choices"][0]["text"]
+                    try:
+                        raw_text = result["choices"][0]["text"]
+                    except (KeyError, IndexError, TypeError) as e:
+                        logger.error(f"[Graph-LLM] LLM响应格式异常(text): {e}, result keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
+                        return ""
                     logger.info(f"[Graph-LLM] 原始响应: {str(raw_text)}")
                     return raw_text.strip() if raw_text else ""
             except Exception as e:
                 logger.error(f"[Graph-LLM] LLM调用失败: {e}")
-                import traceback
                 logger.error(f"[Graph-LLM] 详细错误: {traceback.format_exc()}")
                 return ""
 
@@ -605,6 +616,8 @@ class MultimodalGraphBuilder:
         self.context = context
         self._llm: Optional[Any] = None  # LlamaCppVLMProvider
         self._llm_config = self._get_llm_config()
+        self._triplet_grammar: Optional[Any] = None
+        self._multimodal_grammar: Optional[Any] = None
 
     def _get_llm_config(self) -> MultimodalLLMConfig:
         """获取 LLM 配置"""
@@ -666,6 +679,32 @@ class MultimodalGraphBuilder:
                     temperature=self._llm_config.temperature
                 )
         await self._llm.initialize()
+        self._load_grammars()
+
+    def _load_grammars(self):
+        """加载 GBNF grammar 文件约束 LLM 输出为合法 JSON"""
+        triplet_gbnf = _GRAMMAR_DIR / "triplet_schema.gbnf"
+        multimodal_gbnf = _GRAMMAR_DIR / "multimodal_schema.gbnf"
+
+        if triplet_gbnf.exists():
+            try:
+                from llama_cpp import LlamaGrammar
+                self._triplet_grammar = LlamaGrammar.from_file(str(triplet_gbnf))
+                logger.info(f"[Graph-LLM] 已加载 triplet grammar: {triplet_gbnf.name}")
+            except Exception as e:
+                logger.warning(f"[Graph-LLM] 加载 triplet grammar 失败: {e}")
+        else:
+            logger.warning(f"[Graph-LLM] triplet grammar 文件不存在: {triplet_gbnf}")
+
+        if multimodal_gbnf.exists():
+            try:
+                from llama_cpp import LlamaGrammar
+                self._multimodal_grammar = LlamaGrammar.from_file(str(multimodal_gbnf))
+                logger.info(f"[Graph-LLM] 已加载 multimodal grammar: {multimodal_gbnf.name}")
+            except Exception as e:
+                logger.warning(f"[Graph-LLM] 加载 multimodal grammar 失败: {e}")
+        else:
+            logger.warning(f"[Graph-LLM] multimodal grammar 文件不存在: {multimodal_gbnf}")
 
     async def build_from_nodes(
         self,
@@ -813,7 +852,8 @@ class MultimodalGraphBuilder:
             response = await self._llm.text_chat(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
-                max_tokens=32768  # 无限制输出（使用最大值避免 JSON 被截断）
+                max_tokens=32768,
+                grammar=self._triplet_grammar,
             )
             response_text = response.content if hasattr(response, 'content') else str(response)
 
@@ -931,6 +971,11 @@ class MultimodalGraphBuilder:
                 metadata.get("image_path") and
                 Path(metadata.get("image_path", "")).exists()
             )
+            has_tables = metadata.get("has_table", False) and metadata.get("table_caption")
+
+            # 提取 paper_id（用于图表/表格节点唯一性）
+            file_name = metadata.get("file_name", "")
+            paper_id = Path(file_name).stem if file_name else ""
 
             if has_images and self.config.multimodal_enabled:
                 # 多模态联合抽取
@@ -940,7 +985,8 @@ class MultimodalGraphBuilder:
                     image_path=image_path,
                     image_caption=metadata.get("image_caption", ""),
                     chunk_id=chunk_id,
-                    graph_store=graph_store
+                    graph_store=graph_store,
+                    paper_id=paper_id
                 )
             else:
                 # 纯文本抽取
@@ -949,6 +995,19 @@ class MultimodalGraphBuilder:
                     chunk_id=chunk_id,
                     graph_store=graph_store
                 )
+
+            # 处理表格实体
+            if has_tables and self.config.extract_image_entities:
+                table_caption = metadata.get("table_caption", "")
+                table_id = self._extract_table_id(table_caption, text, paper_id)
+                table_csv_path = metadata.get("table_csv_path", "")
+                table_desc = metadata.get("table_md_path", "")
+                graph_store.add_table_entity(
+                    table_id=table_id,
+                    description=table_desc[:200] if table_desc else table_caption,
+                    chunk_id=chunk_id
+                )
+                result["image_entities_added"] += 1  # 复用该字段统计表格
 
             result["has_images"] = 1 if has_images else 0
             result["has_triplets"] = (
@@ -984,10 +1043,10 @@ class MultimodalGraphBuilder:
             response = await self._llm.text_chat(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
-                max_tokens=32768  # 无限制输出（使用最大值避免 JSON 被截断）
+                max_tokens=32768,
+                grammar=self._triplet_grammar,
             )
             response_text = response.content if hasattr(response, 'content') else str(response)
-
             triplets = self._parse_json_response(response_text)
 
             # Track entities counted in this extraction to avoid double-counting
@@ -1041,7 +1100,8 @@ class MultimodalGraphBuilder:
         image_path: str,
         image_caption: str,
         chunk_id: str,
-        graph_store: Any
+        graph_store: Any,
+        paper_id: str = ""
     ) -> Dict[str, Any]:
         """多模态联合三元组抽取"""
         result = {
@@ -1052,8 +1112,8 @@ class MultimodalGraphBuilder:
         }
 
         try:
-            # 提取 figure_id（如 "Figure 2"）
-            figure_id = self._extract_figure_id(image_caption, text)
+            # 提取 figure_id（如 "paper1_Figure 2"），确保跨论文唯一
+            figure_id = self._extract_figure_id(image_caption, text, paper_id)
 
             system_prompt = MULTIMODAL_TRIPLET_EXTRACTION_PROMPT.format(
                 text=text[:2000],
@@ -1073,7 +1133,8 @@ Extract triplets:"""
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 image_urls=[image_path] if self.config.multimodal_enabled else None,
-                max_tokens=32768  # 无限制输出（使用最大值避免 JSON 被截断）
+                max_tokens=32768,
+                grammar=self._multimodal_grammar,
             )
             response_text = response.content if hasattr(response, 'content') else str(response)
 
@@ -1171,11 +1232,41 @@ Extract triplets:"""
 
         return result
 
-    def _extract_figure_id(self, caption: str, text: str) -> str:
-        """从图注或文本中提取 figure ID"""
-        import re
+    def _stable_caption_hash(self, caption: str, paper_id: str = "", chunk_id: str = "", image_path: str = "") -> str:
+        """基于稳定输入生成确定性哈希（跨运行一致）
 
-        # 从 caption 提取
+        Args:
+            caption: 图片 caption 文本
+            paper_id: 论文标识
+            chunk_id: chunk 标识
+            image_path: 图片路径
+
+        Returns:
+            12 位十六进制哈希字符串
+        """
+        # 使用多个稳定字段组合，确保唯一性且跨运行一致
+        components = [
+            paper_id or "",
+            chunk_id or "",
+            image_path or "",
+            caption.strip() if caption else "",
+        ]
+        combined = "|".join(components).encode('utf-8')
+        # SHA256 是确定性的，输出前 12 位
+        return hashlib.sha256(combined).hexdigest()[:12]
+
+    def _extract_figure_id(self, caption: str, text: str, paper_id: str = "") -> str:
+        """从图注或文本中提取 figure ID，并确保唯一性（跨论文不重名、跨运行一致）
+
+        Args:
+            caption: 图片的 caption 文本
+            text: 关联的文本块
+            paper_id: 论文标识（用于生成唯一 ID）
+
+        Returns:
+            唯一的 figure 标识符，格式: paper_id_Figure_N 或 paper_id_Table_N
+        """
+        # 从 caption 提取（caption 更准确，优先使用）
         patterns = [
             r'(Figure|Fig\.?|图)\s*(\d+[a-zA-Z]?)',
             r'(Table|表格)\s*(\d+)',
@@ -1187,11 +1278,69 @@ Extract triplets:"""
                 prefix = match.group(1)
                 num = match.group(2)
                 if prefix.lower() in ["figure", "fig.", "图"]:
-                    return f"Figure {num}"
+                    base = f"Figure {num}"
                 elif prefix.lower() in ["table", "表格"]:
-                    return f"Table {num}"
+                    base = f"Table {num}"
+                else:
+                    base = "Unknown"
 
-        return "Figure 1"
+                # 使用 paper_id 确保唯一性
+                if paper_id:
+                    return f"{paper_id}_{base}"
+                return base
+
+        # 无法提取时，使用确定性哈希基于 caption 内容生成唯一标识
+        if caption and len(caption.strip()) > 3:
+            stable_hash = self._stable_caption_hash(caption, paper_id, "", "")
+            if paper_id:
+                return f"{paper_id}_Caption_{stable_hash}"
+            return f"Caption_{stable_hash}"
+
+        # 极端 fallback（caption 也为空）：使用确定性哈希
+        stable_hash = self._stable_caption_hash("", paper_id, "", "")
+        fallback_id = f"Fallback_{stable_hash}"
+        if paper_id:
+            return f"{paper_id}_{fallback_id}"
+        return fallback_id
+
+    def _extract_table_id(self, caption: str, text: str, paper_id: str = "") -> str:
+        """从表注或文本中提取 table ID，并确保唯一性（跨论文不重名、跨运行一致）
+
+        Args:
+            caption: 表格的 caption 文本
+            text: 关联的文本块
+            paper_id: 论文标识（用于生成唯一 ID）
+
+        Returns:
+            唯一的 table 标识符，格式: paper_id_Table_N
+        """
+        # 从 caption 提取（caption 更准确，优先使用）
+        patterns = [
+            r'(Table|表格)\s*(\d+[a-zA-Z]?)',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, caption or text, re.IGNORECASE)
+            if match:
+                num = match.group(2)
+                base = f"Table {num}"
+                if paper_id:
+                    return f"{paper_id}_{base}"
+                return base
+
+        # 无法提取时，使用确定性哈希基于 caption 内容生成唯一标识
+        if caption and len(caption.strip()) > 3:
+            stable_hash = self._stable_caption_hash(caption, paper_id, "", "")
+            if paper_id:
+                return f"{paper_id}_Table_{stable_hash}"
+            return f"Table_{stable_hash}"
+
+        # 极端 fallback（caption 也为空）：使用确定性哈希
+        stable_hash = self._stable_caption_hash("", paper_id, "", "")
+        fallback_id = f"Table_{stable_hash}"
+        if paper_id:
+            return f"{paper_id}_{fallback_id}"
+        return fallback_id
 
     def _normalize_entity_type(self, entity_type: str) -> str:
         """标准化实体类型"""
@@ -1221,7 +1370,6 @@ Extract triplets:"""
         """
         if not text:
             return text
-        import re
         # 递归移除所有 <think>...</think> 块
         stripped = text
         while '<think>' in stripped and '</think>' in stripped:

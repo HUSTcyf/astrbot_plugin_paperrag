@@ -26,7 +26,8 @@ class IdeaEngineIdeas(IdeaEngineUtils):
     """
 
     def __getattr__(self, name: str):
-        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        # 未知属性返回 None 而非抛异常，保持 getattr 惯用模式
+        return None
 
     def _load_figure_captions(self, image_path: str) -> Dict[str, str]:
         """
@@ -403,6 +404,10 @@ class IdeaEngineIdeas(IdeaEngineUtils):
 
         folder = ideas_dir / folder_name
         if not folder.exists():
+            return False, actual_topic, folder_name
+
+        if folder.is_symlink():
+            logger.warning(f"[IdeaEngine] 跳过 symlink 删除: {folder}")
             return False, actual_topic, folder_name
 
         shutil.rmtree(folder)

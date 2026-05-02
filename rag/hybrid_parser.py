@@ -179,6 +179,8 @@ class HybridPDFParser:
             truncation=True,
             max_length=self.chunk_size  # 严格限制在 chunk_size 内
         )
+        if len(text) > self.chunk_size * 5:
+            logger.debug(f"[HybridParser] Token 计数截断: 文本 {len(text)} 字符, token 限制在 {self.chunk_size}")
         return len(tokens)
 
     def parse_pdf_to_documents(self, pdf_path: str) -> List[Node]:
@@ -714,9 +716,14 @@ class HybridPDFParser:
 
                     clause_tokens = self._get_token_count(clause)
                     if clause_tokens > self.chunk_size:
-                        # 仍然太大，直接截断（按字符估算截断到 chunk_size tokens）
+                        # 仍然太大，按字符估算截断到 chunk_size tokens，在单词边界截断
                         if chunks:
-                            clipped = clause[:self.chunk_size * 4]  # 粗估算
+                            max_chars = self.chunk_size * 4
+                            if len(clause) > max_chars:
+                                clip_point = clause.rfind(' ', 0, max_chars)
+                                clipped = clause[:clip_point] if clip_point > 0 else clause[:max_chars]
+                            else:
+                                clipped = clause
                             chunks[-1] += " " + clipped
                     else:
                         chunks.append(clause)

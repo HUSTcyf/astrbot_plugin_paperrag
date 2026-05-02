@@ -3,12 +3,29 @@
 
 from neo4j import GraphDatabase
 import csv
+import json
+import os
 from pathlib import Path
+
+def _load_neo4j_password() -> str:
+    """从插件配置文件读取 Neo4j 密码"""
+    config_paths = [
+        Path(__file__).parent.parent / "data" / "config" / "astrbot_plugin_paperrag_config.json",
+        Path.home() / "AstrBot" / "data" / "config" / "astrbot_plugin_paperrag_config.json",
+    ]
+    for p in config_paths:
+        if p.exists():
+            with open(p, encoding="utf-8-sig") as f:
+                cfg = json.load(f)
+                pw = cfg.get("graph_rag", {}).get("neo4j_password", "")
+                if pw:
+                    return pw
+    raise RuntimeError("无法从配置文件中读取 neo4j_password，请检查 graph_rag.neo4j_password 配置")
 
 # ============ 配置 ============
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "neo4j_M73770"  # TODO: 修改为你的密码
+NEO4J_PASSWORD = _load_neo4j_password()
 
 # 导出数量限制
 LIMIT_NODES = 10000   # 节点数量限制

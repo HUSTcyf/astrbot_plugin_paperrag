@@ -1223,7 +1223,7 @@ class LLMReferenceParser:
                     try:
                         json.loads(fixed)
                         return fixed, "fixed_escape"
-                    except:
+                    except Exception:
                         pass
                 return None, str(e)
 

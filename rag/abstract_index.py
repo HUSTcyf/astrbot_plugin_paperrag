@@ -748,7 +748,7 @@ class AbstractExtractor:
             # 从第一页文本中启发式提取标题
             try:
                 if len(doc) > 0:
-                    page_text = doc[0].get_text()
+                    page_text = str(doc[0].get_text())
                     heuristic_title = self.extract_title_from_text(page_text)
                     if heuristic_title:
                         doc.close()

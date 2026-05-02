@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import re
 from typing import Any, Dict, List
 
 from astrbot.api import logger
@@ -192,11 +194,7 @@ class RetrievalHelpersMixin(PluginCoreBase):
         return ""
 
     async def _resolve_sources_arxiv(self, sources: list) -> list:
-        resolved = []
-        for source in sources:
-            resolved_source = await self._resolve_source_arxiv(source)
-            resolved.append(resolved_source)
-        return resolved
+        return await asyncio.gather(*[self._resolve_source_arxiv(s) for s in sources])
 
     def _query_result_to_sources(self, result) -> list:
         nodes = getattr(result, "nodes", [])
@@ -216,93 +214,18 @@ class RetrievalHelpersMixin(PluginCoreBase):
         if not sources:
             return sources
 
-        try:
-            try:
-                from ..idea.llama_cpp_vlm_provider import (
-                    get_cached_llama_cpp_provider,
-                    init_llama_cpp_vlm_provider,
-                )
-            except ImportError:
-                logger.warning("[PaperRAG] 无法导入 LlamaCppVLMProvider，跳过文本压缩")
-                return sources
+        # 简单文本清洗：只删除 [Page X] 标签
+        import re
+        page_pattern = re.compile(r'\[Page\s*\d+(?:-\d+)?\]', re.IGNORECASE)
+        table_fig_pattern = re.compile(r'^(?:TABLE|Figure|Fig\.)\s*\d+:\s*$', re.MULTILINE)
 
-            vlm_provider = get_cached_llama_cpp_provider()
-            if vlm_provider is None:
-                logger.info("[PaperRAG] LlamaCppVLMProvider 未初始化，尝试初始化...")
-                model_dir = _PLUGIN_DIR / "models" / "Qwen3.5-9B-GGUF"
-                model_path = model_dir / "Qwen3.5-9B-UD-Q4_K_XL.gguf"
-                mmproj_path = model_dir / "mmproj-BF16.gguf"
-
-                vlm_provider = init_llama_cpp_vlm_provider(
-                    model_path=str(model_path),
-                    mmproj_path=str(mmproj_path),
-                    n_ctx=self.config.get("llama_vlm_n_ctx", 16384),
-                    n_gpu_layers=99,
-                    max_tokens=25600,
-                    temperature=0.3,
-                )
-                await vlm_provider.initialize()
-
-            chunk_marker = "[Chunk_"
-            separator = "\n---CHUNK_SEPARATOR---\n"
-
-            chunks_parts = []
-            for i, s in enumerate(sources):
-                text = s.get("text", "")
-                chunks_parts.append(f"{chunk_marker}{i + 1}]\n{text}")
-
-            chunks_text = separator.join(chunks_parts)
-
-            prompt = f"""请将以下论文片段重新排版，使其更紧凑，同时过滤图表噪声。
-
-要求：
-1. 去除多余的空格、换行、制表符，合并断行的句子
-2. 保持原文的核心信息和格式
-3. **噪声过滤**：如果某个 chunk 的内容主要是图表坐标轴刻度值（连续数字如 0.0、0.2、2000、4000、6000）、图表标签（PSNR、RMSE、Iteration）、散落的短数字序列等图片提取残留，将该 chunk 替换为"[图表数据，无正文内容]"
-4. 每个 chunk 之间用 {chunk_marker}N] 标记分隔（N 为数字）
-5. 直接输出处理后的内容，不要加任何前缀解释
-
-论文片段：
-{chunks_text}
-
-输出格式（严格遵循）：
-{chunk_marker}1] <处理后的文本>
-{chunk_marker}2] <处理后的文本>
-..."""
-
-            response = await vlm_provider.text_chat(
-                prompt=prompt,
-                image_urls=[],
-                temperature=0.3,
-                max_tokens=4096,
-            )
-
-            if not (response and hasattr(response, "content")):
-                logger.warning("[PaperRAG] VLM 返回无效响应")
-                return sources
-
-            compacted_text = response.content.strip()
-
-            import re
-
-            pattern = r"\[Chunk_(\d+)\]\s*\n?(.*?)(?=\[Chunk_\d+\]|$)"
-            matches = re.findall(pattern, compacted_text, re.DOTALL)
-
-            if not matches:
-                logger.warning("[PaperRAG] VLM 返回格式不符合预期，跳过压缩")
-                return sources
-
-            updated_count = 0
-            for chunk_num_str, chunk_text in matches:
-                chunk_num = int(chunk_num_str)
-                if 1 <= chunk_num <= len(sources):
-                    cleaned_text = " ".join(chunk_text.split())
-                    sources[chunk_num - 1]["text"] = cleaned_text
-                    updated_count += 1
-
-            logger.info(f"[PaperRAG] VLM 文本压缩完成: {updated_count}/{len(sources)} 个 chunks")
-        except Exception as e:
-            logger.warning(f"[PaperRAG] VLM 文本压缩失败: {e}")
+        for s in sources:
+            text = s.get("text", "")
+            # 删除 [Page N] 标签
+            text = page_pattern.sub('', text)
+            # 删除单独的 TABLE N: / Figure N: 行
+            text = table_fig_pattern.sub('', text)
+            s["text"] = text
 
         return sources
 

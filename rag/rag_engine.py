@@ -90,13 +90,13 @@ class RAGConfig:
 
     # Graph RAG 配置
     enable_graph_rag: bool = False
-    graph_storage_type: str = "memory"
+    graph_storage_type: str = "neo4j"
     graph_neo4j_uri: str = "bolt://localhost:7687"
     graph_neo4j_user: str = "neo4j"
     graph_neo4j_password: str = ""
     graph_max_triplets_per_chunk: int = 5
     graph_retrieval_top_k: int = 5
-    graph_hybrid_alpha: float = 0.5
+    graph_rrf_weight: float = 0.2  # 图谱在 RRF 融合中的权重
     graph_auto_build: bool = False
     graph_auto_build_threshold: int = 10
 

@@ -45,15 +45,22 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
     def _get_llm_provider(self):
         """获取LLM provider"""
         if not self.context:
+            logger.debug("[IdeaEngine] _get_llm_provider: context 为 None")
             return None
         provider = getattr(self.context, 'get_using_provider', None)
         if provider:
-            return provider()
+            result = provider()
+            if result is None:
+                logger.debug("[IdeaEngine] _get_llm_provider: get_using_provider() 返回 None")
+            return result
         provider_manager = getattr(self.context, 'provider_manager', None)
         if provider_manager:
             inst_map = getattr(provider_manager, 'inst_map', None)
             if isinstance(inst_map, dict) and inst_map:
                 return list(inst_map.values())[0]
+            logger.debug("[IdeaEngine] _get_llm_provider: inst_map 为空或不存在")
+        else:
+            logger.debug("[IdeaEngine] _get_llm_provider: provider_manager 不存在")
         return None
 
     def _load_paper_urls(self) -> Dict[str, Any]:
@@ -426,6 +433,7 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
             logger.warning(f"[IdeaEngine] VLM分析失败: {e}，使用简单分析")
 
         # Fallback: 简单分析
+        logger.warning("[IdeaEngine] VLM 不可用，返回空 domain 的 TopicAnalysis")
         return TopicAnalysis(
             domain="",
             keywords=[topic],
@@ -688,7 +696,7 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
 
         try:
             logger.info("[IdeaEngine] 使用 VLM 生成详细初始周报草稿...")
-            max_tokens_vlm = self.config.get("llama_vlm_max_tokens", 25600) if hasattr(self, 'config') else 25600
+            max_tokens_vlm = getattr(self, 'config', {}).get("llama_vlm_max_tokens", 25600)
             draft = await self._vlm_chat_with_progress(
                 vlm_provider,
                 prompt=prompt,

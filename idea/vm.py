@@ -253,8 +253,8 @@ class IdeaEngineVM(IdeaEngineCitations):
                 reranked.append({"metadata": candidates_for_rerank[idx]["metadata"], "score": score})
             logger.info(f"[IdeaEngine] ColBERT rerank 完成，{len(reranked)} 个候选")
         except Exception as e:
-            logger.warning(f"[IdeaEngine] ColBERT rerank 失败: {e}，使用原始顺序")
-            reranked = [{"metadata": c, "score": 0.5} for c in all_candidates]
+            logger.warning(f"[IdeaEngine] ColBERT rerank 失败: {e}，使用原始顺序（梯度赋值）")
+            reranked = [{"metadata": c, "score": 1.0 - 0.05 * i} for i, c in enumerate(all_candidates)]
 
         filtered_images = []
         for item in reranked:

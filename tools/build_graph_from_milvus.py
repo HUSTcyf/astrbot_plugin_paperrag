@@ -104,6 +104,21 @@ def chunks_to_documents(chunks: List[Dict[str, Any]]) -> List[Any]:
 # 步骤 3: 构建 Neo4j 知识图谱
 # ============================================================================
 
+def _load_neo4j_password() -> str:
+    """从插件配置文件读取 Neo4j 密码"""
+    config_paths = [
+        Path(__file__).parent.parent / "data" / "config" / "astrbot_plugin_paperrag_config.json",
+        Path.home() / "AstrBot" / "data" / "config" / "astrbot_plugin_paperrag_config.json",
+    ]
+    for p in config_paths:
+        if p.exists():
+            with open(p, encoding="utf-8-sig") as f:
+                cfg = json.load(f)
+                pw = cfg.get("graph_rag", {}).get("neo4j_password", "")
+                if pw:
+                    return pw
+    raise RuntimeError("无法从配置文件中读取 neo4j_password，请检查 graph_rag.neo4j_password 配置")
+
 def build_neo4j_graph(
     documents: List[Any],
     neo4j_config: Optional[dict] = None,
@@ -113,10 +128,11 @@ def build_neo4j_graph(
     print("🏗️ 步骤 3: 构建 Neo4j 知识图谱")
     print("=" * 60)
 
+    neo4j_password = _load_neo4j_password()
     neo4j_config = neo4j_config or {
         "url": "bolt://localhost:7687",
         "username": "neo4j",
-        "password": "neo4j_M73770",
+        "password": neo4j_password,
     }
 
     try:

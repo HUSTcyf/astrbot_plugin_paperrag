@@ -1305,7 +1305,7 @@ def main():
 
     # 优先级: 显式参数 > 环境变量 > 插件配置
     llm_api_key = args.llm_api_key or os.getenv("EVAL_LLM_API_KEY", "")
-    embed_api_key = args.embed_api_key or os.getenv("EVAL_LLM_API_KEY", "")
+    embed_api_key = args.embed_api_key or os.getenv("EVAL_EMBED_API_KEY", "")
 
     # 尝试从插件配置读取 freeapi 设置（当 API Key 未显式提供时）
     plugin_config_path = Path(__file__).parent.parent.parent.parent / "config" / "astrbot_plugin_paperrag_config.json"

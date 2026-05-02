@@ -219,3 +219,8 @@ evaluation/freeapi.json
 *.code-workspace
 .DS_Store
 .planning/
+
+# Safe Refactor drafts
+.claude/
+.refactor/
+.env*

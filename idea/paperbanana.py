@@ -72,13 +72,17 @@ class IdeaEnginePaperBanana(IdeaEngineGeneration, IdeaEngineWebSearch):
         """调用 PaperBanana 服务获取图片路径"""
         if not method_text:
             return None
+        token = os.environ.get('PAPERBANANA_TOKEN', '')
+        if not token:
+            logger.warning("[IdeaEngine] PAPERBANANA_TOKEN 未设置，跳过 PaperBanana 调用")
+            return None
         try:
             import httpx
             async with httpx.AsyncClient(timeout=60.0) as client:
                 response = await client.post(
                     "https://api.paperbanana.com/generate",
                     json={"text": method_text},
-                    headers={"Authorization": f"Bearer {os.environ.get('PAPERBANANA_TOKEN', '')}"}
+                    headers={"Authorization": f"Bearer {token}"}
                 )
                 if response.status_code == 200:
                     data = response.json()

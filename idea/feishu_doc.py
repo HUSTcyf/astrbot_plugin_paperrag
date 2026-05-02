@@ -129,6 +129,12 @@ class IdeaEngineFeishuDoc(IdeaEnginePaperBanana):
                     img_path = tmp.name
 
                 if img_path and os.path.exists(img_path):
+                    # 清理由 base64 创建的临时文件
+                    if img_base64 and os.path.exists(img_path):
+                        try:
+                            os.unlink(img_path)
+                        except OSError:
+                            pass
                     img_path = self._ensure_png(img_path)
                     img_caption = opts.get("caption", "")
                     logger.info(f"[Test] caption='{img_caption}'")
@@ -809,6 +815,12 @@ Caption："""
                                 img_path = tmp.name
 
                             if img_path and os.path.exists(img_path):
+                                # 清理由 base64 创建的临时文件
+                                if img_base64 and os.path.exists(img_path):
+                                    try:
+                                        os.unlink(img_path)
+                                    except OSError:
+                                        pass
                                 img_path = self._ensure_png(img_path)
                                 img_width = opts.get("width")
                                 img_height = opts.get("height")

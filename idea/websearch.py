@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from astrbot.api import logger
 
@@ -18,6 +18,60 @@ class IdeaEngineWebSearch:
     包含：search_engine, discover, scrape_as_markdown, scrape_batch
     不依赖继承链，可被 IdeaEngineGeneration 直接调用。
     """
+
+    def __init__(self):
+        self._mcp_proc: Optional[Any] = None
+        self._mcp_lock = asyncio.Lock()
+
+    async def _ensure_mcp_process(self) -> Optional[Any]:
+        """获取或启动持久化的 MCP 进程（进程级单例）"""
+        if self._mcp_proc is not None:
+            try:
+                if self._mcp_proc.returncode is None:
+                    return self._mcp_proc
+                self._mcp_proc.terminate()
+                await asyncio.wait_for(self._mcp_proc.wait(), timeout=1)
+            except Exception:
+                pass
+            self._mcp_proc = None
+
+        mcp_config_path = Path(__file__).parent.parent / "mcp_server.json"
+        try:
+            with open(mcp_config_path, "r", encoding="utf-8") as f:
+                mcp_config = json.load(f)
+            api_token = mcp_config.get("mcpServers", {}).get("BrightData", {}).get("env", {}).get("API_TOKEN", "")
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logger.error(f"[IdeaEngine] 无法读取 MCP 配置: {e}")
+            return None
+
+        if not api_token:
+            logger.error(f"[IdeaEngine] BrightData API Token 未配置")
+            return None
+
+        env = {**os.environ, "API_TOKEN": api_token}
+        proc = await asyncio.create_subprocess_exec(
+            "npx", "@brightdata/mcp",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env
+        )
+        await asyncio.sleep(2)
+        self._mcp_proc = proc
+        return proc
+
+    async def _close_mcp_process(self):
+        """关闭 MCP 进程"""
+        if self._mcp_proc:
+            try:
+                self._mcp_proc.terminate()
+                await asyncio.wait_for(self._mcp_proc.wait(), timeout=5)
+            except Exception:
+                try:
+                    self._mcp_proc.kill()
+                except Exception:
+                    pass
+            self._mcp_proc = None
 
     async def _call_brightdata_mcp_tool(
         self,
@@ -44,27 +98,10 @@ class IdeaEngineWebSearch:
             Dict 包含工具执行结果
         """
         try:
-            # API Token - 从 mcp_server.json 读取
-            mcp_config_path = Path(__file__).parent.parent / "mcp_server.json"
-            try:
-                with open(mcp_config_path, "r", encoding="utf-8") as f:
-                    mcp_config = json.load(f)
-                api_token = mcp_config.get("mcpServers", {}).get("BrightData", {}).get("env", {}).get("API_TOKEN", "")
-            except (FileNotFoundError, json.JSONDecodeError) as e:
-                return {"success": False, "error": f"无法读取配置: {e}"}
-
-            if not api_token:
-                return {"success": False, "error": "BrightData API Token 未配置"}
-
-            # 启动 Bright Data MCP 服务器
-            env = {**os.environ, "API_TOKEN": api_token}
-            proc = await asyncio.create_subprocess_exec(
-                "npx", "@brightdata/mcp",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env
-            )
+            async with self._mcp_lock:
+                proc = await self._ensure_mcp_process()
+                if proc is None:
+                    return {"success": False, "error": "MCP 进程启动失败"}
 
             # 构建请求
             rpc_request = {
@@ -85,16 +122,6 @@ class IdeaEngineWebSearch:
                     proc.communicate(input=request_str.encode()),
                     timeout=timeout
                 )
-
-                # 关闭进程
-                try:
-                    proc.terminate()
-                    await asyncio.wait_for(proc.wait(), timeout=5)
-                except (ProcessLookupError, asyncio.TimeoutError):
-                    try:
-                        proc.kill()
-                    except ProcessLookupError:
-                        pass
 
                 if stderr:
                     stderr_text = stderr.decode()

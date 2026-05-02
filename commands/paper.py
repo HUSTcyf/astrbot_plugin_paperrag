@@ -97,7 +97,7 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
                     if isinstance(loaded_abstracts, dict):
                         abstracts = loaded_abstracts
             except Exception as e:
-                return {"error": f"读取摘要统计失败: {e}"}
+                logger.warning(f"读取摘要统计失败，跳过: {e}")
 
         papers: list[dict] = []
         total_papers = 0
@@ -220,19 +220,17 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             elif mode == "auto":
                 actual_mode = "rag"  # Graph RAG 未启用时默认回退到 RAG
 
-            # Execute search
-            response = await engine.search(query, mode=actual_mode)
-
-            # 将 QueryResult 转换为 sources 格式
+            # Execute search - all modes now go through unified HybridRetriever pipeline
+            # Graph retrieval is handled internally as RRF 4th channel when enabled
+            response = await engine.search(query, top_k=top_k, mode=actual_mode)
             sources = self._query_result_to_sources(response)
             if sources:
                 sources = await self._resolve_sources_arxiv(sources)
 
-            # 使用本地 VLM 重新排版 chunks 文本
+            # ALL modes: VLM normalizes chunk texts to remove [Page N], Figure/Table noise, etc.
             sources = await self._compact_chunk_texts_with_vlm(sources)
 
-            # Format output. Only explicit retrieve mode returns raw chunks;
-            # the default /paper search path should generate a grounded answer.
+            # Format output - all modes go through unified RAG pipeline
             if actual_mode == "retrieve":
                 output = self._format_retrieve_response(sources)
             else:
@@ -789,7 +787,7 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
                 file_name = paper["file_name"]
                 file_path = paper.get("file_path")
                 try:
-                    result = await engine.delete_paper(file_name, file_path)
+                    result = await engine.delete_paper(file_name, file_path or "")
                     if result.get("status") == "success":
                         deleted_count += 1
                     else:
