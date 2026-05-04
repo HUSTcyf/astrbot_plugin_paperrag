@@ -1153,9 +1153,9 @@ class MultimodalGraphBuilder:
             tail = triplet.get("tail", "").strip()
             if not relation or not tail:
                 continue
-            # Ensure tail entity exists in Neo4j (MATCH in add_relation requires it)
+            # Ensure tail entity exists in Neo4j (add_entity uses MERGE, idempotent)
             tail_type = triplet.get("tail_type", "Application")
-            if tail.lower() not in graph_store._entity_info:
+            if tail.lower() not in graph_store:
                 graph_store.add_entity(
                     name=tail,
                     entity_type=self._normalize_entity_type(tail_type),

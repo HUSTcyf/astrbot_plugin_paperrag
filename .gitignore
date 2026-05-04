@@ -224,3 +224,4 @@ evaluation/freeapi.json
 .claude/
 .refactor/
 .env*
+agentic_rag/
