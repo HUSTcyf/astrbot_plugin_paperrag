@@ -29,7 +29,7 @@ from .commands.base import PluginCoreBase
     "paper_rag",
     "HUSTcyf",
     "本地文档库RAG检索插件 (支持PDF/Word/TXT/HTML, Gemini + Milvus Lite)",
-    "1.12.2",
+    "1.12.5",
     "https://github.com/HUSTcyf/astrbot_plugin_paperrag.git"
 )
 class PaperRAGPlugin(PaperCommandsMixin, ArxivCommandsMixin, GraphCommandsMixin, IdeaCommandsMixin, PluginCoreBase):

@@ -85,20 +85,47 @@ RAGConfig(
 ```
 astrbot_plugin_paperrag/
 ├── main.py                    # 插件入口
-├── rag_engine.py              # 配置和工厂函数
-├── hybrid_parser.py           # PDF解析+语义分块
-├── hybrid_index.py            # Milvus索引管理
-├── hybrid_rag.py              # RAG引擎
-├── multimodal_extractor.py    # 多模态提取器
-├── embedding_providers.py     # Embedding提供者
-├── reference_processor.py     # 参考文献解析
-├── milvus_manager.py          # Milvus管理器
-├── unsloth_embedding.py      # Unsloth 本地 Embedding
-├── llama_index_reranker.py    # 重排序
-├── reranker.py                # 重排序封装
-├── llama_cpp_vlm_provider.py  # Llama.cpp VLM本地推理
+├── rag/
+│   ├── rag_engine.py          # 配置和工厂函数
+│   ├── hybrid_parser.py       # PDF解析+语义分块
+│   ├── hybrid_index.py        # Milvus索引管理
+│   ├── hybrid_rag.py          # RAG引擎（HybridRAGEngine）
+│   ├── multimodal_extractor.py # 多模态提取器
+│   ├── embedding_providers.py  # Embedding提供者
+│   ├── reference_processor.py  # 参考文献解析
+│   ├── abstract_index.py       # 摘要索引管理器
+│   ├── paper_link_resolver.py  # 论文链接解析
+│   ├── milvus_manager.py       # Milvus管理器
+│   ├── unsloth_embedding.py    # Unsloth 本地 Embedding
+│   ├── llama_index_reranker.py # 重排序
+│   └── reranker.py             # 重排序封装
+├── graphrag/
+│   ├── graph_builder.py        # 多模态知识图谱构建器（GBNF + closed-set schema）
+│   ├── graph_rag_engine.py     # Graph RAG 引擎（Neo4j 存储后端）
+│   ├── triplet_schema.gbnf     # GBNF grammar：9 类实体 + 9 类关系
+│   └── multimodal_schema.gbnf  # GBNF grammar：多模态三元组
+├── idea/
+│   ├── ideas.py                # 研究想法生成引擎
+│   ├── llama_cpp_vlm_provider.py # Llama.cpp VLM 本地推理（线程安全单例）
+│   ├── websearch.py            # 网络搜索
+│   ├── feishu_doc.py           # 飞书文档导出
+│   ├── paperbanana.py          # PaperBanana 方法图生成
+│   └── vm.py                   # VM 工具
+├── commands/
+│   ├── base.py                 # 基础命令
+│   ├── paper.py                # 论文管理命令
+│   ├── graph.py                # 图谱管理命令
+│   └── retrieval_helpers.py    # 检索辅助
+├── tools/
+│   ├── build_graph_from_milvus.py # 从 Milvus 构建图谱
+│   └── export_bloom.py          # Bloom 图谱导出
+├── test/
+│   ├── test_closed_set_schema.py    # Closed-set schema 测试（125 项）
+│   ├── test_graph_backup_restore.py # 图谱备份恢复测试
+│   └── test_graph_rag_integration.py # Graph RAG 集成测试
 └── docs/
-    ├── ARCHITECTURE.md        # 本文档
-    ├── CHANGELOG.md          # 变更记录
-    └── INDEX.md              # 文档索引
+    ├── ARCHITECTURE.md         # 本文档
+    ├── CHANGELOG.md            # 变更记录
+    ├── cypher_queries.md       # Neo4j Cypher 查询参考
+    └── INDEX.md                # 文档索引
 ```

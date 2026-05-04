@@ -65,6 +65,10 @@ def _install_neo4j_stub(session):
 
 
 def _make_plugin(tmp_path):
+    # Clear possibly incomplete stubs from other test modules so the full
+    # installation (including astrbot.api.event) can proceed.
+    for mod_name in ["astrbot.api.event", "astrbot.api.star", "astrbot.api", "astrbot"]:
+        sys.modules.pop(mod_name, None)
     _install_astrbot_stubs()
 
     plugin_parent = Path(__file__).resolve().parents[2]

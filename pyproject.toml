@@ -1,0 +1,8 @@
+[tool.pytest.ini_options]
+filterwarnings = [
+    # Suppress SWIG/pymilvus deprecation warnings during test run ( harmless third-party)
+    "ignore::DeprecationWarning:frozen.importlib.bootstrap",
+    "ignore::DeprecationWarning:swigvarlink",
+]
+asyncio_mode = "auto"
+testpaths = ["test"]

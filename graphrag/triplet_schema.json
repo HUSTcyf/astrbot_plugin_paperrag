@@ -1,0 +1,39 @@
+{
+  "type": "object",
+  "properties": {
+    "triplets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "head": {"type": "string"},
+          "head_type": {
+            "enum": [
+              "Method", "Model", "Task", "Dataset", "Metric",
+              "Component", "Limitation", "Application", "Baseline"
+            ]
+          },
+          "relation": {"type": "string"},
+          "relation_type": {
+            "enum": [
+              "ADDRESSES", "PROPOSES", "USES_COMPONENT", "EVALUATED_ON",
+              "ACHIEVES", "COMPARES_WITH", "LIMITED_BY", "APPLIES_TO", "EXTENDS",
+              "TRAINS_ON", "IMPLEMENTS", "OUTPERFORMS", "REQUIRES", "ABLATES_ON"
+            ]
+          },
+          "tail": {"type": "string"},
+          "tail_type": {
+            "enum": [
+              "Method", "Model", "Task", "Dataset", "Metric",
+              "Component", "Limitation", "Application", "Baseline"
+            ]
+          },
+          "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+          "evidence": {"type": "string"}
+        },
+        "required": ["head", "head_type", "relation", "relation_type", "tail", "tail_type", "evidence"]
+      }
+    }
+  },
+  "required": ["triplets"]
+}

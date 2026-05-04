@@ -146,25 +146,47 @@ class SimplePropertyGraphStoreAdapter:
         head: str,
         tail: str,
         relation: str,
+        relation_description: str = "",
         weight: float = 1.0,
         chunk_id: str = ""
     ) -> Optional[str]:
-        """
-        添加关系到图谱
+        """Add a relation to the graph.
 
-        Returns:
-            关系 ID（格式: head##relation##tail）
+        Args:
+            head: Source entity name.
+            tail: Target entity name.
+            relation: Edge label (closed-set predicate or cross-modal free-text).
+            relation_description: Free-text human-readable description (stored as property).
+            weight: Confidence score.
+            chunk_id: Source chunk identifier.
         """
         try:
-            from llama_index.core.graph_stores.types import Relation
-            rel = Relation(label=relation, source_id=head, target_id=tail, properties={})
-            self._store.upsert_relations([rel])
+            driver = self._driver
+            if driver:
+                escaped_head = head.replace("\\", "\\\\").replace("'", "\\'")
+                escaped_tail = tail.replace("\\", "\\\\").replace("'", "\\'")
+                escaped_rel = relation.replace("`", "``").replace("'", "\\'")
+                escaped_desc = relation_description.replace("\\", "\\\\").replace("'", "\\'")
+                escaped_chunk_id = chunk_id.replace("\\", "\\\\").replace("'", "\\'") if chunk_id else ""
+                set_parts = []
+                if escaped_desc:
+                    set_parts.append(f"r.description = '{escaped_desc}'")
+                if escaped_chunk_id:
+                    set_parts.append(f"r.chunk_id = '{escaped_chunk_id}'")
+                set_parts.append(f"r.weight = {float(weight)}")
+                set_clause = " SET " + ", ".join(set_parts) if set_parts else ""
+                with driver.session(database="neo4j") as session:
+                    session.run(
+                        f"MERGE (a {{name: '{escaped_head}'}}) "
+                        f"MERGE (b {{name: '{escaped_tail}'}}) "
+                        f"MERGE (a)-[r:`{escaped_rel}`]->(b)"
+                        f"{set_clause}"
+                    )
 
-            # 确保头尾实体都在缓存中
             if head.lower() not in self._entity_info:
-                self._entity_info[head.lower()] = {"name": head, "type": "UNKNOWN", "description": ""}
+                self._entity_info[head.lower()] = {"name": head, "type": "UNKNOWN", "description": "", "chunk_id": chunk_id}
             if tail.lower() not in self._entity_info:
-                self._entity_info[tail.lower()] = {"name": tail, "type": "UNKNOWN", "description": ""}
+                self._entity_info[tail.lower()] = {"name": tail, "type": "UNKNOWN", "description": "", "chunk_id": chunk_id}
 
             self._relation_count += 1
             return f"{head}##{relation}##{tail}"
@@ -183,32 +205,62 @@ class SimplePropertyGraphStoreAdapter:
     ) -> str:
         """添加图片实体（幂等：已存在则跳过）"""
         try:
-            # 幂等检查：已存在则不重复添加
             if figure_id.lower() in self._entity_info:
                 return figure_id
-            from llama_index.core.graph_stores.types import EntityNode, Relation
-            nodes = [
-                EntityNode(name=figure_id, label=f"Figure:{figure_type}", properties={"description": description}),
-                EntityNode(name=image_path, label="ImagePath", properties={}),
-            ]
-            rels = [
-                Relation(label="__is_a__", source_id=figure_id, target_id=f"Figure:{figure_type}", properties={}),
-                Relation(label="__has_path__", source_id=figure_id, target_id=image_path, properties={}),
-            ]
-            if description:
-                rels.append(Relation(label="__has_description__", source_id=figure_id, target_id=description[:200], properties={}))
-            self._store.upsert_nodes(nodes)
-            self._store.upsert_relations(rels)
+            driver = self._driver
+            if driver:
+                esc = lambda s: s.replace("\\", "\\\\").replace("'", "\\'")  # noqa: E731
+                fig_label = f"Figure_{figure_type}".replace("`", "``")
+                set_parts = [
+                    f"n.description = '{esc(description)}'",
+                    f"n.image_path = '{esc(image_path)}'",
+                    f"n.figure_type = '{esc(figure_type)}'",
+                ]
+                if chunk_id:
+                    set_parts.append(f"n.chunk_id = '{esc(chunk_id)}'")
+                with driver.session(database="neo4j") as session:
+                    session.run(
+                        f"MERGE (n:`{fig_label}` {{name: '{esc(figure_id)}'}}) "
+                        f"SET {', '.join(set_parts)}"
+                    )
             self._entity_info[figure_id.lower()] = {
                 "name": figure_id,
                 "type": f"Figure:{figure_type}",
-                "description": description
+                "description": description,
+                "image_path": image_path,
+                "chunk_id": chunk_id,
             }
             return figure_id
         except Exception as e:
             logger.warning(f"[GraphRAG] 添加图片实体失败: {e}")
             logger.warning(traceback.format_exc())
             return figure_id
+
+    def add_media_link(
+        self,
+        chunk_id: str,
+        media_path: str,
+        media_type: str = "image",
+        caption: str = "",
+    ):
+        """Deterministic Chunk→Media edge from metadata. Survives VLM failure."""
+        key = f"__media__{chunk_id.lower()}##{media_path.lower()}"
+        if key in self._entity_info:
+            return
+        driver = self._driver
+        try:
+            if driver:
+                esc = lambda s: s.replace("\\", "\\\\").replace("'", "\\'")
+                with driver.session(database="neo4j") as session:
+                    session.run(
+                        f"MERGE (c:Chunk {{id: '{esc(chunk_id)}'}}) "
+                        f"MERGE (m:Media {{path: '{esc(media_path)}'}}) "
+                        f"SET m.type = '{esc(media_type)}', m.caption = '{esc(caption)}' "
+                        f"MERGE (c)-[r:HAS_MEDIA]->(m)"
+                    )
+            self._entity_info[key] = {"name": key, "type": "MediaLink", "description": ""}
+        except Exception as e:
+            logger.warning(f"[GraphRAG] 添加媒体链接失败: {e}")
 
     def add_table_entity(
         self,
@@ -218,20 +270,24 @@ class SimplePropertyGraphStoreAdapter:
     ) -> str:
         """添加表格实体（幂等：已存在则跳过）"""
         try:
-            # 幂等检查：已存在则不重复添加
             if table_id.lower() in self._entity_info:
                 return table_id
-            from llama_index.core.graph_stores.types import EntityNode, Relation
-            nodes = [EntityNode(name=table_id, label="Table", properties={"description": description})]
-            rels = [Relation(label="__is_a__", source_id=table_id, target_id="Table", properties={})]
-            if description:
-                rels.append(Relation(label="__has_description__", source_id=table_id, target_id=description[:200], properties={}))
-            self._store.upsert_nodes(nodes)
-            self._store.upsert_relations(rels)
+            driver = self._driver
+            if driver:
+                esc = lambda s: s.replace("\\", "\\\\").replace("'", "\\'")  # noqa: E731
+                set_parts = [f"n.description = '{esc(description)}'"]
+                if chunk_id:
+                    set_parts.append(f"n.chunk_id = '{esc(chunk_id)}'")
+                with driver.session(database="neo4j") as session:
+                    session.run(
+                        f"MERGE (n:Table {{name: '{esc(table_id)}'}}) "
+                        f"SET {', '.join(set_parts)}"
+                    )
             self._entity_info[table_id.lower()] = {
                 "name": table_id,
                 "type": "Table",
-                "description": description
+                "description": description,
+                "chunk_id": chunk_id,
             }
             return table_id
         except Exception as e:
@@ -719,20 +775,25 @@ class GraphRAGEngine:
             **(self._adapter.get_stats() if self._adapter else {}),
         }
 
-    async def clear_graph(self, delete_storage: bool = True) -> Dict[str, Any]:
+    async def clear_graph(self) -> Dict[str, Any]:
         """清空图谱"""
         if not self.config.enable_graph_rag:
             return {"status": "skipped", "message": "Graph RAG 功能未启用"}
 
         if self._adapter is not None:
             # Neo4j: 执行 Cypher 删除所有节点和关系
-            if self._graph_store is not None:
+            driver = self._adapter._driver
+            if driver is not None:
                 try:
-                    with self._graph_store.client.session() as session:
-                        session.run("MATCH (n) DETACH DELETE n")
+                    def _clear_neo4j():
+                        with driver.session(database="neo4j") as session:
+                            session.run("MATCH (n) DETACH DELETE n")
+                    await asyncio.to_thread(_clear_neo4j)
                     logger.info("[GraphRAG] Neo4j 数据库已清空")
                 except Exception as e:
                     logger.warning(f"[GraphRAG] 清空 Neo4j 数据库失败: {e}")
+            else:
+                logger.warning("[GraphRAG] clear_graph: 无可用 driver，跳过 Neo4j 清空")
 
             self._adapter.clear()
 

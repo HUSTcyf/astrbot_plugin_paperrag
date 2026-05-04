@@ -14,8 +14,6 @@ if TYPE_CHECKING:
     except ImportError:
         from hybrid_rag import HybridRAGEngine
 
-HYBRID_RAG_AVAILABLE = True
-
 
 @dataclass
 class RAGConfig:

@@ -1,18 +1,17 @@
-# 📚 Paper RAG Plugin v1.12.4 - 用户指南
+# 📚 Paper RAG Plugin v1.12.5 - 用户指南
 
 本地论文库RAG检索插件，为AstrBot提供智能的论文检索和问答能力（支持多模态VLM问答）。
 
-> **版本说明**：当前版本 v1.12.4，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
+> **版本说明**：当前版本 v1.12.5，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
 
 ### 本版变化
 
-- **图谱检索融入 RRF 四通道融合**：Graph RAG 作为第四通道（Graph Channel）融入 HybridRetriever，通过 chunk_id boost 增强已召回向量
-- **Neo4j 专属化**：移除 MemoryGraphStore，统一使用 Neo4j 存储后端，直接 Cypher MERGE 写入实体
-- **图谱构建增强**：GBNF grammar 约束 LLM 输出、figure_id 跨论文唯一、表格实体抽取
-- **VLM Provider 线程安全**：推理/初始化用 asyncio.Lock 保护，单例复用无需重载模型
-- **安全修复**：移除工具脚本中的硬编码 Neo4j 密码，改从配置文件读取
-- **Idea Engine**：MCP 进程持久化、`__getattr__` 兼容 getattr 惯用模式、rerank 失败梯度赋值
-- **Code Review 修复**：20/20 全部通过，详见 [CHANGELOG](docs/changelog/1.12.4.md)
+- **对抗性审查修复**：对 `graph_builder.py` 和 `graph_rag_engine.py` 进行全面对抗性审查，修复 7 项可操作问题（VLM 缓存淘汰策略、批处理 prompt 优化、`add_relation` MATCH→MERGE 等）
+- **批处理 prompt 优化**：图像节点不再重复发送给批处理 LLM，节省 token 避免重复三元组
+- **`add_relation` 可靠性提升**：Cypher 从 MATCH 改为 MERGE，确保节点创建失败时关系仍能写入
+- **VLM 缓存淘汰改进**：从全量清除改为半量淘汰，避免缓存雪崩
+- **测试增强**：新增 13 项测试覆盖 adversarial review 修复（125 总计）
+- 详见 [CHANGELOG](docs/changelog/1.12.6.md)
 
 ## 🏗️ 系统架构
 
@@ -30,7 +29,7 @@ PaperRAG 是一个基于两阶段检索的学术论文问答系统，其架构�
    - **Stage 2.5 可选重排序**：通过 ColBERT 多向量 MaxSim Late Interaction 对候选 chunk 重排
    - **CRAG 质量评估**：检索结束后输出轻量质量评分；自动纠偏默认关闭，可按需开启
 
-**知识图谱增强**：`GraphRAGEngine` 通过 `MultimodalGraphBuilder` 从 Chunk 中提取知识三元组（实体-关系-实体），支持 MemoryGraphStore（JSON 持久化）和 Neo4j 两种存储后端，支持局部遍历和全局遍历。
+**知识图谱增强**：`GraphRAGEngine` 通过 `MultimodalGraphBuilder` 从 Chunk 中提取知识三元组（实体-关系-实体），使用 Neo4j 存储后端，GBNF grammar 约束 LLM 输出为 closed-set 9 类实体和 9 类关系。图谱检索作为 RRF 第四通道融入 HybridRetriever。
 
 **多模态支持**：`HybridPDFParser` 通过 Docling/PyMuPDF 提取 PDF 中的图片、表格、公式，`LlamaCppVLMProvider`（Qwen3.5 GGUF）支持图片问答。
 
@@ -955,8 +954,8 @@ evaluation_output/
 - [x] 知识图谱检索器与融合检索器（`graph_retriever.py`）
 - [x] 图谱构建器 - LLM 三元组抽取（`graph_builder.py`）
 - [x] 用户意图识别与智能路由（`graph_rag_router.py`）
-- [x] Memory 图谱存储（默认）
-- [x] Neo4j 图数据库支持（可选）
+- [x] Neo4j 图数据库（唯一存储后端，Cypher MERGE 直接写入）
+- [x] Closed-set 9 类实体 + 9 类关系 schema（GBNF grammar 约束）
 - [x] 混合检索模式（向量 + 图谱 RRF 融合）
 - [x] 关系查询引擎（支持"A 和 B 的关系"类问题）
 - [x] 多跳推理增强

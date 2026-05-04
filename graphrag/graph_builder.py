@@ -9,31 +9,105 @@ Graph Builder - 多模态知识图谱构建器
 3. 图片实体提取
 4. 跨模态关系建立
 
-多模态知识图谱实体类型：
-- Model/Architecture: BERT, GPT, Transformer
-- Method/Technique: Attention,Pooling
-- Task: 文本分类、翻译
-- Dataset: GLUE, ImageNet
-- Metric: Accuracy, F1
-- Figure: 图片/图表实体
-- Table: 表格实体
+Closed-set 实体类型 (9 类):
+Method, Model, Task, Dataset, Metric, Component, Limitation, Application, Baseline
+
+Closed-set 关系类型 (9 类):
+ADDRESSES, PROPOSES, USES_COMPONENT, EVALUATED_ON, ACHIEVES, COMPARES_WITH, LIMITED_BY, APPLIES_TO, EXTENDS
 """
 
 import json
-import asyncio
 import os
 import re
 import hashlib
-import traceback
-import concurrent.futures
-from typing import Dict, Any, List, Optional, Union, TYPE_CHECKING
+from typing import Dict, Any, List, Optional, TYPE_CHECKING
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from astrbot.api import logger
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 _GRAMMAR_DIR = Path(__file__).resolve().parent
+
+# ============================================================================
+# Closed-set content-oriented relation schema
+# ============================================================================
+
+CLOSED_RELATION_TYPES: frozenset[str] = frozenset({
+    "ADDRESSES", "PROPOSES", "USES_COMPONENT", "EVALUATED_ON",
+    "ACHIEVES", "COMPARES_WITH", "LIMITED_BY", "APPLIES_TO", "EXTENDS",
+    "TRAINS_ON", "IMPLEMENTS", "OUTPERFORMS", "REQUIRES", "ABLATES_ON",
+})
+
+CLOSED_ENTITY_TYPES: frozenset[str] = frozenset({
+    "Method", "Model", "Task", "Dataset", "Metric",
+    "Component", "Limitation", "Application", "Baseline",
+})
+
+RELATION_ALIASES: Dict[str, str] = {
+    "based_on": "EXTENDS",
+    "uses": "USES_COMPONENT",
+    "achieves": "ACHIEVES",
+    "outperforms": "OUTPERFORMS",
+    "beats": "OUTPERFORMS",
+    "improves": "EXTENDS",
+    "proposes": "PROPOSES",
+    "introduces": "PROPOSES",
+    "trained_on": "TRAINS_ON",
+    "trains_on": "TRAINS_ON",
+    "applied_to": "APPLIES_TO",
+    "compares_with": "COMPARES_WITH",
+    "combines_with": "USES_COMPONENT",
+    "integrates": "USES_COMPONENT",
+    "depends_on": "USES_COMPONENT",
+    "github": "IMPLEMENTS",
+    "code": "IMPLEMENTS",
+    "needs": "REQUIRES",
+    "demands": "REQUIRES",
+    "ablation": "ABLATES_ON",
+    "ablates": "ABLATES_ON",
+    "studies": "ABLATES_ON",
+}
+
+ENTITY_TYPE_ALIASES: Dict[str, str] = {
+    "model/architecture": "Model",
+    "method/technique": "Method",
+    "optimizer/algorithm": "Method",
+    "framework/library": "Component",
+    "hyperparameter": "Component",
+    "result/conclusion": "Metric",
+    "application/domain": "Application",
+    "comparison": "Baseline",
+    "concept": "Method",
+    "experiment": "Dataset",
+    "other": "Method",
+}
+
+_EXT_TO_FIGURE_TYPE: Dict[str, str] = {
+    ".png": "image", ".jpg": "image", ".jpeg": "image",
+    ".svg": "diagram", ".pdf": "document", ".gif": "image",
+    ".tiff": "image", ".bmp": "image", ".webp": "image",
+}
+
+
+# ============================================================================
+# VLM optimization: 哈希缓存 + 确定性降级
+# ============================================================================
+
+# VLM 缓存（进程内，key = SHA256(text)[:12]##SHA256(image_content)[:12]）
+_VLM_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _vlm_cache_key(text: str, image_path: str) -> str:
+    """生成 VLM 缓存键（SHA256 前12位，跨运行一致）"""
+    img_key = ""
+    if image_path and Path(image_path).exists():
+        with open(image_path, "rb") as f:
+            img_key = hashlib.sha256(f.read()).hexdigest()[:12]
+    elif image_path:
+        img_key = hashlib.sha256(image_path.encode("utf-8")).hexdigest()[:12]
+    text_key = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    return f"{text_key}##{img_key}"
 
 # 延迟导入避免循环依赖
 if TYPE_CHECKING:
@@ -51,235 +125,18 @@ class LocalLLMConfig:
     mmproj_path: str = "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf"
     n_ctx: int = 8192
     n_gpu_layers: int = 99
-    max_tokens: int = 1024
+    max_tokens: int = 4096
     temperature: float = 0.1
-
-
-@dataclass
-class MultimodalLLMConfig(LocalLLMConfig):
-    """多模态 LLM 配置"""
-    vision_enabled: bool = True
-
-
-# ============================================================================
-# 本地文本/多模态 LLM Provider
-# ============================================================================
-
-class LocalLLMProvider:
-    """
-    本地推理 Provider（使用 llama-cpp-python + GGUF 模型）
-
-    支持：
-    1. 纯文本推理（text only）
-    2. 多模态推理（text + image）需要 mmproj
-    """
-
-    _instance: Optional["LocalLLMProvider"] = None
-    _llama: Optional[Any] = None
-    _lock: Optional[asyncio.Lock] = None
-    _initialized: bool = False
-    _vision_available: bool = False
-
-    def __init__(self, config: LocalLLMConfig):
-        self.config = config
-        self._lock = asyncio.Lock()
-
-    def _resolve_path(self, path: str) -> str:
-        """将相对路径统一解析到插件根目录。"""
-        candidate = Path(path).expanduser()
-        if candidate.is_absolute():
-            return str(candidate.resolve())
-        return str((_PLUGIN_ROOT / candidate).resolve())
-
-    @classmethod
-    def get_instance(cls, config: Optional[LocalLLMConfig] = None) -> "LocalLLMProvider":
-        """获取单例实例"""
-        if cls._instance is None:
-            if config is None:
-                config = LocalLLMConfig()
-            cls._instance = cls(config)
-        return cls._instance
-
-    @classmethod
-    def reset_instance(cls):
-        """重置单例（用于测试或重新初始化）"""
-        cls._instance = None
-        cls._llama = None
-        cls._initialized = False
-        cls._vision_available = False
-
-    async def initialize(self) -> None:
-        """初始化模型"""
-        if self._initialized:
-            return
-
-        assert self._lock is not None, "Lock not initialized"
-        async with self._lock:
-            if self._initialized:
-                return
-
-            logger.info("[Graph-LLM] 正在初始化本地推理模型...")
-            raw_model_path = self.config.model_path
-            raw_mmproj_path = self.config.mmproj_path
-            self.config.model_path = self._resolve_path(self.config.model_path)
-            self.config.mmproj_path = self._resolve_path(self.config.mmproj_path)
-            logger.info(f"[Graph-LLM] 模型路径: {raw_model_path} -> {self.config.model_path}")
-            logger.info(f"[Graph-LLM] mmproj路径: {raw_mmproj_path} -> {self.config.mmproj_path}")
-
-            # 检查模型文件
-            model_path = Path(self.config.model_path)
-            if not model_path.exists():
-                fallback = _PLUGIN_ROOT / "models" / "Qwen3.5-4B-GGUF" / model_path.name
-                if fallback.exists():
-                    logger.info(f"[Graph-LLM] 降级到 4B 模型: {fallback}")
-                    self.config.model_path = str(fallback)
-
-            # 检查 mmproj
-            mmproj_path = Path(self.config.mmproj_path)
-            if not mmproj_path.exists():
-                fallback_mmproj = _PLUGIN_ROOT / "models" / "Qwen3.5-4B-GGUF" / mmproj_path.name
-                if fallback_mmproj.exists():
-                    logger.info(f"[Graph-LLM] mmproj 降级到 4B: {fallback_mmproj}")
-                    self.config.mmproj_path = str(fallback_mmproj)
-
-            try:
-                from llama_cpp import Llama
-
-                def _load_llama():
-                    # 如果 mmproj 存在，启用 vision
-                    if Path(self.config.mmproj_path).exists():
-                        self._vision_available = True
-                        logger.info("[Graph-LLM] Vision 模式可用（检测到 mmproj）")
-                        return Llama(
-                            model_path=self.config.model_path,
-                            mmproj=self.config.mmproj_path,
-                            n_ctx=self.config.n_ctx,
-                            n_gpu_layers=self.config.n_gpu_layers,
-                            n_batch=32,
-                            verbose=False,
-                        )
-                    else:
-                        logger.info("[Graph-LLM] 纯文本模式（未检测到 mmproj）")
-                        self._vision_available = False
-                        return Llama(
-                            model_path=self.config.model_path,
-                            n_ctx=self.config.n_ctx,
-                            n_gpu_layers=self.config.n_gpu_layers,
-                            n_batch=32,
-                            verbose=False,
-                        )
-
-                loop = asyncio.get_event_loop()
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    self._llama = await loop.run_in_executor(executor, _load_llama)
-
-                self._initialized = True
-                logger.info("[Graph-LLM] ✅ 本地推理模型初始化完成")
-
-            except Exception as e:
-                logger.error(f"[Graph-LLM] ❌ 模型初始化失败: {e}")
-                raise
-
-    async def chat(
-        self,
-        messages: List[Dict[str, str]],
-        images: Optional[List[str]] = None
-    ) -> str:
-        """
-        聊天接口
-
-        Args:
-            messages: [{"role": "system"/"user", "content": "..."}]
-            images: 图片路径列表（可选，用于多模态）
-
-        Returns:
-            LLM 输出文本
-        """
-        if not self._initialized:
-            await self.initialize()
-
-        def _do_completion():
-            try:
-                prompt = self._build_prompt(messages)
-                kwargs = {
-                    "max_tokens": max(self.config.max_tokens, 4096),
-                    "temperature": self.config.temperature,
-                    "stop": ["<|im_end|>", "```"],  # 注意: 不添加 </think> 停止token，因为 JSON 在 thinking 之后
-                }
-
-                # 多模态模式
-                if images and self._vision_available:
-                    content = [
-                        {"type": "image_url", "image_url": {"url": str(Path(img).resolve())}}
-                        for img in images if Path(img).exists()
-                    ]
-                    content.append({"type": "text", "text": prompt})
-                    kwargs["messages"] = [
-                        {"role": "user", "content": content}
-                    ]
-                    logger.info(f"[Graph-LLM] 多模态调用: images={len(images) if images else 0}, prompt长度={len(prompt)}")
-                else:
-                    kwargs["prompt"] = prompt
-                    logger.info(f"[Graph-LLM] 纯文本调用: prompt长度={len(prompt)}")
-
-                assert self._llama is not None
-                if self._vision_available and "messages" in kwargs:
-                    result = self._llama.create_chat_completion(**kwargs)
-                    # create_chat_completion 返回格式: choices[0].message.content
-                    logger.info(f"[Graph-LLM] create_chat_completion result keys: {result.keys() if isinstance(result, dict) else type(result)}")
-                    logger.info(f"[Graph-LLM] choices: {result.get('choices') if isinstance(result, dict) else 'N/A'}")
-                    try:
-                        raw_content = result["choices"][0]["message"]["content"]
-                    except (KeyError, IndexError, TypeError) as e:
-                        logger.error(f"[Graph-LLM] LLM响应格式异常(vision): {e}, result keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
-                        return ""
-                    logger.info(f"[Graph-LLM] 原始响应类型: {type(raw_content)}")
-                    return raw_content.strip() if raw_content else ""
-                else:
-                    result = self._llama(**kwargs)
-                    # __call__ 返回格式: choices[0].text
-                    logger.info(f"[Graph-LLM] __call__ result keys: {result.keys() if isinstance(result, dict) else type(result)}")
-                    logger.info(f"[Graph-LLM] choices: {result.get('choices') if isinstance(result, dict) else 'N/A'}")
-                    try:
-                        raw_text = result["choices"][0]["text"]
-                    except (KeyError, IndexError, TypeError) as e:
-                        logger.error(f"[Graph-LLM] LLM响应格式异常(text): {e}, result keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
-                        return ""
-                    logger.info(f"[Graph-LLM] 原始响应: {str(raw_text)}")
-                    return raw_text.strip() if raw_text else ""
-            except Exception as e:
-                logger.error(f"[Graph-LLM] LLM调用失败: {e}")
-                logger.error(f"[Graph-LLM] 详细错误: {traceback.format_exc()}")
-                return ""
-
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, _do_completion)
-        return result
-
-    def _build_prompt(self, messages: List[Dict[str, str]]) -> str:
-        """构建 Qwen3.5 格式的 prompt"""
-        prompt_parts = []
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role == "system":
-                prompt_parts.append(f"<|im_start|>system\n{content}<|im_end|>")
-            elif role == "user":
-                prompt_parts.append(f"<|im_start|>user\n{content}<|im_end|>")
-            elif role == "assistant":
-                prompt_parts.append(f"<|im_start|>assistant\n{content}<|im_end|>")
-        prompt_parts.append("<|im_start|>assistant\n")
-        return "\n".join(prompt_parts)
 
 
 # ============================================================================
 # Prompt 模板（全英文）
 # ============================================================================
 
-BATCH_TRIPLET_EXTRACTION_PROMPT = """You are an academic knowledge graph construction assistant. Extract structured entity-relationship triplets from multiple academic paper chunks.
+BATCH_TRIPLET_EXTRACTION_PROMPT = """You are a strict academic content extractor. Extract entity-relation triplets ONLY about paper content from the given chunks. Each chunk is labeled with [Chunk X].
 
 ## Your Task
-Extract ALL meaningful relationship triplets from the given paper text chunks. Each chunk is labeled with [Chunk X].
+Extract meaningful content-level relationship triplets from the given paper text chunks.
 
 ## Output Format
 ```json
@@ -287,58 +144,59 @@ Extract ALL meaningful relationship triplets from the given paper text chunks. E
   "triplets": [
     {{
       "head": "Head entity name (concise, max 30 chars)",
-      "head_type": "Entity type",
-      "relation": "Relation description (English)",
-      "relation_type": "Relation type keyword",
+      "head_type": "Entity type (from closed set below)",
+      "relation": "Natural language relation description",
+      "relation_type": "Relation keyword (from closed set below)",
       "tail": "Tail entity name (concise, max 30 chars)",
-      "tail_type": "Entity type",
+      "tail_type": "Entity type (from closed set below)",
       "confidence": 0.95,
-      "evidence": "Original text snippet from [Chunk X]"
-    }}
-  ],
-  "entities": [
-    {{
-      "name": "Entity name",
-      "type": "Entity type",
-      "aliases": []
+      "evidence": "[Chunk X]"
     }}
   ]
 }}
 ```
 
-## Entity Types
-- Model/Architecture: BERT, GPT, Transformer, ResNet, network names
-- Method/Technique: attention, pooling, optimization, training methods
-- Task: text classification, translation, QA, generation
+## Entity Types (closed set — use EXACTLY one of these)
+- Method: attention mechanism, optimization method, training technique, algorithm
+- Model: BERT, GPT, Transformer, ResNet, named architectures
+- Task: text classification, translation, QA, generation, detection
 - Dataset: GLUE, ImageNet, COCO, benchmark names
-- Metric: accuracy, F1, BLEU, precision, recall, loss
-- Optimizer/Algorithm: Adam, SGD, learning rate
-- Framework/Library: PyTorch, TensorFlow
-- Author/Organization: researcher names, labs
-- Venue: NeurIPS, ACL, ICML, conference names
-- Other: anything not matching above
+- Metric: accuracy, F1, BLEU, precision, recall, loss, perplexity
+- Component: layer type, module, sub-architecture, building block
+- Limitation: weakness, constraint, failure mode, boundary condition
+- Application: real-world use case, domain, deployment scenario
+- Baseline: previous method, compared system, prior work
 
-## Relation Types (English keywords)
-- based_on, uses, achieves, outperforms, improves
-- proposes, introduces, achieves, performs
-- trained_on, applied_to, compares_with
-- combines_with, integrates, depends_on
-- publishes_in, collaborates_with
+## Relation Types (closed set — relation_type MUST be one of these keywords)
+- ADDRESSES: Paper/Method → Task or problem it targets
+- PROPOSES: Paper/Method → Method or Model it introduces
+- USES_COMPONENT: Method → Component or technique it incorporates
+- EVALUATED_ON: Method → Dataset used for evaluation
+- ACHIEVES: Method → Metric result or performance attained
+- COMPARES_WITH: Method → Baseline it is compared against
+- LIMITED_BY: Method → Limitation it suffers from
+- APPLIES_TO: Method → Application domain it targets
+- EXTENDS: Method → Prior work or model it builds upon
+- TRAINS_ON: Model → Dataset used for training
+- IMPLEMENTS: Model → Code repository providing implementation
+- OUTPERFORMS: Method → Baseline it significantly exceeds
+- REQUIRES: Method → Hardware or resource requirement
+- ABLATES_ON: Method → Component contribution being studied
 
-## Extraction Rules
-1. Extract ONLY the MOST IMPORTANT relationships (prioritize high-impact relations)
-2. Focus on key entities: major models, methods, datasets, metrics
+## Strict Rules
+1. IGNORE ALL METADATA: authors, institutions, venues, dates, grants, affiliations
+2. Extract ONLY the MOST IMPORTANT relationships (prioritize high-impact relations)
 3. Entity names MUST come from the original text
-4. Use English relation descriptions
-5. Confidence: 0.5-1.0 based on text clarity
-6. **STRICT LIMIT**: Maximum {max_triplets} triplets TOTAL for ALL chunks combined
-7. **IMPORTANT**: evidence field must ONLY contain "[Chunk X]" - do NOT include original text
+4. relation_type MUST be chosen from the closed set above — never invent new ones
+5. Confidence: 0.0-1.0 based on text clarity
+6. **STRICT LIMIT**: Maximum {{max_triplets}} triplets TOTAL for ALL chunks combined
+7. **IMPORTANT**: evidence field must ONLY contain "[Chunk X]" — do NOT include original text
 8. Keep entity names concise (max 30 chars), use abbreviations if needed
 
 ## Example
 Chunks:
 [Chunk 1] BERT is based on the Transformer encoder architecture.
-[Chunk 2] BERT achieves 86.4% accuracy on GLUE benchmark.
+[Chunk 2] BERT achieves 86.4% accuracy on GLUE benchmark, outperforming ELMo.
 
 Output:
 ```json
@@ -346,22 +204,32 @@ Output:
   "triplets": [
     {{
       "head": "BERT",
-      "head_type": "Model/Architecture",
+      "head_type": "Model",
       "relation": "based on",
-      "relation_type": "based_on",
+      "relation_type": "EXTENDS",
       "tail": "Transformer",
-      "tail_type": "Model/Architecture",
+      "tail_type": "Model",
       "confidence": 0.98,
       "evidence": "[Chunk 1]"
     }},
     {{
       "head": "BERT",
-      "head_type": "Model/Architecture",
-      "relation": "achieves",
-      "relation_type": "achieves",
+      "head_type": "Model",
+      "relation": "evaluated on GLUE",
+      "relation_type": "EVALUATED_ON",
       "tail": "GLUE benchmark",
       "tail_type": "Dataset",
       "confidence": 0.95,
+      "evidence": "[Chunk 2]"
+    }},
+    {{
+      "head": "BERT",
+      "head_type": "Model",
+      "relation": "outperforms",
+      "relation_type": "COMPARES_WITH",
+      "tail": "ELMo",
+      "tail_type": "Baseline",
+      "confidence": 0.92,
       "evidence": "[Chunk 2]"
     }}
   ]
@@ -369,10 +237,10 @@ Output:
 ```
 """
 
-TRIPLET_EXTRACTION_PROMPT = """You are an academic knowledge graph construction assistant. Extract structured entity-relationship triplets from academic papers.
+TRIPLET_EXTRACTION_PROMPT = """You are a strict academic content extractor. Extract entity-relation triplets ONLY about paper content.
 
 ## Your Task
-Extract ALL meaningful relationship triplets from the given paper text.
+Extract meaningful content-level relationship triplets from the given paper text.
 
 ## Output Format
 ```json
@@ -380,52 +248,53 @@ Extract ALL meaningful relationship triplets from the given paper text.
   "triplets": [
     {{
       "head": "Head entity name (concise, max 30 chars)",
-      "head_type": "Entity type",
-      "relation": "Relation description (English)",
-      "relation_type": "Relation type keyword",
+      "head_type": "Entity type (from closed set below)",
+      "relation": "Natural language relation description",
+      "relation_type": "Relation keyword (from closed set below)",
       "tail": "Tail entity name (concise, max 30 chars)",
-      "tail_type": "Entity type",
+      "tail_type": "Entity type (from closed set below)",
       "confidence": 0.95,
-      "evidence": "Original text snippet"
-    }}
-  ],
-  "entities": [
-    {{
-      "name": "Entity name",
-      "type": "Entity type",
-      "aliases": []
+      "evidence": "Short phrase from text (max 50 chars)"
     }}
   ]
 }}
 ```
 
-## Entity Types
-- Model/Architecture: BERT, GPT, Transformer, ResNet, network names
-- Method/Technique: attention, pooling, optimization, training methods
-- Task: text classification, translation, QA, generation
+## Entity Types (closed set — use EXACTLY one of these)
+- Method: attention mechanism, optimization method, training technique, algorithm
+- Model: BERT, GPT, Transformer, ResNet, named architectures
+- Task: text classification, translation, QA, generation, detection
 - Dataset: GLUE, ImageNet, COCO, benchmark names
-- Metric: accuracy, F1, BLEU, precision, recall, loss
-- Optimizer/Algorithm: Adam, SGD, learning rate
-- Framework/Library: PyTorch, TensorFlow
-- Author/Organization: researcher names, labs
-- Venue: NeurIPS, ACL, ICML, conference names
-- Other: anything not matching above
+- Metric: accuracy, F1, BLEU, precision, recall, loss, perplexity
+- Component: layer type, module, sub-architecture, building block
+- Limitation: weakness, constraint, failure mode, boundary condition
+- Application: real-world use case, domain, deployment scenario
+- Baseline: previous method, compared system, prior work
 
-## Relation Types (English keywords)
-- based_on, uses, achieves, outperforms, improves
-- proposes, introduces, achieves, performs
-- trained_on, applied_to, compares_with
-- combines_with, integrates, depends_on
-- publishes_in, collaborates_with
+## Relation Types (closed set — relation_type MUST be one of these keywords)
+- ADDRESSES: Paper/Method → Task or problem it targets
+- PROPOSES: Paper/Method → Method or Model it introduces
+- USES_COMPONENT: Method → Component or technique it incorporates
+- EVALUATED_ON: Method → Dataset used for evaluation
+- ACHIEVES: Method → Metric result or performance attained
+- COMPARES_WITH: Method → Baseline it is compared against
+- LIMITED_BY: Method → Limitation it suffers from
+- APPLIES_TO: Method → Application domain it targets
+- EXTENDS: Method → Prior work or model it builds upon
+- TRAINS_ON: Model → Dataset used for training
+- IMPLEMENTS: Model → Code repository providing implementation
+- OUTPERFORMS: Method → Baseline it significantly exceeds
+- REQUIRES: Method → Hardware or resource requirement
+- ABLATES_ON: Method → Component contribution being studied
 
-## Extraction Rules
-1. Extract ONLY the MOST IMPORTANT relationships (prioritize key findings and major contributions)
-2. Focus on: major models, methods, datasets, metrics, SOTA results
+## Strict Rules
+1. IGNORE ALL METADATA: authors, institutions, venues, dates, grants, affiliations
+2. Extract ONLY the MOST IMPORTANT relationships (prioritize key findings and major contributions)
 3. Entity names MUST come from the original text
-4. Use English relation descriptions
-5. Confidence: 0.5-1.0 based on text clarity
-6. **STRICT LIMIT**: Maximum {max_triplets} triplets TOTAL
-7. **IMPORTANT**: evidence field must be a SHORT phrase (max 50 chars) - do NOT include long text snippets
+4. relation_type MUST be chosen from the closed set above — never invent new ones
+5. Confidence: 0.0-1.0 based on text clarity
+6. **STRICT LIMIT**: Maximum {{max_triplets}} triplets TOTAL
+7. **IMPORTANT**: evidence field must be a SHORT phrase (max 50 chars) — do NOT include long text snippets
 8. Keep entity names concise (max 30 chars)
 
 ## Example
@@ -437,19 +306,19 @@ Output:
   "triplets": [
     {{
       "head": "BERT",
-      "head_type": "Model/Architecture",
+      "head_type": "Model",
       "relation": "based on",
-      "relation_type": "based_on",
+      "relation_type": "EXTENDS",
       "tail": "Transformer",
-      "tail_type": "Model/Architecture",
+      "tail_type": "Model",
       "confidence": 0.98,
       "evidence": "based on Transformer"
     }},
     {{
       "head": "BERT",
-      "head_type": "Model/Architecture",
-      "relation": "achieves",
-      "relation_type": "achieves",
+      "head_type": "Model",
+      "relation": "achieves 86.4% on GLUE",
+      "relation_type": "EVALUATED_ON",
       "tail": "GLUE benchmark",
       "tail_type": "Dataset",
       "confidence": 0.95,
@@ -457,26 +326,21 @@ Output:
     }},
     {{
       "head": "BERT",
-      "head_type": "Model/Architecture",
-      "relation": "outperforms",
-      "relation_type": "outperforms",
+      "head_type": "Model",
+      "relation": "outperforms previous models",
+      "relation_type": "COMPARES_WITH",
       "tail": "previous models",
-      "tail_type": "Model/Architecture",
+      "tail_type": "Baseline",
       "confidence": 0.85,
       "evidence": "outperforms previous models"
     }}
-  ],
-  "entities": [
-    {{"name": "BERT", "type": "Model/Architecture", "aliases": []}},
-    {{"name": "Transformer", "type": "Model/Architecture", "aliases": ["Transformer encoder"]}},
-    {{"name": "GLUE benchmark", "type": "Dataset", "aliases": ["GLUE"]}}
   ]
 }}
 ```
 """
 
 
-MULTIMODAL_TRIPLET_EXTRACTION_PROMPT = """You are a multimodal knowledge graph construction assistant. Extract entity-relationship triplets from academic papers with images.
+MULTIMODAL_TRIPLET_EXTRACTION_PROMPT = """You are a multimodal academic content extractor. Extract entity-relation triplets from academic papers with images.
 
 ## Your Task
 1. Extract triplets from the TEXT
@@ -484,9 +348,41 @@ MULTIMODAL_TRIPLET_EXTRACTION_PROMPT = """You are a multimodal knowledge graph c
 3. Establish CROSS-MODAL relations between text entities and figure
 
 ## Input
-Text: {text}
-Image Caption: {image_caption}
+Text: {{text}}
+Image Caption: {{image_caption}}
 Image: (provided as image input)
+
+## Entity Types (closed set — use EXACTLY one of these)
+- Method: attention mechanism, optimization method, training technique, algorithm
+- Model: BERT, GPT, Transformer, ResNet, named architectures
+- Task: text classification, translation, QA, generation, detection
+- Dataset: GLUE, ImageNet, COCO, benchmark names
+- Metric: accuracy, F1, BLEU, precision, recall, loss, perplexity
+- Component: layer type, module, sub-architecture, building block
+- Limitation: weakness, constraint, failure mode, boundary condition
+- Application: real-world use case, domain, deployment scenario
+- Baseline: previous method, compared system, prior work
+
+## Relation Types for text_triplets (closed set — relation_type MUST be one of these)
+- ADDRESSES: Paper/Method → Task or problem it targets
+- PROPOSES: Paper/Method → Method or Model it introduces
+- USES_COMPONENT: Method → Component or technique it incorporates
+- EVALUATED_ON: Method → Dataset used for evaluation
+- ACHIEVES: Method → Metric result or performance attained
+- COMPARES_WITH: Method → Baseline it is compared against
+- LIMITED_BY: Method → Limitation it suffers from
+- APPLIES_TO: Method → Application domain it targets
+- EXTENDS: Method → Prior work or model it builds upon
+- TRAINS_ON: Model → Dataset used for training
+- IMPLEMENTS: Model → Code repository providing implementation
+- OUTPERFORMS: Method → Baseline it significantly exceeds
+- REQUIRES: Method → Hardware or resource requirement
+- ABLATES_ON: Method → Component contribution being studied
+
+## Strict Rules
+1. IGNORE ALL METADATA: authors, institutions, venues, dates, grants, affiliations
+2. text_triplets: relation_type MUST be from the closed set above
+3. cross_modal_triplets: relation_type can be any string (e.g., "visualizes", "shows_results")
 
 ## Output Format
 ```json
@@ -495,8 +391,8 @@ Image: (provided as image input)
     {{
       "head": "Head entity",
       "head_type": "Entity type",
-      "relation": "Relation",
-      "relation_type": "keyword",
+      "relation": "Natural language description",
+      "relation_type": "ADDRESSES|PROPOSES|USES_COMPONENT|EVALUATED_ON|ACHIEVES|COMPARES_WITH|LIMITED_BY|APPLIES_TO|EXTENDS",
       "tail": "Tail entity",
       "tail_type": "Entity type",
       "confidence": 0.95,
@@ -504,16 +400,16 @@ Image: (provided as image input)
     }}
   ],
   "image_info": {{
-    "figure_id": "{figure_id}",
-    "description": "What's in the figure (e.g., bar chart comparing A and B on metric X)",
+    "figure_id": "{{figure_id}}",
+    "description": "What is shown in the figure",
     "figure_type": "chart|photo|diagram|graph|table",
     "key_entities": ["Entity1", "Entity2"],
     "relations_shown": ["comparison", "performance", "trend"]
   }},
   "cross_modal_triplets": [
     {{
-      "head": "{figure_id}",
-      "relation": "visualizes",
+      "head": "{{figure_id}}",
+      "relation": "visualizes or shows",
       "relation_type": "visualizes",
       "tail": "Entity or comparison being shown",
       "tail_type": "Entity type",
@@ -523,13 +419,6 @@ Image: (provided as image input)
   ]
 }}
 ```
-
-## Image Figure Types
-- chart: bar chart, line chart, pie chart (折线图、柱状图、饼图)
-- photo: photograph, microscopic image (照片、显微图)
-- diagram: architecture diagram, flowchart (架构图、流程图)
-- graph: network graph, knowledge graph (网络图、知识图谱)
-- table: data table (数据表格)
 
 ## Example
 Input:
@@ -542,11 +431,11 @@ Output:
   "text_triplets": [
     {{
       "head": "BERT",
-      "head_type": "Model/Architecture",
+      "head_type": "Model",
       "relation": "compares with",
-      "relation_type": "compares_with",
+      "relation_type": "COMPARES_WITH",
       "tail": "GPT",
-      "tail_type": "Model/Architecture",
+      "tail_type": "Model",
       "confidence": 0.9,
       "evidence": "performance comparison between BERT and GPT"
     }}
@@ -567,15 +456,6 @@ Output:
       "tail_type": "Comparison",
       "confidence": 0.95,
       "evidence": "Figure 2 shows performance comparison"
-    }},
-    {{
-      "head": "Figure 2",
-      "relation": "shows_results",
-      "relation_type": "shows_results",
-      "tail": "BERT",
-      "tail_type": "Model/Architecture",
-      "confidence": 0.95,
-      "evidence": "Bar chart comparing BERT and GPT"
     }}
   ]
 }}
@@ -619,7 +499,7 @@ class MultimodalGraphBuilder:
         self._triplet_grammar: Optional[Any] = None
         self._multimodal_grammar: Optional[Any] = None
 
-    def _get_llm_config(self) -> MultimodalLLMConfig:
+    def _get_llm_config(self) -> LocalLLMConfig:
         """获取 LLM 配置"""
         plugin_dir = _PLUGIN_ROOT
 
@@ -647,21 +527,18 @@ class MultimodalGraphBuilder:
             if fallback_mmproj.exists():
                 mmproj_path = str(fallback_mmproj)
 
-        return MultimodalLLMConfig(
+        return LocalLLMConfig(
             model_path=model_path,
             mmproj_path=mmproj_path,
             n_ctx=8192,
             n_gpu_layers=99,
-            max_tokens=32768,
             temperature=0.1,
-            vision_enabled=self.config.multimodal_enabled
         )
 
     async def _ensure_llm_initialized(self):
         """确保 LLM 已初始化 - 使用 LlamaCppVLMProvider"""
         if self._llm is None:
             from ..idea.llama_cpp_vlm_provider import (
-                get_llama_cpp_vlm_provider,
                 get_cached_llama_cpp_provider,
                 init_llama_cpp_vlm_provider,
             )
@@ -682,29 +559,38 @@ class MultimodalGraphBuilder:
         self._load_grammars()
 
     def _load_grammars(self):
-        """加载 GBNF grammar 文件约束 LLM 输出为合法 JSON"""
-        triplet_gbnf = _GRAMMAR_DIR / "triplet_schema.gbnf"
-        multimodal_gbnf = _GRAMMAR_DIR / "multimodal_schema.gbnf"
+        """从 JSON schema 文件生成 grammar，约束 LLM 输出为合法 JSON"""
+        import json
+        from llama_cpp import LlamaGrammar
 
-        if triplet_gbnf.exists():
+        triplet_path = _GRAMMAR_DIR / "triplet_schema.json"
+        if triplet_path.exists():
             try:
-                from llama_cpp import LlamaGrammar
-                self._triplet_grammar = LlamaGrammar.from_file(str(triplet_gbnf))
-                logger.info(f"[Graph-LLM] 已加载 triplet grammar: {triplet_gbnf.name}")
+                schema_text = triplet_path.read_text()
+                grammar = LlamaGrammar.from_json_schema(schema_text)
+                # 放宽 space 规则：允许任意空白符（不只是单个空格）
+                grammar_text = str(grammar._grammar)
+                grammar_text = grammar_text.replace('space ::= " "?', 'space ::= [ \\t\\n\\r]*')
+                self._triplet_grammar = LlamaGrammar.from_string(grammar_text)
+                logger.info(f"[Graph-LLM] 已加载 triplet grammar (space规则已放宽)")
             except Exception as e:
                 logger.warning(f"[Graph-LLM] 加载 triplet grammar 失败: {e}")
         else:
-            logger.warning(f"[Graph-LLM] triplet grammar 文件不存在: {triplet_gbnf}")
+            logger.warning(f"[Graph-LLM] triplet schema 文件不存在: {triplet_path}")
 
-        if multimodal_gbnf.exists():
+        multimodal_path = _GRAMMAR_DIR / "multimodal_schema.json"
+        if multimodal_path.exists():
             try:
-                from llama_cpp import LlamaGrammar
-                self._multimodal_grammar = LlamaGrammar.from_file(str(multimodal_gbnf))
-                logger.info(f"[Graph-LLM] 已加载 multimodal grammar: {multimodal_gbnf.name}")
+                schema_text = multimodal_path.read_text()
+                grammar = LlamaGrammar.from_json_schema(schema_text)
+                grammar_text = str(grammar._grammar)
+                grammar_text = grammar_text.replace('space ::= " "?', 'space ::= [ \\t\\n\\r]*')
+                self._multimodal_grammar = LlamaGrammar.from_string(grammar_text)
+                logger.info(f"[Graph-LLM] 已加载 multimodal grammar (space规则已放宽)")
             except Exception as e:
                 logger.warning(f"[Graph-LLM] 加载 multimodal grammar 失败: {e}")
         else:
-            logger.warning(f"[Graph-LLM] multimodal grammar 文件不存在: {multimodal_gbnf}")
+            logger.warning(f"[Graph-LLM] multimodal schema 文件不存在: {multimodal_path}")
 
     async def build_from_nodes(
         self,
@@ -823,48 +709,9 @@ class MultimodalGraphBuilder:
                 result["chunks_empty"] = len(nodes)
                 return result
 
-            # 构建批量 prompt
-            chunks_text = []
-            total_chars = 0
-            for i, node in enumerate(valid_nodes):
-                text = node.text if hasattr(node, 'text') else str(node)
-                total_chars += len(text)
-                chunks_text.append(f"[Chunk {i + 1}] {text}")
-
-            combined_text = "\n\n".join(chunks_text)
-            system_prompt = BATCH_TRIPLET_EXTRACTION_PROMPT.format(
-                max_triplets=self.config.max_triplets_per_chunk * len(valid_nodes)
-            )
-            user_prompt = f"Extract triplets from the following text chunks:\n\n{combined_text}\n\nExtract all entity-relationship triplets:"
-
-            # 检查是否超出上下文长度（粗略估算：1 token ≈ 4 字符）
-            total_tokens = (len(system_prompt) + len(user_prompt)) // 4
-            max_context = self._llm_config.n_ctx if hasattr(self, '_llm_config') else 4096
-            if total_tokens > max_context:
-                logger.warning(
-                    f"[Graph-LLM] ⚠️ 批次 {batch_idx + 1}/{total_batches} 超出上下文长度: "
-                    f"预估 {total_tokens} tokens > {max_context} tokens "
-                    f"(chars: system={len(system_prompt)}, user={len(user_prompt)})"
-                )
-
-            # 调用 LLM
-            assert self._llm is not None
-            response = await self._llm.text_chat(
-                prompt=user_prompt,
-                system_prompt=system_prompt,
-                max_tokens=32768,
-                grammar=self._triplet_grammar,
-            )
-            response_text = response.content if hasattr(response, 'content') else str(response)
-
-            # 调试：记录响应长度和末尾内容（判断是否截断）
-            logger.info(f"[Graph-LLM] 批次 {batch_idx + 1} LLM响应长度: {len(response_text)}, 末尾: {repr(response_text[-150:] if len(response_text) > 150 else response_text)}")
-
-            # 解析 JSON 响应
-            triplets = self._parse_json_response(response_text)
-
-            # 检查哪些 chunks 有图片
+            # 检查哪些 chunks 有图片（提前检测，用于排除 prompt 和 VLM 处理）
             nodes_with_images = []
+            nodes_with_images_set: set = set()
             for node in valid_nodes:
                 metadata = node.metadata if hasattr(node, 'metadata') else {}
                 has_images = (
@@ -874,21 +721,83 @@ class MultimodalGraphBuilder:
                 )
                 if has_images:
                     nodes_with_images.append(node)
+                    nodes_with_images_set.add(id(node))
+
+            # 构建批量 prompt（排除图像节点，它们由 VLM 单独处理）
+            chunks_text = []
+            text_only_count = 0
+            for i, node in enumerate(valid_nodes):
+                if id(node) in nodes_with_images_set and self.config.multimodal_enabled:
+                    continue
+                text = node.text if hasattr(node, 'text') else str(node)
+                text_only_count += 1
+                chunks_text.append(f"[Chunk {text_only_count}] {text}")
+
+            if not chunks_text:
+                # 全部是图像节点，跳过批处理 LLM 调用
+                result["chunks_empty"] = 0
+                triplets = []
+            else:
+                combined_text = "\n\n".join(chunks_text)
+                system_prompt = BATCH_TRIPLET_EXTRACTION_PROMPT.format(
+                    max_triplets=self.config.max_triplets_per_chunk * text_only_count
+                )
+                user_prompt = f"Extract triplets from the following text chunks:\n\n{combined_text}\n\nExtract all entity-relationship triplets:"
+
+                # 检查是否超出上下文长度（粗略估算：1 token ≈ 4 字符）
+                total_tokens = (len(system_prompt) + len(user_prompt)) // 4
+                max_context = self._llm_config.n_ctx if hasattr(self, '_llm_config') else 4096
+                if total_tokens > max_context:
+                    logger.warning(
+                        f"[Graph-LLM] ⚠️ 批次 {batch_idx + 1}/{total_batches} 超出上下文长度: "
+                        f"预估 {total_tokens} tokens > {max_context} tokens "
+                        f"(chars: system={len(system_prompt)}, user={len(user_prompt)})"
+                    )
+
+                # 调用 LLM（使用 GBNF grammar 约束输出）
+                assert self._llm is not None
+                response = await self._llm.text_chat(
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    max_tokens=self._llm_config.max_tokens,
+                    grammar=self._triplet_grammar,
+                )
+                response_text = response.content if hasattr(response, 'content') else str(response)
+
+                # 调试：记录完整响应
+                logger.info(f"[Graph-LLM] 批次 {batch_idx + 1} LLM响应长度: {len(response_text)}, 响应: {repr(response_text)}")
+
+                # 解析 JSON 响应
+                triplets = self._parse_json_response(response_text)
 
             # 如果有图片节点，使用多模态处理
-            if nodes_with_images and self.config.multimodal_enabled:
+            if nodes_with_images:
                 result["chunks_with_images"] = len(nodes_with_images)
-                # 多模态处理：分别处理每个有图片的节点
-                for node in nodes_with_images:
-                    multimodal_result = await self._process_node(node, graph_store)
-                    if isinstance(multimodal_result, dict):
-                        result["image_entities_added"] += multimodal_result.get("image_entities_added", 0)
-                        result["cross_modal_triplets_added"] += multimodal_result.get("cross_modal_triplets_added", 0)
+                if self.config.multimodal_enabled:
+                    for node in nodes_with_images:
+                        multimodal_result = await self._process_node(node, graph_store)
+                        if isinstance(multimodal_result, dict):
+                            result["entities_added"] += multimodal_result.get("entities_added", 0)
+                            result["text_triplets_added"] += multimodal_result.get("text_triplets_added", 0)
+                            result["image_entities_added"] += multimodal_result.get("image_entities_added", 0)
+                            result["cross_modal_triplets_added"] += multimodal_result.get("cross_modal_triplets_added", 0)
+
+            # Deterministic Chunk→Media edges from metadata (survives VLM failure)
+            for node in valid_nodes:
+                meta = node.metadata if hasattr(node, 'metadata') else {}
+                if meta.get("has_image") and meta.get("image_path"):
+                    graph_store.add_media_link(
+                        chunk_id=meta.get("chunk_id", meta.get("file_name", "")),
+                        media_path=meta["image_path"],
+                        media_type="image",
+                        caption=meta.get("image_caption", ""),
+                    )
 
             # 添加文本三元组
-            # Track entities counted in this batch to avoid double-counting
             counted_entities: set = set()
+            contributing_chunks: set = set()
 
+            triplets = triplets if chunks_text else []
             for triplet in triplets:
                 head = triplet.get("head", "").strip()
                 relation = triplet.get("relation", "").strip()
@@ -906,33 +815,36 @@ class MultimodalGraphBuilder:
                         break
 
                 node = valid_nodes[chunk_idx] if chunk_idx < len(valid_nodes) else valid_nodes[0]
+
+                # Skip image nodes when multimodal enabled — VLM handles them separately
+                if node in nodes_with_images and self.config.multimodal_enabled:
+                    continue
+                contributing_chunks.add(chunk_idx)
                 metadata = node.metadata if hasattr(node, 'metadata') else {}
                 chunk_id = metadata.get("chunk_id", metadata.get("file_name", ""))
 
-                # 添加实体（去重后只计算真正新增的实体）
-                head_id = graph_store.add_entity(
+                graph_store.add_entity(
                     name=head,
                     entity_type=self._normalize_entity_type(triplet.get("head_type", "")),
                     chunk_id=chunk_id
                 )
-                tail_id = graph_store.add_entity(
+                graph_store.add_entity(
                     name=tail,
                     entity_type=self._normalize_entity_type(triplet.get("tail_type", "")),
                     chunk_id=chunk_id
                 )
 
-                # 添加关系
                 rel_id = graph_store.add_relation(
                     head=head,
                     tail=tail,
-                    relation=relation,
+                    relation=self._normalize_relation_type(triplet.get("relation_type", "")),
+                    relation_description=relation,
                     weight=triplet.get("confidence", 1.0),
                     chunk_id=chunk_id
                 )
 
                 if rel_id:
                     result["text_triplets_added"] += 1
-                    # 只统计真正新增的实体（避免同一实体在多个三元组中出现被重复计数）
                     if head.lower() not in counted_entities:
                         result["entities_added"] += 1
                         counted_entities.add(head.lower())
@@ -940,10 +852,12 @@ class MultimodalGraphBuilder:
                         result["entities_added"] += 1
                         counted_entities.add(tail.lower())
 
-            if result["text_triplets_added"] > 0:
-                result["chunks_with_triplets"] = len(valid_nodes)
+            result["chunks_with_triplets"] = len(contributing_chunks)
+            if nodes_with_images and self.config.multimodal_enabled:
+                non_image_count = len(valid_nodes) - len(nodes_with_images)
+                result["chunks_empty"] = non_image_count - len(contributing_chunks)
             else:
-                result["chunks_empty"] = len(valid_nodes)
+                result["chunks_empty"] = len(valid_nodes) - len(contributing_chunks)
 
             return result
 
@@ -977,6 +891,15 @@ class MultimodalGraphBuilder:
             file_name = metadata.get("file_name", "")
             paper_id = Path(file_name).stem if file_name else ""
 
+            # Deterministic Chunk→Media edge (survives VLM failure)
+            if has_images:
+                graph_store.add_media_link(
+                    chunk_id=chunk_id,
+                    media_path=metadata.get("image_path", ""),
+                    media_type="image",
+                    caption=metadata.get("image_caption", ""),
+                )
+
             if has_images and self.config.multimodal_enabled:
                 # 多模态联合抽取
                 image_path = metadata.get("image_path", "")
@@ -1000,11 +923,9 @@ class MultimodalGraphBuilder:
             if has_tables and self.config.extract_image_entities:
                 table_caption = metadata.get("table_caption", "")
                 table_id = self._extract_table_id(table_caption, text, paper_id)
-                table_csv_path = metadata.get("table_csv_path", "")
-                table_desc = metadata.get("table_md_path", "")
                 graph_store.add_table_entity(
                     table_id=table_id,
-                    description=table_desc[:200] if table_desc else table_caption,
+                    description=table_caption,
                     chunk_id=chunk_id
                 )
                 result["image_entities_added"] += 1  # 复用该字段统计表格
@@ -1037,13 +958,13 @@ class MultimodalGraphBuilder:
 
         try:
             system_prompt = TRIPLET_EXTRACTION_PROMPT.format(max_triplets=self.config.max_triplets_per_chunk)
-            user_prompt = f"## Input Text\n\n{text[:3000]}\n\nExtract all entity-relationship triplets:"
+            user_prompt = f"## Input Text\n\n{text}\n\nExtract all entity-relationship triplets:"
 
             assert self._llm is not None
             response = await self._llm.text_chat(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
-                max_tokens=32768,
+                max_tokens=self._llm_config.max_tokens,
                 grammar=self._triplet_grammar,
             )
             response_text = response.content if hasattr(response, 'content') else str(response)
@@ -1060,12 +981,12 @@ class MultimodalGraphBuilder:
                 if not head or not relation or not tail:
                     continue
 
-                head_id = graph_store.add_entity(
+                graph_store.add_entity(
                     name=head,
                     entity_type=self._normalize_entity_type(triplet.get("head_type", "")),
                     chunk_id=chunk_id
                 )
-                tail_id = graph_store.add_entity(
+                graph_store.add_entity(
                     name=tail,
                     entity_type=self._normalize_entity_type(triplet.get("tail_type", "")),
                     chunk_id=chunk_id
@@ -1074,14 +995,14 @@ class MultimodalGraphBuilder:
                 rel_id = graph_store.add_relation(
                     head=head,
                     tail=tail,
-                    relation=relation,
+                    relation=self._normalize_relation_type(triplet.get("relation_type", "")),
+                    relation_description=relation,
                     weight=triplet.get("confidence", 1.0),
                     chunk_id=chunk_id
                 )
 
                 if rel_id:
                     result["text_triplets_added"] += 1
-                    # 只统计真正新增的实体（避免同一实体在多个三元组中出现被重复计数）
                     if head.lower() not in counted_entities:
                         result["entities_added"] += 1
                         counted_entities.add(head.lower())
@@ -1103,132 +1024,206 @@ class MultimodalGraphBuilder:
         graph_store: Any,
         paper_id: str = ""
     ) -> Dict[str, Any]:
-        """多模态联合三元组抽取"""
-        result = {
+        """
+        多模态联合三元组抽取（哈希缓存 + 确定性降级）
+
+        流水线：
+        1. 缓存查询 → 命中则跳过 VLM
+        2. 有图片路径 → 调用 VLM；无则直接降级
+        3. 存储文本三元组（始终执行，不依赖 VLM）
+        4. 无跨模态结果或置信度 <0.7 → 确定性降级
+        5. 置信度足够 → 存储图片实体 + 跨模态三元组
+        """
+        result: Dict[str, Any] = {
             "entities_added": 0,
             "text_triplets_added": 0,
             "image_entities_added": 0,
             "cross_modal_triplets_added": 0
         }
 
-        try:
-            # 提取 figure_id（如 "paper1_Figure 2"），确保跨论文唯一
-            figure_id = self._extract_figure_id(image_caption, text, paper_id)
+        # ── 提取 figure_id ──────────────────────────────────────────────────
+        figure_id = self._extract_figure_id(image_caption, text, paper_id)
 
-            system_prompt = MULTIMODAL_TRIPLET_EXTRACTION_PROMPT.format(
-                text=text[:2000],
-                image_caption=image_caption or "No caption",
-                figure_id=figure_id
+        # ── 步骤1：哈希缓存查键 ───────────────────────────────────────────
+        # 缓存键仅在有图片路径时有意义；跨运行一致性由图片内容哈希保证
+        has_image_path = bool(image_path)
+        cache_key = _vlm_cache_key(text, image_path) if has_image_path else None
+        cached = _VLM_CACHE.get(cache_key) if cache_key else None
+
+        if cached is not None:
+            logger.info(f"[Graph-LLM] VLM 缓存命中，跳过调用: {cache_key}")
+            data = cached
+        elif has_image_path:
+            # ── 步骤2：调用 VLM ───────────────────────────────────────────
+            data = await self._call_vlm_multimodal(
+                text=text,
+                image_path=image_path,
+                image_caption=image_caption,
+                figure_id=figure_id,
             )
-            user_prompt = f"""Analyze the image and extract cross-modal knowledge graph triplets.
+            if cache_key and (data.get("image_info") or data.get("cross_modal_triplets")):
+                if len(_VLM_CACHE) > 500:
+                    keys_to_remove = list(_VLM_CACHE.keys())[:250]
+                    for k in keys_to_remove:
+                        del _VLM_CACHE[k]
+                _VLM_CACHE[cache_key] = data
+        else:
+            # ── 步骤3：无图片路径 → 确定性降级 ───────────────────────────
+            data = {"text_triplets": [], "image_info": {}, "cross_modal_triplets": []}
 
-Text: {text[:2000]}
+        # ── 步骤3：存储文本三元组 ────────────────────────────────────────────
+        text_triplets = data.get("text_triplets", [])
+        counted_entities: set = set()
+        for triplet in text_triplets[:self.config.max_triplets_per_chunk]:
+            head = triplet.get("head", "").strip()
+            relation = triplet.get("relation", "").strip()
+            tail = triplet.get("tail", "").strip()
+            if not head or not relation or not tail:
+                continue
+            graph_store.add_entity(
+                name=head,
+                entity_type=self._normalize_entity_type(triplet.get("head_type", "")),
+                chunk_id=chunk_id
+            )
+            graph_store.add_entity(
+                name=tail,
+                entity_type=self._normalize_entity_type(triplet.get("tail_type", "")),
+                chunk_id=chunk_id
+            )
+            rel_id = graph_store.add_relation(
+                head=head,
+                tail=tail,
+                relation=self._normalize_relation_type(triplet.get("relation_type", "")),
+                relation_description=relation,
+                weight=float(triplet.get("confidence", 1.0)),
+                chunk_id=chunk_id
+            )
+            if rel_id:
+                result["text_triplets_added"] += 1
+                if head.lower() not in counted_entities:
+                    result["entities_added"] += 1
+                    counted_entities.add(head.lower())
+                if tail.lower() not in counted_entities:
+                    result["entities_added"] += 1
+                    counted_entities.add(tail.lower())
+
+        # ── 步骤5：图片实体 + 跨模态三元组（带置信度阈值降级）──────────────
+        image_info = data.get("image_info", {})
+        cross_triplets = data.get("cross_modal_triplets", [])
+
+        if not cross_triplets or not image_info:
+            # VLM 未返回跨模态结果 → 直接降级
+            return self._fallback_cross_modal(
+                figure_id=figure_id,
+                image_path=image_path,
+                chunk_id=chunk_id,
+                graph_store=graph_store,
+                result=result,
+            )
+
+        avg_confidence = sum(
+            float(t.get("confidence", 0)) for t in cross_triplets
+        ) / max(len(cross_triplets), 1)
+
+        if avg_confidence < 0.7:
+            logger.info(f"[Graph-LLM] VLM 置信度 {avg_confidence:.2f} < 0.7，使用确定性降级边")
+            return self._fallback_cross_modal(
+                figure_id=figure_id,
+                image_path=image_path,
+                chunk_id=chunk_id,
+                graph_store=graph_store,
+                result=result,
+            )
+
+        # 置信度足够，存储图片实体 + 跨模态三元组
+        if self.config.extract_image_entities:
+            graph_store.add_image_entity(
+                figure_id=figure_id,
+                image_path=image_path,
+                description=image_info.get("description", ""),
+                figure_type=image_info.get("figure_type", "unknown"),
+                chunk_id=chunk_id
+            )
+            result["image_entities_added"] += 1
+            result["entities_added"] += 1
+
+        for triplet in cross_triplets:
+            head = figure_id
+            relation = triplet.get("relation", "").strip()
+            tail = triplet.get("tail", "").strip()
+            if not relation or not tail:
+                continue
+            # Ensure tail entity exists in Neo4j (MATCH in add_relation requires it)
+            tail_type = triplet.get("tail_type", "Application")
+            if tail.lower() not in graph_store._entity_info:
+                graph_store.add_entity(
+                    name=tail,
+                    entity_type=self._normalize_entity_type(tail_type),
+                    chunk_id=chunk_id,
+                )
+            rel_id = graph_store.add_relation(
+                head=head,
+                tail=tail,
+                relation=relation,
+                weight=float(triplet.get("confidence", 0.9)),
+                chunk_id=chunk_id
+            )
+            if rel_id:
+                result["cross_modal_triplets_added"] += 1
+
+        return result
+
+    async def _call_vlm_multimodal(
+        self,
+        text: str,
+        image_path: str,
+        image_caption: str,
+        figure_id: str,
+    ) -> Dict[str, Any]:
+        """调用 VLM 获取多模态三元组"""
+        system_prompt = MULTIMODAL_TRIPLET_EXTRACTION_PROMPT.format(
+            text=text,
+            image_caption=image_caption or "No caption",
+            figure_id=figure_id
+        )
+        user_prompt = f"""Analyze the image and extract cross-modal knowledge graph triplets.
 Image Caption: {image_caption or 'No caption'}
 
 Extract triplets:"""
 
-            # 调用多模态 LLM
-            assert self._llm is not None
-            response = await self._llm.text_chat(
-                prompt=user_prompt,
-                system_prompt=system_prompt,
-                image_urls=[image_path] if self.config.multimodal_enabled else None,
-                max_tokens=32768,
-                grammar=self._multimodal_grammar,
+        assert self._llm is not None
+        response = await self._llm.text_chat(
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+            image_urls=[image_path] if self.config.multimodal_enabled else None,
+            max_tokens=self._llm_config.max_tokens,
+            grammar=self._multimodal_grammar,
+        )
+        response_text = response.content if hasattr(response, 'content') else str(response)
+        logger.info(f"[Graph-LLM] VLM响应长度: {len(response_text)}, 响应: {repr(response_text)}")
+        return self._parse_multimodal_response(response_text)
+
+    def _fallback_cross_modal(
+        self,
+        figure_id: str,
+        image_path: str,
+        chunk_id: str,
+        graph_store: Any,
+        result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """确定性降级：仅创建 figure 实体节点。Chunk→Media 由 add_media_link() 保证。"""
+        ext = Path(image_path).suffix.lower()
+        figure_type = _EXT_TO_FIGURE_TYPE.get(ext, "unknown")
+        if self.config.extract_image_entities:
+            graph_store.add_image_entity(
+                figure_id=figure_id,
+                image_path=image_path,
+                description="",
+                figure_type=figure_type,
+                chunk_id=chunk_id
             )
-            response_text = response.content if hasattr(response, 'content') else str(response)
-
-            data = self._parse_multimodal_response(response_text)
-
-            # 1. 存储文本三元组
-            text_triplets = data.get("text_triplets", [])
-            # Track entities counted in this extraction to avoid double-counting
-            counted_entities: set = set()
-
-            for triplet in text_triplets[:self.config.max_triplets_per_chunk]:
-                head = triplet.get("head", "").strip()
-                relation = triplet.get("relation", "").strip()
-                tail = triplet.get("tail", "").strip()
-
-                if not head or not relation or not tail:
-                    continue
-
-                head_id = graph_store.add_entity(
-                    name=head,
-                    entity_type=self._normalize_entity_type(triplet.get("head_type", "")),
-                    chunk_id=chunk_id
-                )
-                tail_id = graph_store.add_entity(
-                    name=tail,
-                    entity_type=self._normalize_entity_type(triplet.get("tail_type", "")),
-                    chunk_id=chunk_id
-                )
-
-                rel_id = graph_store.add_relation(
-                    head=head,
-                    tail=tail,
-                    relation=relation,
-                    weight=triplet.get("confidence", 1.0),
-                    chunk_id=chunk_id
-                )
-
-                if rel_id:
-                    result["text_triplets_added"] += 1
-                    # 只统计真正新增的实体（避免同一实体在多个三元组中出现被重复计数）
-                    if head.lower() not in counted_entities:
-                        result["entities_added"] += 1
-                        counted_entities.add(head.lower())
-                    if tail.lower() not in counted_entities:
-                        result["entities_added"] += 1
-                        counted_entities.add(tail.lower())
-
-            # 2. 存储图片实体
-            image_info = data.get("image_info", {})
-            if image_info and self.config.extract_image_entities:
-                figure_entity_id = graph_store.add_image_entity(
-                    figure_id=figure_id,
-                    image_path=image_path,
-                    description=image_info.get("description", ""),
-                    figure_type=image_info.get("figure_type", "unknown"),
-                    chunk_id=chunk_id
-                )
-                result["image_entities_added"] += 1
-                result["entities_added"] += 1
-
-                # 3. 存储跨模态三元组
-                cross_triplets = data.get("cross_modal_triplets", [])
-                for triplet in cross_triplets:
-                    head = triplet.get("head", figure_id)
-                    relation = triplet.get("relation", "").strip()
-                    tail = triplet.get("tail", "").strip()
-
-                    if not relation or not tail:
-                        continue
-
-                    # 确保图片实体存在
-                    graph_store.add_image_entity(
-                        figure_id=figure_id,
-                        image_path=image_path,
-                        description=image_info.get("description", ""),
-                        figure_type=image_info.get("figure_type", "unknown"),
-                        chunk_id=chunk_id
-                    )
-
-                    rel_id = graph_store.add_relation(
-                        head=head,
-                        tail=tail,
-                        relation=relation,
-                        weight=triplet.get("confidence", 0.9),
-                        chunk_id=chunk_id
-                    )
-
-                    if rel_id:
-                        result["cross_modal_triplets_added"] += 1
-
-        except Exception as e:
-            logger.warning(f"多模态三元组抽取失败: {e}")
-            # 回退到纯文本抽取
-            return await self._extract_text_triplets(text, chunk_id, graph_store)
+            result["image_entities_added"] += 1
+            result["entities_added"] += 1
 
         return result
 
@@ -1277,7 +1272,7 @@ Extract triplets:"""
             if match:
                 prefix = match.group(1)
                 num = match.group(2)
-                if prefix.lower() in ["figure", "fig.", "图"]:
+                if prefix.lower() in ["figure", "fig", "fig.", "图"]:
                     base = f"Figure {num}"
                 elif prefix.lower() in ["table", "表格"]:
                     base = f"Table {num}"
@@ -1343,24 +1338,29 @@ Extract triplets:"""
         return fallback_id
 
     def _normalize_entity_type(self, entity_type: str) -> str:
-        """标准化实体类型"""
-        type_mapping = {
-            "model/architecture": "Model/Architecture",
-            "method/technique": "Method/Technique",
-            "task": "Task",
-            "dataset": "Dataset",
-            "metric": "Metric",
-            "optimizer/algorithm": "Optimizer/Algorithm",
-            "framework/library": "Framework/Library",
-            "author/organization": "Author/Organization",
-            "venue": "Venue",
-            "hyperparameter": "Hyperparameter",
-            "experiment setting": "Experiment Setting",
-            "result/conclusion": "Result/Conclusion",
-            "application/domain": "Application/Domain",
-            "other": "Other",
-        }
-        return type_mapping.get(entity_type.lower().strip(), "Other")
+        """Normalize entity type to one of the 9 closed-set content-oriented types."""
+        normalized = entity_type.strip()
+        if normalized in CLOSED_ENTITY_TYPES:
+            return normalized
+        for ct in CLOSED_ENTITY_TYPES:
+            if normalized.lower() == ct.lower():
+                return ct
+        aliased = ENTITY_TYPE_ALIASES.get(normalized.lower().strip())
+        if aliased:
+            return aliased
+        logger.warning(f"[Graph-LLM] Unrecognized entity type '{entity_type}', defaulting to 'Method'")
+        return "Method"
+
+    def _normalize_relation_type(self, relation_type: str) -> str:
+        """Normalize relation_type to one of the 9 closed-set predicates."""
+        normalized = relation_type.strip().upper()
+        if normalized in CLOSED_RELATION_TYPES:
+            return normalized
+        aliased = RELATION_ALIASES.get(relation_type.strip().lower())
+        if aliased:
+            return aliased
+        logger.warning(f"[Graph-LLM] Unknown relation_type '{relation_type}', defaulting to 'USES_COMPONENT'")
+        return "USES_COMPONENT"
 
     def _strip_thinking_tokens(self, text: str) -> str:
         """移除 Qwen3.5 thinking 模式产生的思考 tokens
@@ -1376,95 +1376,34 @@ Extract triplets:"""
             stripped = re.sub(r'<think>.*?</think>', '', stripped, flags=re.DOTALL)
         return stripped.strip()
 
+
     def _parse_json_response(self, response: str) -> List[Dict[str, Any]]:
-        """解析 JSON 响应，支持截断时尝试恢复"""
+        """解析 JSON 响应。Grammar 已约束输出，理论上应该合法。"""
         if not response:
+            logger.warning("[Graph-LLM] JSON 解析失败: 响应为空")
             return []
 
-        json_str = response.strip().lstrip('\ufeff')
+        json_str = response.strip().lstrip('﻿')
         json_str = self._strip_thinking_tokens(json_str)
         if not json_str:
+            logger.warning("[Graph-LLM] JSON 解析失败: 处理后响应为空")
             return []
 
-        # 提取 ```json ... ``` 块
         if json_str.startswith("```"):
             lines = json_str.split("\n")
             json_str = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
 
-        # 第一次尝试：直接解析
         try:
             data = json.loads(json_str)
             return self._extract_triplets(data)
         except json.JSONDecodeError as e:
-            # 分析截断情况
-            truncated_indicators = ['"confidence":', '"evidence":', '"tail":', '"relation":']
-            is_likely_truncated = any(json_str.rstrip().endswith(ind) for ind in truncated_indicators)
-            last_chars = json_str[-100:] if len(json_str) > 100 else json_str
-
-            # 显示错误位置附近的内容 (char 位置)
             err_pos = e.pos if hasattr(e, 'pos') else 0
-            start_pos = max(0, err_pos - 200)
-            end_pos = min(len(json_str), err_pos + 200)
-            near_error = json_str[start_pos:end_pos]
-
-            logger.warning(
-                f"[Graph-LLM] JSON 解析失败: {e}\n"
-                f"  响应总长度: {len(json_str)} 字符\n"
-                f"  错误位置(char): {err_pos}\n"
-                f"  错误位置附近内容 [{start_pos}:{end_pos}]:\n{repr(near_error)}\n"
-                f"  响应末尾(最后100字符): {repr(last_chars)}\n"
-                f"  疑似截断: {'是' if is_likely_truncated else '否'}"
+            logger.error(
+                f"[Graph-LLM] JSON 解析失败: {e}，"
+                f"错误位置: {err_pos}，响应长度: {len(json_str)}，"
+                f"末尾内容: {repr(json_str[-150:] if len(json_str) > 150 else json_str)}"
             )
-
-        # 第二次尝试：找到 triplets 数组的结束位置，截断后面的内容
-        triplets_start = json_str.find('"triplets":')
-        if triplets_start < 0:
-            triplets_start = json_str.find('"triplets" :')
-        if triplets_start >= 0:
-            array_start = json_str.find('[', triplets_start)
-            if array_start >= 0:
-                depth = 0
-                last_valid_pos = -1
-                for i in range(array_start, len(json_str)):
-                    if json_str[i] == '{':
-                        depth += 1
-                    elif json_str[i] == '}':
-                        depth -= 1
-                        if depth == 0:
-                            last_valid_pos = i + 1
-                            break
-
-                if last_valid_pos > 0:
-                    try:
-                        truncated = json_str[:last_valid_pos]
-                        data = json.loads(truncated)
-                        logger.info(f"[Graph-LLM] 截断恢复成功，长度: {len(truncated)}")
-                        return self._extract_triplets(data)
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"[Graph-LLM] 截断 JSON 解析失败: {e}")
-
-        # 第三次尝试：如果以上都失败，尝试找到最后一个完整对象
-        # 在字符串中间截断的情况（如 "name": "Diffusion Mod）
-        last_complete_brace = json_str.rfind('}')
-        if last_complete_brace > 0:
-            try:
-                # 尝试从开头到最后一个完整对象
-                truncated = json_str[:last_complete_brace + 1]
-                # 如果开头是 {，找到对应的 ]
-                if truncated.startswith('{'):
-                    # 查找 triplets 数组
-                    arr_match = truncated.rfind('[')
-                    if arr_match > 0:
-                        # 确保数组有开始的 [
-                        test_str = truncated[:last_complete_brace + 1]
-                        data = json.loads(test_str)
-                        logger.info(f"[Graph-LLM] 最后完整对象恢复成功")
-                        return self._extract_triplets(data)
-            except json.JSONDecodeError:
-                pass
-
-        logger.warning(f"[Graph-LLM] JSON 解析恢复失败")
-        return []
+            return []
 
     def _extract_triplets(self, data) -> List[Dict[str, Any]]:
         """从解析后的数据中提取三元组"""

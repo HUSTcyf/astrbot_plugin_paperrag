@@ -16,7 +16,7 @@ from pathlib import Path
 
 
 # 箭头符号（单独成行时视为噪声）
-ARROW_LINES = {'⇧', '⇩', '↓', '↑', '▸', '▾', '▣', '■', '□', '▪', '▫', '●', '○'}
+ARROW_LINES: set[str] = {'⇧', '⇩', '↓', '↑', '▸', '▾', '▣', '■', '□', '▪', '▫', '●', '○'}
 
 
 def normalize_text(text: str) -> str:

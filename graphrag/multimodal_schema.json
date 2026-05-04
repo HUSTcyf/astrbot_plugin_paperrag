@@ -1,0 +1,71 @@
+{
+  "type": "object",
+  "properties": {
+    "text_triplets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "head": {"type": "string"},
+          "head_type": {
+            "enum": [
+              "Method", "Model", "Task", "Dataset", "Metric",
+              "Component", "Limitation", "Application", "Baseline"
+            ]
+          },
+          "relation": {"type": "string"},
+          "relation_type": {
+            "enum": [
+              "ADDRESSES", "PROPOSES", "USES_COMPONENT", "EVALUATED_ON",
+              "ACHIEVES", "COMPARES_WITH", "LIMITED_BY", "APPLIES_TO", "EXTENDS",
+              "TRAINS_ON", "IMPLEMENTS", "OUTPERFORMS", "REQUIRES", "ABLATES_ON"
+            ]
+          },
+          "tail": {"type": "string"},
+          "tail_type": {
+            "enum": [
+              "Method", "Model", "Task", "Dataset", "Metric",
+              "Component", "Limitation", "Application", "Baseline"
+            ]
+          },
+          "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+          "evidence": {"type": "string"}
+        },
+        "required": ["head", "head_type", "relation", "relation_type", "tail", "tail_type", "evidence"]
+      }
+    },
+    "image_info": {
+      "type": "object",
+      "properties": {
+        "figure_id": {"type": "string"},
+        "description": {"type": "string"},
+        "figure_type": {
+          "enum": ["chart", "photo", "diagram", "graph", "table"]
+        },
+        "key_entities": {"type": "array", "items": {"type": "string"}},
+        "relations_shown": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "cross_modal_triplets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "head": {"type": "string"},
+          "relation": {"type": "string"},
+          "relation_type": {"type": "string"},
+          "tail": {"type": "string"},
+          "tail_type": {
+            "enum": [
+              "Method", "Model", "Task", "Dataset", "Metric",
+              "Component", "Limitation", "Application", "Baseline"
+            ]
+          },
+          "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+          "evidence": {"type": "string"}
+        }
+      }
+    }
+  },
+  "required": ["text_triplets", "image_info", "cross_modal_triplets"]
+}

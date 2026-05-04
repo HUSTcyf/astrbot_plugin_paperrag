@@ -324,6 +324,7 @@ class PluginCoreBase(Star):
 
             self._engine = create_rag_engine(rag_config, self.context)
             self._config_valid = True
+            return self._engine
         except Exception as e:
             logger.error(f"❌ RAG引擎初始化失败: {e}")
             self._config_valid = False

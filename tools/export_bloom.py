@@ -50,7 +50,6 @@ NODE_COLORS = {
     "Venue": "#8E44AD",
     "Optimizer/Algorithm": "#27AE60",
     "Framework/Library": "#16A085",
-    "ImagePath": "#27AE60",
     "Figure": "#2ECC71",
     "Other": "#BDC3C7",
 }
@@ -90,7 +89,6 @@ def get_node_type(labels: list) -> str:
         "Venue": ["Venue"],
         "Optimizer/Algorithm": ["Optimizer/Algorithm"],
         "Framework/Library": ["Framework/Library"],
-        "ImagePath": ["ImagePath"],
         "Figure": ["Figure:photo", "Figure:diagram", "Figure:chart", "Figure:table", "Figure:graph", "Figure"],
     }
 

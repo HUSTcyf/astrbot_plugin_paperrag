@@ -374,19 +374,37 @@ class TestGetRetrieverImport:
             "graph_rag_engine 模块应该有 LLMSynonymRetriever 属性"
 
 
-# ===== 测试 5: 端到端混合检索（需要 Neo4j） =====
+# ===== 测试 5: 端到端混合检索（真实 Neo4j + 真实 Unsloth Embedding） =====
+
+def _neo4j_available() -> bool:
+    """检查 Neo4j 是否可用（通过 socket 连接判断，不受 sys.modules 污染影响）"""
+    import socket
+    try:
+        s = socket.create_connection(("localhost", 7687), timeout=2)
+        s.close()
+        return True
+    except (OSError, ConnectionRefusedError):
+        return False
+
+
+def _get_neo4j_password() -> str:
+    """从插件配置读取 Neo4j 密码"""
+    config_path = Path(__file__).resolve().parents[2] / "data" / "config" / "astrbot_plugin_paperrag_config.json"
+    if config_path.exists():
+        import json
+        with open(config_path, encoding="utf-8-sig") as f:
+            cfg = json.load(f)
+        return cfg.get("graph_rag", {}).get("neo4j_password", "neo4j")
+    return "neo4j"
+
 
 class TestEndToEndHybridRetrieval:
-    """端到端测试：验证整个混合检索流程"""
+    """端到端测试：验证整个混合检索流程（真实 Neo4j + 真实 Embedding）"""
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(
-        not Path(__file__).parents[1].joinpath("data", "graph_store").exists(),
-        reason="需要 Neo4j 数据文件存在"
-    )
+    @pytest.mark.skipif(not _neo4j_available(), reason="Neo4j 不可用")
     async def test_graph_rag_engine_initialization(self):
-        """GraphRAGEngine 初始化应成功（需要真实 Neo4j）"""
-        _install_neo4j_stub()
+        """GraphRAGEngine 初始化应连接真实 Neo4j 并查询统计"""
         _install_astrbot_stubs()
 
         from graphrag.graph_rag_engine import GraphRAGConfig, create_graph_rag_engine
@@ -396,7 +414,7 @@ class TestEndToEndHybridRetrieval:
             storage_type="neo4j",
             neo4j_uri="bolt://localhost:7687",
             neo4j_user="neo4j",
-            neo4j_password="password",
+            neo4j_password=_get_neo4j_password(),
             graph_retrieval_top_k=5,
             graph_rrf_weight=0.2,
         )
@@ -406,38 +424,48 @@ class TestEndToEndHybridRetrieval:
 
         graph_engine = create_graph_rag_engine(config, mock_base_engine, mock_context)
 
-        # initialize 不需要真实 Neo4j 因为我们用的是 FakeDriver
-        # 如果没有真实服务会返回，但不应崩溃
         try:
             await graph_engine.initialize()
         except Exception as e:
-            pytest.skip(f"Neo4j 不可用: {e}")
+            pytest.skip(f"GraphRAGEngine 初始化失败（缺少 LLM provider）: {e}")
+
+        # 即使 _index 未创建成功，Neo4j adapter 应已连接
+        if graph_engine._adapter is not None:
+            stats = await graph_engine.get_graph_stats()
+            assert stats["enabled"] is True
+            assert "entity_count" in stats
 
     @pytest.mark.asyncio
-    async def test_hybrid_rag_engine_with_graph_channel(self):
-        """HybridRAGEngine 应在启用 graph_rag 时连接图谱检索器"""
-        _install_neo4j_stub()
+    @pytest.mark.skipif(not _neo4j_available(), reason="Neo4j 不可用")
+    async def test_hybrid_rag_engine_with_real_embed_and_neo4j(self):
+        """HybridRAGEngine 应使用真实 Unsloth Embedding + 真实 Neo4j 完成检索初始化"""
         _install_astrbot_stubs()
 
         from rag.hybrid_rag import HybridRAGEngine
 
-        config = self._make_mock_config_e2e()
-        config.enable_graph_rag = True
-        config.graph_rrf_weight = 0.2
-
+        config = self._make_real_config_e2e()
         mock_context = types.SimpleNamespace(get_using_provider=MagicMock(return_value=None))
 
         engine = HybridRAGEngine(config, mock_context)
 
-        # 初始化检索器
-        try:
-            retriever = await engine._ensure_retriever_initialized()
-            assert retriever is not None
-            # graph_retriever 可能为 None 因为没有真实 Neo4j，但不應崩潰
-        except Exception as e:
-            pytest.skip(f"图谱检索器初始化失败（需要真实服务）: {e}")
+        # 必须先初始化 embed provider
+        embed_provider = await engine._ensure_embed_provider_initialized()
+        assert embed_provider is not None
 
-    def _make_mock_config_e2e(self):
+        # 验证 embed provider 是真实的 Unsloth，能产出 1024 维向量
+        emb = await embed_provider.get_text_embedding("test query")
+        assert len(emb) == 1024, f"Embedding 维度应为 1024，实际: {len(emb)}"
+
+        # 初始化检索器（会自动初始化 index_manager + graph channel）
+        retriever = await engine._ensure_retriever_initialized()
+        assert retriever is not None
+
+        # 验证 graph_retriever 状态
+        assert hasattr(retriever, '_graph_retriever')
+        if retriever._graph_retriever is not None:
+            assert retriever._graph_weight == 0.2
+
+    def _make_real_config_e2e(self):
         cfg = types.SimpleNamespace(
             top_k=5,
             embedding_mode="unsloth",
@@ -459,11 +487,11 @@ class TestEndToEndHybridRetrieval:
             hybrid_rrf_k=60,
             enable_bm25=False,
             bm25_top_k=20,
-            enable_graph_rag=False,
+            enable_graph_rag=True,
             graph_storage_type="neo4j",
             graph_neo4j_uri="bolt://localhost:7687",
             graph_neo4j_user="neo4j",
-            graph_neo4j_password="password",
+            graph_neo4j_password=_get_neo4j_password(),
             graph_max_triplets_per_chunk=5,
             graph_retrieval_top_k=5,
             graph_rrf_weight=0.2,
