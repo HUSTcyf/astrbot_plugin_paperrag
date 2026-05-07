@@ -13,7 +13,8 @@ from urllib.parse import unquote
 
 from astrbot.api import logger
 
-from .utils import extract_text_from_response, topic_hash
+from .utils import topic_hash
+from provider.llm_utils import extract_text_from_response
 from .paperbanana import IdeaEnginePaperBanana
 
 

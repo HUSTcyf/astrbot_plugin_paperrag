@@ -129,15 +129,31 @@ class HybridPDFParser:
             os.environ["GRPC_VERBOSITY"] = "ERROR"
             os.environ["GLOG_minloglevel"] = "2"
 
-            # 优先尝试从 embedding_providers 中获取已初始化的 tokenizer
+            # 优先从已初始化的 embedding 模型中复用 tokenizer（避免重复加载）
             try:
-                from ..embedding.embedding_providers import get_embedding_provider
-                provider = get_embedding_provider()
-                if provider and hasattr(provider, "tokenizer"):
-                    self._tokenizer = provider.tokenizer
-                    logger.debug("使用 embedding provider 的 tokenizer")
+                try:
+                    from ..embedding.flag_embedding import get_flag_model
+                except ImportError:
+                    from embedding.flag_embedding import get_flag_model
+                flag_model = get_flag_model()
+                if flag_model._initialized and flag_model.tokenizer is not None:
+                    self._tokenizer = flag_model.tokenizer
+                    logger.debug("使用 FlagEmbedding 的 tokenizer")
                     return self._tokenizer
-            except ImportError:
+            except Exception:
+                pass
+
+            try:
+                try:
+                    from ..embedding.unsloth_embedding import get_embedding_model
+                except ImportError:
+                    from embedding.unsloth_embedding import get_embedding_model
+                unsloth_model = get_embedding_model()
+                if unsloth_model is not None and unsloth_model.tokenizer is not None:
+                    self._tokenizer = unsloth_model.tokenizer
+                    logger.debug("使用 Unsloth 的 tokenizer")
+                    return self._tokenizer
+            except Exception:
                 pass
 
             # 降级：从模型目录加载独立 tokenizer

@@ -1,0 +1,26 @@
+# Idea generation output schema — constrains LLM to valid JSON
+# Used by IdeaEngine.generate_ideas() via llama-cpp grammar
+# NOTE: GBNF requires topological ordering — leaf rules must precede
+# rules that reference them (no forward references).
+
+# --- Leaf rules (no dependencies) ---
+
+ws ::= [ \t\n\r]*
+
+esc ::= "\\" [\\/"bfnrt]
+
+chars ::= (esc | [^"\\])*
+
+strval ::= "\"" chars "\""
+
+strarray ::= "[" ws "]" | "[" ws strval ("," ws strval)* ws "]"
+
+floatval ::= "0" "." [0-9] [0-9]* | "1" "." "0"* | [0-9] "." [0-9] [0-9]*
+
+# --- Composite rules (depend on leaf rules above) ---
+
+idea ::= "{" ws "\"title\"" ws ":" ws strval "," ws "\"description\"" ws ":" ws strval "," ws "\"novelty\"" ws ":" ws strval "," ws "\"methodology\"" ws ":" ws strval "," ws "\"potential_challenges\"" ws ":" ws strarray "," ws "\"related_work\"" ws ":" ws strarray "," ws "\"feasibility\"" ws ":" ws floatval "," ws "\"inspiration_sources\"" ws ":" ws strarray ws "}"
+
+array ::= "[" ws "]" | "[" ws idea ("," ws idea)* ws "]"
+
+root ::= "{" ws "\"ideas\"" ws ":" ws array ws "}"

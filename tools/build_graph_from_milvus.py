@@ -37,7 +37,10 @@ async def extract_chunks_from_milvus(
     print("=" * 60)
 
     try:
-        from ..rag.hybrid_index import HybridIndexManager
+        try:
+            from ..rag.hybrid_index import HybridIndexManager
+        except ImportError:
+            from rag.hybrid_index import HybridIndexManager
 
         manager = HybridIndexManager(
             milvus_uri=milvus_path,
@@ -119,7 +122,7 @@ def _load_neo4j_password() -> str:
                     return pw
     raise RuntimeError("无法从配置文件中读取 neo4j_password，请检查 graph_rag.neo4j_password 配置")
 
-def build_neo4j_graph(
+async def build_neo4j_graph(
     documents: List[Any],
     neo4j_config: Optional[dict] = None,
 ) -> None:
@@ -138,25 +141,16 @@ def build_neo4j_graph(
     try:
         from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
         from llama_index.core import PropertyGraphIndex
-        import llama_cpp
 
-        # 获取模型路径（参照 llama_cpp_vlm_provider.py）
-        plugin_dir = Path(__file__).parent.resolve()
-        model_path = os.environ.get(
-            "PAPERRAG_GGUF_MODEL_PATH",
-            str(plugin_dir / "models" / "Qwen3.5-9B-GGUF" / "Qwen3.5-9B-UD-Q4_K_XL.gguf")
-        )
+        # 使用共享 provider 加载模型
+        from provider.llama_cpp_vlm import get_llama_cpp_vlm_provider
 
-        print(f"🤖 使用 LlamaCpp 加载模型: {model_path}")
-
-        # 直接使用 llama_cpp.Llama（不需要 mmproj，用于纯文本）
-        llama_llm = llama_cpp.Llama(
-            model_path=model_path,
-            n_ctx=8192,  # 上下文窗口
-            n_gpu_layers=99,  # GPU 加速层数
-            n_batch=32,  # 批处理大小
-            verbose=False,
-        )
+        try:
+            provider = get_llama_cpp_vlm_provider()
+            await provider.initialize()
+        except Exception as e:
+            print(f"❌ LLM 初始化失败: {e}")
+            return
 
         class LlamaCppWrapper:
             """LlamaCpp 包装器，适配 llama_index 接口"""
@@ -178,7 +172,7 @@ def build_neo4j_graph(
                 )
                 return result["choices"][0]["message"]["content"]
 
-        llm = LlamaCppWrapper(llama_llm)
+        llm = LlamaCppWrapper(provider.get_llama())
         print(f"✅ LLM 初始化完成: {llm.model_name}")
 
         print(f"🤖 使用 LLM: {llm}")
@@ -339,7 +333,7 @@ def main():
             return
 
         # 步骤 3: 构建 Neo4j 图谱
-        build_neo4j_graph(documents, neo4j_config)
+        loop.run_until_complete(build_neo4j_graph(documents, neo4j_config))
 
     finally:
         loop.close()

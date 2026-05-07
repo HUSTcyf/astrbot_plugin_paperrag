@@ -412,7 +412,7 @@ def test_chunking_with_real_pdf(skip_llm: bool = False):
 
     # 检查4：LlamaCppVLMProvider 是否实现
     try:
-        from idea.llama_cpp_vlm_provider import LlamaCppVLMProvider
+        from provider.llama_cpp_vlm import LlamaCppVLMProvider
         print(f"  [OK] LlamaCppVLMProvider 已实现")
         # 检查模型路径是否存在
         provider = LlamaCppVLMProvider.__new__(LlamaCppVLMProvider)
@@ -442,7 +442,7 @@ async def test_local_llm_preprocessing() -> bool:
 
     # 1. 加载 VLM Provider
     try:
-        from idea.llama_cpp_vlm_provider import LlamaCppVLMProvider
+        from provider.llama_cpp_vlm import LlamaCppVLMProvider
     except ImportError as e:
         print(f"  [FAIL] LlamaCppVLMProvider 导入失败: {e}")
         return False
@@ -480,7 +480,7 @@ async def test_local_llm_preprocessing() -> bool:
         return False
 
     # 注入测试用的 vlm_provider（复用已初始化的单例）
-    import idea.llama_cpp_vlm_provider as llama_module
+    import provider.llama_cpp_vlm as llama_module
     llama_module._vlm_provider_instance = vlm_provider
 
     parser = HybridPDFParser(

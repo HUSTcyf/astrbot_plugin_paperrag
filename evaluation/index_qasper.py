@@ -290,7 +290,10 @@ async def index_papers(
         - total_indexed: 索引的段落数量
         - paper_stats: {paper_id: {"file_name": ..., "chunk_count": ..., "paper_title": ...}, ...}
     """
-    from ..embedding.embedding_providers import create_embedding_provider
+    try:
+        from ..embedding.embedding_providers import create_embedding_provider
+    except ImportError:
+        from embedding.embedding_providers import create_embedding_provider
     from legacy.milvus_manager import PaperMilvusManager
 
     # 使用覆盖路径或配置中的路径

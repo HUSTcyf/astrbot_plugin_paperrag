@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pymilvus import connections, Collection
 
-from idea.llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
+from provider.llama_cpp_vlm import get_llama_cpp_vlm_provider
 
 
 # ============================================================================

@@ -262,131 +262,18 @@ class RetrievalHelpersMixin(PluginCoreBase):
 
 请给出答案："""
 
-    def _extract_provider_text(self, response: Any) -> str:
-        """Normalize common AstrBot/LLM provider response shapes to text."""
-        if response is None:
-            return ""
-        if isinstance(response, str):
-            return response.strip()
-
-        result_chain_text = self._extract_message_chain_text(getattr(response, "result_chain", None))
-        if result_chain_text:
-            return result_chain_text
-
-        for attr in ("content", "text"):
-            value = getattr(response, attr, None)
-            if value:
-                return str(value).strip()
-
-        if isinstance(response, dict):
-            for key in ("content", "text", "answer", "message"):
-                value = response.get(key)
-                if value:
-                    value_text = self._extract_message_chain_text(value)
-                    return value_text or str(value).strip()
-            result_chain_text = self._extract_message_chain_text(response.get("result_chain"))
-            if result_chain_text:
-                return result_chain_text
-
-        raw_completion_text = self._extract_raw_completion_text(getattr(response, "raw_completion", None))
-        if raw_completion_text:
-            return raw_completion_text
-
-        return str(response).strip()
-
-    def _extract_message_chain_text(self, value: Any) -> str:
-        """Extract plain text from AstrBot MessageChain-like values."""
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value.strip()
-
-        chain = getattr(value, "chain", None)
-        if chain is None and isinstance(value, dict):
-            chain = value.get("chain")
-        if chain is None:
-            return ""
-
-        parts = []
-        for component in chain:
-            text = getattr(component, "text", None)
-            if text is None and isinstance(component, dict):
-                text = component.get("text")
-            if text:
-                parts.append(str(text))
-
-        return "\n".join(parts).strip()
-
-    def _extract_raw_completion_text(self, raw_completion: Any) -> str:
-        """Extract assistant content from OpenAI-compatible raw completion objects."""
-        if raw_completion is None:
-            return ""
-
-        choices = getattr(raw_completion, "choices", None)
-        if choices is None and isinstance(raw_completion, dict):
-            choices = raw_completion.get("choices")
-        if not choices:
-            return ""
-
-        first_choice = choices[0]
-        message = getattr(first_choice, "message", None)
-        if message is None and isinstance(first_choice, dict):
-            message = first_choice.get("message")
-        if message is None:
-            return ""
-
-        content = getattr(message, "content", None)
-        if content is None and isinstance(message, dict):
-            content = message.get("content")
-        return str(content).strip() if content else ""
-
-    async def _get_text_llm_provider(self) -> Any:
-        """Get the configured text LLM provider, falling back to the active session provider."""
-        engine = self._get_engine()
-        if engine is not None and hasattr(engine, "_ensure_llm_initialized"):
-            try:
-                return await engine._ensure_llm_initialized()
-            except Exception as e:
-                logger.warning(f"[PaperRAG] 配置文本 LLM 初始化失败，尝试当前会话 Provider: {e}")
-
-        try:
-            if self.context is not None and hasattr(self.context, "get_using_provider"):
-                provider = self.context.get_using_provider()
-                if provider:
-                    return provider
-                logger.warning("[PaperRAG] get_using_provider() 返回 None，无可用 Provider")
-            else:
-                logger.warning("[PaperRAG] context 不可用或无 get_using_provider 方法")
-        except Exception as e:
-            logger.warning(f"[PaperRAG] 获取当前会话 Provider 失败: {e}")
-
-        return None
-
     async def _generate_rag_answer(self, query: str, sources: list) -> str:
         """Generate a grounded RAG answer from retrieved sources."""
         if not sources:
             return "未找到可用于回答的本地论文片段。"
 
         prompt = self._build_rag_answer_prompt(query, sources)
-        provider = await self._get_text_llm_provider()
-        if provider is None:
-            return "已完成检索，但未找到可用的文本 LLM Provider，因此无法生成回答。"
-
         try:
-            if hasattr(provider, "text_chat"):
-                response = await provider.text_chat(
-                    prompt=prompt,
-                    contexts=[],
-                    temperature=0.2,
-                    max_tokens=2048,
-                )
-            elif hasattr(provider, "generate"):
-                response = await provider.generate(prompt)
-            else:
-                return "已完成检索，但当前 LLM Provider 不支持 text_chat/generate，无法生成回答。"
-
-            answer = self._extract_provider_text(response)
+            from provider.llm_utils import call_llm
+            answer = await call_llm(prompt, self.context, self.config, temperature=0.2)
             return answer or "LLM 未返回有效回答。"
+        except RuntimeError as e:
+            return f"已完成检索，但{e}"
         except Exception as e:
             logger.error(f"[PaperRAG] RAG回答生成失败: {e}")
             return f"回答生成失败: {e}"

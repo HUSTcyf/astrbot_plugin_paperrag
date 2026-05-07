@@ -12,8 +12,15 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from astrbot.api import logger
 from astrbot.api.star import Context, Star
 
-from ..plugin_common import SUPPORTED_DOC_EXTENSIONS, _is_hidden_file
-from ..rag.rag_engine import RAGConfig, create_rag_engine
+try:
+    from ..plugin_common import SUPPORTED_DOC_EXTENSIONS, _is_hidden_file
+except ImportError:
+    from plugin_common import SUPPORTED_DOC_EXTENSIONS, _is_hidden_file
+
+try:
+    from ..rag.rag_engine import RAGConfig, create_rag_engine
+except ImportError:
+    from rag.rag_engine import RAGConfig, create_rag_engine
 
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 
@@ -124,7 +131,10 @@ class PluginCoreBase(Star):
 
     def _create_graph_rag_config(self) -> "GraphRAGConfig":
         """创建 GraphRAGConfig（从配置中读取所有设置）"""
-        from ..graphrag.graph_rag_engine import GraphRAGConfig
+        try:
+            from ..graphrag.graph_rag_engine import GraphRAGConfig
+        except ImportError:
+            from graphrag.graph_rag_engine import GraphRAGConfig
 
         graph_rag_config = self.config.get("graph_rag", {})
         multimodal_config = graph_rag_config.get("multimodal_extraction", {})
@@ -164,7 +174,7 @@ class PluginCoreBase(Star):
 
 只需回答"是"或"否"，不要解释。"""
         try:
-            from ..idea.llama_cpp_vlm_provider import get_cached_llama_cpp_provider
+            from provider.llama_cpp_vlm import get_cached_llama_cpp_provider
 
             vlm_provider = get_cached_llama_cpp_provider()
             if vlm_provider and vlm_provider._initialized and vlm_provider._llama:
@@ -176,7 +186,7 @@ class PluginCoreBase(Star):
                 return True, "学术问题"
 
             logger.info("[_check_academic_intent] VLM未就绪，触发初始化...")
-            from ..idea.llama_cpp_vlm_provider import init_llama_cpp_vlm_provider
+            from provider.llama_cpp_vlm import init_llama_cpp_vlm_provider
 
             model_dir = _PLUGIN_DIR / "models" / "Qwen3.5-9B-GGUF"
             model_path = model_dir / "Qwen3.5-9B-UD-Q4_K_XL.gguf"
@@ -221,12 +231,18 @@ class PluginCoreBase(Star):
                         response = await llm_provider.generate(query)
                         return response.text.strip() if hasattr(response, "text") else str(response)
             else:
-                from ..idea.llama_cpp_vlm_provider import get_cached_llama_cpp_provider
+                try:
+                    from provider.llama_cpp_vlm import get_cached_llama_cpp_provider
+                except ImportError:
+                    from provider.llama_cpp_vlm import get_cached_llama_cpp_provider
                 vlm_provider = get_cached_llama_cpp_provider()
                 if not vlm_provider:
                     logger.error("[_llm_direct_answer] 本地 VLM Provider 不可用")
                 else:
-                    response = await vlm_provider.text_chat(prompt=query, temperature=0.7)
+                    response = await vlm_provider.text_chat(
+                        prompt=query,
+                        temperature=self.config.get("llama_vlm_temperature", 0.7),
+                    )
                     if hasattr(response, 'content'):
                         return response.content.strip()
                     else:
@@ -341,7 +357,10 @@ class PluginCoreBase(Star):
             return None
 
         try:
-            from ..graphrag.graph_rag_engine import GraphRAGEngine
+            try:
+                from ..graphrag.graph_rag_engine import GraphRAGEngine
+            except ImportError:
+                from graphrag.graph_rag_engine import GraphRAGEngine
             graph_config = self._create_graph_rag_config()
             engine_instance = GraphRAGEngine(graph_config, base_engine, self.context)
             await engine_instance.initialize()
@@ -437,7 +456,7 @@ class PluginCoreBase(Star):
             self._response_cache.clear()
 
         try:
-            from ..idea.llama_cpp_vlm_provider import reset_llama_cpp_vlm_provider
+            from provider.llama_cpp_vlm import reset_llama_cpp_vlm_provider
 
             reset_llama_cpp_vlm_provider()
             logger.info("[Llama.cpp-VLM] Provider 已清理")

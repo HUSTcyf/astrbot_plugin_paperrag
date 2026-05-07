@@ -263,8 +263,16 @@ def parse_inline_styles(text: str) -> List[Dict[str, Any]]:
 
 # ==================== JSON / LLM 响应解析 ====================
 
+def _strip_trailing_commas(text: str) -> str:
+    """Remove trailing commas before } or ] (common LLM JSON issue)."""
+    # Multiple passes to handle nested cases like },}
+    for _ in range(3):
+        text = re.sub(r',(\s*[}\]])', r'\1', text)
+    return text
+
+
 def parse_json_response(text: str) -> Optional[Dict]:
-    """从文本中解析 JSON（支持 ```json 包裹）"""
+    """从文本中解析 JSON（支持 ```json 包裹，容忍尾逗号）"""
     text = text.strip()
     if text.startswith("```"):
         parts = text.split("```", 2)
@@ -273,6 +281,7 @@ def parse_json_response(text: str) -> Optional[Dict]:
             if text.startswith("json"):
                 text = text[4:]
             text = text.strip()
+    text = _strip_trailing_commas(text)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -380,9 +389,11 @@ class IdeaEngineUtils(IdeaEngineBase):
     def _check_bright_data_config(self) -> bool:
         """检查 Bright Data MCP 是否已配置"""
         try:
-            mcp_config_path = self._get_ideas_dir().parent.parent.parent / "mcp_server.json"
+            # idea/utils.py → idea/ → astrbot_plugin_paperrag/ → plugins/ → data/
+            data_dir = Path(__file__).resolve().parent.parent.parent.parent
+            mcp_config_path = data_dir / "mcp_server.json"
             if not mcp_config_path.exists():
-                logger.warning("[IdeaEngine] mcp_server.json 不存在，Bright Data 搜索将不可用")
+                logger.warning(f"[IdeaEngine] mcp_server.json 不存在 (path={mcp_config_path})，Bright Data 搜索将不可用")
                 return False
             with open(mcp_config_path, "r", encoding="utf-8") as f:
                 mcp_config = json.load(f)

@@ -65,6 +65,15 @@ class LegacyPDFParser:
         """懒加载 BGE-M3 tokenizer"""
         if self._tokenizer is None:
             try:
+                from ...embedding.flag_embedding import get_flag_model
+                flag_model = get_flag_model()
+                if flag_model._initialized and flag_model.tokenizer is not None:
+                    self._tokenizer = flag_model.tokenizer
+                    return self._tokenizer
+            except Exception:
+                pass
+
+            try:
                 from ...embedding.unsloth_embedding import get_embedding_model
                 model_instance = get_embedding_model()
                 if model_instance is not None and model_instance.tokenizer is not None:

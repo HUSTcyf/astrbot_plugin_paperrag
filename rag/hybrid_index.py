@@ -352,7 +352,18 @@ class HybridIndexManager:
     async def _ensure_collection(self):
         """确保集合已创建"""
         if self._collection is not None:
-            return
+            # 连接可能已断开（Milvus 进程崩溃等），验证连接活跃性
+            try:
+                if not connections.has_connection(self.alias):
+                    logger.warning(f"[HybridIndexManager] 连接已断开 ({self.alias})，尝试重连")
+                    self._collection = None
+                    self._is_connected = False
+                else:
+                    return
+            except Exception:
+                logger.warning(f"[HybridIndexManager] 连接检查失败 ({self.alias})，尝试重连")
+                self._collection = None
+                self._is_connected = False
 
         try:
             if not self._is_connected:

@@ -17,7 +17,7 @@ class IdeaEngineBase:
     3. to_feishu_markdown - 格式化输出
     """
 
-    def __init__(self, context, rag_engine=None):
+    def __init__(self, context, rag_engine=None, **kwargs):
         """
         初始化创意引擎
 
@@ -25,12 +25,14 @@ class IdeaEngineBase:
             context: AstrBot上下文（用于LLM/VLM调用）
             rag_engine: RAG引擎实例
         """
+        super().__init__(**kwargs)
         self.context = context
         self._rag_engine = rag_engine
 
     def _get_ideas_dir(self) -> Path:
         """获取想法存储根目录，不存在则创建"""
-        # 向上三级: idea/datatypes.py -> idea/ -> plugin -> plugins -> data
-        ideas_dir = Path(__file__).parent.parent / "plugin_data" / "astrbot_plugin_paperrag" / "ideas"
+        # base.py → idea/ → astrbot_plugin_paperrag/ → plugins/ → data/
+        data_dir = Path(__file__).resolve().parent.parent.parent.parent
+        ideas_dir = data_dir / "plugin_data" / "astrbot_plugin_paperrag" / "ideas"
         ideas_dir.mkdir(parents=True, exist_ok=True)
         return ideas_dir

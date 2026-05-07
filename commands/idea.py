@@ -20,7 +20,10 @@ if TYPE_CHECKING:
 
 
 def _create_idea_engine(context, rag_engine):
-    from ..idea import IdeaEngine
+    try:
+        from ..idea import IdeaEngine
+    except ImportError:
+        from idea import IdeaEngine
 
     return IdeaEngine(context=context, rag_engine=rag_engine)
 
@@ -387,6 +390,41 @@ class IdeaCommandsMixin(PluginCoreBase):
         if not topic:
             yield event.plain_result("📚 Usage: /idea explore <研究主题>\nExample: /idea explore 大语言模型在医学诊断中的应用")
             return
+
+        # Agentic workflow 模式（config 开关控制）
+        if self.config.get("enable_agentic_ideas", False):
+            yield event.plain_result(f"🧠 Agentic Idea 生成中...\n主题: {topic}")
+            try:
+                from idea import run_agentic_ideas
+                rag_engine = self._get_engine()
+                result = await run_agentic_ideas(
+                    topic=topic,
+                    context=self.context,
+                    depth=depth,
+                    num_ideas=num_ideas,
+                    rag_engine=rag_engine,
+                    config=self.config,
+                )
+                # 流式输出各阶段
+                for step in result.get("steps", []):
+                    yield event.plain_result(step)
+                # 输出最终结果
+                final = result.get("final_output", "")
+                if final:
+                    yield event.plain_result(final)
+                saved = result.get("saved_paths", [])
+                if saved:
+                    yield event.plain_result(f"\n✅ 已保存 {len(saved)} 个想法到本地")
+                else:
+                    yield event.plain_result("⚠️ 想法未保存（请检查知识库是否有相关文档）")
+            except Exception as e:
+                logger.error(f"Agentic idea failed: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                yield event.plain_result(f"❌ Agentic Idea 生成失败: {e}")
+            return
+
+        # ===== 原有流程（enable_agentic_ideas=False） =====
 
         yield event.plain_result(f"🔍 正在分析研究主题...\n主题: {topic}")
 

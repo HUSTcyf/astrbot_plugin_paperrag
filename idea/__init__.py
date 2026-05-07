@@ -8,6 +8,7 @@
 
 from .datatypes import ResearchIdea, TopicAnalysis
 from .feishu_doc import IdeaEngineFeishuDoc
+from .agentic_workflow import run_agentic_ideas
 
 
 class IdeaEngine(IdeaEngineFeishuDoc):
@@ -33,4 +34,9 @@ class IdeaEngine(IdeaEngineFeishuDoc):
     pass
 
 
-__all__ = ["IdeaEngine", "ResearchIdea", "TopicAnalysis"]
+__all__ = [
+    "IdeaEngine",
+    "ResearchIdea",
+    "TopicAnalysis",
+    "run_agentic_ideas",
+]

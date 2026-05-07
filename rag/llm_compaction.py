@@ -29,7 +29,7 @@ class LLMCompactionMixin:
         """
         用 LLM 从论文首页文本中提取 title/abstract/authors。
         """
-        from idea.llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
+        from provider.llama_cpp_vlm import get_llama_cpp_vlm_provider
 
         vlm_provider = get_llama_cpp_vlm_provider()
         if vlm_provider is None:
@@ -48,7 +48,6 @@ class LLMCompactionMixin:
             response = await vlm_provider.text_chat(
                 prompt=prompt,
                 temperature=0.0,
-                max_tokens=2048,
             )
         except Exception as e:
             logger.warning(f"⚠️ LLM 调用失败: {e}")

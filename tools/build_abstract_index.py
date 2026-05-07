@@ -649,12 +649,11 @@ class LocalGGUFClient:
     def is_model_loaded(self) -> bool:
         """检查模型是否已加载（通过 LlamaCppVLMProvider 单例）"""
         try:
-            # 尝试获取已缓存的 Provider
-            from ..idea.llama_cpp_vlm_provider import get_cached_llama_cpp_provider
+            from provider.llama_cpp_vlm import get_cached_llama_cpp_provider
             provider = get_cached_llama_cpp_provider()
-            if provider is not None and provider._initialized and provider._llama is not None:
+            if provider is not None and provider._initialized:
                 logger.info(f"✅ 检测到已加载的 LlamaCppVLMProvider 模型: {provider.model_path}")
-                self._llama = provider._llama
+                self._llama = provider.get_llama()
                 self._is_loaded = True
                 return True
             return False
@@ -665,44 +664,24 @@ class LocalGGUFClient:
             return False
 
     async def load(self) -> bool:
-        """加载 GGUF 模型"""
+        """加载 GGUF 模型（通过共享 provider）"""
         if self._is_loaded and self._llama is not None:
             logger.info("✅ GGUF 模型已在内存中，直接复用")
             return True
 
-        model_path = self._resolve_path(self._model_path)
-        mmproj_path = self._resolve_path(self._mmproj_path)
-
-        # 检查文件是否存在
-        if not os.path.exists(model_path):
-            logger.error(f"模型文件不存在: {model_path}")
-            return False
-        if not os.path.exists(mmproj_path):
-            logger.error(f"mmproj 文件不存在: {mmproj_path}")
-            return False
-
-        logger.info(f"🔄 正在加载 GGUF 模型: {model_path}")
-        logger.info(f"   mmproj: {mmproj_path}")
-
         try:
-            from llama_cpp import Llama
-            import concurrent.futures
+            from provider.llama_cpp_vlm import init_llama_cpp_vlm_provider
 
-            def _load():
-                return Llama(
-                    model_path=model_path,
-                    mmproj=mmproj_path,
-                    n_ctx=4096,
-                    n_gpu_layers=99,
-                    n_batch=32,
-                    verbose=False,
-                )
-
-            loop = asyncio.get_event_loop()
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                self._llama = await loop.run_in_executor(executor, _load)
+            provider = init_llama_cpp_vlm_provider(
+                model_path=self._model_path,
+                mmproj_path=self._mmproj_path,
+                n_ctx=4096,
+                n_gpu_layers=99,
+            )
+            await provider.initialize()
+            self._llama = provider.get_llama()
             self._is_loaded = True
-            logger.success(f"✅ GGUF 模型加载成功")
+            logger.success(f"✅ GGUF 模型加载成功: {provider.model_path}")
             return True
 
         except Exception as e:
@@ -1261,7 +1240,10 @@ async def build_abstract_index(
         logger.info("✅ GGUF LLM 模型已加载，直接复用")
     else:
         logger.info("🔄 GGUF LLM 未加载，将在需要时加载")
-        await llm_client.load()
+        if await llm_client.load():
+            logger.success("GGUF LLM 已就绪")
+        else:
+            logger.warning("GGUF LLM 加载失败，将使用规则提取作为兜底")
 
     # 初始化摘要索引管理器
     plugin_dir = Path(__file__).parent

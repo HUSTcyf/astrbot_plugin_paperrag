@@ -216,6 +216,7 @@ evaluation/freeapi.json
 *.ipynb
 *.tgz
 *.zip
+*.html
 *.code-workspace
 .DS_Store
 .planning/
@@ -224,4 +225,3 @@ evaluation/freeapi.json
 .claude/
 .refactor/
 .env*
-agentic_rag/

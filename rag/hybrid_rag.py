@@ -71,6 +71,7 @@ try:
         create_embedding_provider,
         UnslothEmbeddingProvider,
         AstrBotEmbeddingProvider,
+        FlagEmbeddingProvider,
     )
     from .rag_engine import RAGConfig
 except ImportError:
@@ -80,6 +81,7 @@ except ImportError:
         create_embedding_provider,
         UnslothEmbeddingProvider,
         AstrBotEmbeddingProvider,
+        FlagEmbeddingProvider,
     )
     from .rag_engine import RAGConfig
 
@@ -89,14 +91,17 @@ try:
 except ImportError:
     from ..embedding.unsloth_embedding import get_embedding_model
 
+# 导入 FlagEmbedding 模型（跨平台备选）
+try:
+    from embedding.flag_embedding import get_flag_model
+except ImportError:
+    from ..embedding.flag_embedding import get_flag_model
+
 # 导入 Llama.cpp VLM Provider（用于图片问答）
 LLAMA_CPP_VLM_AVAILABLE = False
 LLAMA_CPP_VLM_IMPORT_ERROR = None
 try:
-    try:
-        from idea.llama_cpp_vlm_provider import LlamaCppVLMProvider
-    except ImportError:
-        from ..idea.llama_cpp_vlm_provider import LlamaCppVLMProvider
+    from provider.llama_cpp_vlm import LlamaCppVLMProvider
     LLAMA_CPP_VLM_AVAILABLE = True
     logger.info("[Llama.cpp-VLM] Llama.cpp VLM Provider 已加载")
 except ImportError as e:
@@ -175,11 +180,15 @@ class SparseRetriever(BaseRetriever):
         self._embedding_model = None
 
     def _get_embedding_model(self):
-        """获取 Unsloth embedding 模型"""
+        """获取 embedding 模型（优先已初始化的 FlagEmbedding，降级 Unsloth）"""
         if self._embedding_model is None:
-            self._embedding_model = get_embedding_model()
+            flag = get_flag_model()
+            if flag._initialized:
+                self._embedding_model = flag
+            else:
+                self._embedding_model = get_embedding_model()
             if self._embedding_model is None:
-                logger.error("[PaperRAG] get_embedding_model() 返回 None，embedding 模型不可用")
+                logger.error("[PaperRAG] embedding 模型不可用（FlagEmbedding 和 Unsloth 均返回 None）")
         return self._embedding_model
 
     async def retrieve(self, query: str, top_k: int = 20) -> QueryResult:
@@ -395,6 +404,7 @@ class BM25Retriever:
 
 
 class MultiVectorReranker:
+    """多向量 ColBERT 式 Reranker"""
     """
     ColBERT 式多向量 reranker
 
@@ -411,11 +421,15 @@ class MultiVectorReranker:
         self._colbert_storage = storage
 
     def _get_embedding_model(self):
-        """获取 Unsloth embedding 模型"""
+        """获取 embedding 模型（优先已初始化的 FlagEmbedding，降级 Unsloth）"""
         if self._embedding_model is None:
-            self._embedding_model = get_embedding_model()
+            flag = get_flag_model()
+            if flag._initialized:
+                self._embedding_model = flag
+            else:
+                self._embedding_model = get_embedding_model()
             if self._embedding_model is None:
-                logger.error("[PaperRAG] get_embedding_model() 返回 None，embedding 模型不可用")
+                logger.error("[PaperRAG] embedding 模型不可用（FlagEmbedding 和 Unsloth 均返回 None）")
         return self._embedding_model
 
     async def rerank(
@@ -833,14 +847,19 @@ class HybridRetriever(BaseRetriever):
         for i, item in enumerate(vector_results):
             vector_rank_map[item["text"]] = i + 1
 
-        # 构建 chunk_id -> text 映射（用于图谱增强）
-        chunk_id_to_text: Dict[str, str] = {}
+        # 构建 text -> chunk_id 映射（用于图谱增强）
+        text_to_chunk_id: Dict[str, str] = {}
+        paper_rank: Dict[str, int] = {}
         if has_graph:
             for item in vector_results:
                 meta = item.get("metadata", {})
-                cid = meta.get("chunk_id") or meta.get("source_chunk_id")
+                cid = meta.get("chunk_id") or meta.get("source_chunk_id") or meta.get("file_name")
                 if cid and cid in graph_chunk_boost:
-                    chunk_id_to_text[cid] = item["text"]
+                    text_to_chunk_id[item["text"]] = cid
+            # 按 boost_score 排序论文，分配 rank（RRF 兼容）
+            assert graph_chunk_boost is not None
+            ranked = sorted(graph_chunk_boost.items(), key=lambda x: x[1], reverse=True)
+            paper_rank = {cid: i + 1 for i, (cid, _) in enumerate(ranked)}
 
         # 稀疏结果按分数排序并分配 rank
         sorted_sparse = sorted(sparse_results.items(), key=lambda x: x[1], reverse=True)
@@ -893,13 +912,13 @@ class HybridRetriever(BaseRetriever):
                 b_rrf = alpha_b * (1.0 / (self._rrf_k + b_rank))
                 rrf_scores[text] += b_rrf
 
-            # 图谱增强：直接加到 RRF 分数上（图谱分数已经是 0-1 归一化的boost）
-            if has_graph and text in chunk_id_to_text:
-                cid = next(ck for ck, t in chunk_id_to_text.items() if t == text)
-                boost = graph_chunk_boost[cid]  # type: ignore[arg-type]
-                g_rrf = alpha_g * boost
+            # 图谱增强：RRF 兼容公式，与其他通道量级对齐
+            if has_graph and text in text_to_chunk_id:
+                cid = text_to_chunk_id[text]
+                g_rank = paper_rank.get(cid, len(paper_rank) + 1)
+                g_rrf = alpha_g * (1.0 / (self._rrf_k + g_rank))
                 rrf_scores[text] += g_rrf
-                logger.debug(f"[HybridRetriever] graph boost: chunk_id={cid}, text={text[:40]}, boost={boost:.4f}, added_rrf={g_rrf:.6f}")
+                logger.debug(f"[HybridRetriever] graph boost: chunk_id={cid}, text={text[:40]}, graph_rank={g_rank}, added_rrf={g_rrf:.6f}")
 
         # 按分数降序排列
         sorted_texts = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
@@ -1328,7 +1347,7 @@ class HybridRAGEngine:
         self._parser: HybridPDFParser = cast(HybridPDFParser, None)
         self._index_manager: HybridIndexManager = cast(HybridIndexManager, None)
         self._abstract_manager: Optional[Any] = None
-        self._embed_provider: Union[UnslothEmbeddingProvider, AstrBotEmbeddingProvider, None] = None
+        self._embed_provider: Union[FlagEmbeddingProvider, UnslothEmbeddingProvider, AstrBotEmbeddingProvider, None] = None
         self._llm_client: Any = cast(Any, None)
         self._retriever: Union[VectorRetriever, HybridRetriever] = cast(Any, None)
         self._colbert_storage: Any = cast(Any, None)
@@ -1356,7 +1375,7 @@ class HybridRAGEngine:
         logger.info("✅ HybridPDFParser初始化完成")
         return self._parser
 
-    async def _ensure_embed_provider_initialized(self) -> Union[UnslothEmbeddingProvider, AstrBotEmbeddingProvider]:
+    async def _ensure_embed_provider_initialized(self) -> Union[FlagEmbeddingProvider, UnslothEmbeddingProvider, AstrBotEmbeddingProvider]:
         """确保Embedding Provider已初始化"""
         if self._embed_provider_initialized:
             assert self._embed_provider is not None
@@ -1391,7 +1410,7 @@ class HybridRAGEngine:
             return self._llm_provider
 
         try:
-            from idea.llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
+            from provider.llama_cpp_vlm import get_llama_cpp_vlm_provider
             self._llm_provider = get_llama_cpp_vlm_provider()
             await self._llm_provider.initialize()
             logger.info("✅ LLM Provider 初始化完成（噪声过滤）")
@@ -1415,10 +1434,7 @@ class HybridRAGEngine:
         if not provider_id:
             # text_provider_id 未配置时，默认使用本地VLM
             try:
-                try:
-                    from idea.llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
-                except ImportError:
-                    from ..idea.llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
+                from provider.llama_cpp_vlm import get_llama_cpp_vlm_provider
                 vlm_provider = get_llama_cpp_vlm_provider()
                 if vlm_provider and vlm_provider._initialized:
                     self._llm_client = vlm_provider
@@ -1703,7 +1719,10 @@ class HybridRAGEngine:
         # 如果启用了 Graph RAG，连接图谱检索器作为第四通道
         if getattr(self.config, 'enable_graph_rag', False):
             try:
-                from ..graphrag.graph_rag_engine import GraphRAGConfig, create_graph_rag_engine
+                try:
+                    from ..graphrag.graph_rag_engine import GraphRAGConfig, create_graph_rag_engine
+                except ImportError:
+                    from graphrag.graph_rag_engine import GraphRAGConfig, create_graph_rag_engine
                 graph_config = GraphRAGConfig.from_rag_config(self.config)
                 graph_engine = create_graph_rag_engine(graph_config, self, self.context)
                 pg_retriever = await graph_engine.get_retriever()

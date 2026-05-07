@@ -21,6 +21,10 @@ os.environ.setdefault('PYTORCH_MPS_HIGH_WATERMARK_RATIO', '0.0')
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import register
 
+import logging
+for _ln in ("neo4j",):
+    logging.getLogger(_ln).setLevel(logging.WARNING)
+
 from .commands import ArxivCommandsMixin, GraphCommandsMixin, IdeaCommandsMixin, PaperCommandsMixin
 from .commands.base import PluginCoreBase
 
@@ -35,11 +39,36 @@ from .commands.base import PluginCoreBase
 class PaperRAGPlugin(PaperCommandsMixin, ArxivCommandsMixin, GraphCommandsMixin, IdeaCommandsMixin, PluginCoreBase):
     """论文RAG检索插件"""
 
+    def __init__(self, context, config: dict = {}):
+        super().__init__(context, config)
+        # 注册 agentic_rag 为 LLM Tool
+        context.register_llm_tool(
+            name="paper_arag",
+            func_args=[
+                {"type": "string", "name": "query", "description": "复杂论文问答查询，支持多跳推理、对比分析、引用溯源"},
+                {"type": "integer", "name": "top_k", "description": "召回数，默认5", "default": 5}
+            ],
+            desc="用于需要多跳推理、对比分析、引用溯源的复杂论文问题",
+            func_obj=self._agentic_rag_tool,
+        )
+        # 注册 ReAct Agent 为 LLM Tool
+        context.register_llm_tool(
+            name="paper_react",
+            func_args=[
+                {"type": "string", "name": "query", "description": "论文问答查询，Agent 自主决定使用哪些检索工具"},
+                {"type": "integer", "name": "top_k", "description": "召回数，默认5", "default": 5}
+            ],
+            desc="用于论文问答的智能 Agent，可自主选择向量检索或知识图谱检索",
+            func_obj=self._react_rag_tool,
+        )
+
     # ==================== Paper 命令组 ====================
     @filter.command_group("paper")
     def paper_commands(self):
         """Paper RAG command group
         search         - Search documents and answer questions
+        arag           - Agentic RAG complex query (static DAG)
+        react          - Tool-Using Agent (ReAct mode, dynamic tool selection)
         list           - List indexed documents
         add            - Add documents to knowledge base (PDF/Word/TXT supported)
         addf           - Add a single document to knowledge base
@@ -61,9 +90,9 @@ class PaperRAGPlugin(PaperCommandsMixin, ArxivCommandsMixin, GraphCommandsMixin,
         pass
 
     @paper_commands.command("search")
-    async def cmd_search(self, event: AstrMessageEvent, query: str = '', mode: str = "rag", top_k: int = 5):
+    async def cmd_search(self, event: AstrMessageEvent, query: str = '', top_k: int = 5):
         """Search document library and answer questions"""
-        async for result in self._paper_search(event, query=query, mode=mode, top_k=top_k):
+        async for result in self._paper_search(event, query=query, top_k=top_k):
             yield result
 
     @paper_commands.command("list")
@@ -110,6 +139,26 @@ class PaperRAGPlugin(PaperCommandsMixin, ArxivCommandsMixin, GraphCommandsMixin,
     async def cmd_abstractstats(self, event: AstrMessageEvent, top_k: int = 20):
         """Show abstract extraction statistics"""
         async for result in self._paper_abstractstats(event, top_k=top_k):
+            yield result
+
+    @paper_commands.command("arag")
+    async def cmd_arag(self, event: AstrMessageEvent, query: str = '', top_k: int = 5):
+        """Agentic RAG complex query (multi-hop reasoning / comparison / citation tracing)
+
+        Args:
+            top_k: Number of results to return (default: 5)
+        """
+        async for result in self._agentic_rag(event, query=query, top_k=top_k):
+            yield result
+
+    @paper_commands.command("react")
+    async def cmd_react(self, event: AstrMessageEvent, query: str = '', top_k: int = 5):
+        """Tool-Using Agent (ReAct mode) for paper Q&A
+
+        Args:
+            top_k: Number of results to return (default: 5)
+        """
+        async for result in self._react_rag(event, query=query, top_k=top_k):
             yield result
 
     @filter.permission_type(filter.PermissionType.ADMIN)

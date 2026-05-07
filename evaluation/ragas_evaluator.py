@@ -189,8 +189,11 @@ class RAGQueryWrapper:
             except (json.JSONDecodeError, TypeError):
                 pass
             return text
+        except asyncio.TimeoutError:
+            logger.warning(f"[RAGQueryWrapper] LLM answer 生成超时 (120s): api_base={self._llm_base_url}, model={self._llm_model}")
+            return ""
         except Exception as e:
-            logger.warning(f"[RAGQueryWrapper] LLM answer 生成失败: {e}")
+            logger.warning(f"[RAGQueryWrapper] LLM answer 生成失败: {type(e).__name__}: {e}")
             return ""
 
 

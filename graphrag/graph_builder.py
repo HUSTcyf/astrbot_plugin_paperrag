@@ -24,6 +24,30 @@ from typing import Dict, Any, List, Optional, TYPE_CHECKING
 from pathlib import Path
 from dataclasses import dataclass
 
+# Token 计算（精确计算，避免上下文溢出）
+try:
+    import tiktoken
+    _TOKEN_ENCODER: Optional[Any] = None
+except ImportError:
+    tiktoken = None
+    _TOKEN_ENCODER = None
+
+def _get_token_encoder():
+    """获取 tiktoken 编码器（懒加载单例）"""
+    global _TOKEN_ENCODER
+    if _TOKEN_ENCODER is None and tiktoken is not None:
+        _TOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
+    return _TOKEN_ENCODER
+
+def count_tokens(text: str) -> int:
+    """精确计算文本的 token 数量（使用 tiktoken）"""
+    encoder = _get_token_encoder()
+    if encoder:
+        return len(encoder.encode(text))
+    # Fallback：估算 1 token ≈ 4 字符
+    return len(text) // 4
+
+
 from astrbot.api import logger
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -111,7 +135,7 @@ def _vlm_cache_key(text: str, image_path: str) -> str:
 
 # 延迟导入避免循环依赖
 if TYPE_CHECKING:
-    from .graph_rag_engine import SimplePropertyGraphStoreAdapter, GraphRAGConfig
+    from .graph_rag_engine import GraphRAGConfig
 
 
 # ============================================================================
@@ -125,7 +149,7 @@ class LocalLLMConfig:
     mmproj_path: str = "./models/Qwen3.5-9B-GGUF/mmproj-BF16.gguf"
     n_ctx: int = 8192
     n_gpu_layers: int = 99
-    max_tokens: int = 4096
+    max_tokens: int = 8192
     temperature: float = 0.1
 
 
@@ -530,15 +554,16 @@ class MultimodalGraphBuilder:
         return LocalLLMConfig(
             model_path=model_path,
             mmproj_path=mmproj_path,
-            n_ctx=8192,
+            n_ctx=self.config.llm_n_ctx if hasattr(self.config, 'llm_n_ctx') else 16384,
             n_gpu_layers=99,
+            max_tokens=self.config.llm_max_tokens if hasattr(self.config, 'llm_max_tokens') else 8192,
             temperature=0.1,
         )
 
     async def _ensure_llm_initialized(self):
         """确保 LLM 已初始化 - 使用 LlamaCppVLMProvider"""
         if self._llm is None:
-            from ..idea.llama_cpp_vlm_provider import (
+            from provider.llama_cpp_vlm import (
                 get_cached_llama_cpp_provider,
                 init_llama_cpp_vlm_provider,
             )
@@ -560,7 +585,6 @@ class MultimodalGraphBuilder:
 
     def _load_grammars(self):
         """从 JSON schema 文件生成 grammar，约束 LLM 输出为合法 JSON"""
-        import json
         from llama_cpp import LlamaGrammar
 
         triplet_path = _GRAMMAR_DIR / "triplet_schema.json"
@@ -725,6 +749,7 @@ class MultimodalGraphBuilder:
 
             # 构建批量 prompt（排除图像节点，它们由 VLM 单独处理）
             chunks_text = []
+            chunk_label_to_valid_idx: dict[int, int] = {}  # [Chunk N] label → valid_nodes index
             text_only_count = 0
             for i, node in enumerate(valid_nodes):
                 if id(node) in nodes_with_images_set and self.config.multimodal_enabled:
@@ -732,6 +757,7 @@ class MultimodalGraphBuilder:
                 text = node.text if hasattr(node, 'text') else str(node)
                 text_only_count += 1
                 chunks_text.append(f"[Chunk {text_only_count}] {text}")
+                chunk_label_to_valid_idx[text_only_count] = i
 
             if not chunks_text:
                 # 全部是图像节点，跳过批处理 LLM 调用
@@ -744,31 +770,92 @@ class MultimodalGraphBuilder:
                 )
                 user_prompt = f"Extract triplets from the following text chunks:\n\n{combined_text}\n\nExtract all entity-relationship triplets:"
 
-                # 检查是否超出上下文长度（粗略估算：1 token ≈ 4 字符）
-                total_tokens = (len(system_prompt) + len(user_prompt)) // 4
+                # 检查是否超出上下文长度（精确计算）
+                system_tokens = count_tokens(system_prompt)
+                user_prefix_tokens = count_tokens("Extract triplets from the following text chunks:\n\n")
+                user_suffix_tokens = count_tokens("\n\nExtract all entity-relationship triplets:")
+                content_tokens = count_tokens(combined_text)
+                # n_ctx 覆盖 prompt + 生成，必须为输出预留空间
                 max_context = self._llm_config.n_ctx if hasattr(self, '_llm_config') else 4096
+                max_output = self._llm_config.max_tokens if hasattr(self, '_llm_config') else 4096
+                total_tokens = system_tokens + user_prefix_tokens + content_tokens + user_suffix_tokens + max_output
+
                 if total_tokens > max_context:
                     logger.warning(
                         f"[Graph-LLM] ⚠️ 批次 {batch_idx + 1}/{total_batches} 超出上下文长度: "
-                        f"预估 {total_tokens} tokens > {max_context} tokens "
-                        f"(chars: system={len(system_prompt)}, user={len(user_prompt)})"
+                        f"{total_tokens} tokens (含输出预算 {max_output}) > {max_context} tokens，自动拆分"
+                    )
+                    # 预算 = n_ctx - system - overhead - max_tokens(输出)
+                    budget = max_context - max_output - system_tokens - user_prefix_tokens - user_suffix_tokens
+                    if budget <= 0:
+                        budget = max_context // 4  # 极端情况：至少保留 1/4 给内容
+
+                    # 统计每个 chunk 的 token 数
+                    chunk_tokens_list = [count_tokens(c) for c in chunks_text]
+                    avg_chunk_tokens = sum(chunk_tokens_list) / len(chunk_tokens_list) if chunk_tokens_list else 200
+
+                    # 安全每组 chunk 数（每个 chunk 留 50% buffer）
+                    safe_chunks = max(1, int(budget / (avg_chunk_tokens * 1.5)))
+                    num_chunks = len(chunks_text)
+                    num_splits = (num_chunks + safe_chunks - 1) // safe_chunks
+
+                    logger.warning(
+                        f"[Graph-LLM] 批次 {batch_idx + 1} 拆分为 {num_splits} 组 "
+                        f"(共 {num_chunks} chunks，每组约 {safe_chunks} 个)"
                     )
 
-                # 调用 LLM（使用 GBNF grammar 约束输出）
-                assert self._llm is not None
-                response = await self._llm.text_chat(
-                    prompt=user_prompt,
-                    system_prompt=system_prompt,
-                    max_tokens=self._llm_config.max_tokens,
-                    grammar=self._triplet_grammar,
-                )
-                response_text = response.content if hasattr(response, 'content') else str(response)
+                    if self._triplet_grammar is None:
+                        logger.error(
+                            "[Graph-LLM] Grammar 未加载，分块路径的约束生成已禁用。"
+                            "请检查 triplet_schema.json。"
+                        )
 
-                # 调试：记录完整响应
-                logger.info(f"[Graph-LLM] 批次 {batch_idx + 1} LLM响应长度: {len(response_text)}, 响应: {repr(response_text)}")
+                    all_triplets = []
+                    for i in range(num_splits):
+                        start = i * safe_chunks
+                        end = min(start + safe_chunks, num_chunks)
+                        chunk_group = chunks_text[start:end]
 
-                # 解析 JSON 响应
-                triplets = self._parse_json_response(response_text)
+                        try:
+                            chunk_result = await self._call_llm_for_chunks(
+                                chunk_group, self.config.max_triplets_per_chunk * len(chunk_group),
+                                batch_idx, f"split{i+1}"
+                            )
+                            chunk_triplets = self._parse_json_response(chunk_result) if chunk_result else []
+
+                            group_text = "\n\n".join(chunk_group)
+                            group_tokens = count_tokens(system_prompt) + count_tokens(group_text) + 100
+                            logger.info(f"[Graph-LLM] 分组 {i+1}/{num_splits}: {len(chunk_group)} chunks, 约 {group_tokens} tokens, {len(chunk_triplets)} triplets")
+
+                            all_triplets.extend(chunk_triplets)
+                        except Exception as group_err:
+                            logger.error(
+                                f"[Graph-LLM] 分组 {i+1}/{num_splits} 失败（已跳过，继续处理其余分组）: {group_err}"
+                            )
+                    triplets = all_triplets
+                else:
+                    # 调用 LLM（使用 GBNF grammar 约束输出）
+                    assert self._llm is not None
+
+                    if self._triplet_grammar is None:
+                        logger.error(
+                            "[Graph-LLM] Grammar 未加载，grammar 约束已禁用。"
+                            "输出可能不符合预期格式。请检查 triplet_schema.json。"
+                        )
+
+                    response = await self._llm.text_chat(
+                        prompt=user_prompt,
+                        system_prompt=system_prompt,
+                        max_tokens=self._llm_config.max_tokens,
+                        grammar=self._triplet_grammar,
+                    )
+                    response_text = response.content if hasattr(response, 'content') else str(response)
+
+                    # 调试：记录完整响应
+                    logger.info(f"[Graph-LLM] 批次 {batch_idx + 1} LLM响应长度: {len(response_text)}")
+
+                    # 解析 JSON 响应
+                    triplets = self._parse_json_response(response_text)
 
             # 如果有图片节点，使用多模态处理
             if nodes_with_images:
@@ -806,15 +893,15 @@ class MultimodalGraphBuilder:
                 if not head or not relation or not tail:
                     continue
 
-                # 从 evidence 中提取 chunk 索引
+                # 从 evidence 中提取 chunk 索引，通过 mapping 定位 valid_nodes
                 evidence = triplet.get("evidence", "")
                 chunk_idx = 0
-                for i in range(1, len(valid_nodes) + 1):
-                    if f"[Chunk {i}]" in evidence:
-                        chunk_idx = i - 1
+                for label in range(1, text_only_count + 1):
+                    if f"[Chunk {label}]" in evidence:
+                        chunk_idx = chunk_label_to_valid_idx.get(label, 0)
                         break
 
-                node = valid_nodes[chunk_idx] if chunk_idx < len(valid_nodes) else valid_nodes[0]
+                node = valid_nodes[chunk_idx]
 
                 # Skip image nodes when multimodal enabled — VLM handles them separately
                 if node in nodes_with_images and self.config.multimodal_enabled:
@@ -862,15 +949,16 @@ class MultimodalGraphBuilder:
             return result
 
         except Exception as e:
-            logger.error(f"批量处理失败: {e}")
-            return result
+            logger.error(f"[Graph-LLM] 批次 {batch_idx + 1}/{total_batches} 处理失败: {e}")
+            return e
 
     async def _process_node(
         self,
         node: Any,
         graph_store: Any
     ) -> Optional[Dict[str, Any]]:
-        """处理单个节点"""
+        """处理单个节点，失败时返回 Exception"""
+        chunk_id = "unknown"
         try:
             text = node.text if hasattr(node, 'text') else str(node)
             metadata = node.metadata if hasattr(node, 'metadata') else {}
@@ -939,8 +1027,41 @@ class MultimodalGraphBuilder:
             return result
 
         except Exception as e:
-            logger.error(f"处理节点失败: {e}")
-            return None
+            logger.error(f"[Graph-LLM] 节点 {chunk_id} 处理失败: {e}")
+            return e
+
+    async def _call_llm_for_chunks(
+        self,
+        chunks_text: List[str],
+        max_triplets: int,
+        batch_idx: int,
+        part_suffix: str
+    ) -> str:
+        """调用 LLM 处理指定 chunks，返回原始响应文本。调用前验证 token 预算。"""
+        combined_text = "\n\n".join(chunks_text)
+        system_prompt = BATCH_TRIPLET_EXTRACTION_PROMPT.format(max_triplets=max_triplets)
+        user_prompt = f"Extract triplets from the following text chunks:\n\n{combined_text}\n\nExtract all entity-relationship triplets:"
+
+        # 预检查：确保输入 + 输出不超 n_ctx
+        input_tokens = count_tokens(system_prompt) + count_tokens(user_prompt)
+        max_context = self._llm_config.n_ctx if hasattr(self, '_llm_config') else 4096
+        max_output = self._llm_config.max_tokens if hasattr(self, '_llm_config') else 4096
+        if input_tokens + max_output > max_context:
+            logger.warning(
+                f"[Graph-LLM] 分组 {batch_idx + 1}.{part_suffix} token 预算紧张: "
+                f"input={input_tokens} + output={max_output} = {input_tokens + max_output} > n_ctx={max_context}"
+            )
+
+        assert self._llm is not None
+        response = await self._llm.text_chat(
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+            max_tokens=self._llm_config.max_tokens,
+            grammar=self._triplet_grammar,
+        )
+        response_text = response.content if hasattr(response, 'content') else str(response)
+        logger.info(f"[Graph-LLM] 批次 {batch_idx + 1}.{part_suffix} LLM响应长度: {len(response_text)}")
+        return response_text
 
     async def _extract_text_triplets(
         self,
@@ -1362,19 +1483,6 @@ Extract triplets:"""
         logger.warning(f"[Graph-LLM] Unknown relation_type '{relation_type}', defaulting to 'USES_COMPONENT'")
         return "USES_COMPONENT"
 
-    def _strip_thinking_tokens(self, text: str) -> str:
-        """移除 Qwen3.5 thinking 模式产生的思考 tokens
-
-        Qwen3.5 模型在 think=True 时会输出 <think>...</think> 块，
-        这些内容不是 JSON，需要移除后再解析。
-        """
-        if not text:
-            return text
-        # 递归移除所有 <think>...</think> 块
-        stripped = text
-        while '<think>' in stripped and '</think>' in stripped:
-            stripped = re.sub(r'<think>.*?</think>', '', stripped, flags=re.DOTALL)
-        return stripped.strip()
 
 
     def _parse_json_response(self, response: str) -> List[Dict[str, Any]]:
@@ -1384,11 +1492,6 @@ Extract triplets:"""
             return []
 
         json_str = response.strip().lstrip('﻿')
-        json_str = self._strip_thinking_tokens(json_str)
-        if not json_str:
-            logger.warning("[Graph-LLM] JSON 解析失败: 处理后响应为空")
-            return []
-
         if json_str.startswith("```"):
             lines = json_str.split("\n")
             json_str = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
@@ -1398,12 +1501,95 @@ Extract triplets:"""
             return self._extract_triplets(data)
         except json.JSONDecodeError as e:
             err_pos = e.pos if hasattr(e, 'pos') else 0
+
+            # 尝试截断恢复：从后向前找最后一个完整的 JSON 块
+            truncated_data = self._try_truncate_recover(json_str)
+            if truncated_data is not None:
+                logger.warning(f"[Graph-LLM] JSON 截断恢复成功，提取 {len(truncated_data.get('triplets', []))} 个三元组")
+                return self._extract_triplets(truncated_data)
+
+            # 恢复失败，记录完整响应用于调试
             logger.error(
                 f"[Graph-LLM] JSON 解析失败: {e}，"
                 f"错误位置: {err_pos}，响应长度: {len(json_str)}，"
-                f"末尾内容: {repr(json_str[-150:] if len(json_str) > 150 else json_str)}"
+                f"末尾内容: {repr(json_str[-200:] if len(json_str) > 200 else json_str)}"
             )
+            # 记录原始响应到文件（用于调试）
+            self._save_failed_response(response, err_pos)
             return []
+
+    def _try_truncate_recover(self, json_str: str) -> Optional[Dict]:
+        """尝试恢复被截断的 JSON。
+
+        策略：找到最后一个完整的三元组对象（以 }, 结尾），
+        然后关闭 JSON 数组和对象，重新解析。
+        """
+        if not json_str:
+            return None
+
+        # 策略1：找到最后一个 }, 并关闭 JSON
+        # 从后向前搜索 },（完整三元组对象的结束标志）
+        pos = len(json_str)
+        while True:
+            pos = json_str.rfind('},', 0, pos)
+            if pos == -1:
+                break
+            # 尝试在这里关闭 JSON：}, → }]}
+            candidate = json_str[:pos + 1] + ']}'
+            try:
+                data = json.loads(candidate)
+                if isinstance(data, dict) and 'triplets' in data:
+                    return data
+            except json.JSONDecodeError:
+                pass
+
+        # 策略2：单三元组场景 — 找到 "evidence" 字段结束的 } 并关闭
+        last_brace = json_str.rfind('}')
+        if last_brace > 0:
+            candidate = json_str[:last_brace + 1] + ']}'
+            try:
+                data = json.loads(candidate)
+                if isinstance(data, dict) and 'triplets' in data:
+                    return data
+            except json.JSONDecodeError:
+                pass
+
+        # 策略3：原有的 ] 搜索（处理已有关闭括号但嵌套错误的情况）
+        last_bracket = json_str.rfind(']')
+        if last_bracket > 0:
+            for i in range(last_bracket, 0, -1):
+                try:
+                    candidate = json_str[:i + 1]
+                    if candidate.rstrip().endswith(']'):
+                        data = json.loads(candidate)
+                        if isinstance(data, dict) and 'triplets' in data:
+                            return data
+                except json.JSONDecodeError:
+                    continue
+
+        return None
+
+    def _save_failed_response(self, response: str, err_pos: int):
+        """保存解析失败的响应到文件用于调试"""
+        import time
+
+        debug_dir = _PLUGIN_ROOT / "data" / "debug"
+        debug_dir.mkdir(exist_ok=True)
+
+        timestamp = int(time.time())
+        filename = debug_dir / f"failed_response_{timestamp}.txt"
+
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(f"# Error position: {err_pos}\n")
+                f.write(f"# Total length: {len(response)}\n")
+                f.write(f"# Content around error (pos {err_pos - 50}:{err_pos + 100}):\n")
+                f.write(repr(response[max(0, err_pos - 50):err_pos + 100]) + "\n\n")
+                f.write("# Full response:\n")
+                f.write(response)
+            logger.info(f"[Graph-LLM] 失败响应已保存: {filename}")
+        except Exception as ex:
+            logger.warning(f"[Graph-LLM] 保存失败响应失败: {ex}")
 
     def _extract_triplets(self, data) -> List[Dict[str, Any]]:
         """从解析后的数据中提取三元组"""
@@ -1445,9 +1631,6 @@ Extract triplets:"""
             return {"text_triplets": [], "image_info": {}, "cross_modal_triplets": []}
 
         json_str = response.strip().lstrip('\ufeff')
-        json_str = self._strip_thinking_tokens(json_str)
-        if not json_str:
-            return {"text_triplets": [], "image_info": {}, "cross_modal_triplets": []}
 
         if json_str.startswith("```"):
             lines = json_str.split("\n")

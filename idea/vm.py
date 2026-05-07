@@ -18,7 +18,7 @@ class IdeaEngineVM(IdeaEngineCitations):
     def _get_vlm_provider(self):
         """获取本地VLM provider（LlamaCppVLMProvider）"""
         try:
-            from .llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
+            from provider.llama_cpp_vlm import get_llama_cpp_vlm_provider
         except ImportError as e:
             logger.warning(f"[IdeaEngine] 无法导入 LlamaCppVLMProvider: {e}")
             return None
@@ -244,7 +244,10 @@ class IdeaEngineVM(IdeaEngineCitations):
         ]
 
         try:
-            from ..embedding.unsloth_embedding import get_embedding_model
+            try:
+                from ..embedding.unsloth_embedding import get_embedding_model
+            except ImportError:
+                from embedding.unsloth_embedding import get_embedding_model
             model = get_embedding_model()
             doc_texts = [ca["text"] for ca in candidates_for_rerank]
             reranked_indices = model.colbert_rerank(query, doc_texts, top_k=len(doc_texts))

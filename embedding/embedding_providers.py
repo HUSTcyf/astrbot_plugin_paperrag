@@ -5,11 +5,17 @@
 
 from typing import List, Dict, Any, Optional, Union
 
+import numpy as np
+
 from astrbot.api import logger
 
 from .unsloth_embedding import (
     UnslothEmbeddingModel,
     init_embedding_model,
+)
+from .flag_embedding import (
+    FlagEmbeddingModel,
+    init_flag_model,
 )
 
 
@@ -188,6 +194,129 @@ class UnslothEmbeddingProvider:
             return self._model.embedding_dim
         # 默认 BGE-M3 1024 维
         return 1024
+
+
+# ============================================================================
+# FlagEmbedding Embedding Provider
+# ============================================================================
+
+class FlagEmbeddingProvider:
+    """
+    FlagEmbedding BGE-M3 Provider (跨平台兼容)
+
+    使用 FlagEmbedding BGEM3FlagModel 加载 BGE-M3，提供：
+    - 稠密向量 (dense vector) - 用于 Milvus 检索
+    - 稀疏权重 (sparse/lexical weight) - 用于关键词匹配检索
+    - 多向量序列 (colbert vector) - 用于 ColBERT 式 reranking
+
+    相比 UnslothEmbeddingProvider，FlagEmbedding 跨平台兼容性更好
+    (Linux/Mac/Windows)，且 API 更简洁。
+    """
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        device: str = "cpu",
+        max_seq_length: int = 512,
+        use_fp16: bool = True,
+    ):
+        self.model_path = model_path or ""
+        self.device = device
+        self.max_seq_length = max_seq_length
+        self.use_fp16 = use_fp16
+        self._model: Optional[FlagEmbeddingModel] = None
+        self._initialized = False
+
+    async def initialize(self) -> None:
+        if self._initialized:
+            return
+        self._model = await init_flag_model(
+            model_path=self.model_path,
+            device=self.device,
+            max_seq_length=self.max_seq_length,
+            use_fp16=self.use_fp16,
+        )
+        self._initialized = True
+        logger.info(f"[FlagEmbeddingProvider] 初始化完成，维度: {self._model.embedding_dim}")
+
+    async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
+        if not self._initialized:
+            await self.initialize()
+        assert self._model is not None
+        return self._model.get_dense_embedding(texts)
+
+    async def embed(self, texts: Union[str, List[str]]) -> List[List[float]]:
+        if isinstance(texts, str):
+            texts = [texts]
+        return await self.get_embeddings(texts)
+
+    async def get_text_embedding(self, text: str) -> List[float]:
+        result = await self.embed([text])
+        return result[0] if result else []
+
+    async def get_query_embedding(self, query: str) -> List[float]:
+        return await self.get_text_embedding(query)
+
+    async def get_text_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
+        return await self.get_embeddings(texts)
+
+    async def get_sparse_weight(
+        self, text: str, query_embedding: Optional[List[float]] = None
+    ) -> Dict[int, float]:
+        if not self._initialized:
+            await self.initialize()
+        assert self._model is not None
+        return self._model.get_sparse_weight(text, query_embedding)
+
+    async def get_multi_vector(self, text: str) -> List[List[float]]:
+        if not self._initialized:
+            await self.initialize()
+        assert self._model is not None
+        return self._model.get_multi_vector(text)
+
+    async def colbert_rerank(
+        self,
+        query_text: str,
+        doc_texts: List[str],
+        top_k: int = 5,
+    ) -> List[tuple]:
+        if not self._initialized:
+            await self.initialize()
+        assert self._model is not None
+
+        q_vecs = self._model.get_multi_vector(query_text)
+        if not q_vecs:
+            return [(i, 0.0) for i in range(min(top_k, len(doc_texts)))]
+
+        q_array = np.array(q_vecs, dtype=np.float32)
+
+        scored: List[tuple] = []
+        for i, doc in enumerate(doc_texts):
+            d_vecs = self._model.get_multi_vector(doc)
+            if d_vecs:
+                d_array = np.array(d_vecs, dtype=np.float32)
+                sim = np.dot(q_array, d_array.T)
+                score = float(sim.max(axis=1).sum())
+            else:
+                score = 0.0
+            scored.append((i, score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:top_k]
+
+
+def create_flag_provider(
+    model_path: Optional[str] = None,
+    device: str = "cpu",
+    max_seq_length: int = 512,
+    use_fp16: bool = True,
+) -> FlagEmbeddingProvider:
+    return FlagEmbeddingProvider(
+        model_path=model_path,
+        device=device,
+        max_seq_length=max_seq_length,
+        use_fp16=use_fp16,
+    )
 
 
 def create_unsloth_provider(
@@ -372,6 +501,7 @@ class AstrBotEmbeddingProvider:
 
 class EmbeddingProviderType:
     """Embedding Provider 类型"""
+    FLAG = "flagembedding"  # FlagEmbedding 本地加载 (跨平台)
     UNSLOTH = "unsloth"  # Unsloth 本地加载
     ASTRBOT = "astrbot"
 
@@ -381,7 +511,7 @@ def create_embedding_provider(
     context: Any = None,
     provider_id: str = "",
     **kwargs,
-) -> Union[UnslothEmbeddingProvider, AstrBotEmbeddingProvider]:
+) -> Union[FlagEmbeddingProvider, UnslothEmbeddingProvider, AstrBotEmbeddingProvider]:
     """
     创建 Embedding Provider 的工厂函数
 
@@ -394,7 +524,15 @@ def create_embedding_provider(
     Returns:
         Embedding Provider 实例
     """
-    if mode == EmbeddingProviderType.UNSLOTH:
+    if mode == EmbeddingProviderType.FLAG:
+        return create_flag_provider(
+            model_path=kwargs.get("model_path"),
+            device=kwargs.get("device", "cpu"),
+            max_seq_length=kwargs.get("max_seq_length", 512),
+            use_fp16=kwargs.get("use_fp16", True),
+        )
+
+    elif mode == EmbeddingProviderType.UNSLOTH:
         return create_unsloth_provider(
             model_path=kwargs.get("model_path"),
             device=kwargs.get("device", "mps"),

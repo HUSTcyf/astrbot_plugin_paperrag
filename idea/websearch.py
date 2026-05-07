@@ -19,7 +19,8 @@ class IdeaEngineWebSearch:
     不依赖继承链，可被 IdeaEngineGeneration 直接调用。
     """
 
-    def __init__(self):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
         self._mcp_proc: Optional[Any] = None
         self._mcp_lock = asyncio.Lock()
 
@@ -35,7 +36,9 @@ class IdeaEngineWebSearch:
                 pass
             self._mcp_proc = None
 
-        mcp_config_path = Path(__file__).parent.parent / "mcp_server.json"
+        # websearch.py → idea/ → astrbot_plugin_paperrag/ → plugins/ → data/
+        data_dir = Path(__file__).resolve().parent.parent.parent.parent
+        mcp_config_path = data_dir / "mcp_server.json"
         try:
             with open(mcp_config_path, "r", encoding="utf-8") as f:
                 mcp_config = json.load(f)

@@ -47,6 +47,29 @@ from astrbot.api import logger
 MULTIMODAL_DOC_MULTIPLIER = 2
 
 
+class _MinimalLLMProvider:
+    """最小化 LLM provider，用于评估时注入云端 LLM 凭据到 FakeContext。"""
+
+    def __init__(self, model: str, api_key: str, api_base: str):
+        self.model_name = model
+        self.chosen_api_key = api_key
+        self.provider_config = {"api_base": api_base}
+
+    def __repr__(self):
+        return f"_MinimalLLMProvider(model={self.model_name}, api_key=***)"
+
+
+class _EvalFakeContext:
+    """用于评估脚本的模拟上下文，可选地注入 LLM provider 用于图谱检索。"""
+
+    def __init__(self, llm_provider=None):
+        self.provider_manager = None
+        self._llm_provider = llm_provider
+
+    def get_using_provider(self):
+        return self._llm_provider
+
+
 # ============================================================================
 # 步骤 1: 从 Milvus 提取全量文本
 # ============================================================================
@@ -930,7 +953,7 @@ async def run_evaluation(
         embedding_model=embedding_model,
         embed_base_url=embed_base_url,
         embed_api_key=embed_api_key,
-        embedding_mode=embedding_mode,
+        embedding_mode=eval_embedding_mode,
     )
 
     results = await evaluator.evaluate(
@@ -1152,14 +1175,18 @@ async def run_full_pipeline(
         enable_crag_quality_eval=rag_cfg.get("enable_crag_quality_eval", True),
         crag_enable_correction=rag_cfg.get("crag_enable_correction", True),
         crag_min_score=rag_cfg.get("crag_min_score", 0.5),
+        # 图谱 RAG 配置
+        enable_graph_rag=rag_cfg.get("enable_graph_rag", False),
+        graph_storage_type=rag_cfg.get("graph_rag", {}).get("storage_type", "neo4j"),
+        graph_neo4j_uri=rag_cfg.get("graph_rag", {}).get("neo4j_uri", "bolt://localhost:7687"),
+        graph_neo4j_user=rag_cfg.get("graph_rag", {}).get("neo4j_user", "neo4j"),
+        graph_neo4j_password=rag_cfg.get("graph_rag", {}).get("neo4j_password", ""),
+        graph_rrf_weight=rag_cfg.get("graph_rag", {}).get("graph_rrf_weight", 0.2),
+        graph_retrieval_top_k=rag_cfg.get("graph_rag", {}).get("graph_retrieval_top_k", 5),
+        graph_max_triplets_per_chunk=rag_cfg.get("graph_rag", {}).get("max_triplets_per_chunk", 5),
     )
 
-    # context 需要从 AstrBot 传入，这里用 None（引擎会跳过LLM初始化用于检索模式）
-    class FakeContext:
-        def __init__(self):
-            self.provider_manager = None
-
-    fake_context = FakeContext()
+    fake_context = _EvalFakeContext()
 
     engine = create_rag_engine(config, fake_context)
     print("✅ HybridRAG 引擎创建成功")
@@ -1304,7 +1331,7 @@ def main():
     args = parser.parse_args()
 
     # 优先级: 显式参数 > 环境变量 > 插件配置
-    llm_api_key = args.llm_api_key or os.getenv("EVAL_LLM_API_KEY", "")
+    llm_api_key = args.llm_api_key or args.eval_llm_api_key or os.getenv("EVAL_LLM_API_KEY", "")
     embed_api_key = args.embed_api_key or os.getenv("EVAL_EMBED_API_KEY", "")
 
     # 尝试从插件配置读取 freeapi 设置（当 API Key 未显式提供时）
@@ -1321,14 +1348,22 @@ def main():
         if config_freeapi_key and not embed_api_key:
             embed_api_key = config_freeapi_key
         if config_freeapi_url:
-            llm_base_url = config_freeapi_url + "/v1/"
-            # freeapi 同时用于 LLM 和 Embedding
-            embed_base_url = config_freeapi_url + "/v1/"
-            print(f"✅ 已从插件配置加载 freeapi: {llm_base_url}")
+            # 命令行 --eval-llm-base-url / --llm-base-url 优先于插件配置
+            _default_url = "https://open.bigmodel.cn/api/paas/v4"
+            user_url = args.eval_llm_base_url if args.eval_llm_base_url != _default_url else ""
+            user_url = user_url or (args.llm_base_url if args.llm_base_url != _default_url else "")
+            if user_url:
+                llm_base_url = user_url
+                embed_base_url = user_url
+                print(f"✅ 使用命令行指定的 LLM URL: {llm_base_url}")
+            else:
+                llm_base_url = config_freeapi_url + "/v1/"
+                embed_base_url = config_freeapi_url + "/v1/"
+                print(f"✅ 已从插件配置加载 freeapi: {llm_base_url}")
         else:
-            llm_base_url = args.llm_base_url or "https://open.bigmodel.cn/api/paas/v4"
+            llm_base_url = args.eval_llm_base_url or args.llm_base_url or "https://open.bigmodel.cn/api/paas/v4"
     else:
-        llm_base_url = args.llm_base_url
+        llm_base_url = args.eval_llm_base_url or args.llm_base_url
 
     print(f"\n📊 配置信息:")
     print(f"   步骤: {args.step}")
@@ -1450,7 +1485,7 @@ def main():
                 output_path=results_path,
                 max_concurrent=args.max_concurrent,
                 llm_model=args.eval_llm_model,
-                llm_base_url=llm_base_url,
+                llm_base_url=args.eval_llm_base_url or llm_base_url,
                 llm_api_key=llm_api_key,
                 embedding_model=args.embedding_model,
                 embed_base_url=embed_base_url,
@@ -1506,14 +1541,24 @@ def main():
                 enable_crag_quality_eval=rag_cfg.get("enable_crag_quality_eval", True),
                 crag_enable_correction=rag_cfg.get("crag_enable_correction", True),
                 crag_min_score=rag_cfg.get("crag_min_score", 0.5),
+                # 图谱 RAG 配置
+                enable_graph_rag=rag_cfg.get("enable_graph_rag", False),
+                graph_storage_type=rag_cfg.get("graph_rag", {}).get("storage_type", "neo4j"),
+                graph_neo4j_uri=rag_cfg.get("graph_rag", {}).get("neo4j_uri", "bolt://localhost:7687"),
+                graph_neo4j_user=rag_cfg.get("graph_rag", {}).get("neo4j_user", "neo4j"),
+                graph_neo4j_password=rag_cfg.get("graph_rag", {}).get("neo4j_password", ""),
+                graph_rrf_weight=rag_cfg.get("graph_rag", {}).get("graph_rrf_weight", 0.2),
+                graph_retrieval_top_k=rag_cfg.get("graph_rag", {}).get("graph_retrieval_top_k", 5),
+                graph_max_triplets_per_chunk=rag_cfg.get("graph_rag", {}).get("max_triplets_per_chunk", 5),
             )
 
             # Fake context for engine
-            class FakeContext:
-                def __init__(self):
-                    self.provider_manager = None
-
-            fake_context = FakeContext()
+            llm_provider = _MinimalLLMProvider(
+                model=args.eval_llm_model,
+                api_key=llm_api_key,
+                api_base=llm_base_url,
+            ) if llm_api_key else None
+            fake_context = _EvalFakeContext(llm_provider)
 
             print("🔧 初始化 HybridRAG 引擎...")
             engine = create_rag_engine(config, fake_context)
@@ -1526,7 +1571,7 @@ def main():
                 output_path=results_path,
                 max_concurrent=args.max_concurrent,
                 llm_model=args.eval_llm_model,
-                llm_base_url=llm_base_url,
+                llm_base_url=args.eval_llm_base_url or llm_base_url,
                 llm_api_key=llm_api_key,
                 embedding_model=args.embedding_model,
                 embed_base_url=embed_base_url,

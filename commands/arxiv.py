@@ -13,7 +13,11 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from .base import PluginCoreBase
-from ..plugin_common import CoreAPIClient, _is_hidden_file
+
+try:
+    from ..plugin_common import CoreAPIClient, _is_hidden_file
+except ImportError:
+    from plugin_common import CoreAPIClient, _is_hidden_file
 
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 

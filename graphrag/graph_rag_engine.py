@@ -9,6 +9,7 @@ Graph RAG Engine - 图谱增强检索引擎
 
 import asyncio
 import gc
+import re
 import shutil
 import subprocess
 import time
@@ -16,6 +17,8 @@ import traceback
 from typing import Dict, Any, Optional, List, TYPE_CHECKING
 from dataclasses import dataclass
 from pathlib import Path
+
+from neo4j import GraphDatabase
 
 from astrbot.api import logger
 
@@ -68,6 +71,9 @@ class GraphRAGConfig:
     multimodal_enabled: bool = True  # 是否启用多模态图谱抽取
     max_images_per_chunk: int = 1  # 每个chunk最多处理图片数
     extract_image_entities: bool = True  # 是否提取图片为实体
+    # LLM 配置
+    llm_n_ctx: int = 16384  # 模型上下文窗口大小
+    llm_max_tokens: int = 8192  # 最大生成 token 数
 
     @classmethod
     def from_rag_config(cls, config: "RAGConfig") -> "GraphRAGConfig":
@@ -86,6 +92,8 @@ class GraphRAGConfig:
             multimodal_enabled=getattr(config, 'graph_multimodal_enabled', True),
             max_images_per_chunk=getattr(config, 'graph_max_images_per_chunk', 1),
             extract_image_entities=getattr(config, 'graph_extract_image_entities', True),
+            llm_n_ctx=getattr(config, 'graph_llm_n_ctx', 16384),
+            llm_max_tokens=getattr(config, 'graph_llm_max_tokens', 8192),
         )
 
 
@@ -325,6 +333,113 @@ class SimplePropertyGraphStoreAdapter:
         logger.info("[GraphRAG] 图谱缓存已清空")
 
 
+_CYPHER_PROMPT = """\
+You are a Neo4j Cypher query generator for an academic paper knowledge graph.
+
+## Schema
+Node labels: Method, Model, Task, Dataset, Metric, Component, Limitation, Application, Baseline
+Node properties: name (string), description (string)
+
+Relationship semantics (Source → Target):
+- ADDRESSES: Method/Model → Task it solves
+- PROPOSES: Method → new Component/technique it introduces
+- USES_COMPONENT: Method → Component it relies on
+- EVALUATED_ON: Method → Dataset used for evaluation
+- ACHIEVES: Method → Metric result
+- COMPARES_WITH: Method → Baseline compared to
+- OUTPERFORMS: Method → Baseline it outperforms
+- LIMITED_BY: Method → Limitation
+- APPLIES_TO: Method → Application domain
+- EXTENDS: Method → prior Method/Model it builds upon
+- TRAINS_ON: Model → Dataset used for training
+- IMPLEMENTS: Model → Code repository
+- REQUIRES: Method → hardware/resource requirement
+
+## Rules
+- **CRITICAL**: ALWAYS bind relationships to r with `-[r:TYPE]->`, NEVER use `-[:TYPE]->` — \
+the RETURN clause needs `type(r)` so `r` must be bound in every MATCH
+- Return exactly: coalesce(h.name,'') AS head, labels(h)[0] AS head_type, \
+type(r) AS relation, coalesce(t.name,'') AS tail, labels(t)[0] AS tail_type
+- Use CONTAINS for fuzzy name matching (names may include suffixes like "dataset")
+- Do NOT filter on description — it is often empty
+- Use OR between alternatives, not AND, to maximize recall
+- For indirect connections, use MATCH ... WHERE ... WITH ... MATCH ... (2-hop query)
+- LIMIT 30
+- Output ONLY the Cypher query, no explanation, no backticks
+
+## Examples
+Q: What methods are evaluated on Mip-NeRF360?
+MATCH (h)-[r:EVALUATED_ON]->(t) WHERE t.name CONTAINS 'Mip-NeRF360' \
+RETURN coalesce(h.name,'') AS head, labels(h)[0] AS head_type, \
+type(r) AS relation, coalesce(t.name,'') AS tail, labels(t)[0] AS tail_type LIMIT 30
+
+Q: What are the limitations of Gaussian Splatting?
+MATCH (h)-[r:LIMITED_BY]->(t:Limitation) WHERE h.name CONTAINS 'Gaussian' OR h.name CONTAINS '3DGS' \
+RETURN coalesce(h.name,'') AS head, labels(h)[0] AS head_type, \
+type(r) AS relation, coalesce(t.name,'') AS tail, labels(t)[0] AS tail_type LIMIT 30
+
+Q: How does InstantSplat achieve sparse-view reconstruction?
+MATCH (h)-[r:ADDRESSES|USES_COMPONENT|ACHIEVES]->(t) WHERE h.name CONTAINS 'InstantSplat' \
+RETURN coalesce(h.name,'') AS head, labels(h)[0] AS head_type, \
+type(r) AS relation, coalesce(t.name,'') AS tail, labels(t)[0] AS tail_type LIMIT 30
+
+Q: Compare 3DGS with NeRF methods
+MATCH (h)-[r:COMPARES_WITH|OUTPERFORMS]->(t) WHERE h.name CONTAINS '3DGS' OR h.name CONTAINS 'Gaussian' \
+OR t.name CONTAINS 'NeRF' \
+RETURN coalesce(h.name,'') AS head, labels(h)[0] AS head_type, \
+type(r) AS relation, coalesce(t.name,'') AS tail, labels(t)[0] AS tail_type LIMIT 30
+
+Q: What components are used by sparse-view reconstruction methods?  (2-hop)
+MATCH (h)-[r1:ADDRESSES]->(task) WHERE task.name CONTAINS 'sparse-view' WITH h \
+MATCH (h)-[r:USES_COMPONENT]->(t) \
+RETURN coalesce(h.name,'') AS head, labels(h)[0] AS head_type, \
+type(r) AS relation, coalesce(t.name,'') AS tail, labels(t)[0] AS tail_type LIMIT 30
+
+Q: What is the relationship between MASt3R and DUSt3R?
+MATCH (h)-[r]->(t) WHERE h.name CONTAINS 'MASt3R' OR h.name CONTAINS 'DUSt3R' \
+OR t.name CONTAINS 'MASt3R' OR t.name CONTAINS 'DUSt3R' \
+RETURN coalesce(h.name,'') AS head, labels(h)[0] AS head_type, \
+type(r) AS relation, coalesce(t.name,'') AS tail, labels(t)[0] AS tail_type LIMIT 30
+
+Q: What methods address novel view synthesis?
+MATCH (h)-[r:ADDRESSES]->(t:Task) WHERE t.name CONTAINS 'novel view' \
+RETURN coalesce(h.name,'') AS head, labels(h)[0] AS head_type, \
+type(r) AS relation, coalesce(t.name,'') AS tail, labels(t)[0] AS tail_type LIMIT 30
+
+Q: What hardware do methods require?
+MATCH (h)-[r:REQUIRES]->(t) WHERE t.name CONTAINS 'GPU' OR t.name CONTAINS 'memory' \
+RETURN coalesce(h.name,'') AS head, labels(h)[0] AS head_type, \
+type(r) AS relation, coalesce(t.name,'') AS tail, labels(t)[0] AS tail_type LIMIT 30
+
+## Query
+{query}
+"""
+
+
+def _parse_cypher_records(records: list[dict]) -> tuple[list[dict], list[dict]]:
+    """将 Cypher 返回记录解析为 entities + triplets。"""
+    entity_set: dict[str, str] = {}
+    triplets: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for r in records:
+        head = str(r.get("head") or "")
+        tail = str(r.get("tail") or "")
+        relation = str(r.get("relation") or "")
+        if not head or not tail:
+            continue
+        entity_set.setdefault(head, str(r.get("head_type", "")))
+        entity_set.setdefault(tail, str(r.get("tail_type", "")))
+        key = (head, relation, tail)
+        if key not in seen:
+            seen.add(key)
+            triplets.append({
+                "head": head, "relation": relation,
+                "tail": tail, "description": "",
+            })
+    entities = [{"name": n, "type": t} for n, t in entity_set.items()]
+    return entities, triplets
+
+
 class GraphRAGEngine:
     """
     Graph RAG 引擎 - 扩展现有 HybridRAGEngine
@@ -353,31 +468,31 @@ class GraphRAGEngine:
         self._initialized = False
         self._health_status: str = "not_initialized"
 
-    async def _get_llm(self):
-        """从 AstrBot Provider 创建 LlamaIndex 兼容的 LLM，优先使用本地VLM"""
+    async def _get_llm(self, prefer_cloud: bool = False):
+        """从 AstrBot Provider 创建 LlamaIndex 兼容的 LLM。
+
+        Args:
+            prefer_cloud: 为 True 时跳过本地 VLM，直接使用云端 Provider（适合 Cypher 生成）。
+        """
         try:
             from llama_index.llms.openai import OpenAI
 
             # 优先使用本地VLM（与 HybridRAGEngine 保持一致）
-            try:
+            if not prefer_cloud:
                 try:
-                    from idea.llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
-                except ImportError:
-                    from ..idea.llama_cpp_vlm_provider import get_llama_cpp_vlm_provider
-                vlm_provider = get_llama_cpp_vlm_provider()
-                if vlm_provider and not getattr(vlm_provider, '_initialized', False):
-                    logger.info("[GraphRAG] 本地VLM未初始化，尝试初始化...")
-                    await vlm_provider.initialize()
-                if vlm_provider and getattr(vlm_provider, '_initialized', False):
-                    logger.info("[GraphRAG] 使用本地VLM Provider")
-                    model = getattr(vlm_provider, 'model_name', '') or 'local-vlm'
-                    api_base = getattr(vlm_provider, 'api_base', '') or 'http://localhost:8080/v1'
-                    api_key = getattr(vlm_provider, 'api_key', 'dummy') or 'dummy'
-                    return OpenAI(model=model, api_key=api_key, base_url=api_base)
-            except Exception as e:
-                logger.debug(f"[GraphRAG] 本地VLM不可用: {e}")
+                    from provider.llama_cpp_vlm import get_llama_cpp_vlm_provider
+                    vlm_provider = get_llama_cpp_vlm_provider()
+                    if vlm_provider and not getattr(vlm_provider, '_initialized', False):
+                        logger.info("[GraphRAG] 本地VLM未初始化，尝试初始化...")
+                        await vlm_provider.initialize()
+                    if vlm_provider and getattr(vlm_provider, '_initialized', False):
+                        logger.info("[GraphRAG] 使用本地VLM Provider")
+                        model = 'local-vlm'
+                        return OpenAI(model=model, api_key='dummy', api_base='http://localhost:8080/v1')
+                except Exception as e:
+                    logger.debug(f"[GraphRAG] 本地VLM不可用: {e}")
 
-            # Fall back to cloud provider
+            # Cloud provider（fallback 或 prefer_cloud）
             if self.context is None:
                 return None
             provider = self.context.get_using_provider()
@@ -410,8 +525,6 @@ class GraphRAGEngine:
         Raises:
             RuntimeError: if Neo4j cannot be started or does not become reachable.
         """
-        from neo4j import GraphDatabase
-
         uri = self.config.neo4j_uri
         user = self.config.neo4j_user
         password = self.config.neo4j_password
@@ -437,8 +550,27 @@ class GraphRAGEngine:
 
         logger.warning(f"[GraphRAG] Neo4j not reachable at {uri}, attempting neo4j start...")
         result = subprocess.run([neo4j_bin, "start"], capture_output=True, text=True, timeout=30)
+
+        if result.returncode != 0 and "already running" in result.stderr:
+            logger.warning(f"[GraphRAG] Neo4j already running (pid detected), verifying actual connectivity...")
+            try:
+                driver = GraphDatabase.driver(uri, auth=(user, password), max_connection_lifetime=5)
+                driver.verify_connectivity()
+                # 额外验证：执行一个简单查询确保数据库真的可用
+                with driver.session() as session:
+                    result = session.run("RETURN 1")
+                    result.consume()
+                driver.close()
+                logger.info(f"[GraphRAG] Neo4j already running and database verified at {uri}")
+                return
+            except Exception as e:
+                logger.error(f"[GraphRAG] Neo4j reported running but verification failed: {e}")
+                return
+
         if result.returncode != 0:
-            raise RuntimeError(f"[GraphRAG] neo4j start failed: {result.stderr}")
+            # 如果是"already running"错误，前面已处理过连通性，这里不再重复抛异常
+            if not ("already running" in result.stderr):
+                raise RuntimeError(f"[GraphRAG] neo4j start failed: {result.stderr}")
 
         # Poll until reachable (max 30s)
         for attempt in range(15):
@@ -649,39 +781,176 @@ class GraphRAGEngine:
         return result
 
     async def _graph_search(self, query: str, top_k: int) -> Dict[str, Any]:
-        """图谱检索 — 委托 LlamaIndex 官方 query engine"""
-        if self._query_engine is None:
-            return {"type": "error", "message": "图谱查询引擎未初始化（缺少LLM）"}
+        """图谱检索 — Text-to-Cypher 子图提取 + 可选 query engine 回答"""
+        entities, triplets = await self._fetch_subgraph(query)
+
+        answer = ""
+        sources = []
+        if self._query_engine is not None:
+            try:
+                response = await asyncio.to_thread(self._query_engine.query, query)
+                answer = str(response)
+                for n in getattr(response, "source_nodes", []):
+                    sources.append({
+                        "text": str(getattr(n, "text", "")),
+                        "metadata": getattr(n, "metadata", {}),
+                        "score": getattr(n, "score", None) or 0,
+                    })
+            except Exception as e:
+                logger.warning(f"[GraphRAG] query engine 调用失败: {e}")
+
+        return {
+            "type": "graph",
+            "answer": answer,
+            "sources": sources,
+            "entities": entities,
+            "triplets": triplets,
+        }
+
+    async def _fetch_subgraph(self, query: str) -> tuple[list[dict], list[dict]]:
+        """从 Neo4j 提取与查询相关的实体和三元组（Text-to-Cypher + 关键词 fallback）。"""
+        driver = self._adapter._driver if self._adapter else None
+        if driver is None:
+            return [], []
+
+        # Text-to-Cypher: LLM 生成 Cypher 查询
+        try:
+            llm = await self._get_llm(prefer_cloud=True)
+            if llm is not None:
+                prompt = _CYPHER_PROMPT.format(query=query)
+                response = await asyncio.to_thread(llm.complete, prompt)
+                cypher = response.text.strip()
+                if cypher.startswith("```"):
+                    first_nl = cypher.find("\n")
+                    cypher = cypher[first_nl + 1:] if first_nl != -1 else cypher[3:]
+                    if cypher.endswith("```"):
+                        cypher = cypher[:-3]
+                    cypher = cypher.strip()
+
+                def _run(tx):
+                    result = tx.run(cypher)
+                    return [dict(r) for r in result]
+
+                with driver.session() as session:
+                    records = session.execute_read(_run)
+
+                if records:
+                    entities, triplets = _parse_cypher_records(records)
+                    if triplets:
+                        logger.info(
+                            f"[GraphRAG] Text-to-Cypher: {len(entities)} 实体, "
+                            f"{len(triplets)} 三元组"
+                        )
+                        return entities, triplets
+        except Exception as e:
+            logger.warning(f"[GraphRAG] Text-to-Cypher 失败，回退关键词: {e}")
+
+        # Fallback: 关键词匹配
+        return await self._fetch_subgraph_keywords(query)
+
+    async def _fetch_subgraph_keywords(self, query: str) -> tuple[list[dict], list[dict]]:
+        """关键词匹配提取子图（fallback）。"""
+        entities: list[dict] = []
+        triplets: list[dict] = []
+
+        driver = self._adapter._driver if self._adapter else None
+        if driver is None:
+            return entities, triplets
+
+        _STOPWORDS = frozenset({
+            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+            "do", "does", "did", "has", "have", "had", "can", "could", "will",
+            "would", "should", "may", "might", "shall", "must", "need",
+            "what", "which", "who", "whom", "how", "when", "where", "why",
+            "this", "that", "these", "those", "it", "its", "he", "she", "they",
+            "we", "you", "i", "me", "my", "our", "your", "his", "her", "their",
+            "of", "in", "on", "at", "to", "for", "with", "from", "by", "about",
+            "as", "into", "through", "during", "before", "after", "above", "below",
+            "between", "and", "or", "not", "no", "nor", "but", "so", "if", "then",
+            "than", "too", "very", "just", "also", "only", "such", "each", "all",
+            "any", "both", "few", "more", "most", "other", "some", "up", "out",
+            "method", "methods", "approach", "approaches", "model", "models",
+            "dataset", "datasets", "result", "results", "compare", "comparison",
+            "limitation", "limitations", "achieve", "achieves", "achieved",
+            "evaluate", "evaluated", "evaluation", "use", "used", "using",
+            "propose", "proposes", "proposed", "based", "performance",
+            "novel", "new", "different", "improve", "improves", "improved",
+            "work", "works", "paper", "study", "task", "tasks",
+            "component", "components", "technique", "techniques",
+            "better", "best", "state", "art", "recent", "efficient",
+            "effective", "show", "shown", "describe", "described",
+            "explain", "tell", "give", "list", "find", "found",
+        })
+
+        tokens = re.findall(r'[A-Za-z][A-Za-z0-9_\-]*', query)
+        tokens += [w for w in re.findall(r'[A-Za-z0-9][A-Za-z0-9\-_]{2,}', query)
+                   if w not in tokens]
+
+        raw = list(dict.fromkeys(
+            w for w in tokens
+            if w.lower() not in _STOPWORDS and len(w) >= 2
+        ))
+        filtered = []
+        for w in raw:
+            if not any(w != o and w in o for o in raw):
+                filtered.append(w)
+        keywords = filtered[:5]
+
+        if not keywords:
+            return entities, triplets
 
         try:
-            response = await asyncio.to_thread(self._query_engine.query, query)
-            sources = []
-            for n in getattr(response, "source_nodes", []):
-                sources.append({
-                    "text": str(getattr(n, "text", "")),
-                    "metadata": getattr(n, "metadata", {}),
-                    "score": getattr(n, "score", None) or 0,
-                })
-            return {
-                "type": "graph",
-                "answer": str(response),
-                "sources": sources,
-                "entities": [],
-                "triplets": [],
-            }
+            def _run(tx, kw_list):
+                ent_result = tx.run("""
+                    MATCH (n)
+                    WHERE any(kw IN $kw_list WHERE coalesce(n.name, n.id, '') CONTAINS kw)
+                    RETURN labels(n)[0] AS type, coalesce(n.name, n.id, '') AS name
+                    LIMIT 20
+                """, kw_list=kw_list)
+                ents = [{"name": r["name"], "type": r["type"] or ""} for r in ent_result]
+
+                trip_result = tx.run("""
+                    MATCH (h)-[r]->(t)
+                    WHERE any(kw IN $kw_list WHERE
+                        coalesce(h.name, h.id, '') CONTAINS kw
+                        OR coalesce(t.name, t.id, '') CONTAINS kw)
+                    RETURN coalesce(h.name, h.id, '') AS head,
+                           type(r) AS relation,
+                           coalesce(t.name, t.id, '') AS tail,
+                           coalesce(r.description, '') AS description
+                    LIMIT 30
+                """, kw_list=kw_list)
+                trips = []
+                seen = set()
+                for r in trip_result:
+                    key = (r["head"], r["relation"], r["tail"])
+                    if key not in seen:
+                        seen.add(key)
+                        trips.append({
+                            "head": r["head"],
+                            "relation": r["relation"],
+                            "tail": r["tail"],
+                            "description": r["description"] or "",
+                        })
+                return ents, trips
+
+            with driver.session() as session:
+                entities, triplets = session.execute_read(_run, keywords)
+
+            logger.info(
+                f"[GraphRAG] 关键词子图提取: {len(entities)} 实体, "
+                f"{len(triplets)} 三元组 (keywords={keywords})"
+            )
         except Exception as e:
-            logger.error(f"[GraphRAG] 图谱查询失败: {e}")
-            return {"type": "error", "message": f"图谱查询失败: {str(e)}"}
+            logger.warning(f"[GraphRAG] 关键词子图提取失败: {e}")
+
+        return entities, triplets
 
     async def _hybrid_search(self, query: str, top_k: int) -> Dict[str, Any]:
-        """混合检索 — 图谱答案 + 向量库补充来源"""
+        """混合检索 — 图谱子图 + 向量库补充来源"""
         graph_result = await self._graph_search(query, top_k)
 
-        if graph_result.get("type") == "error":
-            graph_result["type"] = "hybrid"
-            return graph_result
-
-        # Supplement with vector DB sources so references have real text
+        # 补充向量检索来源
         vector_sources = []
         if self.base_engine is not None:
             try:

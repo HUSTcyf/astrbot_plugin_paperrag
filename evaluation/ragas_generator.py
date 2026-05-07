@@ -241,7 +241,7 @@ class OpenAICompatibleLLM(BaseRagasLLM):
         # 获取信号量后执行请求
         sync_sem.acquire()
         try:
-            response = requests.post(url, headers=headers, json=data, timeout=120)
+            response = requests.post(url, headers=headers, json=data)
             response.raise_for_status()
             result = response.json()
             raw_text = result.get('choices', [{}])[0].get('message', {}).get('content') or ""
@@ -327,7 +327,7 @@ class OpenAICompatibleLLM(BaseRagasLLM):
 
         async with OpenAICompatibleLLM._semaphore:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=data, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                async with session.post(url, headers=headers, json=data) as resp:
                     # 检查 HTTP 状态码
                     if resp.status != 200:
                         text = await resp.text()

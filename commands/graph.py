@@ -13,10 +13,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
-import logging
-# Suppress noisy neo4j driver debug logs (neo4j.io, neo4j.pool, etc.)
-for _ln in ("neo4j", "neo4j.io", "neo4j.pool", "neo4j.bolt", "neo4j.routing"):
-    logging.getLogger(_ln).setLevel(logging.WARNING)
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -92,8 +88,8 @@ class GraphCommandsMixin(PluginCoreBase):
         """后台运行图谱构建"""
         try:
             from ..graphrag.graph_rag_engine import GraphRAGEngine, GraphRAGConfig
-        except Exception as e:
-            raise ImportError(f"模块导入失败: {e}") from e
+        except ImportError:
+            from graphrag.graph_rag_engine import GraphRAGEngine, GraphRAGConfig
 
         try:
             graph_config = self._create_graph_rag_config()
@@ -222,13 +218,13 @@ class GraphCommandsMixin(PluginCoreBase):
             # 导入必要的模块
             try:
                 from ..graphrag.graph_rag_engine import GraphRAGEngine, GraphRAGConfig
-            except Exception as e:
-                raise ImportError(f"模块导入失败: {e}") from e
+            except ImportError:
+                from graphrag.graph_rag_engine import GraphRAGEngine, GraphRAGConfig
 
             try:
                 from ..graphrag.graph_builder import MultimodalGraphBuilder
-            except Exception as e:
-                raise ImportError(f"模块导入失败: {e}") from e
+            except ImportError:
+                from graphrag.graph_builder import MultimodalGraphBuilder
 
             import json as _json_json
 
@@ -239,7 +235,11 @@ class GraphCommandsMixin(PluginCoreBase):
 
             # Neo4j 存储
             from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
-            from ..graphrag.graph_rag_engine import SimplePropertyGraphStoreAdapter
+
+            try:
+                from ..graphrag.graph_rag_engine import SimplePropertyGraphStoreAdapter
+            except ImportError:
+                from graphrag.graph_rag_engine import SimplePropertyGraphStoreAdapter
             raw_store = Neo4jPropertyGraphStore(
                 url=graph_config.neo4j_uri,
                 username=graph_config.neo4j_user,
@@ -436,8 +436,8 @@ class GraphCommandsMixin(PluginCoreBase):
 
         try:
             from ..graphrag.graph_rag_engine import GraphRAGEngine, GraphRAGConfig
-        except Exception as e:
-            raise ImportError(f"模块导入失败: {e}") from e
+        except ImportError:
+            from graphrag.graph_rag_engine import GraphRAGEngine, GraphRAGConfig
 
         try:
             graph_config = self._create_graph_rag_config()
@@ -503,8 +503,8 @@ class GraphCommandsMixin(PluginCoreBase):
 
             try:
                 from ..graphrag.graph_rag_engine import GraphRAGEngine, GraphRAGConfig
-            except Exception as e:
-                raise ImportError(f"模块导入失败: {e}") from e
+            except ImportError:
+                from graphrag.graph_rag_engine import GraphRAGEngine, GraphRAGConfig
 
             graph_config = self._create_graph_rag_config()
 
@@ -603,8 +603,8 @@ class GraphCommandsMixin(PluginCoreBase):
 
         try:
             from ..graphrag.graph_rag_engine import GraphRAGEngine, GraphRAGConfig
-        except Exception as e:
-            raise ImportError(f"模块导入失败: {e}") from e
+        except ImportError:
+            from graphrag.graph_rag_engine import GraphRAGEngine, GraphRAGConfig
 
         try:
             graph_config = self._create_graph_rag_config()
@@ -638,7 +638,10 @@ class GraphCommandsMixin(PluginCoreBase):
             yield event.plain_result("❌ Graph RAG 功能未启用")
             return
 
-        from ..graphrag.graph_rag_engine import GraphRAGConfig
+        try:
+            from ..graphrag.graph_rag_engine import GraphRAGConfig
+        except ImportError:
+            from graphrag.graph_rag_engine import GraphRAGConfig
         graph_config = self._create_graph_rag_config()
 
         yield event.plain_result(f"🔄 开始备份图谱 (模式: {mode})...")
@@ -865,7 +868,10 @@ class GraphCommandsMixin(PluginCoreBase):
                 yield result
             return
 
-        from ..graphrag.graph_rag_engine import GraphRAGConfig
+        try:
+            from ..graphrag.graph_rag_engine import GraphRAGConfig
+        except ImportError:
+            from graphrag.graph_rag_engine import GraphRAGConfig
         graph_config = self._create_graph_rag_config()
 
         yield event.plain_result(f"🔄 正在恢复备份: {backup_file}...")

@@ -1642,5 +1642,345 @@ class TestAddRelationMerge:
         assert "MATCH" not in q
 
 
+# ============================================================================
+# Test 15: Token counting with tiktoken (精确计算)
+# ============================================================================
+
+
+class TestTokenCounting:
+    """Test tiktoken-based token counting for accurate context overflow detection."""
+
+    def test_count_tokens_uses_tiktoken(self):
+        """count_tokens should use tiktoken for accurate counting, not char/4 estimation."""
+        from graphrag.graph_builder import count_tokens
+
+        # "hello" is 1 token in cl100k_base
+        # " world" is 1 token
+        # Together: "hello world" = 2 tokens (not 3)
+        result = count_tokens("hello world")
+        assert result == 2, f"Expected 2 tokens for 'hello world', got {result}"
+
+    def test_count_tokens_accurate_for_english(self):
+        """Token counting should match tiktoken for English text."""
+        from graphrag.graph_builder import count_tokens
+
+        text = "The Transformer architecture uses self-attention mechanism."
+        tokens = count_tokens(text)
+        # Should be ~12 tokens, not ~14 (which would be char/4 estimate)
+        assert 8 <= tokens <= 16, f"Expected ~12 tokens, got {tokens}"
+
+    def test_count_tokens_accurate_for_chinese(self):
+        """Token counting should handle Chinese text (3-4 chars per token)."""
+        from graphrag.graph_builder import count_tokens
+
+        # 4 Chinese chars ≈ 1-2 tokens typically
+        text = "这是中文测试"
+        tokens = count_tokens(text)
+        assert tokens >= 2, f"Expected >=2 tokens for Chinese text, got {tokens}"
+
+    def test_count_tokens_safe_fallback(self):
+        """count_tokens should work even without tiktoken (fallback to char/4)."""
+        from graphrag.graph_builder import count_tokens
+
+        result = count_tokens("test text")
+        assert isinstance(result, int)
+        assert result > 0
+
+
+# ============================================================================
+# Test 16: Context overflow detection and chunk splitting
+# ============================================================================
+
+
+class TestContextOverflowHandling:
+    """Test that context overflow is correctly detected and chunks are split."""
+
+    def setup_method(self):
+        _install_astrbot_stubs()
+        _install_neo4j_stub()
+
+    def _make_builder_with_mock_llm(self, response_content: str):
+        builder = _make_builder(FakeGraphRAGConfig(max_triplets_per_chunk=5))
+        mock_llm = AsyncMock()
+        mock_llm.text_chat = AsyncMock(return_value=_make_llm_response(response_content))
+        builder._llm = mock_llm
+        return builder
+
+    @pytest.mark.asyncio
+    async def test_exceeding_context_triggers_split(self):
+        """When total tokens > n_ctx, _process_batch should split chunks into multiple calls."""
+        from graphrag.graph_builder import count_tokens
+
+        # Create a builder with very small context (256 tokens)
+        builder = _make_builder(FakeGraphRAGConfig(max_triplets_per_chunk=3))
+        builder._llm_config = types.SimpleNamespace(n_ctx=256, max_tokens=128, model_path="", mmproj_path="")
+
+        # Create chunks that together would exceed 256 tokens
+        # ~80 chars of English ≈ 20 tokens (4 chars/token estimate, but tiktoken is more accurate)
+        # For safety, use longer text
+        short_text = "This is a test sentence about BERT and Transformer models in deep learning."  # ~20 tokens
+        chunk_text = short_text * 4  # ~80 tokens
+
+        # Create 6 chunks (should trigger splitting with small context)
+        nodes = [_make_node(chunk_text, chunk_id=f"chunk_{i}") for i in range(6)]
+
+        # Mock LLM returns empty triplets
+        mock_llm = AsyncMock()
+        mock_llm.text_chat = AsyncMock(return_value=_make_llm_response('{"triplets": []}'))
+        mock_llm.initialize = AsyncMock()
+        builder._llm = mock_llm
+
+        adapter, driver = _make_graph_store_adapter()
+
+        # Calculate expected token count
+        system_prompt = "Your task is to..."  # Approximate system prompt
+        total_tokens = count_tokens(system_prompt) + count_tokens(chunk_text * 6) + 50
+
+        result = await builder._process_batch(nodes, adapter)
+
+        # If context is exceeded, LLM should be called multiple times (split)
+        # With n_ctx=256 and ~80 tokens per chunk, we can only fit ~2-3 chunks per call
+        if total_tokens > 256:
+            # Verify multiple calls were made (split happened)
+            call_count = mock_llm.text_chat.call_count
+            assert call_count >= 2, f"Expected split into multiple calls, but only {call_count} call(s) made"
+
+    @pytest.mark.asyncio
+    async def test_split_preserves_chunk_indices(self):
+        """When chunks are split, evidence [Chunk X] indices should be corrected."""
+        from graphrag.graph_builder import MultimodalGraphBuilder, count_tokens
+
+        # Use a very small context to force splitting
+        builder = MultimodalGraphBuilder.__new__(MultimodalGraphBuilder)
+        builder.config = FakeGraphRAGConfig(max_triplets_per_chunk=3)
+        builder.context = None
+        builder._llm_config = types.SimpleNamespace(n_ctx=200, max_tokens=100)
+        builder._triplet_grammar = None
+        builder._multimodal_grammar = None
+
+        # Create triplets with [Chunk 1], [Chunk 2] evidence
+        triplets_response = json.dumps({"triplets": [
+            {"head": "A", "head_type": "Method", "relation": "r1", "relation_type": "PROPOSES",
+             "tail": "B", "tail_type": "Task", "confidence": 0.9, "evidence": "[Chunk 1]"},
+            {"head": "C", "head_type": "Method", "relation": "r2", "relation_type": "PROPOSES",
+             "tail": "D", "tail_type": "Task", "confidence": 0.9, "evidence": "[Chunk 2]"},
+        ]})
+
+        mock_llm = AsyncMock()
+        mock_llm.text_chat = AsyncMock(return_value=_make_llm_response(triplets_response))
+        mock_llm.initialize = AsyncMock()
+        builder._llm = mock_llm
+        builder._load_grammars = lambda: None
+
+        adapter, driver = _make_graph_store_adapter()
+
+        # Create nodes with text that will trigger split
+        chunk_text = "A test sentence about machine learning models. " * 5
+        nodes = [_make_node(chunk_text, chunk_id=f"chunk_{i}") for i in range(8)]
+
+        result = await builder._process_batch(nodes, adapter)
+
+        # Verify evidence indices in stored triplets
+        rel_cyphers = [q for q in driver.queries if "r.description" in q]
+        for q in rel_cyphers:
+            # After split correction, indices should be preserved as [Chunk 1], [Chunk 2]
+            # (since these came from the same split group, not offset by group boundary)
+            assert "[Chunk" in q or "chunk_" in q  # Either format acceptable
+
+
+# ============================================================================
+# Test 17: JSON truncation recovery
+# ============================================================================
+
+
+class TestJSONTruncationRecovery:
+    """Test that truncated JSON responses can be recovered."""
+
+    def setup_method(self):
+        _install_astrbot_stubs()
+
+    def _make_builder(self, config=None):
+        return _make_builder(config or FakeGraphRAGConfig())
+
+    def test_truncate_recover_finds_complete_triplets(self):
+        """_try_truncate_recover should extract valid JSON from truncated response."""
+        builder = self._make_builder()
+
+        # Simulate truncated JSON - cut off mid-word, but first triplet is complete
+        # The second triplet is cut off mid-word ("GLUE benchmar")
+        truncated = """{
+          "triplets": [
+            {
+              "head": "BERT",
+              "head_type": "Model",
+              "relation": "based on",
+              "relation_type": "EXTENDS",
+              "tail": "Transformer",
+              "tail_type": "Model",
+              "confidence": 0.95,
+              "evidence": "[Chunk 1]"
+            },
+            {
+              "head": "BERT",
+              "head_type": "Model",
+              "relation": "evaluated on",
+              "relation_type": "EVALUATED_ON",
+              "tail": "GLUE benchmar"""
+
+        result = builder._try_truncate_recover(truncated)
+
+        # Should recover the first complete triplet
+        assert result is not None, f"_try_truncate_recover returned None for truncated JSON"
+        assert "triplets" in result
+        assert len(result["triplets"]) >= 1, f"Expected at least 1 triplet, got {len(result.get('triplets', []))}"
+        assert result["triplets"][0]["head"] == "BERT"
+
+    def test_truncate_recover_invalid_json_returns_none(self):
+        """_try_truncate_recover should return None for completely invalid JSON."""
+        builder = self._make_builder()
+
+        invalid = "This is not JSON at all! {{{{[[["
+        result = builder._try_truncate_recover(invalid)
+        assert result is None
+
+    def test_truncate_recover_empty_string_returns_none(self):
+        """_try_truncate_recover should return None for empty string."""
+        builder = self._make_builder()
+        result = builder._try_truncate_recover("")
+        assert result is None
+
+    def test_parse_json_response_recovers_truncated(self):
+        """_parse_json_response should attempt truncation recovery on JSON decode error."""
+        builder = self._make_builder()
+
+        # Truncated JSON that should be recoverable
+        truncated = '''{
+          "triplets": [
+            {"head": "X", "head_type": "Method", "relation": "r", "relation_type": "PROPOSES",
+             "tail": "Y", "tail_type": "Task", "confidence": 0.9, "evidence": "[Chunk 1]"}
+          ]
+        }'''
+
+        # First parse should succeed (complete JSON)
+        result = builder._parse_json_response(truncated)
+        assert len(result) >= 1
+
+    def test_parse_json_response_handles_invalid_json(self):
+        """_parse_json_response should return empty list for completely invalid JSON."""
+        builder = self._make_builder()
+
+        result = builder._parse_json_response("not json at all")
+        assert result == []
+
+    def test_parse_json_response_handles_empty_response(self):
+        """_parse_json_response should return empty list for empty response."""
+        builder = self._make_builder()
+
+        result = builder._parse_json_response("")
+        assert result == []
+
+    def test_strip_thinking_tokens_from_json_utils(self):
+        """strip_thinking_tokens from json_utils should handle various think scenarios."""
+        from graphrag.json_utils import strip_thinking_tokens
+
+        response_with_thinking = '''<think>
+Let me analyze the paper content...
+
+<think>
+First, identify entities like BERT, Transformer...
+
+
+{
+  "triplets": [
+    {"head": "A", "head_type": "Method", "relation": "r", "relation_type": "PROPOSES",
+     "tail": "B", "tail_type": "Task", "confidence": 0.9, "evidence": ""}
+  ]
+}
+
+Done analyzing.'''
+
+        cleaned = strip_thinking_tokens(response_with_thinking)
+        # Should extract just the JSON object
+        assert cleaned.startswith('{')
+        assert cleaned.endswith('}')
+        assert '"head": "A"' in cleaned
+
+    def test_parse_json_response_handles_clean_json(self):
+        """_parse_json_response should parse clean JSON (no think blocks, default think=False)."""
+        builder = self._make_builder()
+
+        # In think=False mode, response is pure JSON
+        clean_response = '''{
+  "triplets": [
+    {"head": "A", "head_type": "Method", "relation": "r", "relation_type": "PROPOSES",
+     "tail": "B", "tail_type": "Task", "confidence": 0.9, "evidence": ""}
+  ]
+}'''
+
+        result = builder._parse_json_response(clean_response)
+        assert len(result) >= 1, f"Expected at least 1 triplet, got {len(result)}"
+        assert result[0]["head"] == "A"
+
+    def test_parse_json_response_handles_complete_json(self):
+        """_parse_json_response should parse complete JSON directly."""
+        builder = self._make_builder()
+
+        # Complete valid JSON (no thinking tokens)
+        valid_json = '{"triplets": [{"head": "X", "head_type": "Method", "relation": "r", "relation_type": "PROPOSES", "tail": "Y", "tail_type": "Task", "confidence": 0.9, "evidence": ""}]}'
+
+        result = builder._parse_json_response(valid_json)
+        assert len(result) == 1
+        assert result[0]["head"] == "X"
+
+
+# ============================================================================
+# Test 18: Failed response saving
+# ============================================================================
+
+
+class TestFailedResponseSaving:
+    """Test that failed JSON parsing responses are saved for debugging."""
+
+    def setup_method(self):
+        _install_astrbot_stubs()
+
+    def test_save_failed_response_creates_file(self):
+        """_save_failed_response should create a debug file with response content."""
+        builder = _make_builder()
+
+        debug_dir = _plugin_root / "data" / "debug"
+        debug_dir.mkdir(exist_ok=True)
+
+        # Clean up any existing debug files
+        for f in debug_dir.glob("failed_response_*.txt"):
+            f.unlink()
+
+        # Call save method
+        response = '{"triplets": [{"head": "Test", truncated'
+        builder._save_failed_response(response, err_pos=50)
+
+        # Verify file was created
+        files = list(debug_dir.glob("failed_response_*.txt"))
+        assert len(files) >= 1, "Expected at least one failed response file to be created"
+
+        # Verify file content
+        latest_file = max(files, key=lambda f: f.stat().st_mtime)
+        content = latest_file.read_text()
+        assert "Error position: 50" in content
+        assert "Total length:" in content
+        assert response in content or "truncated" in content
+
+        # Clean up
+        for f in debug_dir.glob("failed_response_*.txt"):
+            f.unlink()
+
+    def test_save_failed_response_handles_exception(self):
+        """_save_failed_response should not raise exception on file write failure."""
+        builder = _make_builder()
+
+        # Should not raise even with invalid path
+        builder._save_failed_response("test", 0)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

@@ -89,34 +89,21 @@ class LocalGGUFClient:
         return str((_PLUGIN_ROOT / path).resolve())
 
     async def load(self) -> bool:
-        """加载 GGUF 模型"""
+        """加载 GGUF 模型（通过共享 provider）"""
         if self._is_loaded and self._llama is not None:
             return True
 
-        model_path = self._resolve_path(self._model_path)
-        mmproj_path = self._resolve_path(self._mmproj_path)
-
-        if not os.path.exists(model_path) or not os.path.exists(mmproj_path):
-            logger.warning(f"GGUF 模型文件不存在")
-            return False
-
         try:
-            from llama_cpp import Llama
-            import concurrent.futures
+            from provider.llama_cpp_vlm import init_llama_cpp_vlm_provider
 
-            def _load():
-                return Llama(
-                    model_path=model_path,
-                    mmproj=mmproj_path,
-                    n_ctx=4096,
-                    n_gpu_layers=99,
-                    n_batch=32,
-                    verbose=False,
-                )
-
-            loop = asyncio.get_event_loop()
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                self._llama = await loop.run_in_executor(executor, _load)
+            provider = init_llama_cpp_vlm_provider(
+                model_path=self._model_path,
+                mmproj_path=self._mmproj_path,
+                n_ctx=4096,
+                n_gpu_layers=99,
+            )
+            await provider.initialize()
+            self._llama = provider.get_llama()
             self._is_loaded = True
             logger.info("✅ GGUF 模型加载成功")
             return True

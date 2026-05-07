@@ -12,13 +12,18 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 from astrbot.api import logger
 
 from .datatypes import ResearchIdea, TopicAnalysis
+
+_IDEA_SCHEMA_PATH = Path(__file__).parent / "idea_schema.gbnf"
+
 from .utils import (
-    parse_json_response,
-    extract_text_from_response,
     format_ideas_as_markdown,
     fuse_knowledge,
     fuse_knowledge_context,
     load_paper_urls,
+)
+from provider.llm_utils import (
+    parse_json_response,
+    extract_text_from_response,
 )
 from .vm import IdeaEngineVM
 from .websearch import IdeaEngineWebSearch
@@ -43,25 +48,16 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
         return fuse_knowledge_context(local_results, web_results)
 
     def _get_llm_provider(self):
-        """获取LLM provider"""
+        """获取LLM provider（统一 4 步解析链）。"""
         if not self.context:
             logger.debug("[IdeaEngine] _get_llm_provider: context 为 None")
             return None
-        provider = getattr(self.context, 'get_using_provider', None)
-        if provider:
-            result = provider()
-            if result is None:
-                logger.debug("[IdeaEngine] _get_llm_provider: get_using_provider() 返回 None")
-            return result
-        provider_manager = getattr(self.context, 'provider_manager', None)
-        if provider_manager:
-            inst_map = getattr(provider_manager, 'inst_map', None)
-            if isinstance(inst_map, dict) and inst_map:
-                return list(inst_map.values())[0]
-            logger.debug("[IdeaEngine] _get_llm_provider: inst_map 为空或不存在")
-        else:
-            logger.debug("[IdeaEngine] _get_llm_provider: provider_manager 不存在")
-        return None
+        try:
+            from provider.llm_utils import get_llm_provider
+            return get_llm_provider(self.context, getattr(self, 'config', None))
+        except ImportError:
+            logger.warning("[IdeaEngine] 无法导入 get_llm_provider，使用内联回退")
+            return None
 
     def _load_paper_urls(self) -> Dict[str, Any]:
         """从 milvus_abstracts_doc_stats.json 加载论文完整信息"""
@@ -136,8 +132,7 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
             if vlm_provider:
                 response = await vlm_provider.text_chat(
                     prompt=prompt,
-                    temperature=0.7,
-                    max_tokens=2048
+                    grammar=str(_IDEA_SCHEMA_PATH),
                 )
                 if hasattr(response, 'content'):
                     response_text = response.content
@@ -146,29 +141,9 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
                 else:
                     response_text = str(response)
             else:
-                provider = self._get_llm_provider()
-                if not provider:
-                    return []
-                response = await provider.text_chat(
-                    prompt=prompt,
-                    contexts=[],
-                    temperature=0.7,
-                    max_tokens=4096
-                )
-                if hasattr(response, 'result_chain'):
-                    chain = getattr(response.result_chain, 'chain', None)
-                    if chain and len(chain) > 0:
-                        first = chain[0]
-                        if hasattr(first, 'get_text'):
-                            response_text = first.get_text()
-                        elif hasattr(first, 'text'):
-                            response_text = first.text
-                elif hasattr(response, 'content'):
-                    response_text = response.content
-                elif isinstance(response, dict):
-                    response_text = response.get("content", "") or response.get("text", "")
-                else:
-                    response_text = str(response)
+                from provider.llm_utils import call_llm
+                config = getattr(self, 'config', None)
+                response_text = await call_llm(prompt, self.context, config, max_tokens=4096)
 
             result = self._parse_json_response(response_text)
 
@@ -470,15 +445,24 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
             try:
                 for query in queries[:5]:  # 限制查询数
                     result = await self._rag_engine.search(query, mode="retrieve")
-                    sources = result.get("sources", [])
-                    logger.info(f"[IdeaEngine] search_knowledge: query='{query[:50]}...' 返回 sources 数量: {len(sources)}")
-                    for src in sources[:local_rag_top_k]:
-                        src_metadata = src.get("metadata", {})
+                    # result is QueryResult with .nodes (list of Node) and .scores (list of float)
+                    nodes = result.nodes if hasattr(result, 'nodes') else []
+                    scores = result.scores if hasattr(result, 'scores') else [0.0] * len(nodes)
+                    logger.info(f"[IdeaEngine] search_knowledge: query='{query[:50]}...' 返回 nodes 数量: {len(nodes)}")
+                    for i, node in enumerate(nodes[:local_rag_top_k]):
+                        src_metadata = node.metadata if hasattr(node, 'metadata') else {}
+                        if isinstance(src_metadata, str):
+                            import json as _json
+                            try:
+                                src_metadata = _json.loads(src_metadata)
+                            except Exception:
+                                src_metadata = {}
+                        score = scores[i] if i < len(scores) else 0.0
                         local_results.append({
-                            "text": src.get("text", ""),
+                            "text": node.text if hasattr(node, 'text') else str(node),
                             "paper": src_metadata.get("file_name", "Unknown"),
                             "page": str(src_metadata.get("page", "")),
-                            "score": src.get("score", 0.0),
+                            "score": score,
                             "metadata": {
                                 "file_name": src_metadata.get("file_name", "Unknown"),
                                 "page": str(src_metadata.get("page", "")),

@@ -5,14 +5,21 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional
+
+if TYPE_CHECKING:
+    from astrbot.api.event import AstrMessageEvent
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.message.message_event_result import MessageChain
 
 from .retrieval_helpers import RetrievalHelpersMixin
-from ..plugin_common import SUPPORTED_DOC_EXTENSIONS
+
+try:
+    from ..plugin_common import SUPPORTED_DOC_EXTENSIONS
+except ImportError:
+    from plugin_common import SUPPORTED_DOC_EXTENSIONS
 
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 
@@ -146,13 +153,11 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
 
     async def _paper_search(self, event: AstrMessageEvent,
                          query: str = '',
-                         mode: str = "rag",
                          top_k: int = 5):
         """Search document library and answer questions
 
         Args:
             query: Search question
-            mode: Mode (rag=retrieval augmented generation, retrieve=retrieval only, auto=intent routing when Graph RAG enabled)
             top_k: Number of results to return
         """
         if not self.enabled:
@@ -163,7 +168,13 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             yield event.plain_result("📚 Usage: /paper search [question]\nExample: /paper search What are the key innovations of 3D Gaussian Splatting")
             return
 
-        mode = (mode or "rag").strip().lower()
+        mode = "rag"  # 内部路由模式（rag/retrieve/auto）
+
+        # Agentic RAG 模式（由配置开关控制）
+        if self.config.get("enable_agentic_rag", False):
+            async for result in self._agentic_rag(event, query=query, top_k=top_k):
+                yield result
+            return
 
         # 获取引擎
         engine = self._get_engine()
@@ -203,8 +214,8 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             if mode == "auto" and self.config.get("enable_graph_rag", False):
                 try:
                     from ..graphrag.graph_rag_router import create_router, RetrievalMode
-                except Exception as e:
-                    raise ImportError(f"模块导入失败: {e}") from e
+                except ImportError:
+                    from graphrag.graph_rag_router import create_router, RetrievalMode
 
                 router = create_router(context=self.context)
                 route_result = router.route(query)
@@ -261,6 +272,125 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
         except Exception as e:
             logger.error(f"Search failed: {e}")
             yield event.plain_result(f"❌ Search failed: {e}")
+
+
+    async def _agentic_rag(self, event: AstrMessageEvent, query: str = '', top_k: int = 5):
+        """Agentic RAG complex query (multi-hop reasoning / comparison / citation tracing)
+
+        Args:
+            query: Search question
+            top_k: Number of results to return (default: 5)
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if not query:
+            yield event.plain_result(
+                "📚 Usage: /paper arag [question]\n"
+                "Example: /paper arag 比较 ViT 和 CNN 的差异\n"
+                "Example: /paper arag 这篇论文引用了哪些方法\n"
+                "Example: /paper arag attention mechanism 的原理"
+            )
+            return
+
+        yield event.plain_result(f"🧠 Agentic RAG 查询中...\n问题: {query}")
+
+        try:
+            try:
+                from ..agentic_rag import run_agentic_rag
+            except ImportError:
+                from agentic_rag import run_agentic_rag
+
+            final_answer = await run_agentic_rag(query, self.context, top_k=top_k, config=self.config)
+
+            if not final_answer or not final_answer.strip():
+                yield event.plain_result("⚠️ 未能生成回答，请检查知识库是否有相关文档")
+                return
+
+            yield event.plain_result(final_answer)
+
+        except Exception as e:
+            logger.error(f"Agentic RAG failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            yield event.plain_result(f"❌ Agentic RAG 执行失败: {e}")
+
+    async def _agentic_rag_tool(self, query: str, top_k: int = 5) -> str:
+        """LLM Tool 版本：同步返回字符串，供 context.register_llm_tool 使用。
+
+        Args:
+            query: 查询字符串
+            top_k: 召回数
+
+        Returns:
+            final_answer 字符串
+        """
+        class _FakeEvent:
+            """伪造事件对象，仅用于触发 _agentic_rag 内部逻辑。"""
+            def plain_result(self, text: str) -> str:
+                return text
+
+        fake_event = _FakeEvent()
+        results: list[str] = []
+        async for result in self._agentic_rag(fake_event, query=query, top_k=top_k):
+            if isinstance(result, str):
+                results.append(result)
+        return "\n".join(results) if results else ""
+
+    async def _react_rag(self, event: AstrMessageEvent, query: str = '', top_k: int = 5):
+        """Tool-Using Agent (ReAct 模式) 复杂查询
+
+        Args:
+            query: Search question
+            top_k: Number of results to return (default: 5)
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if not query:
+            yield event.plain_result(
+                "🤖 Usage: /paper react [question]\n"
+                "Example: /paper react 比较 ViT 和 CNN 的差异\n"
+                "Example: /paper react attention mechanism 的原理"
+            )
+            return
+
+        yield event.plain_result(f"🤖 ReAct Agent 查询中...\n问题: {query}")
+
+        try:
+            try:
+                from ..agentic_rag import run_react_rag
+            except ImportError:
+                from agentic_rag import run_react_rag
+
+            final_answer = await run_react_rag(query, self.context, top_k=top_k, config=self.config)
+
+            if not final_answer or not final_answer.strip():
+                yield event.plain_result("⚠️ 未能生成回答，请检查知识库是否有相关文档")
+                return
+
+            yield event.plain_result(final_answer)
+
+        except Exception as e:
+            logger.error(f"ReAct Agent failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            yield event.plain_result(f"❌ ReAct Agent 执行失败: {e}")
+
+    async def _react_rag_tool(self, query: str, top_k: int = 5) -> str:
+        """LLM Tool 版本：ReAct Agent，供 context.register_llm_tool 使用。"""
+        class _FakeEvent:
+            def plain_result(self, text: str) -> str:
+                return text
+
+        fake_event = _FakeEvent()
+        results: list[str] = []
+        async for result in self._react_rag(fake_event, query=query, top_k=top_k):
+            if isinstance(result, str):
+                results.append(result)
+        return "\n".join(results) if results else ""
 
 
     async def _paper_list(self, event: AstrMessageEvent):
@@ -1035,7 +1165,10 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
 
             # 同时清除摘要索引
             try:
-                from ..rag.abstract_index import AbstractIndexManager
+                try:
+                    from ..rag.abstract_index import AbstractIndexManager
+                except ImportError:
+                    from rag.abstract_index import AbstractIndexManager
                 plugin_dir = _PLUGIN_DIR
                 embed_dim = self.config.get("embed_dim", 768)
                 milvus_uri = str(plugin_dir / "data" / "milvus_abstracts.db")
