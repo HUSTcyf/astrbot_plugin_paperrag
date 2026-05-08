@@ -167,7 +167,7 @@ class RAGQueryWrapper:
             }
 
     async def _generate_answer(self, prompt: str) -> str:
-        """复用 OpenAICompatibleLLM 生成 answer"""
+        """复用 OpenAICompatibleLLM 生成 answer（底层自动重试 3 次）"""
         from .ragas_generator import OpenAICompatibleLLM
         from langchain_core.prompt_values import StringPromptValue
 
@@ -181,7 +181,6 @@ class RAGQueryWrapper:
         try:
             llm_result = await llm.agenerate_text(StringPromptValue(text=prompt))
             text = llm_result.generations[0][0].text
-            # OpenAICompatibleLLM 可能返回 JSON 包装
             try:
                 parsed = json.loads(text)
                 if isinstance(parsed, dict) and "text" in parsed:
@@ -190,10 +189,10 @@ class RAGQueryWrapper:
                 pass
             return text
         except asyncio.TimeoutError:
-            logger.warning(f"[RAGQueryWrapper] LLM answer 生成超时 (120s): api_base={self._llm_base_url}, model={self._llm_model}")
+            logger.warning(f"[RAGQueryWrapper] LLM answer 生成超时 (3次尝试均失败): api_base={self._llm_base_url}, model={self._llm_model}")
             return ""
         except Exception as e:
-            logger.warning(f"[RAGQueryWrapper] LLM answer 生成失败: {type(e).__name__}: {e}")
+            logger.warning(f"[RAGQueryWrapper] LLM answer 生成失败 (3次尝试均失败): {type(e).__name__}: {e}")
             return ""
 
 
@@ -250,9 +249,12 @@ class RagasEvaluator:
                 # 使用 ragas 0.4.3 新接口 llm_factory 创建 InstructorLLM
                 # 这解决了 collection metrics 要求的 InstructorLLM 接口
                 from openai import OpenAI
+                import httpx
                 client = OpenAI(
                     base_url=self._llm_config["base_url"].rstrip('/'),
                     api_key=self._llm_config["api_key"] or "sk-placeholder",
+                    max_retries=5,
+                    timeout=httpx.Timeout(300.0, connect=30.0),
                 )
                 self._llm = llm_factory(
                     model=self._llm_config["model"],
@@ -272,9 +274,12 @@ class RagasEvaluator:
 
             if self._embed_config["base_url"]:
                 from openai import OpenAI
+                import httpx
                 client = OpenAI(
                     base_url=self._embed_config["base_url"].rstrip('/'),
                     api_key=self._embed_config["api_key"] or "sk-placeholder",
+                    max_retries=5,
+                    timeout=httpx.Timeout(300.0, connect=30.0),
                 )
                 self._embed_model = embedding_factory(
                     provider="openai",

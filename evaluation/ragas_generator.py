@@ -208,21 +208,10 @@ class OpenAICompatibleLLM(BaseRagasLLM):
             pass
         return False
 
-    def _call_api(self, prompt_text: str, temperature: float, max_tokens: int, stop: Optional[list]):
-        """同步调用 API（受全局 Semaphore 限制并发）"""
+    def _call_api(self, prompt_text: str, temperature: float, max_tokens: int, stop: Optional[list], max_retries: int = 3):
+        """同步调用 API（受全局 Semaphore 限制并发），超时/网络错误自动重试"""
         import threading
-
-        # RPM 限制
-        self._wait_for_rpm_slot()
-
-        # 同步路径也必须限速：获取或创建信号量
-        # 注意：同步路径无法直接使用 asyncio.Semaphore，改用 threading.Semaphore
-        # 使用线程锁防止竞争条件
-        if not hasattr(OpenAICompatibleLLM, '_sync_semaphore'):
-            with threading.Lock():
-                if not hasattr(OpenAICompatibleLLM, '_sync_semaphore'):
-                    OpenAICompatibleLLM._sync_semaphore = threading.Semaphore(self._max_concurrent)
-        sync_sem = OpenAICompatibleLLM._sync_semaphore
+        import time
 
         url = f"{self.api_base}/chat/completions"
         headers = {
@@ -238,40 +227,57 @@ class OpenAICompatibleLLM(BaseRagasLLM):
         if stop:
             data['stop'] = stop
 
-        # 获取信号量后执行请求
-        sync_sem.acquire()
-        try:
-            response = requests.post(url, headers=headers, json=data)
-            response.raise_for_status()
-            result = response.json()
-            raw_text = result.get('choices', [{}])[0].get('message', {}).get('content') or ""
+        # RPM 限制
+        self._wait_for_rpm_slot()
 
-            # Step 1: 去除 markdown 代码块包裹
-            import re
-            stripped = raw_text.strip()
-            if stripped.startswith("```"):
-                stripped = re.sub(r'^```(?:json)?\s*', '', stripped, flags=re.MULTILINE)
-                stripped = re.sub(r'\s*```$', '', stripped)
-                stripped = stripped.strip()
+        # 同步路径也必须限速：获取或创建信号量
+        if not hasattr(OpenAICompatibleLLM, '_sync_semaphore'):
+            with threading.Lock():
+                if not hasattr(OpenAICompatibleLLM, '_sync_semaphore'):
+                    OpenAICompatibleLLM._sync_semaphore = threading.Semaphore(self._max_concurrent)
+        sync_sem = OpenAICompatibleLLM._sync_semaphore
 
-            # Step 2: 处理空内容
-            if not stripped:
-                final_text = '{"text": "模型未返回有效响应"}'
-            else:
-                # Step 3: 验证 JSON 有效性
-                try:
-                    parsed = json.loads(stripped)
-                    if parsed == {}:
-                        final_text = '{"text": "模型未返回有效响应"}'
-                    else:
-                        # 有效 JSON，直接返回
-                        final_text = stripped
-                except json.JSONDecodeError:
-                    final_text = json.dumps({"text": stripped})
+        last_error = None
+        for attempt in range(max_retries):
+            sync_sem.acquire()
+            try:
+                response = requests.post(url, headers=headers, json=data, timeout=300)
+                response.raise_for_status()
+                result = response.json()
+                raw_text = result.get('choices', [{}])[0].get('message', {}).get('content') or ""
 
-            return final_text
-        finally:
-            sync_sem.release()
+                import re
+                stripped = raw_text.strip()
+                if stripped.startswith("```"):
+                    stripped = re.sub(r'^```(?:json)?\s*', '', stripped, flags=re.MULTILINE)
+                    stripped = re.sub(r'\s*```$', '', stripped)
+                    stripped = stripped.strip()
+
+                if not stripped:
+                    final_text = '{"text": "模型未返回有效响应"}'
+                else:
+                    try:
+                        parsed = json.loads(stripped)
+                        if parsed == {}:
+                            final_text = '{"text": "模型未返回有效响应"}'
+                        else:
+                            final_text = stripped
+                    except json.JSONDecodeError:
+                        final_text = json.dumps({"text": stripped})
+
+                return final_text
+            except (requests.Timeout, requests.ConnectionError, requests.RequestException) as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning(f"[OpenAICompatibleLLM] 同步请求失败({e})，{wait}s 后重试 ({attempt + 1}/{max_retries})")
+                    time.sleep(wait)
+                else:
+                    logger.error(f"[OpenAICompatibleLLM] 同步请求失败，已重试{max_retries}次: {e}")
+            finally:
+                sync_sem.release()
+
+        raise RuntimeError(f"同步 API 调用失败，已重试{max_retries}次: {last_error}")
 
     def generate_text(
         self,
@@ -287,6 +293,19 @@ class OpenAICompatibleLLM(BaseRagasLLM):
         gen = Generation(text=text)
         return LLMResult(generations=[[gen]])
 
+    async def _do_agenerate_request(self, url: str, headers: dict, data: dict) -> dict:
+        """执行单次 HTTP 请求（供 agenerate_text 重试使用）"""
+        import aiohttp
+
+        async with OpenAICompatibleLLM._semaphore:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
+                logger.info(f"[OpenAICompatibleLLM] 请求 LLM: model={self.model}, api_base={self.api_base}")
+                async with session.post(url, headers=headers, json=data) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        raise RuntimeError(f"API 请求失败: HTTP {resp.status}, 响应: {text[:500]}")
+                    return await resp.json()
+
     async def agenerate_text(
         self,
         prompt: Any,
@@ -294,10 +313,12 @@ class OpenAICompatibleLLM(BaseRagasLLM):
         temperature: Optional[float] = 0.01,
         stop: Optional[list] = None,
         callbacks: Any = None,
+        max_retries: int = 3,
     ) -> LLMResult:
-        """异步生成文本（实现 BaseRagasLLM 接口）"""
+        """异步生成文本（实现 BaseRagasLLM 接口），超时/网络错误自动重试"""
         import aiohttp
         import asyncio
+        import re
 
         # RPM 限制
         await self._await_for_rpm_slot_async()
@@ -325,63 +346,60 @@ class OpenAICompatibleLLM(BaseRagasLLM):
         if stop:
             data['stop'] = stop
 
-        async with OpenAICompatibleLLM._semaphore:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=data) as resp:
-                    # 检查 HTTP 状态码
-                    if resp.status != 200:
-                        text = await resp.text()
-                        raise RuntimeError(f"API 请求失败: HTTP {resp.status}, 响应: {text[:500]}")
-                    result = await resp.json()
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                result = await self._do_agenerate_request(url, headers, data)
 
-        # 安全的 JSON 响应处理
-        import re
+                # 安全的 JSON 响应处理
+                if not isinstance(result, dict):
+                    raise RuntimeError(f"API 响应不是字典类型: {type(result)}, 响应: {str(result)[:500]}")
 
-        # 验证响应结构
-        if not isinstance(result, dict):
-            raise RuntimeError(f"API 响应不是字典类型: {type(result)}, 响应: {str(result)[:500]}")
+                choices = result.get('choices')
+                if not choices or not isinstance(choices, list) or len(choices) == 0:
+                    error_msg = result.get('error', {}).get('message', result.get('error', str(result)))
+                    raise RuntimeError(f"API 返回空 choices，可能被限流或出错: {error_msg}")
 
-        choices = result.get('choices')
-        if not choices or not isinstance(choices, list) or len(choices) == 0:
-            # API 返回错误信息
-            error_msg = result.get('error', {}).get('message', result.get('error', str(result)))
-            raise RuntimeError(f"API 返回空 choices，可能被限流或出错: {error_msg}")
+                first_choice = choices[0]
+                if not isinstance(first_choice, dict):
+                    raise RuntimeError(f"API choice 格式错误: {type(first_choice)}")
 
-        first_choice = choices[0]
-        if not isinstance(first_choice, dict):
-            raise RuntimeError(f"API choice 格式错误: {type(first_choice)}")
+                message = first_choice.get('message')
+                if not isinstance(message, dict):
+                    raise RuntimeError(f"API message 格式错误: {type(message)}")
 
-        message = first_choice.get('message')
-        if not isinstance(message, dict):
-            raise RuntimeError(f"API message 格式错误: {type(message)}")
+                raw_text = message.get('content') or ""
 
-        raw_text = message.get('content') or ""
+                stripped = raw_text.strip()
+                if stripped.startswith("```"):
+                    stripped = re.sub(r'^```(?:json)?\s*', '', stripped, flags=re.MULTILINE)
+                    stripped = re.sub(r'\s*```$', '', stripped)
+                    stripped = stripped.strip()
 
-        # Step 1: 去除 markdown 代码块包裹
-        stripped = raw_text.strip()
-        if stripped.startswith("```"):
-            stripped = re.sub(r'^```(?:json)?\s*', '', stripped, flags=re.MULTILINE)
-            stripped = re.sub(r'\s*```$', '', stripped)
-            stripped = stripped.strip()
+                if not stripped:
+                    raise RuntimeError("LLM 返回空内容，可能是模型服务暂时不可用或被限流")
 
-        # Step 2: 处理空内容
-        if not stripped:
-            raise RuntimeError("LLM 返回空内容，可能是模型服务暂时不可用或被限流")
+                try:
+                    parsed = json.loads(stripped)
+                    if parsed == {}:
+                        raise RuntimeError("LLM 返回空 JSON 对象，可能是模型服务暂时不可用")
+                    final_text = stripped
+                except json.JSONDecodeError:
+                    final_text = json.dumps({"text": stripped})
 
-        # Step 3: 验证 JSON 有效性
-        try:
-            parsed = json.loads(stripped)
-            if parsed == {}:
-                # 空字典，视为无效响应
-                raise RuntimeError("LLM 返回空 JSON 对象，可能是模型服务暂时不可用")
-            # 有效 JSON，直接返回（不再包装）
-            final_text = stripped
-        except json.JSONDecodeError:
-            # 非 JSON，包装为标准格式
-            final_text = json.dumps({"text": stripped})
+                gen = Generation(text=final_text)
+                return LLMResult(generations=[[gen]])
 
-        gen = Generation(text=final_text)
-        return LLMResult(generations=[[gen]])
+            except (asyncio.TimeoutError, RuntimeError) as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning(f"[OpenAICompatibleLLM] 请求失败({type(e).__name__}: {e})，{wait}s 后重试 ({attempt + 1}/{max_retries})")
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(f"[OpenAICompatibleLLM] 请求失败，已重试{max_retries}次: {type(e).__name__}: {e}")
+
+        raise last_error  # type: ignore[misc]
 
     def _get_prompt_text(self, prompt: Any) -> str:
         """从 prompt 对象提取文本"""
@@ -518,7 +536,7 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings):
         sync_sem = self._get_sync_semaphore()
         sync_sem.acquire()
         try:
-            response = requests.post(url, headers=headers, json=data, timeout=60)
+            response = requests.post(url, headers=headers, json=data, timeout=300)
             response.raise_for_status()
             result = response.json()
         finally:
@@ -541,7 +559,7 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings):
         """获取或创建 aiohttp ClientSession（实例级复用）"""
         import aiohttp
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=120)
+            timeout = aiohttp.ClientTimeout(total=300)
             self._session = aiohttp.ClientSession(timeout=timeout)
         return self._session
 

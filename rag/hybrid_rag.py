@@ -314,6 +314,7 @@ class BM25Retriever:
         - 查询包含数字（年份、DOI、arXiv ID）
         - 查询包含具体名称（论文标题、机构名）
         - 查询包含特殊符号（括号、连字符等）
+        - 查询是事实性问题（who, when, where, what role/contributions）
         """
         query_lower = query.lower()
 
@@ -328,6 +329,8 @@ class BM25Retriever:
             r'["""].*["""]',  # 引用的确切词语
             r'\([^)]{1,30}\)',  # 括号内的短文本（可能是专有名词）
             r'[-_]',  # 包含连字符的专有名词
+            r'\b[A-Z]{2,}\b',  # 全大写缩写 (DTU, LERF, RMSE, SAC)
+            r'[A-Z][a-z]+[A-Z][a-z]*',  # CamelCase (SparseNeRF, PointNeRF, InstantNGP)
         ]
 
         for pattern in exact_match_patterns:
@@ -335,12 +338,12 @@ class BM25Retriever:
                 return True
 
         # 2. 检测是否是事实性问题（who, when, where, which name）
-        # 这些问题通常需要精确匹配
         factual_patterns = [
-            r'\bwho\s+(?:proposed|suggested|developed|created|invented|authored)\b',
+            r'\bwho\s+(?:proposed|suggested|developed|created|invented|authored|is|are|was|were)\b',
             r'\bwhen\s+(?:was|did|were)\b',
             r'\bwhere\s+(?:was|did|did\s+it)\b',
             r'\bwhat\s+is\s+the\s+name\b',
+            r'\bwhat\s+(?:role|contributions?)\s+(?:does|did|has|have)\b',
             r'\bwhich\s+(?:paper|author|method|model)\b',
         ]
 
@@ -2142,22 +2145,30 @@ class HybridRAGEngine:
 
                 logger.info(f"[两阶段] 阶段2 dense检索完成: chunks={len(chunk_results)}")
 
-                # 阶段2 BM25: 论文内精确匹配检索
+                # 阶段2 BM25: 全库精确匹配检索（不受论文筛选限制）
+                # BM25 的优势是跨全集词匹配，不应被语义抽象筛选的 paper_id 过滤
                 paper_id_set = set(reranked_paper_ids)
                 if getattr(self.config, 'enable_bm25', True):
                     bm25_retriever = await self._get_bm25_retriever()
                     if bm25_retriever and bm25_retriever.is_exact_match_query(query):
                         try:
                             bm25_raw = await bm25_retriever.retrieve(query, top_k=self.config.bm25_top_k)
-                            bm25_filtered = [
+                            # 不过滤 paper_id：精确词匹配不应受语义筛选限制
+                            bm25_all = [
                                 {"text": n.text, "metadata": n.metadata or {}, "score": float(s)}
                                 for n, s in zip(bm25_raw.nodes, bm25_raw.scores)
-                                if (n.metadata or {}).get("file_name", "") in paper_id_set
                             ]
-                            if bm25_filtered:
-                                logger.info(f"[两阶段] 阶段2 BM25论文内召回: {len(bm25_filtered)} chunks")
+                            if bm25_all:
+                                outside_count = sum(
+                                    1 for n in bm25_raw.nodes
+                                    if (n.metadata or {}).get("file_name", "") not in paper_id_set
+                                )
+                                logger.info(
+                                    f"[两阶段] 阶段2 BM25全库召回: {len(bm25_all)} chunks "
+                                    f"(含筛选论文外 {outside_count} chunks)"
+                                )
                                 chunk_results = self._stage2_rrf_fusion(
-                                    chunk_results, bm25_filtered, top_k=stage2_candidate_k
+                                    chunk_results, bm25_all, top_k=stage2_candidate_k
                                 )
                                 logger.info(f"[两阶段] 阶段2 RRF融合完成: {len(chunk_results)} chunks")
                         except Exception as e:
