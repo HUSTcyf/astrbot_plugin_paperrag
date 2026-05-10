@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 from astrbot.api import logger
 
 from .utils import topic_hash, fuse_knowledge_context, IdeaEngineUtils
+import uuid as uuid_module
 
 class IdeaEngineIdeas(IdeaEngineUtils):
     """
@@ -40,7 +41,6 @@ class IdeaEngineIdeas(IdeaEngineUtils):
             Dict: key = 图片文件名 (如 "14-Figure1.png"), value = caption 文本
                 空 dict 表示文件不存在或解析失败
         """
-        import json
         path = Path(image_path)
         if not path.exists():
             return {}
@@ -201,7 +201,6 @@ class IdeaEngineIdeas(IdeaEngineUtils):
             <uuid1>.json        # 单个 idea
             <uuid2>.json
         """
-        import uuid as uuid_module
 
         folder = self._topic_folder(topic)
         folder.mkdir(parents=True, exist_ok=True)
@@ -426,7 +425,6 @@ class IdeaEngineIdeas(IdeaEngineUtils):
         knowledge: Dict[str, Any]
     ) -> List[Tuple[str, Path]]:
         """追加保存想法到已有 topic 文件夹（不覆盖已有想法）"""
-        import uuid as uuid_module
 
         folder = self._topic_folder(topic)
         folder.mkdir(parents=True, exist_ok=True)

@@ -1,6 +1,8 @@
 from typing import Any, List
 
 from astrbot.api import logger
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core import Document
 
 
 class UniformSentenceSplitter:
@@ -38,11 +40,11 @@ class UniformSentenceSplitter:
         self.min_chunk_size = int(chunk_size * min_chunk_ratio)  # 约 333 tokens
 
     def _get_token_count(self, text: str) -> int:
-        """使用 BGE tokenizer 计数"""
-        if self.tokenizer is None:
-            raise RuntimeError("BGE tokenizer 不可用")
-        tokens = self.tokenizer.encode(text, add_special_tokens=False)
-        return len(tokens)
+        """使用 BGE tokenizer 计数，无 tokenizer 时回退到 tiktoken。"""
+        if self.tokenizer is not None:
+            return len(self.tokenizer.encode(text, add_special_tokens=False))
+        from rag.token_utils import count_tokens
+        return count_tokens(text)
 
     def split(self, text: str) -> List[str]:
         """
@@ -62,8 +64,6 @@ class UniformSentenceSplitter:
         Raises:
             ValueError: chunk_overlap >= chunk_size
         """
-        from llama_index.core.node_parser import SentenceSplitter
-        from llama_index.core import Document
 
         # 提前验证 tokenizer
         if self.tokenizer is None:
@@ -217,12 +217,16 @@ class UniformSentenceSplitter:
                 continue
 
             overlap_tokens = min(self.chunk_overlap, available)
-            tokens = self.tokenizer.encode(prev_text, add_special_tokens=False)
-            if len(tokens) <= overlap_tokens:
-                overlap_text = prev_text
+            if self.tokenizer is not None:
+                tokens = self.tokenizer.encode(prev_text, add_special_tokens=False)
+                if len(tokens) <= overlap_tokens:
+                    overlap_text = prev_text
+                else:
+                    overlap_ids = tokens[-overlap_tokens:]
+                    overlap_text = self.tokenizer.decode(overlap_ids, skip_special_tokens=True)
             else:
-                overlap_ids = tokens[-overlap_tokens:]
-                overlap_text = self.tokenizer.decode(overlap_ids, skip_special_tokens=True)
+                char_budget = overlap_tokens * 4
+                overlap_text = prev_text[-char_budget:] if len(prev_text) > char_budget else prev_text
 
             combined = overlap_text + "\n\n" + curr_text
             result.append(combined)

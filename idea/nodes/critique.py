@@ -7,6 +7,7 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 from astrbot.api import logger
+from provider.llm_utils import call_llm_json
 
 
 class CritiqueInput(BaseModel):
@@ -60,7 +61,6 @@ async def critique_ideas_node(state: dict) -> dict:
         raise ValueError("[critique] _context 未传入")
 
     # 获取 LLM provider（统一 4 步解析）
-    from provider.llm_utils import call_llm_json
 
     ideas_text = "\n".join(
         f"[{i+1}] {idea['title']}\n  描述: {idea.get('description','')[:100]}\n"

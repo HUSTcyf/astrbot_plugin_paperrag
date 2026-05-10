@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 
 from astrbot.api import logger
+from provider.llm_utils import call_llm_json
 
 DEBATE_IDEATOR_PROMPT = """你是一个创新研究者。一位学术评审专家对你的研究想法提出了批评。
 
@@ -119,7 +120,6 @@ async def debate_node(state: dict) -> dict:
     if context is None:
         raise ValueError("[debate] _context 未传入")
 
-    from provider.llm_utils import call_llm_json
 
     # 构建辩论 prompt
     topic = state.get("topic", "")

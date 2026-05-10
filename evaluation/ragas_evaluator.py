@@ -4,36 +4,36 @@
 """
 
 import asyncio
+import copy
 import json
+import os
+import sys
 import time
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Union, cast
-from dataclasses import dataclass, asdict
 
 import pandas as pd
+from datasets import Dataset
 from ragas import evaluate, RunConfig, EvaluationDataset
 from ragas.llms.base import BaseRagasLLM, llm_factory
 from ragas.embeddings.base import BaseRagasEmbedding, embedding_factory
-# 使用内部 `_` 模块的 metric 类，避免 collections 模块的 class identity 问题
 from ragas.metrics._faithfulness import Faithfulness
 from ragas.metrics._answer_relevance import AnswerRelevancy
 from ragas.metrics._context_precision import ContextPrecision
 from ragas.metrics._context_recall import ContextRecall
 from ragas.metrics._nv_metrics import ContextRelevance
 from ragas.metrics._answer_correctness import AnswerCorrectness
-from datasets import Dataset
+from llama_index.core import VectorStoreIndex, Document
+from langchain_core.prompt_values import StringPromptValue
 
 # 禁用 Ragas 遥测追踪（避免 SSL 证书过期错误）
-import os
 os.environ["RAGAS_DO_NOT_TRACK"] = "True"
 
 from astrbot.api import logger
 
-# 导入 EvalSample（用于测试集加载）
-import sys
-from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
-from ragas_generator import EvalSample
+from ragas_generator import EvalSample, OpenAICompatibleLLM, RagasTestsetGenerator
 
 
 # ============================================================================
@@ -79,18 +79,20 @@ class RAGQueryWrapper:
     统一 HybridRAGEngine 和标准 llama-index QueryEngine 的接口
     """
 
-    def __init__(self, query_engine: Any, llm_model: str = "", llm_base_url: str = "", llm_api_key: str = ""):
+    def __init__(self, query_engine: Any, llm_model: str = "", llm_base_url: str = "", llm_api_key: str = "", answer_top_k: int = 5):
         """
         Args:
             query_engine: HybridRAGEngine 实例或 llama-index QueryEngine 实例
             llm_model: LLM 模型名称（用于 hybrid 路径的 answer 生成）
             llm_base_url: LLM API 基础 URL
             llm_api_key: LLM API Key
+            answer_top_k: 用 top-K 个检索 chunk 生成答案（默认5）
         """
         self._engine = query_engine
         self._llm_model = llm_model
         self._llm_base_url = llm_base_url
         self._llm_api_key = llm_api_key
+        self._answer_top_k = answer_top_k
 
         # 检测引擎类型
         self._is_hybrid = hasattr(query_engine, "search")
@@ -120,11 +122,12 @@ class RAGQueryWrapper:
                     "score": scores[i] if i < len(scores) else 0.0,
                 })
 
-            # 从检索结果中生成 answer（复用 OpenAICompatibleLLM）
-            context_texts = [n["text"] for n in source_nodes if n["text"]]
+            # 从检索结果中生成 answer（用 top-K chunk，K 可配置）
             answer = ""
-            if context_texts and self._llm_base_url:
-                context_block = "\n\n".join(context_texts[:5])
+            answer_chunks = source_nodes[:self._answer_top_k]
+            answer_texts = [n["text"] for n in answer_chunks if n["text"]]
+            if answer_texts and self._llm_base_url:
+                context_block = "\n\n".join(answer_texts)
                 prompt = (
                     "You are a research paper assistant. "
                     "Answer the question based ONLY on the provided paper excerpts.\n\n"
@@ -168,8 +171,6 @@ class RAGQueryWrapper:
 
     async def _generate_answer(self, prompt: str) -> str:
         """复用 OpenAICompatibleLLM 生成 answer（底层自动重试 3 次）"""
-        from .ragas_generator import OpenAICompatibleLLM
-        from langchain_core.prompt_values import StringPromptValue
 
         llm = OpenAICompatibleLLM(
             model=self._llm_model or "gpt-4o-mini",
@@ -213,6 +214,7 @@ class RagasEvaluator:
         embed_api_key: Optional[str] = None,
         embedding_mode: str = "api",
         max_concurrent: int = 3,
+        answer_top_k: int = 5,
     ):
         """
         初始化评估器
@@ -229,6 +231,7 @@ class RagasEvaluator:
         self._llm = None
         self._embed_model = None
         self._max_concurrent = max_concurrent
+        self._answer_top_k = answer_top_k
 
         self._llm_config = {
             "model": llm_model,
@@ -305,7 +308,6 @@ class RagasEvaluator:
         重要：此类必须支持 copy.copy() 和 pickle，否则在 ragas executor
         复制指标时会触发无限递归（__getattr__ -> __reduce_ex__ 循环）。
         """
-        import copy
 
         embed = self._get_embed_model()
 
@@ -410,7 +412,6 @@ class RagasEvaluator:
         print(f"{'='*60}")
 
         # 加载测试集
-        from .ragas_generator import RagasTestsetGenerator
         generator = RagasTestsetGenerator(
             llm_model=self._llm_config["model"],
             llm_base_url=self._llm_config["base_url"],
@@ -428,6 +429,7 @@ class RagasEvaluator:
             llm_model=self._llm_config["model"],
             llm_base_url=self._llm_config["base_url"],
             llm_api_key=self._llm_config["api_key"],
+            answer_top_k=self._answer_top_k,
         )
 
         # 准备数据
@@ -535,7 +537,7 @@ class RagasEvaluator:
             print(f"\n⚠️ {nan_count} 个样本存在 NaN 指标值，正在重试...")
             try:
                 from datasets import Dataset as HFDataset
-                full_dict = ragas_dataset.to_dict()
+                full_dict = cast(dict, ragas_dataset.to_dict())
                 retry_dict = {
                     k: [v[i] for i in nan_indices]
                     for k, v in full_dict.items()
@@ -808,7 +810,6 @@ class RagasEvaluator:
 
 async def main():
     """使用示例"""
-    from llama_index.core import VectorStoreIndex, Document
 
     # 初始化评估器（使用 freeapi）
     evaluator = RagasEvaluator(

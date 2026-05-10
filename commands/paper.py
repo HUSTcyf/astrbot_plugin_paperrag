@@ -15,6 +15,7 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.core.message.message_event_result import MessageChain
 
 from .retrieval_helpers import RetrievalHelpersMixin
+import time
 
 try:
     from ..plugin_common import SUPPORTED_DOC_EXTENSIONS
@@ -468,7 +469,6 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
                 return
 
             # Import documents using new API
-            import time
             start_time = time.time()
 
             total_files = len(doc_files)
@@ -933,7 +933,6 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             # Step 4: Re-parse and re-vectorize
             yield event.plain_result("🔍 Step 4/4: Re-parsing and vectorizing...")
 
-            import time
             start_time = time.time()
             success_count = 0
             fail_count = 0
@@ -1054,7 +1053,6 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
                 yield event.plain_result("❌ Abstract index manager is not ready")
                 return
 
-            import time
             start_time = time.time()
             success_count = 0
             fail_count = 0
@@ -1220,7 +1218,6 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
         yield event.plain_result(f"📄 Step 3/5: Found {len(doc_files)} documents")
 
         # Re-add documents
-        import time
         start_time = time.time()
         total_files = len(doc_files)
         successful = 0

@@ -497,7 +497,6 @@ class ArxivCommandsMixin(PluginCoreBase):
         yield event.plain_result(f"🧹 扫描MCP存储路径: {mcp_storage_path}")
 
         try:
-            import re
             from collections import defaultdict
 
             mcp_path = Path(mcp_storage_path)

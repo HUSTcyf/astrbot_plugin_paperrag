@@ -5,6 +5,7 @@ ReAct Tool Executor — 工具注册与执行。
 from __future__ import annotations
 
 from astrbot.api import logger
+from .engine_utils import get_engine, get_graph_engine
 
 TOOL_DEFINITIONS = {
     "vector_search": "vector_search(query) - 在论文数据库中进行向量检索，返回相关论文片段",
@@ -21,7 +22,6 @@ async def _tool_vector_search(
     query: str, context, config, top_k: int
 ) -> tuple[str, list[dict]]:
     """向量检索工具。返回 (observation_text, retrieved_nodes)。"""
-    from .engine_utils import get_engine
 
     engine = get_engine(context, config)
     if engine is None:
@@ -76,7 +76,6 @@ async def _tool_graph_search(
     query: str, context, config, top_k: int
 ) -> tuple[str, list[dict], list[dict], list[dict]]:
     """图谱检索工具。返回 (observation_text, source_nodes, entities, relations)。"""
-    from .engine_utils import get_graph_engine
 
     try:
         graph_engine = await get_graph_engine(context, config)
@@ -155,7 +154,6 @@ async def _tool_graph_search(
 
 async def _tool_list_documents(context, config) -> tuple[str, list[dict]]:
     """列出所有已收录论文。"""
-    from .engine_utils import get_engine
 
     engine = get_engine(context, config)
     if engine is None:
@@ -184,7 +182,6 @@ async def _tool_list_documents(context, config) -> tuple[str, list[dict]]:
 
 async def _tool_graph_stats(context, config) -> str:
     """获取知识图谱统计信息。"""
-    from .engine_utils import get_graph_engine
 
     try:
         graph_engine = await get_graph_engine(context, config)
@@ -214,7 +211,6 @@ async def _tool_graph_stats(context, config) -> str:
 
 async def _tool_get_paper_info(filename: str, context, config) -> str:
     """获取指定论文的详细信息。"""
-    from .engine_utils import get_engine
 
     engine = get_engine(context, config)
     if engine is None:
@@ -277,7 +273,6 @@ async def _tool_get_paper_info(filename: str, context, config) -> str:
 
 async def _tool_reference_stats(top_k_str: str, context, config) -> str:
     """获取参考文献引用统计。top_k_str: "10" 或 "-1"（列出零引用论文）。"""
-    from .engine_utils import get_engine
 
     engine = get_engine(context, config)
     if engine is None:
@@ -354,7 +349,6 @@ async def _tool_reference_stats(top_k_str: str, context, config) -> str:
 
 async def _tool_abstract_stats(top_k_str: str, context, config) -> str:
     """获取摘要提取统计。top_k_str: 任意值 或 "-1"（列出零摘要论文）。"""
-    from .engine_utils import get_engine
 
     engine = get_engine(context, config)
     if engine is None:

@@ -18,6 +18,8 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from .base import PluginCoreBase
+import gzip
+import subprocess
 
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 
@@ -188,7 +190,6 @@ class GraphCommandsMixin(PluginCoreBase):
 
     async def _graph_build_background_task(self, event: AstrMessageEvent, engine, skip_count: int = 0):
         """后台运行图谱构建任务（支持检查点和进度日志）"""
-        from pathlib import Path
 
         plugin_dir = _PLUGIN_DIR
 
@@ -688,10 +689,6 @@ class GraphCommandsMixin(PluginCoreBase):
 
     async def _online_backup(self, graph_config: "GraphRAGConfig") -> dict:
         """在线备份：使用 Cypher 导出为 JSON"""
-        import json
-        import gzip
-        from pathlib import Path
-        from datetime import datetime
 
         try:
             from neo4j import GraphDatabase
@@ -774,10 +771,6 @@ class GraphCommandsMixin(PluginCoreBase):
 
     async def _offline_backup(self, graph_config: "GraphRAGConfig") -> dict:
         """离线备份：复制 Neo4j 数据目录"""
-        import shutil
-        import subprocess
-        from pathlib import Path
-        from datetime import datetime
 
         neo4j_data_dir = Path("/opt/homebrew/var/neo4j/data")
         if not neo4j_data_dir.exists():
@@ -896,9 +889,6 @@ class GraphCommandsMixin(PluginCoreBase):
 
     async def _restore_backup(self, backup_file: str, graph_config: "GraphRAGConfig") -> dict:
         """从备份恢复"""
-        import json
-        import gzip
-        from pathlib import Path
 
         try:
             from neo4j import GraphDatabase
@@ -1015,8 +1005,6 @@ class GraphCommandsMixin(PluginCoreBase):
             yield event.plain_result("❌ Graph RAG 功能未启用")
             return
 
-        from pathlib import Path
-        from datetime import datetime
 
         plugin_dir = _PLUGIN_DIR
         backup_dir = plugin_dir / "data" / "graph_store"
@@ -1076,8 +1064,6 @@ class GraphCommandsMixin(PluginCoreBase):
             yield event.plain_result("❌ Plugin is disabled")
             return
 
-        from pathlib import Path
-        import os
 
         # Neo4j 原始数据目录
         neo4j_db_path = Path("/opt/homebrew/var/neo4j/data/databases/neo4j")

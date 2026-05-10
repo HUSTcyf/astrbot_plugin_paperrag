@@ -17,6 +17,8 @@ import sys
 import os
 import argparse
 from pathlib import Path
+from docling.datamodel.settings import settings
+from docling.utils.model_downloader import download_models
 
 # 添加插件目录到 path
 # __file__ = .../astrbot_plugin_paperrag/tools/download_models.py
@@ -113,11 +115,9 @@ def download_docling(force: bool = False) -> bool:
     print()
 
     # 设置 docling settings
-    from docling.datamodel.settings import settings
     settings.cache_dir = LOCAL_MODELS_DIR
     settings.artifacts_path = LOCAL_MODELS_DIR
 
-    from docling.utils.model_downloader import download_models
 
     try:
         print("🚀 开始下载 Docling 模型...")

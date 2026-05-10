@@ -89,7 +89,7 @@ class TestReactAgentNode:
             "tool_call_count": 0,
         }
 
-        with patch("provider.llm_utils.call_llm", new_callable=AsyncMock, return_value="THOUGHT: I know this.\nFINISH: The answer is attention."):
+        with patch("agentic_rag.react_agent.call_llm", new_callable=AsyncMock, return_value="THOUGHT: I know this.\nFINISH: The answer is attention."):
             result = await react_agent_node(state)
 
         assert result["draft"] == "The answer is attention."
@@ -109,7 +109,7 @@ class TestReactAgentNode:
             "tool_call_count": 0,
         }
 
-        with patch("provider.llm_utils.call_llm", new_callable=AsyncMock, return_value="THOUGHT: Need to search.\nACTION: vector_search(transformer architecture)"):
+        with patch("agentic_rag.react_agent.call_llm", new_callable=AsyncMock, return_value="THOUGHT: Need to search.\nACTION: vector_search(transformer architecture)"):
             result = await react_agent_node(state)
 
         assert result["_pending_action"] is not None
@@ -147,7 +147,7 @@ class TestReactAgentNode:
             "retry_count": 1,
         }
 
-        with patch("provider.llm_utils.call_llm", new_callable=AsyncMock, return_value="THOUGHT: Fix the issues.\nFINISH: Better answer with [#1] citation."):
+        with patch("agentic_rag.react_agent.call_llm", new_callable=AsyncMock, return_value="THOUGHT: Fix the issues.\nFINISH: Better answer with [#1] citation."):
             result = await react_agent_node(state)
 
         # The scratchpad should contain the quality feedback
@@ -189,13 +189,9 @@ class TestReactToolExecutor:
     async def test_vector_search_tool(self):
         """vector_search tool calls engine and returns nodes + observation."""
         mock_engine = MagicMock()
-        mock_node = MagicMock()
-        mock_node.text = "Attention is all you need"
-        mock_node.metadata = {"file_name": "attention.pdf"}
-        mock_result = MagicMock()
-        mock_result.nodes = [mock_node]
-        mock_result.scores = [0.95]
-        mock_engine.search = AsyncMock(return_value=mock_result)
+        mock_engine.search = AsyncMock(return_value=[
+            {"text": "Attention is all you need", "score": 0.95, "metadata": {"file_name": "attention.pdf"}},
+        ])
 
         state = {
             "scratchpad": "SYSTEM...\nTHOUGHT: ...\n",
@@ -206,7 +202,7 @@ class TestReactToolExecutor:
             "tool_call_count": 0,
         }
 
-        with patch("agentic_rag.engine_utils.get_engine", return_value=mock_engine):
+        with patch("agentic_rag.react_tools.get_engine", return_value=mock_engine):
             result = await react_tool_executor_node(state)
 
         assert result["tool_call_count"] == 1
@@ -235,7 +231,7 @@ class TestReactToolExecutor:
             "tool_call_count": 0,
         }
 
-        with patch("agentic_rag.engine_utils.get_graph_engine", AsyncMock(return_value=mock_graph_engine)):
+        with patch("agentic_rag.react_tools.get_graph_engine", AsyncMock(return_value=mock_graph_engine)):
             result = await react_tool_executor_node(state)
 
         assert result["tool_call_count"] == 1

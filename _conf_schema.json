@@ -451,20 +451,12 @@
                 "hint": "从知识图谱中检索相关实体时返回的数量"
             },
             "hybrid_alpha": {
-                "description": "混合检索权重（0=纯图，1=纯向量）- 已废弃，请使用 graph_rrf_weight",
+                "description": "混合检索权重（0=纯图，1=纯向量）- 已废弃",
                 "type": "float",
                 "default": 0.5,
                 "minimum": 0.0,
                 "maximum": 1.0,
-                "hint": "RRF 融合中向量检索的权重。0.5 表示向量和图谱同等重要（已废弃，推荐使用 graph_rrf_weight）"
-            },
-            "graph_rrf_weight": {
-                "description": "图谱 RRF 融合权重",
-                "type": "float",
-                "default": 0.2,
-                "minimum": 0.0,
-                "maximum": 1.0,
-                "hint": "图谱通道在 RRF 融合中的权重，默认 0.2 表示图谱占 20%"
+                "hint": "RRF 融合中向量检索的权重。0.5 表示向量和稀疏同等重要（已废弃）"
             },
             "auto_build": {
                 "description": "自动构建知识图谱",

@@ -15,6 +15,9 @@ import argparse
 import asyncio
 import sys
 from pathlib import Path
+from agentic_rag.workflow import compile_workflow
+from unittest.mock import MagicMock
+from agentic_rag.engine_utils import get_engine
 
 # 添加插件根目录到 sys.path
 _plugin_root = Path(__file__).parent.parent.parent
@@ -28,8 +31,6 @@ async def smoke_test_isolated():
     print("🧪 节点隔离冒烟测试")
     print("=" * 60)
 
-    from agentic_rag.workflow import compile_workflow
-    from unittest.mock import MagicMock
 
     app = compile_workflow()
     print(f"✅ workflow 编译成功: {type(app).__name__}")
@@ -75,8 +76,6 @@ async def smoke_test_full():
     print("🌍 完整流程冒烟测试（真实引擎）")
     print("=" * 60)
 
-    from agentic_rag.workflow import compile_workflow
-    from agentic_rag.engine_utils import get_engine
 
     app = compile_workflow()
 

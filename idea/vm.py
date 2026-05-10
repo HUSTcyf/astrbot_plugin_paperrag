@@ -283,7 +283,6 @@ class IdeaEngineVM(IdeaEngineCitations):
 
     def _load_captions_by_paper(self, paper_name: str) -> Dict[str, Any]:
         """加载指定论文的所有图表 caption 信息（自动查找匹配的 JSON 文件）。"""
-        import json
         captions_dir = Path(__file__).parent.parent / "data" / "captions"
         if not captions_dir.exists():
             logger.warning(f"[IdeaEngine] caption 目录不存在: {captions_dir}")

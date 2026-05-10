@@ -125,12 +125,18 @@ for tag, query in queries.items():
     keywords = [w for w in raw if not any(w != o and w in o for o in raw)][:5]
 
     graph_chunk_boost = {}
+    graph_text_results = []
     matched_names = []
     for name, cid, label in kg_entities:
         for kw in keywords:
             if kw.lower() in name.lower():
                 score = min(1.0, 0.5 + len(kw) / max(len(name), 1) * 0.5)
                 graph_chunk_boost[cid] = max(graph_chunk_boost.get(cid, 0.0), score)
+                graph_text_results.append({
+                    "text": f"Graph context for {name} ({label})",
+                    "metadata": {"chunk_id": cid, "file_name": cid, "retrieval_type": "graph"},
+                    "score": score,
+                })
                 matched_names.append(name)
                 break
 
@@ -168,7 +174,7 @@ for tag, query in queries.items():
                 vector_results=vector_results,
                 sparse_results={},
                 bm25_results=None,
-                graph_chunk_boost=None,
+                graph_text_results=None,
                 top_k=10,
             )
         else:
@@ -176,7 +182,7 @@ for tag, query in queries.items():
                 vector_results=vector_results,
                 sparse_results={},
                 bm25_results=None,
-                graph_chunk_boost=graph_chunk_boost,
+                graph_text_results=graph_text_results,
                 top_k=10,
             )
 

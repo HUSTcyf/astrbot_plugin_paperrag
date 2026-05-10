@@ -28,6 +28,8 @@ import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from legacy.milvus_manager import PaperMilvusManager
+import datetime
 
 # 添加插件目录到路径
 SCRIPT_DIR = Path(__file__).parent.parent
@@ -229,7 +231,6 @@ async def initialize_milvus(
     milvus_lite_path: Optional[str] = None
 ):
     """初始化 Milvus 数据库（清除旧数据）"""
-    from legacy.milvus_manager import PaperMilvusManager
 
     # 使用覆盖路径或配置中的路径
     effective_lite_path = milvus_lite_path if milvus_lite_path else config.get("milvus_lite_path", "")
@@ -294,7 +295,6 @@ async def index_papers(
         from ..embedding.embedding_providers import create_embedding_provider
     except ImportError:
         from embedding.embedding_providers import create_embedding_provider
-    from legacy.milvus_manager import PaperMilvusManager
 
     # 使用覆盖路径或配置中的路径
     effective_lite_path = milvus_lite_path if milvus_lite_path else config.get("milvus_lite_path", "")
@@ -405,7 +405,6 @@ async def index_papers(
 
 async def main_async(args):
     """异步主函数"""
-    import datetime
 
     data_dir = Path(args.data_dir) if args.data_dir else DEFAULT_DATA_DIR
 

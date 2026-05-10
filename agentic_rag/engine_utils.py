@@ -5,15 +5,16 @@ Shared engine factory — 单例模式复用 HybridRAGEngine 和 GraphRAGEngine�
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import TYPE_CHECKING, Any, Optional
 
 from astrbot.api import logger
+from rag.rag_engine import RAGConfig, create_rag_engine
+from graphrag.graph_rag_engine import GraphRAGConfig, GraphRAGEngine
 
 if TYPE_CHECKING:
     from ..rag.hybrid_rag import HybridRAGEngine
-    from ..graphrag.graph_rag_engine import GraphRAGEngine
-    from rag.rag_engine import RAGConfig
 
 
 _engine_lock = threading.Lock()
@@ -21,14 +22,12 @@ _engine_lock = threading.Lock()
 
 def _configure_mps_memory() -> None:
     """Configure PyTorch MPS memory behavior."""
-    import os
     os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
     os.environ.setdefault('PYTORCH_MPS_HIGH_WATERMARK_RATIO', '0.0')
 
 
 def _create_rag_config(config: dict[str, Any]) -> "RAGConfig":
     """从插件配置字典构建 RAGConfig。"""
-    from rag.rag_engine import RAGConfig
 
     raw_embedding_mode = config.get("embedding_mode", "unsloth")
     if raw_embedding_mode == "api":
@@ -91,7 +90,6 @@ def _create_rag_config(config: dict[str, Any]) -> "RAGConfig":
         graph_neo4j_password=config.get("graph_rag", {}).get("neo4j_password", ""),
         graph_max_triplets_per_chunk=config.get("graph_rag", {}).get("max_triplets_per_chunk", 5),
         graph_retrieval_top_k=config.get("graph_rag", {}).get("graph_retrieval_top_k", 5),
-        graph_rrf_weight=config.get("graph_rag", {}).get("graph_rrf_weight", 0.2),
         graph_auto_build=config.get("graph_rag", {}).get("auto_build", False),
         graph_auto_build_threshold=config.get("graph_rag", {}).get("auto_build_threshold", 10),
     )
@@ -117,7 +115,6 @@ def get_engine(context: Any, config: Optional[dict[str, Any]] = None) -> Optiona
         logger.error(f"[agentic_rag] RAG配置无效: {error_msg}")
         return None
 
-    from rag.rag_engine import create_rag_engine
     engine = create_rag_engine(rag_config, context)
     logger.info("[agentic_rag] HybridRAGEngine 已创建")
     return engine
@@ -144,7 +141,6 @@ async def get_graph_engine(
         logger.warning("[agentic_rag] 基础引擎未就绪")
         return None
 
-    from graphrag.graph_rag_engine import GraphRAGConfig, GraphRAGEngine
 
     graph_config = GraphRAGConfig.from_rag_config(base_engine.config)
     engine_instance = GraphRAGEngine(graph_config, base_engine, context)

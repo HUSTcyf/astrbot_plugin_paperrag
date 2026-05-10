@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 """
 Ragas 自动化评估主入口
 从 Milvus 数据库读取 chunks → 生成测试集 → RAG 评估 → 报告生成
@@ -41,6 +43,20 @@ from typing import List, Dict, Any, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from astrbot.api import logger
+from rag.hybrid_index import HybridIndexManager
+import csv
+import io
+from collections import defaultdict
+from llama_index.core import Document as LIDocument
+from .ragas_generator import RagasTestsetGenerator
+import tempfile
+import uuid
+import re
+from .ragas_generator import EvalSample
+from .ragas_evaluator import RagasEvaluator
+from .report_generator import ReportGenerator
+from rag.rag_engine import create_rag_engine, RAGConfig
+from .ragas_generator import OpenAICompatibleLLM
 
 
 # 多模态文档生成时，发送给 LLM 的文档数量倍数（test_size * MULTIMODAL_DOC_MULTIPLIER）
@@ -85,7 +101,6 @@ def create_index_manager() -> Any:
     rag_config = config.get("rag_config", {})
     milvus_config = rag_config.get("milvus", {})
 
-    from rag.hybrid_index import HybridIndexManager
 
     return HybridIndexManager(
         collection_name=rag_config.get("collection_name", "paper_embeddings"),
@@ -152,8 +167,6 @@ def _read_table_csv_as_text(csv_path: str, max_rows: int = 50) -> str:
     Returns:
         表格的文本表示
     """
-    import csv
-    import io
 
     try:
         csv_path_obj = Path(csv_path)
@@ -255,8 +268,6 @@ def chunks_to_documents(
     Returns:
         llama-index Document 列表
     """
-    from collections import defaultdict
-    from llama_index.core import Document as LIDocument
 
     # 确定 figures 目录
     if not figures_dir:
@@ -418,8 +429,6 @@ def extract_multimodal_chunks_with_context(
     Returns:
         (多模态 chunks, 上下文 chunks) 元组
     """
-    from collections import defaultdict
-    import random
 
     # 按 paper_id 分组
     chunks_by_paper = defaultdict(list)
@@ -513,7 +522,6 @@ def build_multimodal_documents(
     Returns:
         多模态 Document 列表
     """
-    from llama_index.core import Document as LIDocument
 
     if not figures_dir:
         plugin_dir = Path(__file__).parent.parent
@@ -699,7 +707,6 @@ async def generate_multimodal_testset(
         return []
 
     # 构建上下文 documents（普通文本）
-    from llama_index.core import Document as LIDocument
     context_docs = []
     for chunk in context_chunks:
         text = chunk.get("text", "")
@@ -718,7 +725,6 @@ async def generate_multimodal_testset(
     all_docs = multimodal_docs + context_docs
 
     # 使用 Ragas 生成测试集
-    from .ragas_generator import RagasTestsetGenerator
 
     generator = RagasTestsetGenerator(
         llm_model=llm_model,
@@ -739,8 +745,6 @@ async def generate_multimodal_testset(
     trimmed_docs = multimodal_docs[:min(test_size * MULTIMODAL_DOC_MULTIPLIER, len(multimodal_docs))]
 
     # 使用临时文件避免覆盖主文件（generate_testset 会直接写入文件）
-    import tempfile
-    import uuid
     temp_output = str(Path(tempfile.gettempdir()) / f"ragas_temp_{uuid.uuid4().hex}.json")
 
     print(f"正在调用 LLM 生成 {test_size} 个多模态问答对...")
@@ -765,8 +769,6 @@ async def generate_multimodal_testset(
             }
 
     # 从 contexts[0] 解析 chunk_id 并找回 metadata
-    import re
-    from .ragas_generator import EvalSample
     multimodal_samples = []
     matched_count = 0
     unmatched_count = 0
@@ -857,7 +859,6 @@ async def generate_multimodal_testset(
 
     # 原子写入：先写临时文件，再 rename
     output_path_obj.parent.mkdir(parents=True, exist_ok=True)
-    import os
     temp_final = str(output_path_obj) + ".tmp"
     with open(temp_final, "w", encoding="utf-8") as f:
         json.dump(all_samples, f, ensure_ascii=False, indent=2)
@@ -898,7 +899,6 @@ async def generate_testset_from_documents(
     print(f"📝 步骤 2/4: 生成 {test_size} 个评测问题")
     print("=" * 60)
 
-    from .ragas_generator import RagasTestsetGenerator
 
     generator = RagasTestsetGenerator(
         llm_model=llm_model,
@@ -938,13 +938,13 @@ async def run_evaluation(
     embed_api_key: str = "",
     embedding_mode: str = "api",
     eval_embedding_mode: str = "api",
+    answer_top_k: int = 5,
 ) -> Any:
     """执行 Ragas 评估"""
     print(f"\n{'='*60}")
     print("📊 步骤 3/4: 执行 Ragas 评估")
     print("=" * 60)
 
-    from .ragas_evaluator import RagasEvaluator
 
     evaluator = RagasEvaluator(
         llm_model=llm_model,
@@ -954,6 +954,7 @@ async def run_evaluation(
         embed_base_url=embed_base_url,
         embed_api_key=embed_api_key,
         embedding_mode=eval_embedding_mode,
+        answer_top_k=answer_top_k,
     )
 
     results = await evaluator.evaluate(
@@ -978,13 +979,13 @@ async def run_evaluation_from_raw_answers(
     embed_base_url: str = "",  # 强制留空，使用 freeapi_url
     embed_api_key: str = "",
     embedding_mode: str = "api",
+    answer_top_k: int = 5,
 ) -> Any:
     """从已有 raw_answers.json 执行 Ragas 评估（跳过 RAG 推理）"""
     print(f"\n{'='*60}")
     print("📊 步骤 3/4: 执行 Ragas 评估（跳过 RAG 推理）")
     print("=" * 60)
 
-    from .ragas_evaluator import RagasEvaluator
 
     evaluator = RagasEvaluator(
         llm_model=llm_model,
@@ -994,6 +995,7 @@ async def run_evaluation_from_raw_answers(
         embed_base_url=embed_base_url,
         embed_api_key=embed_api_key,
         embedding_mode=embedding_mode,
+        answer_top_k=answer_top_k,
     )
 
     results = await evaluator.evaluate_from_raw_answers(
@@ -1021,7 +1023,6 @@ def generate_reports(
     print("📋 步骤 4/4: 生成评测报告")
     print("=" * 60)
 
-    from .report_generator import ReportGenerator
 
     reporter = ReportGenerator(results_path)
     html_path = reporter.generate_html_report(
@@ -1068,6 +1069,7 @@ async def run_full_pipeline(
     top_k: int | None = None,
     multimodal_context_before: int = 1,
     multimodal_context_after: int = 1,
+    answer_top_k: int = 5,
 ) -> dict:
     """
     完整评测流程
@@ -1141,7 +1143,6 @@ async def run_full_pipeline(
     print("=" * 60)
 
     # 使用插件现有配置创建引擎
-    from rag.rag_engine import create_rag_engine, RAGConfig
 
     plugin_dir = Path(__file__).parent.parent
     config_path = plugin_dir.parent.parent / "config" / "astrbot_plugin_paperrag_config.json"
@@ -1181,7 +1182,6 @@ async def run_full_pipeline(
         graph_neo4j_uri=rag_cfg.get("graph_rag", {}).get("neo4j_uri", "bolt://localhost:7687"),
         graph_neo4j_user=rag_cfg.get("graph_rag", {}).get("neo4j_user", "neo4j"),
         graph_neo4j_password=rag_cfg.get("graph_rag", {}).get("neo4j_password", ""),
-        graph_rrf_weight=rag_cfg.get("graph_rag", {}).get("graph_rrf_weight", 0.2),
         graph_retrieval_top_k=rag_cfg.get("graph_rag", {}).get("graph_retrieval_top_k", 5),
         graph_max_triplets_per_chunk=rag_cfg.get("graph_rag", {}).get("max_triplets_per_chunk", 5),
     )
@@ -1205,6 +1205,7 @@ async def run_full_pipeline(
         embed_base_url=embed_base_url,
         embed_api_key=embed_api_key,
         embedding_mode=eval_embedding_mode,
+        answer_top_k=answer_top_k,
     )
 
     # ========== 步骤 5: 生成报告 ==========
@@ -1315,6 +1316,7 @@ def main():
 
     # 评测参数
     parser.add_argument("--max-concurrent", type=int, default=5, help="最大并发数")
+    parser.add_argument("--answer-top-k", type=int, default=5, help="用 top-K 个检索 chunk 生成答案（默认5）")
     parser.add_argument("--max-rpm", type=int, default=96, help="RPM 限制（默认96）")
 
     # 报告配置
@@ -1381,7 +1383,6 @@ def main():
     # ========== 根据步骤执行 ==========
 
     # 设置 RPM 限制
-    from .ragas_generator import OpenAICompatibleLLM
     OpenAICompatibleLLM.set_max_rpm(args.max_rpm)
     print(f"   RPM 限制: {args.max_rpm}")
     if args.step == "all":
@@ -1407,6 +1408,7 @@ def main():
             top_k=args.top_k,
             multimodal_context_before=args.multimodal_context_before,
             multimodal_context_after=args.multimodal_context_after,
+            answer_top_k=args.answer_top_k,
         ))
 
     elif args.step == "extract":
@@ -1491,6 +1493,7 @@ def main():
                 embed_base_url=embed_base_url,
                 embed_api_key=embed_api_key,
                 embedding_mode=args.embedding_mode,
+                answer_top_k=args.answer_top_k,
             ))
         else:
             # 正常流程：RAG 推理 + 评估
@@ -1547,7 +1550,6 @@ def main():
                 graph_neo4j_uri=rag_cfg.get("graph_rag", {}).get("neo4j_uri", "bolt://localhost:7687"),
                 graph_neo4j_user=rag_cfg.get("graph_rag", {}).get("neo4j_user", "neo4j"),
                 graph_neo4j_password=rag_cfg.get("graph_rag", {}).get("neo4j_password", ""),
-                graph_rrf_weight=rag_cfg.get("graph_rag", {}).get("graph_rrf_weight", 0.2),
                 graph_retrieval_top_k=rag_cfg.get("graph_rag", {}).get("graph_retrieval_top_k", 5),
                 graph_max_triplets_per_chunk=rag_cfg.get("graph_rag", {}).get("max_triplets_per_chunk", 5),
             )
@@ -1577,6 +1579,7 @@ def main():
                 embed_base_url=embed_base_url,
                 embed_api_key=embed_api_key,
                 eval_embedding_mode=args.eval_embedding_mode,
+                answer_top_k=args.answer_top_k,
             ))
 
         # 生成报告

@@ -15,7 +15,7 @@ async def test_synthesize_no_context():
 @pytest.mark.asyncio
 async def test_synthesize_no_provider():
     """无可用 provider 时失败。"""
-    with patch("provider.llm_utils.call_llm", new_callable=AsyncMock, side_effect=RuntimeError("无可用 LLM provider")):
+    with patch("agentic_rag.nodes.synthesize.call_llm", new_callable=AsyncMock, side_effect=RuntimeError("无可用 LLM provider")):
         mock_ctx = MagicMock()
         state = {"query": "test", "_context": mock_ctx, "retrieved_nodes": [], "graph_entities": [], "graph_relations": []}
         with pytest.raises(RuntimeError, match="生成失败"):
@@ -25,7 +25,7 @@ async def test_synthesize_no_provider():
 @pytest.mark.asyncio
 async def test_synthesize_success():
     """正常生成。"""
-    with patch("provider.llm_utils.call_llm", new_callable=AsyncMock, return_value="Answer: Attention mechanism"):
+    with patch("agentic_rag.nodes.synthesize.call_llm", new_callable=AsyncMock, return_value="Answer: Attention mechanism"):
         mock_ctx = MagicMock()
         state = {
             "query": "What is attention?",

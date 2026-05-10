@@ -18,11 +18,10 @@ import argparse
 import asyncio
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
-
-import sys
 SCRIPT_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
@@ -73,7 +72,6 @@ def save_predictions(predictions: list, output_file: Path):
 
 async def translate_text(api_key: str, base_url: str, text: str, model: str = "gpt-4o-mini") -> str:
     """使用 LLM API 翻译文本为英文"""
-    importaiohttp = None
     try:
         import aiohttp
     except ImportError:
@@ -258,7 +256,6 @@ def run_evaluator(predictions_file: Path, gold_file: Path, output_dir: Path, tex
     print(f"  {' '.join(cmd)}")
     print(f"\n评估结果将保存到: {output_file}")
 
-    import subprocess
     result = subprocess.run(
         cmd,
         capture_output=True,

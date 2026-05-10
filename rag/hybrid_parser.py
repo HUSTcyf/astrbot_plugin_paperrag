@@ -123,13 +123,13 @@ class HybridPDFParser:
         logger.info(f"✅ HybridPDFParser初始化完成 (chunk_size={chunk_size} tokens, overlap={chunk_overlap}, min_size={min_chunk_size})")
 
     def _get_tokenizer(self):
-        """懒加载 BGE-M3 tokenizer（与 embedding 模型共用同一个）"""
+        """懒加载 BGE-M3 tokenizer，并注册到全局 token_utils。"""
         if self._tokenizer is None:
             import os
             os.environ["GRPC_VERBOSITY"] = "ERROR"
             os.environ["GLOG_minloglevel"] = "2"
 
-            # 优先从已初始化的 embedding 模型中复用 tokenizer（避免重复加载）
+            # 优先从已初始化的 embedding 模型中复用 tokenizer
             try:
                 try:
                     from ..embedding.flag_embedding import get_flag_model
@@ -139,65 +139,58 @@ class HybridPDFParser:
                 if flag_model._initialized and flag_model.tokenizer is not None:
                     self._tokenizer = flag_model.tokenizer
                     logger.debug("使用 FlagEmbedding 的 tokenizer")
-                    return self._tokenizer
             except Exception:
                 pass
 
-            try:
+            if self._tokenizer is None:
                 try:
-                    from ..embedding.unsloth_embedding import get_embedding_model
-                except ImportError:
-                    from embedding.unsloth_embedding import get_embedding_model
-                unsloth_model = get_embedding_model()
-                if unsloth_model is not None and unsloth_model.tokenizer is not None:
-                    self._tokenizer = unsloth_model.tokenizer
-                    logger.debug("使用 Unsloth 的 tokenizer")
-                    return self._tokenizer
-            except Exception:
-                pass
+                    try:
+                        from ..embedding.unsloth_embedding import get_embedding_model
+                    except ImportError:
+                        from embedding.unsloth_embedding import get_embedding_model
+                    unsloth_model = get_embedding_model()
+                    if unsloth_model is not None and unsloth_model.tokenizer is not None:
+                        self._tokenizer = unsloth_model.tokenizer
+                        logger.debug("使用 Unsloth 的 tokenizer")
+                except Exception:
+                    pass
 
             # 降级：从模型目录加载独立 tokenizer
-            try:
-                from transformers import AutoTokenizer
-                from pathlib import Path
+            if self._tokenizer is None:
+                try:
+                    from transformers import AutoTokenizer
+                    from pathlib import Path
 
-                plugin_root = Path(__file__).parent.parent
-                model_dir = plugin_root / "models" / "bge-m3"
-                if not model_dir.exists():
-                    # 模型未下载时跳过 tokenizer 初始化（回退到字符长度）
-                    logger.warning("⚠️ BGE-M3 模型未下载，chunk_size 将基于字符数（不精确）")
-                    return None
-                self._tokenizer = AutoTokenizer.from_pretrained(
-                    str(model_dir), local_files_only=True
-                )
-                logger.debug("加载独立 BGE-M3 tokenizer")
-            except Exception as e:
-                logger.warning(f"⚠️ tokenizer 加载失败: {e}，回退到字符长度")
-                self._tokenizer = None
+                    plugin_root = Path(__file__).parent.parent
+                    model_dir = plugin_root / "models" / "bge-m3"
+                    if model_dir.exists():
+                        self._tokenizer = AutoTokenizer.from_pretrained(
+                            str(model_dir), local_files_only=True
+                        )
+                        logger.debug("加载独立 BGE-M3 tokenizer")
+                    else:
+                        logger.warning("⚠️ BGE-M3 模型未下载，将使用 tiktoken 精确计数")
+                except Exception as e:
+                    logger.warning(f"⚠️ tokenizer 加载失败: {e}，将使用 tiktoken 精确计数")
+
+            # 注册到全局 token_utils，供 count_embedding_tokens 使用
+            if self._tokenizer is not None:
+                from rag.token_utils import set_embedding_tokenizer
+                set_embedding_tokenizer(self._tokenizer)
 
         return self._tokenizer
 
     def _get_token_count(self, text: str) -> int:
-        """
-        获取文本的 token 数（严格模式：超过 max_seq_length 则截断）
-
-        优先使用 tokenizer；加载失败时降级为字符数 / 4（英文经验值）。
-        """
+        """精确 token 计数（使用 BGE tokenizer 或 tiktoken）。"""
         tokenizer = self._get_tokenizer()
-        if tokenizer is None:
-            # 降级：英文约 4 chars ≈ 1 token
-            return len(text) // 4
+        if tokenizer is not None:
+            tokens = tokenizer.encode(text, add_special_tokens=False)
+            if len(text) > self.chunk_size * 5:
+                logger.debug(f"[HybridParser] Token 计数: 文本 {len(text)} 字符, {len(tokens)} tokens")
+            return len(tokens)
 
-        # tokenize 后去掉 [CLS] 和 [SEP]，仅计算 content tokens
-        tokens = tokenizer.encode(
-            text,
-            add_special_tokens=False,  # 不加 [CLS]/[SEP]
-            truncation=True,
-            max_length=self.chunk_size  # 严格限制在 chunk_size 内
-        )
-        if len(text) > self.chunk_size * 5:
-            logger.debug(f"[HybridParser] Token 计数截断: 文本 {len(text)} 字符, token 限制在 {self.chunk_size}")
-        return len(tokens)
+        from rag.token_utils import count_tokens
+        return count_tokens(text)
 
     def parse_pdf_to_documents(self, pdf_path: str) -> List[Node]:
         """
@@ -824,7 +817,7 @@ class HybridPDFParser:
             if current_size >= self.chunk_overlap:
                 break
             overlap_parts.insert(0, part)
-            current_size += len(part) // 4 + 1  # 估算 token 数
+            current_size += self._get_token_count(part)
 
         return "\n\n".join(overlap_parts)
 

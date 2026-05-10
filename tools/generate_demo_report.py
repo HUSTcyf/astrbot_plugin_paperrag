@@ -17,12 +17,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
+import re
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from agentic_rag.workflow import compile_workflow
+from idea import IdeaEngine
+from idea.agentic_workflow import run_agentic_ideas
+from rag.rag_engine import create_rag_engine, RAGConfig
 
 # ── 路径设置 ─────────────────────────────────────────────
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
@@ -342,7 +347,6 @@ async def run_rag_comparison(
         print("  🧪 Dry-run mode: using mock RAG data")
         return MOCK_RAG_DATA
 
-    from agentic_rag.workflow import compile_workflow
 
     provider = await _get_local_vlm_provider()
     results = []
@@ -433,8 +437,6 @@ async def run_idea_comparison(
         print("  🧪 Dry-run mode: using mock Idea data")
         return MOCK_IDEA_DATA
 
-    from idea import IdeaEngine
-    from idea.agentic_workflow import run_agentic_ideas
 
     results = []
 
@@ -642,7 +644,6 @@ def _escape_html(text: str) -> str:
 
 def _markdown_to_html(text: str) -> str:
     """将 Markdown 文本转为 HTML（仅处理常见格式：bold, italic, code, lists, headings, paragraphs）。"""
-    import re
 
     lines = text.split("\n")
     out: list[str] = []
@@ -1172,7 +1173,6 @@ async def main(dry_run: bool = False):
 
     # 3. 初始化引擎（直接创建，避免 engine_utils 的相对导入问题）
     print("\n🔧 Initializing HybridRAGEngine...")
-    from rag.rag_engine import create_rag_engine, RAGConfig
 
     rag_config = RAGConfig(
         embedding_mode="unsloth",
@@ -1205,7 +1205,6 @@ async def main(dry_run: bool = False):
         graph_neo4j_password=config.get("graph_rag", {}).get("neo4j_password", ""),
         graph_max_triplets_per_chunk=config.get("graph_rag", {}).get("max_triplets_per_chunk", 5),
         graph_retrieval_top_k=config.get("graph_rag", {}).get("graph_retrieval_top_k", 5),
-        graph_rrf_weight=config.get("graph_rag", {}).get("graph_rrf_weight", 0.2),
         unsloth_config=config.get("unsloth", {}),
         llama_vlm_model_path=config.get("llama_vlm_model_path", ""),
         llama_vlm_mmproj_path=config.get("llama_vlm_mmproj_path", ""),

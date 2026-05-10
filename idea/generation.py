@@ -27,6 +27,7 @@ from provider.llm_utils import (
 )
 from .vm import IdeaEngineVM
 from .websearch import IdeaEngineWebSearch
+import uuid as uuid_module
 
 
 class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
@@ -295,7 +296,6 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
         initial_draft: str
     ) -> None:
         """重新生成后保存 ideas 到文件"""
-        import uuid as uuid_module
 
         folder = self._topic_folder(topic)
         folder.mkdir(parents=True, exist_ok=True)

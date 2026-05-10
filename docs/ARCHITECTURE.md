@@ -93,19 +93,30 @@ Agentic 查询 /paper arag|react → LangGraph workflow
 
 ## 检索架构
 
-### 四通道混合检索 + RRF 融合
+### 三通道混合检索 + RRF 融合（单阶段路径）
 
 | 通道 | 配置项 | 权重控制 |
 |------|------|---------|
 | 稠密向量 | 始终启用 | RRF k=60 |
 | 稀疏权重 | `enable_sparse_retrieval` | RRF k=60 |
 | BM25 精确 | `enable_bm25` | RRF k=60 |
-| 知识图谱 | `enable_graph_rag` | `graph_rrf_weight` (默认 0.2) |
+
+### 两阶段检索（`enable_two_stage_retrieval`）
+
+```
+Stage 1    摘要向量检索 → top-20 candidates
+Stage 1.5  ColBERT rerank → top-6 papers（摘要通道配额）
+Stage 1.6  知识图谱独立召回 → top-2 papers（图谱通道配额，不参与 rerank）
+           合并去重 → 最多 8 篇论文进入 Stage 2
+Stage 2    在选中论文内检索 chunks → top-k 最终结果
+```
+
+图谱通道使用实体关系作为结构性信号（如 `DUSt3R → enables → InstantSplat`），与摘要的文本相似度信号互补。
+图谱召回的论文不经过 ColBERT rerank，避免文本打分过滤掉结构上相关但摘要匹配度低的论文。
 
 ### 可选增强
 
 - **ColBERT 多向量重排序** (`enable_multi_vector_rerank`)：token-level late-interaction
-- **两阶段检索** (`enable_two_stage_retrieval`)：摘要匹配 → chunk 检索
 - **CRAG 质量评估** (`enable_crag_quality_eval`)：自动质量评估 + 可选纠偏重搜
 
 ## 知识图谱 Schema
@@ -168,7 +179,6 @@ RAGConfig(
 
     # Graph RAG
     enable_graph_rag=False,
-    graph_rrf_weight=0.2,
 
     # 两阶段检索
     enable_two_stage_retrieval=False,

@@ -3,6 +3,8 @@ Paper RAG Plugin - 核心RAG引擎模块
 混合架构版本：结合自定义PDF解析 + 本地向量存储
 """
 
+from __future__ import annotations
+
 from typing import Optional, TYPE_CHECKING
 from dataclasses import dataclass, field
 from astrbot.api import logger
@@ -94,7 +96,6 @@ class RAGConfig:
     graph_neo4j_password: str = ""
     graph_max_triplets_per_chunk: int = 5
     graph_retrieval_top_k: int = 5
-    graph_rrf_weight: float = 0.2  # 图谱在 RRF 融合中的权重
     graph_auto_build: bool = False
     graph_auto_build_threshold: int = 10
 
@@ -162,7 +163,6 @@ def create_rag_engine(config: RAGConfig, context) -> "HybridRAGEngine":
     Returns:
         RAG引擎实例（HybridRAGEngine）
     """
-    from .hybrid_rag import HybridRAGEngine
 
     logger.info("✅ 使用混合架构 RAG引擎（HybridRAGEngine）")
     logger.info("   - 自定义PDF解析（多模态）")
@@ -172,4 +172,5 @@ def create_rag_engine(config: RAGConfig, context) -> "HybridRAGEngine":
     if config.enable_multi_vector_rerank:
         logger.info("   - ColBERT 多向量 reranking")
 
+    from .hybrid_rag import HybridRAGEngine
     return HybridRAGEngine(config, context)

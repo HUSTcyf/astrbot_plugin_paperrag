@@ -26,6 +26,10 @@ import os
 import sys
 from pathlib import Path
 from typing import Any, Callable, Tuple, Optional, Union
+import tarfile
+import shutil
+from urllib.request import urlopen
+from urllib.error import URLError
 
 # 数据集保存路径
 SCRIPT_DIR = Path(__file__).parent
@@ -142,11 +146,6 @@ def download_dataset() -> Any:
     - qasper-dev-v0.3.json
     - qasper-test-v0.3.json
     """
-    import json
-    import tarfile
-    import shutil
-    from urllib.request import urlopen
-    from urllib.error import URLError
 
     print(f"正在下载 Qasper 数据集 (v0.3)")
     print("=" * 60)
@@ -261,7 +260,6 @@ def download_dataset() -> Any:
 
 def load_local_dataset() -> Any:
     """从本地加载数据集"""
-    import json
 
     output_path = DATA_DIR / "qasper"
 

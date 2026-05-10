@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, cast
 
 import httpx
+from rapidfuzz import fuzz
 
 try:
     from rag.paper_link_resolver import LinkResolution, PaperLinkResolver
@@ -75,13 +76,12 @@ class OpenAlexAPIClient:
 
     def _normalize(self, title: str) -> str:
         """基础清洗 + LaTeX 符号转换"""
-        import re as _re
         # 转换常见 LaTeX 符号为 ASCII
         title = title.replace('$π_0$', 'pi0').replace('$π_0.5$', 'pi05')
         title = title.replace('$π$', 'pi').replace('π', 'pi')
         # 去除 LaTeX 格式残留
-        title = _re.sub(r'\$([^$]+)\$', r'\1', title)
-        title = _re.sub(r'[^\w\s]', ' ', title).strip().lower()
+        title = re.sub(r'\$([^$]+)\$', r'\1', title)
+        title = re.sub(r'[^\w\s]', ' ', title).strip().lower()
         return title
 
     async def search_by_title(self, title: str, limit: int = 5) -> list:
@@ -171,7 +171,6 @@ class OpenAlexAPIClient:
 
     async def get_arxiv_by_title(self, title: str, threshold: float = 75) -> Tuple[Optional[str], Optional[str]]:
         """根据标题获取 arxiv 链接，使用 rapidfuzz 二次验证"""
-        from rapidfuzz import fuzz
 
         works = await self.search_by_title(title)
         best_work = None
@@ -195,7 +194,6 @@ class OpenAlexAPIClient:
 
 def find_best_title_match(query_title: str, works: list, threshold: int = 80) -> tuple:
     """从候选结果中找到 rapidfuzz 相似度最高的（OpenAlex已做初步筛选）"""
-    from rapidfuzz import fuzz
 
     best_work = None
     best_score = 0
@@ -847,7 +845,6 @@ class AbstractIndexManager:
         try:
             import asyncio
             from pymilvus import connections, utility, Collection, FieldSchema, CollectionSchema, DataType
-            from typing import cast
 
             db_dir = os.path.dirname(self._db_path)
             if db_dir and not os.path.exists(db_dir):

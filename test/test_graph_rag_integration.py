@@ -22,6 +22,11 @@ from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock
 
 import pytest
+import socket
+import inspect
+from rag.hybrid_rag import HybridRetriever, HybridRAGEngine
+from graphrag import graph_rag_engine
+from graphrag.graph_rag_engine import GraphRAGConfig, create_graph_rag_engine
 
 # 确保 rag 模块可导入
 _plugin_root = Path(__file__).resolve().parents[1]
@@ -146,7 +151,6 @@ class TestHybridRetrieverGraphChannel:
     @pytest.mark.asyncio
     async def test_rrf_fusion_includes_graph_channel(self):
         """RRF 融合应包含图谱通道的贡献（但不暴露无出处的图谱节点）"""
-        from rag.hybrid_rag import HybridRetriever
 
         index_manager = self._make_fake_index_manager()
         embed_provider = self._make_fake_embed_provider()
@@ -181,7 +185,6 @@ class TestHybridRetrieverGraphChannel:
     @pytest.mark.asyncio
     async def test_provenance_guard_filters_graph_only_nodes(self):
         """无 file_name/chunk_id 的图谱节点应被过滤"""
-        from rag.hybrid_rag import HybridRetriever
 
         index_manager = self._make_fake_index_manager()
         embed_provider = self._make_fake_embed_provider()
@@ -208,7 +211,6 @@ class TestHybridRetrieverGraphChannel:
     @pytest.mark.asyncio
     async def test_graph_disabled_does_not_crash(self):
         """禁用图谱时 HybridRetriever 应正常工作"""
-        from rag.hybrid_rag import HybridRetriever
 
         index_manager = self._make_fake_index_manager()
         embed_provider = self._make_fake_embed_provider()
@@ -231,60 +233,6 @@ class TestHybridRetrieverGraphChannel:
 
 class TestGraphRAGConfigConstruction:
     """测试 _create_graph_rag_config() 参数正确映射"""
-
-    def test_graph_rrf_weight_replaces_hybrid_alpha(self):
-        """graph_rag.graph_rrf_weight 应替代已删除的 hybrid_alpha"""
-        _install_astrbot_stubs()
-        sys.path.insert(0, str(Path(__file__).parents[1]))
-
-        plugin_parent = Path(__file__).resolve().parents[1]
-        if str(plugin_parent) not in sys.path:
-            sys.path.insert(0, str(plugin_parent))
-
-        # 模拟配置
-        config = {
-            "enable_graph_rag": True,
-            "graph_rag": {
-                "storage_type": "neo4j",
-                "neo4j_uri": "bolt://localhost:7687",
-                "neo4j_user": "neo4j",
-                "neo4j_password": "password",
-                "max_triplets_per_chunk": 5,
-                "graph_retrieval_top_k": 5,
-                "graph_rrf_weight": 0.3,
-                "auto_build": True,
-                "auto_build_threshold": 5,
-                "multimodal_extraction": {
-                    "enabled": True,
-                    "max_images_per_chunk": 2,
-                    "extract_image_entities": True,
-                },
-            }
-        }
-
-        # 加载 GraphRAGConfig
-        from graphrag.graph_rag_engine import GraphRAGConfig
-        graph_cfg = GraphRAGConfig.from_rag_config(
-            types.SimpleNamespace(  # type: ignore[arg-type]
-                enable_graph_rag=True,
-                graph_storage_type="neo4j",
-                graph_neo4j_uri="bolt://localhost:7687",
-                graph_neo4j_user="neo4j",
-                graph_neo4j_password="password",
-                graph_max_triplets_per_chunk=5,
-                graph_retrieval_top_k=5,
-                graph_rrf_weight=0.3,
-                graph_auto_build=True,
-                graph_auto_build_threshold=5,
-                graph_multimodal_enabled=True,
-                graph_max_images_per_chunk=2,
-                graph_extract_image_entities=True,
-            )
-        )
-
-        assert hasattr(graph_cfg, 'graph_rrf_weight'), "GraphRAGConfig 应该有 graph_rrf_weight 属性"
-        assert not hasattr(graph_cfg, 'hybrid_alpha'), "GraphRAGConfig 不应该有 hybrid_alpha 属性"
-        assert graph_cfg.graph_rrf_weight == 0.3
 
 
 # ===== 测试 3: search() mode/top_k threading =====
@@ -319,7 +267,6 @@ class TestSearchModeThreading:
             enable_bm25=False,
             bm25_top_k=20,
             enable_graph_rag=False,
-            graph_rrf_weight=0.2,
             enable_two_stage_retrieval=False,
             two_stage_top_k=10,
             two_stage_rerank_k=5,
@@ -335,7 +282,6 @@ class TestSearchModeThreading:
     @pytest.mark.asyncio
     async def test_search_accepts_mode_parameter(self):
         """search() 应接受 mode 参数并记录到日志"""
-        from rag.hybrid_rag import HybridRAGEngine
 
         config = self._make_mock_config()
         mock_context = types.SimpleNamespace(get_using_provider=MagicMock(return_value=None))
@@ -343,21 +289,18 @@ class TestSearchModeThreading:
         engine = HybridRAGEngine(config, mock_context)
 
         # 验证 search 方法签名包含 mode 参数
-        import inspect
         sig = inspect.signature(engine.search)
         assert 'mode' in sig.parameters, f"search() 应该有 mode 参数，当前签名: {sig}"
 
     @pytest.mark.asyncio
     async def test_search_accepts_top_k_parameter(self):
         """search() 应接受 top_k 参数"""
-        from rag.hybrid_rag import HybridRAGEngine
 
         config = self._make_mock_config()
         mock_context = types.SimpleNamespace(get_using_provider=MagicMock(return_value=None))
 
         engine = HybridRAGEngine(config, mock_context)
 
-        import inspect
         sig = inspect.signature(engine.search)
         assert 'top_k' in sig.parameters, f"search() 应该有 top_k 参数，当前签名: {sig}"
 
@@ -369,7 +312,6 @@ class TestGetRetrieverImport:
 
     def test_llm_synonym_retriever_imported_at_module_scope(self):
         """LLMSynonymRetriever 应在模块级别导入"""
-        from graphrag import graph_rag_engine
         assert hasattr(graph_rag_engine, 'LLMSynonymRetriever'), \
             "graph_rag_engine 模块应该有 LLMSynonymRetriever 属性"
 
@@ -378,7 +320,6 @@ class TestGetRetrieverImport:
 
 def _neo4j_available() -> bool:
     """检查 Neo4j 是否可用（通过 socket 连接判断，不受 sys.modules 污染影响）"""
-    import socket
     try:
         s = socket.create_connection(("localhost", 7687), timeout=2)
         s.close()
@@ -407,7 +348,6 @@ class TestEndToEndHybridRetrieval:
         """GraphRAGEngine 初始化应连接真实 Neo4j 并查询统计"""
         _install_astrbot_stubs()
 
-        from graphrag.graph_rag_engine import GraphRAGConfig, create_graph_rag_engine
 
         config = GraphRAGConfig(
             enable_graph_rag=True,
@@ -416,7 +356,6 @@ class TestEndToEndHybridRetrieval:
             neo4j_user="neo4j",
             neo4j_password=_get_neo4j_password(),
             graph_retrieval_top_k=5,
-            graph_rrf_weight=0.2,
         )
 
         mock_base_engine = MagicMock()
@@ -441,7 +380,6 @@ class TestEndToEndHybridRetrieval:
         """HybridRAGEngine 应使用真实 Unsloth Embedding + 真实 Neo4j 完成检索初始化"""
         _install_astrbot_stubs()
 
-        from rag.hybrid_rag import HybridRAGEngine
 
         config = self._make_real_config_e2e()
         mock_context = types.SimpleNamespace(get_using_provider=MagicMock(return_value=None))
@@ -494,7 +432,6 @@ class TestEndToEndHybridRetrieval:
             graph_neo4j_password=_get_neo4j_password(),
             graph_max_triplets_per_chunk=5,
             graph_retrieval_top_k=5,
-            graph_rrf_weight=0.2,
             graph_auto_build=False,
             graph_auto_build_threshold=10,
             graph_multimodal_enabled=True,

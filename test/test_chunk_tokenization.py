@@ -22,6 +22,14 @@ os.environ["GLOG_minloglevel"] = "3"
 
 # 屏蔽 pdfminer/pdfplumber 等库的 DEBUG 日志
 import logging
+from rag.hybrid_parser import HybridPDFParser
+import asyncio
+import numpy as np
+import tempfile
+from rag.colbert_storage import ColBERTStorage
+import provider.llama_cpp_vlm as llama_module
+from llama_index.core import Document as LIDocument
+from rag.hybrid_parser import Node
 logger = logging.getLogger("test_chunk_tokenization")
 for noisy_module in ["pdfminer", "pdfplumber", "pypdf", "PIL", "PIL.Image",
                      "astrbot_core", "astrbot_plugin", "faiss", "torch", "torchao"]:
@@ -57,7 +65,6 @@ def test_chunk_tokenization():
 
     tokenizer = load_tokenizer()
 
-    from rag.hybrid_parser import HybridPDFParser
 
     parser = HybridPDFParser(
         chunk_size=512,
@@ -116,16 +123,13 @@ def test_chunk_tokenization():
         llamaparser = await parser._get_llamaindex_semantic_parser()
         if llamaparser is None:
             return None
-        from llama_index.core import Document as LIDocument
         lldoc = LIDocument(text=long_text, metadata={"file_name": "synthetic_test.pdf"})
         llnodes = llamaparser.get_nodes_from_documents([lldoc])
-        from rag.hybrid_parser import Node
         nodes = []
         for i, n in enumerate(llnodes):
             nodes.append(Node(text=n.get_text(), metadata={"chunk_index": i})) # type: ignore
         return nodes
 
-    import asyncio
     nodes = asyncio.run(get_llamaindex_chunks())
     if nodes is None:
         print("  [FAIL] LlamaIndex 语义分块不可用")
@@ -157,9 +161,6 @@ def test_colbert_storage_no_truncation():
     print("测试 2：ColBERT storage 防截断断言")
     print("=" * 70)
 
-    import numpy as np
-    import tempfile
-    from rag.colbert_storage import ColBERTStorage
 
     with tempfile.TemporaryDirectory() as tmpdir:
         storage = ColBERTStorage(tmpdir)
@@ -291,8 +292,6 @@ def test_chunking_with_real_pdf(skip_llm: bool = False):
 
     print(f"  PDF: {test_pdf.name} ({test_pdf.stat().st_size / 1024:.1f} KB)\n")
 
-    import asyncio
-    from rag.hybrid_parser import HybridPDFParser
 
     parser = HybridPDFParser(
         chunk_size=512,
@@ -437,8 +436,6 @@ async def test_local_llm_preprocessing() -> bool:
     print("测试 4：本地大模型提取 title/abstract/authors")
     print("=" * 70)
 
-    from pathlib import Path
-    from rag.hybrid_parser import HybridPDFParser
 
     # 1. 加载 VLM Provider
     try:
@@ -480,7 +477,6 @@ async def test_local_llm_preprocessing() -> bool:
         return False
 
     # 注入测试用的 vlm_provider（复用已初始化的单例）
-    import provider.llama_cpp_vlm as llama_module
     llama_module._vlm_provider_instance = vlm_provider
 
     parser = HybridPDFParser(

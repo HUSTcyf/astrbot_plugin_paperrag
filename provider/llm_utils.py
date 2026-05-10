@@ -197,3 +197,131 @@ async def call_llm_json(
     """
     text = await call_llm(prompt, context, config, temperature, max_tokens, **kwargs)
     return parse_json_response(text)
+
+
+# ============================================================================
+# LlamaIndex LLM Bridge
+# ============================================================================
+
+def _create_vlm_custom_llm(vlm_provider):
+    """Create a LlamaIndex CustomLLM that wraps LlamaCppVLMProvider.
+
+    Uses llama_index.core.llms.CustomLLM base class so that Pydantic
+    validation in LlamaIndex components (SimpleLLMPathExtractor, etc.)
+    accepts the instance.  Avoids llama_index.llms.openai.OpenAI which
+    validates model names against OpenAI's known list and rejects 'local-vlm'.
+    """
+    from llama_index.core.llms import CustomLLM, CompletionResponse, LLMMetadata
+    import asyncio
+
+    class _Impl(CustomLLM):
+        model_name: str = "local-vlm"
+        _ctx_window: int = 16384
+
+        class Config:
+            arbitrary_types_allowed = True
+
+        @property
+        def metadata(self) -> LLMMetadata:
+            return LLMMetadata(
+                model_name=self.model_name,
+                context_window=self._ctx_window,
+                is_chat_model=True,
+            )
+
+        def stream_complete(self, prompt: str, formatted: bool = False, **kwargs):
+            raise NotImplementedError
+
+        def complete(self, prompt: str, formatted: bool = False, **kwargs):
+            return asyncio.get_event_loop().run_until_complete(
+                self.acomplete(prompt, formatted, **kwargs)
+            )
+
+        async def acomplete(self, prompt: str, formatted: bool = False, **kwargs):
+            resp = await vlm_provider.text_chat(
+                prompt=prompt,
+                contexts=[],
+                temperature=kwargs.get("temperature", 0.1),
+                max_tokens=kwargs.get("max_tokens", 256),
+            )
+            return CompletionResponse(
+                text=resp.content if hasattr(resp, "content") else str(resp)
+            )
+
+    return _Impl()
+
+
+async def get_llama_index_llm(context: Any = None, prefer_cloud: bool = False):
+    """
+    Create a LlamaIndex-compatible LLM from the provider resolution chain.
+
+    Priority:
+    1. Local VLM via _VLMCustomLLM (bypasses OpenAI SDK model validation)
+    2. Cloud provider via llama_index.llms.openai.OpenAI
+
+    Returns:
+        LlamaIndex LLM object, or None if no provider available.
+    """
+    # Step 1: Local VLM (CustomLLM — no model name validation)
+    if not prefer_cloud:
+        try:
+            from provider.llama_cpp_vlm import get_llama_cpp_vlm_provider
+            vlm = get_llama_cpp_vlm_provider()
+            if vlm and not getattr(vlm, '_initialized', False):
+                await vlm.initialize()
+            if vlm and getattr(vlm, '_initialized', False):
+                return _create_vlm_custom_llm(vlm)
+        except Exception:
+            pass
+
+    # Step 2: Cloud provider
+    from astrbot.api import logger
+    try:
+        from llama_index.llms.openai import OpenAI
+    except ImportError:
+        logger.warning("[Provider] llama_index.llms.openai 不可用")
+        return None
+
+    if context is None:
+        return None
+
+    provider = None
+    pm = getattr(context, 'provider_manager', None)
+    inst_map = getattr(pm, 'inst_map', None) if pm else None
+
+    # Try context.get_using_provider()
+    if not provider:
+        try:
+            provider = context.get_using_provider()
+        except Exception:
+            pass
+
+    # Fallback: first provider with text_chat from inst_map
+    if not provider and isinstance(inst_map, dict):
+        for p in inst_map.values():
+            if callable(getattr(p, 'text_chat', None)):
+                provider = p
+                break
+
+    if not provider:
+        return None
+
+    model = getattr(provider, 'model_name', '') or getattr(provider, 'provider_config', {}).get('model', '')
+    if not model:
+        return None
+
+    api_key = getattr(provider, 'chosen_api_key', None)
+    if not api_key:
+        try:
+            api_key = provider.get_current_key()
+        except Exception:
+            pass
+    if not api_key:
+        return None
+
+    api_base = getattr(provider, 'provider_config', {}).get('api_base', '')
+    kwargs = {"model": model, "api_key": api_key}
+    if api_base:
+        kwargs["api_base"] = api_base
+    logger.info(f"[Provider] 创建 LlamaIndex LLM: model={model}")
+    return OpenAI(**kwargs)

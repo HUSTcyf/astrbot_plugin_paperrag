@@ -9,6 +9,7 @@ import argparse
 import string
 import re
 import json
+import sys
 
 
 # Lazy import bert_score to avoid heavy dependency at module load
@@ -224,7 +225,6 @@ def evaluate(gold, predicted, use_bert_f1=False, verbose=True):
     Returns:
         Evaluation metrics dict
     """
-    import sys
 
     max_answer_f1s = []
     max_answer_bert_f1s = []  # Separate list for BERT F1

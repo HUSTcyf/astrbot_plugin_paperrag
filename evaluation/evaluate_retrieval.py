@@ -18,6 +18,11 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, List, Optional, Dict
+from rag.hybrid_rag import VectorRetriever
+from rag.hybrid_rag import SparseRetriever
+from rag.hybrid_rag import HybridRetriever
+from rag.hybrid_rag import QueryResult, Node
+from rag.rag_engine import RAGConfig, create_rag_engine
 
 # 添加插件目录到路径
 SCRIPT_DIR = Path(__file__).parent
@@ -63,19 +68,16 @@ class LatencyTracker:
 # ============================================================================
 
 async def new_dense_only(index_manager, embed_provider, query: str, top_k: int) -> Any:
-    from rag.hybrid_rag import VectorRetriever
     r = VectorRetriever(index_manager, embed_provider)
     return await r.retrieve(query, top_k=top_k)
 
 
 async def new_sparse_only(index_manager, embed_provider, query: str, top_k: int) -> Any:
-    from rag.hybrid_rag import SparseRetriever
     r = SparseRetriever(index_manager, embed_provider)
     return await r.retrieve(query, top_k=top_k)
 
 
 async def new_hybrid_rrf(index_manager, embed_provider, query: str, top_k: int) -> Any:
-    from rag.hybrid_rag import HybridRetriever
     r = HybridRetriever(
         index_manager=index_manager,
         embed_provider=embed_provider,
@@ -87,7 +89,6 @@ async def new_hybrid_rrf(index_manager, embed_provider, query: str, top_k: int) 
 
 
 async def new_rerank_colbert(index_manager, embed_provider, query: str, top_k: int) -> Any:
-    from rag.hybrid_rag import HybridRetriever
     r = HybridRetriever(
         index_manager=index_manager,
         embed_provider=embed_provider,
@@ -107,7 +108,6 @@ async def legacy_full_rerank(query: str, doc_texts: List[str], top_k: int) -> Op
     try:
         sys.path.insert(0, str(PLUGIN_DIR / "legacy"))
         from legacy.embedding.reranker import ContentReranker, RerankerConfig
-        from rag.hybrid_rag import QueryResult, Node
         config = RerankerConfig(model_name="BAAI/bge-reranker-v2-m3", device="auto")
         reranker = ContentReranker(config)
         reranker._ensure_initialized()  # synchronous init
@@ -125,7 +125,6 @@ async def legacy_full_rerank(query: str, doc_texts: List[str], top_k: int) -> Op
 async def legacy_bm25_dense_rrf(query: str, top_k: int, embed_provider, index_manager) -> Any:
     """旧版: BM25 + 稠密向量 RRF"""
     try:
-        from rag.hybrid_rag import VectorRetriever
         bm25_hits = await index_manager.bm25_search(query, top_k=top_k)
         dense_r = VectorRetriever(index_manager, embed_provider)
         dense_result = await dense_r.retrieve(query, top_k=top_k)
@@ -141,7 +140,6 @@ def _rrf_fuse_bm25_and_dense(bm25_hits: List[Dict], dense_result: Any, k=60, alp
     与 HybridRetriever._rrf_fusion() 保持一致：纯 rank-based RRF 公式
     RRF score = alpha * 1/(k + v_rank) + (1-alpha) * 1/(k + s_rank)
     """
-    from rag.hybrid_rag import QueryResult, Node
 
     # 构建 rank 映射（1-indexed，排名从1开始）
     bm25_rank_map = {}
@@ -293,7 +291,6 @@ async def main():
 
     # 初始化引擎
     print("\n🚀 初始化引擎...")
-    from rag.rag_engine import RAGConfig, create_rag_engine
 
     class DummyContext:
         provider_manager = platform_manager = conversation_manager = persona_manager = None

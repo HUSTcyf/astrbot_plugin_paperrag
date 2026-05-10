@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from astrbot.api import logger
 from astrbot.api.star import Context, Star
+import time
 
 try:
     from ..plugin_common import SUPPORTED_DOC_EXTENSIONS, _is_hidden_file
@@ -146,7 +147,6 @@ class PluginCoreBase(Star):
             neo4j_password=graph_rag_config.get("neo4j_password", ""),
             max_triplets_per_chunk=graph_rag_config.get("max_triplets_per_chunk", 5),
             graph_retrieval_top_k=graph_rag_config.get("graph_retrieval_top_k", 5),
-            graph_rrf_weight=graph_rag_config.get("graph_rrf_weight", 0.2),
             auto_build=graph_rag_config.get("auto_build", False),
             auto_build_threshold=graph_rag_config.get("auto_build_threshold", 10),
             multimodal_enabled=multimodal_config.get("enabled", True),
@@ -231,10 +231,7 @@ class PluginCoreBase(Star):
                         response = await llm_provider.generate(query)
                         return response.text.strip() if hasattr(response, "text") else str(response)
             else:
-                try:
-                    from provider.llama_cpp_vlm import get_cached_llama_cpp_provider
-                except ImportError:
-                    from provider.llama_cpp_vlm import get_cached_llama_cpp_provider
+                from provider.llama_cpp_vlm import get_cached_llama_cpp_provider
                 vlm_provider = get_cached_llama_cpp_provider()
                 if not vlm_provider:
                     logger.error("[_llm_direct_answer] 本地 VLM Provider 不可用")
@@ -327,7 +324,6 @@ class PluginCoreBase(Star):
                 graph_neo4j_password=self.config.get("graph_rag", {}).get("neo4j_password", ""),
                 graph_max_triplets_per_chunk=self.config.get("graph_rag", {}).get("max_triplets_per_chunk", 5),
                 graph_retrieval_top_k=self.config.get("graph_rag", {}).get("graph_retrieval_top_k", 5),
-                graph_rrf_weight=self.config.get("graph_rag", {}).get("graph_rrf_weight", 0.2),
                 graph_auto_build=self.config.get("graph_rag", {}).get("auto_build", False),
                 graph_auto_build_threshold=self.config.get("graph_rag", {}).get("auto_build_threshold", 10),
             )
@@ -383,7 +379,6 @@ class PluginCoreBase(Star):
         if not self.cache_enabled:
             return None
 
-        import time
 
         with self._response_cache_lock:
             if cache_key in self._response_cache:
@@ -399,7 +394,6 @@ class PluginCoreBase(Star):
         if not self.cache_enabled:
             return
 
-        import time
 
         with self._response_cache_lock:
             if len(self._response_cache) >= self.cache_max_size:

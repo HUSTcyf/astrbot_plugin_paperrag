@@ -32,7 +32,7 @@ os.environ['GLOG_minloglevel'] = '3'
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pymilvus import connections, Collection
+from pymilvus import connections, Collection, utility
 
 from provider.llama_cpp_vlm import get_llama_cpp_vlm_provider
 
@@ -71,7 +71,6 @@ def connect_milvus(db_path: str) -> Collection:
         print(f"连接失败: {e}")
         raise
 
-    from pymilvus import utility
     collections = utility.list_collections(using=alias)
     print(f"可用 collections: {collections}")
 

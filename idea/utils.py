@@ -15,6 +15,10 @@ import mistune
 from astrbot.api import logger
 
 from .base import IdeaEngineBase
+import os
+from urllib.parse import unquote
+from html.parser import HTMLParser
+from html import unescape
 
 if TYPE_CHECKING:
     from .datatypes import ResearchIdea
@@ -98,8 +102,6 @@ def convert_paren_paths_to_markdown(text: str) -> Tuple[str, int]:
     Returns:
         (转换后的文本, 转换的裸路径数量)
     """
-    import os
-    from urllib.parse import unquote
     converted_count = 0
     lines = text.split('\n')
     result_lines = []
@@ -151,8 +153,6 @@ def create_feishu_markdown() -> mistune.Markdown:
 
 def parse_html_with_html_parser(html: str) -> List[Dict[str, Any]]:
     """使用 Python 内置 html.parser 解析 HTML，返回 textStyles 格式"""
-    from html.parser import HTMLParser
-    from html import unescape
 
     class FeishuHTMLParser(HTMLParser):
         def __init__(self):

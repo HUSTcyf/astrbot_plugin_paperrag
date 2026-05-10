@@ -21,6 +21,9 @@ import torch
 import numpy as np
 
 from astrbot.api import logger
+import platform
+import concurrent.futures
+from transformers import AutoTokenizer, AutoModel
 
 # ============================================================================
 # ABSPEC 公式实现
@@ -212,15 +215,12 @@ class UnslothEmbeddingModel:
 
     def _is_apple_silicon(self) -> bool:
         """检测是否在 Apple Silicon 上运行"""
-        import platform
         return platform.system() == "Darwin" and platform.machine() == "arm64"
 
     def _load_model(self) -> None:
         """加载模型（在独立线程中执行）"""
-        import concurrent.futures
 
         def _load():
-            from transformers import AutoTokenizer, AutoModel
 
             # 确保模型已下载
             actual_model_path = self._ensure_model_downloaded()

@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 from astrbot.api import logger
+from provider.llm_utils import get_llm_provider
 
 
 class RouterInput(BaseModel):
@@ -54,7 +55,6 @@ async def router_node(state: dict) -> dict:
 
     context = state.get("_context")
 
-    from provider.llm_utils import get_llm_provider
     provider = get_llm_provider(context)
 
     query_type = "fact"

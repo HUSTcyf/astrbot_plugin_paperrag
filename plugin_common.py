@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 import requests
+from astrbot.api import logger
 
 SUPPORTED_DOC_EXTENSIONS = ['.pdf', '.docx', '.doc', '.txt', '.md', '.html', '.htm']
 """支持的文档扩展名列表"""
@@ -71,7 +72,6 @@ class Neo4jServiceManager:
         Returns:
             Neo4j 是否可连接
         """
-        from astrbot.api import logger
 
         if self._is_neo4j_available():
             logger.info("[Neo4j] Neo4j 服务已连接")
@@ -107,7 +107,6 @@ class CoreAPIClient:
 
     def search_by_title(self, title: str, year: Optional[int] = None, limit: int = 5) -> list:
         """根据论文标题搜索论文"""
-        from astrbot.api import logger
 
         query_parts = [f'title:"{title}"']
         if year:

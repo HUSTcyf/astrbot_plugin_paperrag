@@ -11,7 +11,6 @@ import re
 import json
 import asyncio
 import aiohttp
-import time
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from astrbot.api import logger

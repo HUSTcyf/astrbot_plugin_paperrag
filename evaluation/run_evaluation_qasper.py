@@ -37,6 +37,14 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import shutil
+from datetime import datetime
+import tempfile
+import subprocess
+from ragas_generator import RagasTestsetGenerator
+from ragas_evaluator import RagasEvaluator
+from report_generator import ReportGenerator
+from llama_index.core import VectorStoreIndex
 
 # 添加插件目录到路径
 SCRIPT_DIR = Path(__file__).parent.parent
@@ -386,8 +394,6 @@ def backup_predictions(output_file: Path) -> Optional[Path]:
     if not output_file.exists():
         return None
 
-    import shutil
-    from datetime import datetime
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_file = output_file.parent / f"predictions_backup_{timestamp}.jsonl"
@@ -772,7 +778,6 @@ def run_evaluator(predictions_file: Path, gold_file: Path, output_dir: Path, tex
 
     # 检查是否是子集评估（预测数量 < gold总数）
     # 如果是，创建临时子集 gold 文件
-    import tempfile
     gold_data = None
     temp_gold_file = None
     predicted_question_ids = set(predictions.keys())
@@ -835,7 +840,6 @@ def run_evaluator(predictions_file: Path, gold_file: Path, output_dir: Path, tex
     print(f"\n评估结果将保存到: {output_file}")
 
     # 执行评估
-    import subprocess
     result = subprocess.run(
         cmd,
         capture_output=True,
@@ -889,9 +893,6 @@ async def run_ragas_full_evaluation(
     Returns:
         包含各步骤结果的字典
     """
-    from ragas_generator import RagasTestsetGenerator
-    from ragas_evaluator import RagasEvaluator
-    from report_generator import ReportGenerator
 
     results = {}
 
@@ -958,7 +959,6 @@ async def run_ragas_full_evaluation(
     print("=" * 60)
 
     # 使用已有文档创建简单引擎
-    from llama_index.core import VectorStoreIndex
     index = VectorStoreIndex.from_documents(documents)
     query_engine = index.as_query_engine()
     print("✅ 已创建默认查询引擎")
@@ -1024,7 +1024,6 @@ async def run_ragas_generate_only(
     max_concurrent: int = 3,
 ) -> dict:
     """仅生成测试集（RAGAS Qasper 版本）"""
-    from ragas_generator import RagasTestsetGenerator
 
     milvus_qasper_path = str(DEFAULT_MILVUS_QASPER_PATH)
     qasper_stats_path = str(DEFAULT_QASPER_DOC_STATS_PATH)

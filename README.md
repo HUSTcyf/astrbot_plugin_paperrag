@@ -1,17 +1,17 @@
-# 📚 Paper RAG Plugin v2.0.0 — 用户指南
+# 📚 Paper RAG Plugin v2.0.2 — 用户指南
 
 本地论文库 RAG 检索插件，为 AstrBot 提供智能论文检索、知识图谱增强问答和研究想法生成。支持多模态（图片/表格/公式）提取、Llama.cpp VLM 本地问答和 Agentic RAG（LangGraph 工作流）。
 
-> **版本说明**：当前版本 v2.0.0，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
+> **版本说明**：当前版本 v2.0.2，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
 
-### 本版变化 (v2.0.0)
+### 本版变化 (v2.0.2)
 
-- **provider/ 模块**：统一模型服务层，`call_llm()` / `call_llm_json()` 封装消除全项目重复 LLM 调用代码。所有节点和命令路径共享同一套 provider 解析，支持 AstrBot cloud provider（result_chain）格式。
-- **Agentic RAG 增强**：ReAct Tool-Using Agent 工具从 2 个扩展到 7 个（`list_documents`, `graph_stats`, `get_paper_info`, `reference_stats`, `abstract_stats`），支持自主工具选择和动态检索策略。
-- **配置驱动 LLM 参数**：新增 `text_llm_temperature` / `text_llm_max_tokens` 配置项，所有 LLM 调用统一从插件配置读取默认值（优先级：显式传入 > config > 函数默认），不再硬编码。
-- **Idea Engine GBNF 修复**：重写 `idea_schema.gbnf`（拓扑排序 + 单行规则），修复 llama.cpp GBNF parser 解析失败及 segfault。
-- **Regular RAG 路径统一**：`_generate_rag_answer()` 改用 `call_llm()`，删除 80 行重复 provider 解析代码，Regular RAG 和 Agentic RAG 共享同一套安全校验。
-- 完整变更详见 [docs/changelog/2.0.0.md](docs/changelog/2.0.0.md)
+- **Token 计数统一**：新增 `rag/token_utils.py` 模块，统一 tiktoken cl100k_base 精确计数，消除全项目 `len(text) // 4` 估算。
+- **Import 整理**：62 个文件中将所有函数级直接 import 提升到文件顶部。
+- **LlamaIndex LLM Bridge**：新增 `get_llama_index_llm()` / `_create_vlm_custom_llm()`，绕过 OpenAI SDK 模型名校验。
+- **图谱通道重构**：知识图谱从 RRF 第四通道改为两阶段独立召回（Stage 1.6），移除 `graph_rrf_weight` 配置项。修复 `_graph_recall_papers` 嵌套 async 问题。
+- **测试修复**：修复 mock patch 路径，全量 41 个 agentic 测试通过。
+- 完整变更详见 [docs/changelog/2.0.2.md](docs/changelog/2.0.2.md)
 
 ---
 
@@ -22,10 +22,11 @@
 PaperRAG 是一个多层学术论文问答系统，支持从简单向量检索到 Agentic 自主推理的多种查询模式：
 
 **检索流水线**：
-- **4 通道混合检索**：稠密向量（BGE-M3） + 稀疏权重（ABSPEC） + BM25 精确匹配 + 知识图谱通道（Neo4j），通过 RRF 融合
-- **可选增强**：ColBERT 多向量重排序、两阶段检索（摘要匹配 → chunk 检索）、CRAG 质量评估
+- **单阶段 3 通道混合检索**：稠密向量（BGE-M3） + 稀疏权重（ABSPEC） + BM25 精确匹配，通过 RRF 融合
+- **两阶段检索**（可选）：Stage 1 摘要匹配 → ColBERT 重排序 → 知识图谱独立召回 → Stage 2 chunk 检索
+- **可选增强**：ColBERT 多向量重排序、CRAG 质量评估
 
-**知识图谱增强**：`MultimodalGraphBuilder` 从论文 Chunk 中自动抽取知识三元组，使用 Neo4j 作为图存储后端，JSON Schema 精确约束 LLM 输出。支持 **9 类实体**（Method、Model、Task、Dataset、Metric、Component、Limitation、Application、Baseline）和 **14 类关系**（ADDRESSES、PROPOSES、USES_COMPONENT、EVALUATED_ON、ACHIEVES、COMPARES_WITH、LIMITED_BY、APPLIES_TO、EXTENDS、TRAINS_ON、IMPLEMENTS、OUTPERFORMS、REQUIRES、ABLATES_ON）。图谱作为 RRF 第四通道融入 HybridRetriever。
+**知识图谱增强**：`MultimodalGraphBuilder` 从论文 Chunk 中自动抽取知识三元组，使用 Neo4j 作为图存储后端，JSON Schema 精确约束 LLM 输出。支持 **9 类实体**（Method、Model、Task、Dataset、Metric、Component、Limitation、Application、Baseline）和 **14 类关系**（ADDRESSES、PROPOSES、USES_COMPONENT、EVALUATED_ON、ACHIEVES、COMPARES_WITH、LIMITED_BY、APPLIES_TO、EXTENDS、TRAINS_ON、IMPLEMENTS、OUTPERFORMS、REQUIRES、ABLATES_ON）。两阶段检索中，图谱作为独立召回通道（Stage 1.6）补充论文召回，不与向量/BM25 走同一 RRF 融合，避免文本打分过滤掉结构相关但摘要匹配度低的论文。
 
 **Agentic 工作流**（LangGraph，可选启用）：
 - **静态 DAG** (`/paper arag`)：router → [vector_search ∥ graph_search] 并行 → synthesize → quality_check 反馈循环
@@ -41,7 +42,7 @@ PaperRAG 是一个多层学术论文问答系统，支持从简单向量检索�
 
 ## ✨ 核心功能
 
-- 🔍 **混合检索**：稠密向量 + 稀疏权重（ABSPEC）+ BM25 精确匹配 + 知识图谱 四通道 RRF 融合
+- 🔍 **混合检索**：稠密向量 + 稀疏权重（ABSPEC）+ BM25 精确匹配 三通道 RRF 融合，知识图谱独立召回（两阶段）
 - 🧠 **Agentic RAG**：LangGraph 静态 DAG + ReAct Tool-Using Agent（7 个自主工具），智能查询分类与多跳推理
 - 🕸️ **知识图谱**：Neo4j 图数据库，9 类实体 + 14 类关系，LLM 自动三元组抽取，多模态图谱构建
 - 💡 **Idea 生成**：线性 + Agentic 迭代优化（自反思 critique→debate→refine 循环），飞书文档导出
@@ -218,7 +219,7 @@ pip install -r requirements.txt
 | `enable_agentic_rag` | 启用 Agentic RAG | `false` |
 | `enable_agentic_ideas` | 启用 Agentic Idea Engine | `false` |
 | `enable_graph_rag` | 启用 Graph RAG | `false` |
-| `graph_rrf_weight` | 图谱在 RRF 中的权重 | `0.2` |
+
 
 ### 分块配置
 

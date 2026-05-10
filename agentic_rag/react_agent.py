@@ -10,6 +10,7 @@ from astrbot.api import logger
 
 from .react_state import MAX_ITERATIONS, MAX_TOOL_CALLS
 from .react_tools import TOOL_DEFINITIONS
+from provider.llm_utils import call_llm
 
 SYSTEM_PROMPT = """你是一个学术论文问答助手。你可以使用以下工具来帮助回答问题：
 
@@ -121,7 +122,6 @@ async def react_agent_node(state: dict) -> dict:
     if context is None:
         raise ValueError("[react_agent] _context 未传入")
 
-    from provider.llm_utils import call_llm
 
     # 调用 LLM
     try:

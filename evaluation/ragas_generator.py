@@ -6,12 +6,29 @@ Ragas 测试集生成器
 
 import asyncio
 import json
+import os
+import re
 import sys
+import threading
+import time
+
+import aiohttp
 import requests
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Type, Union
-from dataclasses import dataclass, asdict, field
-from dataclasses import dataclass as dc
+
+from llama_index.core import Document
+from pymilvus import connections, Collection
+from ragas.llms.base import BaseRagasLLM
+from ragas.embeddings.base import BaseRagasEmbeddings
+from ragas.run_config import RunConfig
+from ragas.testset import TestsetGenerator
+from ragas.testset.graph import KnowledgeGraph
+from ragas.testset.transforms.splitters import HeadlineSplitter
+from ragas.testset.synthesizers.testset_schema import Testset
+from langchain_core.outputs.llm_result import LLMResult
+from langchain_core.outputs.generation import Generation
 
 # 确保能导入 astrbot.api
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -25,45 +42,16 @@ except Exception:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(handler)
-    # logger.info = lambda x: print(x)
-    # logger.warning = lambda x: print(f"WARNING: {x}")
-    # logger.error = lambda x: print(f"ERROR: {x}")
-
-# ============================================================================
-# 懒加载 ragas（评估框架，可选安装）
-# ============================================================================
-
-RAGAS_AVAILABLE = True
-TestsetGenerator = None
-Document = None
-
-from ragas.testset import TestsetGenerator
-from ragas.testset.graph import KnowledgeGraph
-from ragas.llms.base import BaseRagasLLM
-from ragas.embeddings.base import BaseRagasEmbeddings
-from llama_index.core import Document
 
 # 禁用 Ragas 遥测追踪（避免 SSL 证书过期错误）
-import os
 os.environ["RAGAS_DO_NOT_TRACK"] = "True"
-
-# except ImportError as e:
-#     RAGAS_AVAILABLE = False
-#     logger.warning(f"Ragas 评估框架未安装，部分功能不可用: {e}")
-
-
-# ============================================================================
-# 自定义 Ragas LLM 和 Embedding 包装器（适配 OpenAI 兼容接口）
-# ============================================================================
 
 try:
     from langchain_core.prompt_values import StringPromptValue
 except ImportError:
     StringPromptValue = None
 
-from ragas.llms.base import BaseRagasLLM
-from langchain_core.outputs.llm_result import LLMResult
-from langchain_core.outputs.generation import Generation
+RAGAS_AVAILABLE = True
 
 
 class InvalidLLMResponseError(ValueError):
@@ -112,15 +100,12 @@ class OpenAICompatibleLLM(BaseRagasLLM):
     @classmethod
     def set_max_rpm(cls, rpm: int):
         """设置 RPM 限制"""
-        import threading
         cls._max_rpm = rpm
         if cls._rpm_lock is None:
             cls._rpm_lock = threading.Lock()
 
     def _wait_for_rpm_slot(self):
         """等待直到获取 RPM 槽位（同步版本）"""
-        import threading
-        import time
 
         if OpenAICompatibleLLM._rpm_lock is None:
             OpenAICompatibleLLM._rpm_lock = threading.Lock()
@@ -152,7 +137,6 @@ class OpenAICompatibleLLM(BaseRagasLLM):
 
     async def _await_for_rpm_slot_async(self):
         """等待直到获取 RPM 槽位（异步版本）"""
-        import asyncio
 
         while True:
             now = asyncio.get_event_loop().time()
@@ -210,8 +194,6 @@ class OpenAICompatibleLLM(BaseRagasLLM):
 
     def _call_api(self, prompt_text: str, temperature: float, max_tokens: int, stop: Optional[list], max_retries: int = 3):
         """同步调用 API（受全局 Semaphore 限制并发），超时/网络错误自动重试"""
-        import threading
-        import time
 
         url = f"{self.api_base}/chat/completions"
         headers = {
@@ -246,7 +228,6 @@ class OpenAICompatibleLLM(BaseRagasLLM):
                 result = response.json()
                 raw_text = result.get('choices', [{}])[0].get('message', {}).get('content') or ""
 
-                import re
                 stripped = raw_text.strip()
                 if stripped.startswith("```"):
                     stripped = re.sub(r'^```(?:json)?\s*', '', stripped, flags=re.MULTILINE)
@@ -295,7 +276,6 @@ class OpenAICompatibleLLM(BaseRagasLLM):
 
     async def _do_agenerate_request(self, url: str, headers: dict, data: dict) -> dict:
         """执行单次 HTTP 请求（供 agenerate_text 重试使用）"""
-        import aiohttp
 
         async with OpenAICompatibleLLM._semaphore:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
@@ -316,9 +296,6 @@ class OpenAICompatibleLLM(BaseRagasLLM):
         max_retries: int = 3,
     ) -> LLMResult:
         """异步生成文本（实现 BaseRagasLLM 接口），超时/网络错误自动重试"""
-        import aiohttp
-        import asyncio
-        import re
 
         # RPM 限制
         await self._await_for_rpm_slot_async()
@@ -435,7 +412,6 @@ class OpenAICompatibleLLM(BaseRagasLLM):
             pass
 
         # 步骤 2：去除 markdown code block 包装
-        import re
         stripped = re.sub(r'^```(?:json)?\s*', '', text.strip(), flags=re.MULTILINE)
         stripped = re.sub(r'\s*```$', '', stripped)
         try:
@@ -501,7 +477,6 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings):
         # 复用 aiohttp session（实例级）
         self._session: Optional[Any] = None
         # 初始化 run_config（父类需要这个属性）
-        from ragas.run_config import RunConfig
         self.run_config = RunConfig()
 
     def set_run_config(self, run_config):
@@ -510,7 +485,6 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings):
 
     def _get_sync_semaphore(self):
         """获取同步信号量（threading.Semaphore，所有实例共享）"""
-        import threading
         if OpenAICompatibleEmbeddings._sync_semaphore is None:
             if OpenAICompatibleEmbeddings._sync_semaphore_lock is None:
                 OpenAICompatibleEmbeddings._sync_semaphore_lock = threading.Lock()
@@ -521,7 +495,6 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings):
 
     def _post_embedding(self, texts: Union[str, List[str]]) -> List[List[float]]:
         """通用的 embedding API 调用（受全局 Semaphore 限制并发）"""
-        import threading
 
         url = f"{self.api_base}/embeddings"
         headers = {
@@ -557,7 +530,6 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings):
 
     async def _get_session(self) -> Any:
         """获取或创建 aiohttp ClientSession（实例级复用）"""
-        import aiohttp
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=300)
             self._session = aiohttp.ClientSession(timeout=timeout)
@@ -569,7 +541,6 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings):
 
     async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
         """异步批量获取文本 embeddings（受全局 Semaphore 限制并发）"""
-        import aiohttp
 
         # 获取或创建信号量（使用类变量锁防止竞争条件）
         if OpenAICompatibleEmbeddings._semaphore is None:
@@ -680,7 +651,6 @@ class MilvusDocumentLoader:
         if self._connection is not None:
             return
 
-        from pymilvus import connections, Collection
 
         connections.connect(uri=self.milvus_lite_path)
         self._collection = Collection(self.collection_name)
@@ -842,7 +812,6 @@ class MilvusDocumentLoader:
         - 排除参考文献相关
         - 排除前几行有多个姓名行的 chunk
         """
-        import re
 
         # 最核心的过滤模式
         exclude_patterns = [
@@ -1095,7 +1064,6 @@ class RagasTestsetGenerator:
         """
         过滤低质量问题（作者、机构、发表信息等元数据问题）。
         """
-        import re
 
         # 核心：只过滤关于作者/机构/发表信息的问题
         low_quality_patterns = [
@@ -1180,7 +1148,6 @@ class RagasTestsetGenerator:
 
         # 容错：HeadlinesExtractor 失败时 headlines 属性为 None，
         # 原版 HeadlineSplitter 会抛 ValueError，此处 patch 为安全返回
-        from ragas.testset.transforms.splitters import HeadlineSplitter
         _orig_split = HeadlineSplitter.split
         async def _safe_split(self, node):
             if node.get_property("headlines") is None:
@@ -1205,7 +1172,6 @@ class RagasTestsetGenerator:
             HeadlineSplitter.split = _orig_split
 
         # 转换为标准格式
-        from ragas.testset.synthesizers.testset_schema import Testset
         samples = []
         if testset is not None:
             assert isinstance(testset, Testset), f"Expected Testset, got {type(testset)}"
@@ -1255,7 +1221,6 @@ class RagasTestsetGenerator:
             print(f"   未发现低质量问题")
 
         # 保存结果（使用原子写入：先写临时文件，再 rename）
-        import os
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         temp_path = output_path + ".tmp"
         with open(temp_path, "w", encoding="utf-8") as f:

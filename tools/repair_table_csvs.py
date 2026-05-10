@@ -79,7 +79,6 @@ def extract_table_from_pdf(pdf_path: str, page_no: int, table_idx: int) -> Optio
     try:
         from docling_core.types.doc.document import TableItem
         from PIL import Image
-        import io
 
         converter = _get_converter()
         result = converter.convert(pdf_path)

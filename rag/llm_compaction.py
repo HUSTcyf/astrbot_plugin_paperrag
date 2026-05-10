@@ -6,6 +6,9 @@ import re
 from typing import Tuple, List, Any
 
 from astrbot.api import logger
+from provider.llama_cpp_vlm import get_llama_cpp_vlm_provider
+from rag.reference_processor import _find_all_reference_sections
+from rag.llm_preprocessor import remove_reference_sections
 
 
 LLM_EXTRACT_PROMPT_TEMPLATE = """从以下学术论文文本中提取标题、摘要和作者信息。
@@ -29,7 +32,6 @@ class LLMCompactionMixin:
         """
         用 LLM 从论文首页文本中提取 title/abstract/authors。
         """
-        from provider.llama_cpp_vlm import get_llama_cpp_vlm_provider
 
         vlm_provider = get_llama_cpp_vlm_provider()
         if vlm_provider is None:
@@ -64,9 +66,9 @@ class LLMCompactionMixin:
         content_clean = re.sub(r'```json\s*', '', content.strip())
         content_clean = re.sub(r'```\s*$', '', content_clean)
 
+        import json
         try:
-            import json as json_module
-            data = json_module.loads(content_clean, strict=False)
+            data = json.loads(content_clean, strict=False)
             title = str(data.get("title", "")).strip().strip('"\n ')
             abstract = str(data.get("abstract", "")).strip().strip('"\n ')
             authors_raw = data.get("authors", [])
@@ -76,7 +78,7 @@ class LLMCompactionMixin:
                 authors = []
             logger.info(f"✅ LLM 提取: title={title[:50] if title else 'N/A'}, authors={len(authors)}人")
             return title, abstract, authors
-        except json_module.JSONDecodeError:
+        except json.JSONDecodeError:
             logger.warning(f"⚠️ LLM 响应 JSON 解析失败: {content[:100]}")
             return "", "", []
 
@@ -84,8 +86,6 @@ class LLMCompactionMixin:
         """
         预处理：LLM 只提取 title/abstract/authors，正文用 docling 原文（去掉参考文献）。
         """
-        from rag.reference_processor import _find_all_reference_sections
-        from rag.llm_preprocessor import remove_reference_sections
 
         logger.info(f"🔄 文本预处理，共 {len(documents)} 个文档（LLM 仅提取 title/abstract/authors）...")
 

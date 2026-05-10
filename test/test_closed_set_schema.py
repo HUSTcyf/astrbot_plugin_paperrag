@@ -21,6 +21,22 @@ from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import re
+import inspect
+from graphrag.graph_rag_engine import SimplePropertyGraphStoreAdapter
+from graphrag.graph_builder import (
+    MultimodalGraphBuilder,
+    CLOSED_RELATION_TYPES,
+    CLOSED_ENTITY_TYPES,
+    BATCH_TRIPLET_EXTRACTION_PROMPT,
+    TRIPLET_EXTRACTION_PROMPT,
+    MULTIMODAL_TRIPLET_EXTRACTION_PROMPT,
+    _VLM_CACHE,
+    _vlm_cache_key,
+    _EXT_TO_FIGURE_TYPE,
+)
+from rag.token_utils import count_tokens
+from graphrag.json_utils import strip_thinking_tokens
 
 _plugin_root = Path(__file__).resolve().parents[1]
 if str(_plugin_root) not in sys.path:
@@ -97,7 +113,6 @@ def _make_graph_store_adapter(driver=None):
     _install_astrbot_stubs()
     _install_neo4j_stub()
 
-    from graphrag.graph_rag_engine import SimplePropertyGraphStoreAdapter
 
     if driver is None:
         driver = CypherCaptureDriver()
@@ -110,7 +125,6 @@ def _make_graph_store_adapter(driver=None):
 class FakeGraphRAGConfig:
     max_triplets_per_chunk: int = 10
     graph_retrieval_top_k: int = 5
-    graph_rrf_weight: float = 0.2
     multimodal_enabled: bool = True
     extract_image_entities: bool = True
 
@@ -120,7 +134,6 @@ def _make_builder(config=None):
     _install_astrbot_stubs()
     _install_neo4j_stub()
 
-    from graphrag.graph_builder import MultimodalGraphBuilder
 
     if config is None:
         config = FakeGraphRAGConfig()
@@ -185,8 +198,6 @@ class TestConstantsMatchGBNF:
 
     def test_relation_types_match_schema_exactly(self):
         _install_astrbot_stubs()
-        from graphrag.graph_builder import CLOSED_RELATION_TYPES
-        import json
 
         schema = json.loads((_plugin_root / "graphrag" / "triplet_schema.json").read_text())
         schema_values = _parse_json_schema_enum_values(schema, "relation_type")
@@ -194,29 +205,23 @@ class TestConstantsMatchGBNF:
 
     def test_entity_types_match_schema_exactly(self):
         _install_astrbot_stubs()
-        from graphrag.graph_builder import CLOSED_ENTITY_TYPES
-        import json
 
         schema = json.loads((_plugin_root / "graphrag" / "triplet_schema.json").read_text())
         schema_values = _parse_json_schema_enum_values(schema, "head_type")
         assert schema_values == CLOSED_ENTITY_TYPES
 
     def test_schema_has_exactly_14_relation_types(self):
-        import json
         schema = json.loads((_plugin_root / "graphrag" / "triplet_schema.json").read_text())
         schema_values = _parse_json_schema_enum_values(schema, "relation_type")
         assert len(schema_values) == 14
 
     def test_schema_has_exactly_9_entity_types(self):
-        import json
         schema = json.loads((_plugin_root / "graphrag" / "triplet_schema.json").read_text())
         schema_values = _parse_json_schema_enum_values(schema, "head_type")
         assert len(schema_values) == 9
 
     def test_multimodal_schema_relation_types_match_exactly(self):
         _install_astrbot_stubs()
-        from graphrag.graph_builder import CLOSED_RELATION_TYPES
-        import json
 
         schema = json.loads((_plugin_root / "graphrag" / "multimodal_schema.json").read_text())
         schema_values = _parse_multimodal_json_schema_enum_values(schema, "relation_type")
@@ -224,8 +229,6 @@ class TestConstantsMatchGBNF:
 
     def test_multimodal_schema_entity_types_match_exactly(self):
         _install_astrbot_stubs()
-        from graphrag.graph_builder import CLOSED_ENTITY_TYPES
-        import json
 
         schema = json.loads((_plugin_root / "graphrag" / "multimodal_schema.json").read_text())
         schema_values = _parse_multimodal_json_schema_enum_values(schema, "head_type")
@@ -236,7 +239,6 @@ class TestConstantsMatchGBNF:
             from llama_cpp import LlamaGrammar
         except ImportError:
             pytest.skip("llama-cpp-python not installed")
-        import json
         schema_text = (_plugin_root / "graphrag" / "triplet_schema.json").read_text()
         grammar = LlamaGrammar.from_json_schema(schema_text)
         assert grammar is not None
@@ -246,7 +248,6 @@ class TestConstantsMatchGBNF:
             from llama_cpp import LlamaGrammar
         except ImportError:
             pytest.skip("llama-cpp-python not installed")
-        import json
         schema_text = (_plugin_root / "graphrag" / "multimodal_schema.json").read_text()
         grammar = LlamaGrammar.from_json_schema(schema_text)
         assert grammar is not None
@@ -371,37 +372,30 @@ class TestPromptsClosedSet:
         _install_astrbot_stubs()
 
     def test_batch_prompt_has_all_predicates(self):
-        from graphrag.graph_builder import BATCH_TRIPLET_EXTRACTION_PROMPT, CLOSED_RELATION_TYPES
         for rt in CLOSED_RELATION_TYPES:
             assert rt in BATCH_TRIPLET_EXTRACTION_PROMPT
 
     def test_batch_prompt_has_all_entity_types(self):
-        from graphrag.graph_builder import BATCH_TRIPLET_EXTRACTION_PROMPT, CLOSED_ENTITY_TYPES
         for et in CLOSED_ENTITY_TYPES:
             assert et in BATCH_TRIPLET_EXTRACTION_PROMPT
 
     def test_single_prompt_has_all_predicates(self):
-        from graphrag.graph_builder import TRIPLET_EXTRACTION_PROMPT, CLOSED_RELATION_TYPES
         for rt in CLOSED_RELATION_TYPES:
             assert rt in TRIPLET_EXTRACTION_PROMPT
 
     def test_single_prompt_has_all_entity_types(self):
-        from graphrag.graph_builder import TRIPLET_EXTRACTION_PROMPT, CLOSED_ENTITY_TYPES
         for et in CLOSED_ENTITY_TYPES:
             assert et in TRIPLET_EXTRACTION_PROMPT
 
     def test_multimodal_prompt_has_all_predicates(self):
-        from graphrag.graph_builder import MULTIMODAL_TRIPLET_EXTRACTION_PROMPT, CLOSED_RELATION_TYPES
         for rt in CLOSED_RELATION_TYPES:
             assert rt in MULTIMODAL_TRIPLET_EXTRACTION_PROMPT
 
     def test_multimodal_prompt_has_all_entity_types(self):
-        from graphrag.graph_builder import MULTIMODAL_TRIPLET_EXTRACTION_PROMPT, CLOSED_ENTITY_TYPES
         for et in CLOSED_ENTITY_TYPES:
             assert et in MULTIMODAL_TRIPLET_EXTRACTION_PROMPT
 
     def test_no_metadata_types_in_prompts(self):
-        from graphrag.graph_builder import BATCH_TRIPLET_EXTRACTION_PROMPT, TRIPLET_EXTRACTION_PROMPT
         for prompt in [BATCH_TRIPLET_EXTRACTION_PROMPT, TRIPLET_EXTRACTION_PROMPT]:
             # Metadata types are now VALID entity types (Venue, Author, Institution)
             # Just verify they appear in their proper form (not as aliases)
@@ -421,14 +415,12 @@ class TestCallSitesUseRelationType:
 
     def test_three_text_sites_use_normalize(self):
         source = (_plugin_root / "graphrag" / "graph_builder.py").read_text()
-        import re
         pattern = r'relation\s*=\s*self\._normalize_relation_type\('
         matches = re.findall(pattern, source)
         assert len(matches) == 3
 
     def test_three_text_sites_pass_relation_description(self):
         source = (_plugin_root / "graphrag" / "graph_builder.py").read_text()
-        import re
         pattern = r'relation_description\s*=\s*relation\b'
         matches = re.findall(pattern, source)
         assert len(matches) == 3
@@ -462,9 +454,7 @@ class TestAddRelationSignature:
         _install_astrbot_stubs()
 
     def test_add_relation_has_description_param(self):
-        import inspect
         _install_neo4j_stub()
-        from graphrag.graph_rag_engine import SimplePropertyGraphStoreAdapter
         sig = inspect.signature(SimplePropertyGraphStoreAdapter.add_relation)
         assert "relation_description" in sig.parameters
         assert sig.parameters["relation_description"].default == ""
@@ -537,7 +527,6 @@ class TestProcessBatchPipeline:
     @pytest.mark.asyncio
     async def test_all_nine_relation_types_in_cypher(self):
         """Every closed-set relation type should produce valid Cypher with backtick label."""
-        from graphrag.graph_builder import CLOSED_RELATION_TYPES
 
         triplets = []
         for i, rt in enumerate(sorted(CLOSED_RELATION_TYPES)):
@@ -1237,7 +1226,6 @@ class TestBuildFromNodesEndToEnd:
     @pytest.mark.asyncio
     async def test_build_from_nodes_writes_closed_set_relations(self):
         """build_from_nodes should write only closed-set relation labels to Neo4j."""
-        from graphrag.graph_builder import MultimodalGraphBuilder, CLOSED_RELATION_TYPES
 
         triplets_json = json.dumps({"triplets": [
             {
@@ -1304,7 +1292,6 @@ class TestBuildFromNodesEndToEnd:
     @pytest.mark.asyncio
     async def test_build_from_nodes_multiple_batches(self):
         """build_from_nodes should batch nodes (4 per batch) and aggregate stats."""
-        from graphrag.graph_builder import MultimodalGraphBuilder
 
         triplets_json = json.dumps({"triplets": [
             {
@@ -1534,7 +1521,6 @@ class TestVLMCacheEviction:
 
     def test_cache_eviction_removes_half_not_all(self):
         _install_astrbot_stubs()
-        from graphrag.graph_builder import _VLM_CACHE, _vlm_cache_key
 
         _VLM_CACHE.clear()
         for i in range(501):
@@ -1570,13 +1556,11 @@ class TestFallbackFigureTypeMapping:
     ])
     def test_extension_mapping(self, ext, expected):
         _install_astrbot_stubs()
-        from graphrag.graph_builder import _EXT_TO_FIGURE_TYPE
 
         assert _EXT_TO_FIGURE_TYPE[ext] == expected
 
     def test_unknown_extension_returns_unknown(self):
         _install_astrbot_stubs()
-        from graphrag.graph_builder import _EXT_TO_FIGURE_TYPE
 
         assert _EXT_TO_FIGURE_TYPE.get(".xyz", "unknown") == "unknown"
 
@@ -1652,7 +1636,6 @@ class TestTokenCounting:
 
     def test_count_tokens_uses_tiktoken(self):
         """count_tokens should use tiktoken for accurate counting, not char/4 estimation."""
-        from graphrag.graph_builder import count_tokens
 
         # "hello" is 1 token in cl100k_base
         # " world" is 1 token
@@ -1662,7 +1645,6 @@ class TestTokenCounting:
 
     def test_count_tokens_accurate_for_english(self):
         """Token counting should match tiktoken for English text."""
-        from graphrag.graph_builder import count_tokens
 
         text = "The Transformer architecture uses self-attention mechanism."
         tokens = count_tokens(text)
@@ -1671,20 +1653,16 @@ class TestTokenCounting:
 
     def test_count_tokens_accurate_for_chinese(self):
         """Token counting should handle Chinese text (3-4 chars per token)."""
-        from graphrag.graph_builder import count_tokens
 
         # 4 Chinese chars ≈ 1-2 tokens typically
         text = "这是中文测试"
         tokens = count_tokens(text)
         assert tokens >= 2, f"Expected >=2 tokens for Chinese text, got {tokens}"
 
-    def test_count_tokens_safe_fallback(self):
-        """count_tokens should work even without tiktoken (fallback to char/4)."""
-        from graphrag.graph_builder import count_tokens
-
+    def test_count_tokens_always_precise(self):
+        """count_tokens uses tiktoken — no char/4 estimation."""
         result = count_tokens("test text")
-        assert isinstance(result, int)
-        assert result > 0
+        assert result == 2, f"'test text' should be exactly 2 tokens, got {result}"
 
 
 # ============================================================================
@@ -1709,7 +1687,6 @@ class TestContextOverflowHandling:
     @pytest.mark.asyncio
     async def test_exceeding_context_triggers_split(self):
         """When total tokens > n_ctx, _process_batch should split chunks into multiple calls."""
-        from graphrag.graph_builder import count_tokens
 
         # Create a builder with very small context (256 tokens)
         builder = _make_builder(FakeGraphRAGConfig(max_triplets_per_chunk=3))
@@ -1748,7 +1725,6 @@ class TestContextOverflowHandling:
     @pytest.mark.asyncio
     async def test_split_preserves_chunk_indices(self):
         """When chunks are split, evidence [Chunk X] indices should be corrected."""
-        from graphrag.graph_builder import MultimodalGraphBuilder, count_tokens
 
         # Use a very small context to force splitting
         builder = MultimodalGraphBuilder.__new__(MultimodalGraphBuilder)
@@ -1881,7 +1857,6 @@ class TestJSONTruncationRecovery:
 
     def test_strip_thinking_tokens_from_json_utils(self):
         """strip_thinking_tokens from json_utils should handle various think scenarios."""
-        from graphrag.json_utils import strip_thinking_tokens
 
         response_with_thinking = '''<think>
 Let me analyze the paper content...

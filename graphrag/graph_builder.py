@@ -16,39 +16,21 @@ Closed-set 关系类型 (9 类):
 ADDRESSES, PROPOSES, USES_COMPONENT, EVALUATED_ON, ACHIEVES, COMPARES_WITH, LIMITED_BY, APPLIES_TO, EXTENDS
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
 import hashlib
+import time
 from typing import Dict, Any, List, Optional, TYPE_CHECKING
 from pathlib import Path
 from dataclasses import dataclass
 
-# Token 计算（精确计算，避免上下文溢出）
-try:
-    import tiktoken
-    _TOKEN_ENCODER: Optional[Any] = None
-except ImportError:
-    tiktoken = None
-    _TOKEN_ENCODER = None
-
-def _get_token_encoder():
-    """获取 tiktoken 编码器（懒加载单例）"""
-    global _TOKEN_ENCODER
-    if _TOKEN_ENCODER is None and tiktoken is not None:
-        _TOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
-    return _TOKEN_ENCODER
-
-def count_tokens(text: str) -> int:
-    """精确计算文本的 token 数量（使用 tiktoken）"""
-    encoder = _get_token_encoder()
-    if encoder:
-        return len(encoder.encode(text))
-    # Fallback：估算 1 token ≈ 4 字符
-    return len(text) // 4
-
-
 from astrbot.api import logger
+from llama_cpp import LlamaGrammar
+from rag.token_utils import count_tokens
+
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 _GRAMMAR_DIR = Path(__file__).resolve().parent
@@ -585,7 +567,6 @@ class MultimodalGraphBuilder:
 
     def _load_grammars(self):
         """从 JSON schema 文件生成 grammar，约束 LLM 输出为合法 JSON"""
-        from llama_cpp import LlamaGrammar
 
         triplet_path = _GRAMMAR_DIR / "triplet_schema.json"
         if triplet_path.exists():
@@ -1571,7 +1552,6 @@ Extract triplets:"""
 
     def _save_failed_response(self, response: str, err_pos: int):
         """保存解析失败的响应到文件用于调试"""
-        import time
 
         debug_dir = _PLUGIN_ROOT / "data" / "debug"
         debug_dir.mkdir(exist_ok=True)

@@ -83,7 +83,7 @@
 - **Embedding**：`embedding_mode` (unsloth/api), `embed_dim`, `unsloth.*`
 - **检索**：`top_k`, `similarity_cutoff`, `enable_sparse_retrieval`, `enable_bm25`, `enable_multi_vector_rerank`
 - **Agentic**：`enable_agentic_rag`, `enable_agentic_ideas`
-- **Graph RAG**：`enable_graph_rag`, `graph_rrf_weight`, `graph_rag.*`
+- **Graph RAG**：`enable_graph_rag`, `graph_rag.*`
 - **分块**：`chunk_size`, `chunk_overlap`, `min_chunk_size`, `use_semantic_chunking`
 
 ## 核心文件速查

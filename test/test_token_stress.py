@@ -41,8 +41,9 @@ def _install_stubs():
 _install_stubs()
 
 from graphrag.graph_builder import (
-    MultimodalGraphBuilder, count_tokens, BATCH_TRIPLET_EXTRACTION_PROMPT
+    MultimodalGraphBuilder, BATCH_TRIPLET_EXTRACTION_PROMPT
 )
+from rag.token_utils import count_tokens
 
 
 # ============================================================================

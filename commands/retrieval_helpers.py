@@ -11,6 +11,7 @@ from typing import Any, Dict, List
 from astrbot.api import logger
 
 from .base import PluginCoreBase, _PLUGIN_DIR
+from astrbot.api.event import AstrMessageEvent
 
 
 class RetrievalHelpersMixin(PluginCoreBase):
@@ -18,7 +19,6 @@ class RetrievalHelpersMixin(PluginCoreBase):
 
     async def _search_papers_tool_impl(self, query: str | None, top_k: int = 5) -> str:
         """搜索本地论文库并返回结果（RAG模式）"""
-        from astrbot.api.event import AstrMessageEvent
 
         if isinstance(query, AstrMessageEvent):
             logger.warning("[PaperRAG] search_papers_tool 收到 event 对象，跳过执行")
@@ -55,7 +55,6 @@ class RetrievalHelpersMixin(PluginCoreBase):
 
     async def _retrieve_papers_tool_impl(self, query: str | None, top_k: int = 5) -> str:
         """仅检索论文片段，不生成回答"""
-        from astrbot.api.event import AstrMessageEvent
 
         if isinstance(query, AstrMessageEvent):
             logger.warning("[PaperRAG] retrieve_papers_tool 收到 event 对象，跳过执行")
@@ -215,7 +214,6 @@ class RetrievalHelpersMixin(PluginCoreBase):
             return sources
 
         # 简单文本清洗：只删除 [Page X] 标签
-        import re
         page_pattern = re.compile(r'\[Page\s*\d+(?:-\d+)?\]', re.IGNORECASE)
         table_fig_pattern = re.compile(r'^(?:TABLE|Figure|Fig\.)\s*\d+:\s*$', re.MULTILINE)
 

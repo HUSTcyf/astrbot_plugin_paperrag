@@ -4,6 +4,8 @@
 支持优雅降级：如果依赖不可用，自动禁用相应功能
 """
 
+from __future__ import annotations
+
 import io
 import json
 import os
@@ -20,6 +22,7 @@ logger = logging.getLogger(__name__)
 # 必需依赖
 from PIL import Image
 import fitz  # PyMuPDF
+from docling.datamodel.settings import settings
 
 # Docling 预导入（在 AstrBot 事件循环中避免延迟导入崩溃）
 try:
@@ -881,7 +884,6 @@ def _configure_docling_globals() -> None:
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
     # 3. 设置 docling settings
-    from docling.datamodel.settings import settings
     settings.cache_dir = models_dir
     settings.artifacts_path = models_dir
 
@@ -1088,7 +1090,6 @@ class DoclingExtractor:
         """将表格数据转换为 CSV 格式"""
         if hasattr(data, 'export_to_dataframe'):
             try:
-                import io
                 df = data.export_to_dataframe(doc=None)
                 buf = io.StringIO()
                 df.to_csv(buf, index=False, header=True, encoding='utf-8')

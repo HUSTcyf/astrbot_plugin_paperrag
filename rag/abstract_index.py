@@ -10,12 +10,14 @@
   查询 → [阶段1] 摘要向量检索 → top-k 相关论文 → [阶段2] chunk 检索 → 最终结果
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import os
 import re
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Set, Tuple, cast
+from typing import Dict, Any, List, Optional, Tuple, cast
 from dataclasses import dataclass
 
 try:

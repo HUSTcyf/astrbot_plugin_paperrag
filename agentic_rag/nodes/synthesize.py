@@ -4,9 +4,12 @@ Synthesize node — 多源聚合生成。
 
 from __future__ import annotations
 
+import re
+
 from pydantic import BaseModel, Field, model_validator
 
 from astrbot.api import logger
+from provider.llm_utils import call_llm
 
 
 class SynthesizeInput(BaseModel):
@@ -127,7 +130,6 @@ async def synthesize_node(state: dict) -> dict:
         }
 
     # 获取 LLM provider（统一 4 步解析）
-    from provider.llm_utils import call_llm
 
     try:
         quality_feedback = ""
@@ -149,7 +151,6 @@ async def synthesize_node(state: dict) -> dict:
         draft = draft.strip()
 
         # 简单引用提取：找 [#n] 格式
-        import re
         cite_refs = re.findall(r"\[#(\d+)\]", draft)
         for ref in set(cite_refs):
             idx = int(ref) - 1

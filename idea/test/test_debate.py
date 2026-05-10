@@ -11,6 +11,8 @@ from idea.nodes.debate import (
     _build_history_section,
 )
 from provider.llm_utils import parse_json_response as _parse_json
+from idea.agentic_workflow import route_after_critique
+from idea.agentic_workflow import route_after_debate
 
 
 class TestFormatHelpers:
@@ -217,42 +219,36 @@ class TestWorkflowRouting:
 
     def test_route_after_critique_to_debate(self):
         """critique → debate when phase=refine and debate_rounds left."""
-        from idea.agentic_workflow import route_after_critique
 
         state = {"phase": "refine", "debate_round": 0, "_max_debate_rounds": 2}
         assert route_after_critique(state) == "debate"
 
     def test_route_after_critique_to_refine(self):
         """critique → refine when debate rounds exhausted."""
-        from idea.agentic_workflow import route_after_critique
 
         state = {"phase": "refine", "debate_round": 2, "_max_debate_rounds": 2}
         assert route_after_critique(state) == "refine"
 
     def test_route_after_critique_to_save(self):
         """critique → save when ideas are good (phase=done)."""
-        from idea.agentic_workflow import route_after_critique
 
         state = {"phase": "done", "debate_round": 0, "_max_debate_rounds": 2}
         assert route_after_critique(state) == "save"
 
     def test_route_after_debate_to_critique(self):
         """debate → critique for re-evaluation."""
-        from idea.agentic_workflow import route_after_debate
 
         state = {"phase": "critique"}
         assert route_after_debate(state) == "critique"
 
     def test_route_after_debate_to_refine(self):
         """debate → refine when phase=refine (e.g., LLM failed)."""
-        from idea.agentic_workflow import route_after_debate
 
         state = {"phase": "refine"}
         assert route_after_debate(state) == "refine"
 
     def test_route_after_debate_to_save(self):
         """debate → save when phase=done (e.g., all good)."""
-        from idea.agentic_workflow import route_after_debate
 
         state = {"phase": "done"}
         assert route_after_debate(state) == "save"

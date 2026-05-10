@@ -16,6 +16,7 @@ from astrbot.api import logger
 from .utils import topic_hash
 from provider.llm_utils import extract_text_from_response
 from .paperbanana import IdeaEnginePaperBanana
+from astrbot.core.agent.run_context import ContextWrapper
 
 
 class IdeaEngineFeishuDoc(IdeaEnginePaperBanana):
@@ -25,7 +26,6 @@ class IdeaEngineFeishuDoc(IdeaEnginePaperBanana):
         """
         测试用：列表样式 + 图片插入 + 引用链接
         """
-        from astrbot.core.agent.run_context import ContextWrapper
         ctx_wrapper = ContextWrapper(context=self.context)
 
         provider_manager = getattr(self.context, 'provider_manager', None)
@@ -233,7 +233,6 @@ class IdeaEngineFeishuDoc(IdeaEnginePaperBanana):
                 # 匹配：按文本内容找到列表块（空白符归一化后比较）
                 def _normalize_text(t: str) -> str:
                     """归一化空白符：将多个连续空白符合并为一个，去除首尾空白"""
-                    import re
                     return re.sub(r'\s+', ' ', t).strip()
 
                 updates = []

@@ -19,6 +19,7 @@ import numpy as np
 import torch
 
 from astrbot.api import logger
+from FlagEmbedding import BGEM3FlagModel
 
 
 class FlagEmbeddingModel:
@@ -72,7 +73,6 @@ class FlagEmbeddingModel:
             self._initialized = True
 
     def _load_model(self) -> None:
-        from FlagEmbedding import BGEM3FlagModel
 
         logger.info(f"[FlagEmbedding] 加载模型: {self.model_path}")
         self.model = BGEM3FlagModel(

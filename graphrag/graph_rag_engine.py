@@ -7,6 +7,8 @@ Graph RAG Engine - 图谱增强检索引擎
 图谱检索作为 RRF 第四通道融入 HybridRetriever，不再独立运行。
 """
 
+from __future__ import annotations
+
 import asyncio
 import gc
 import re
@@ -64,7 +66,6 @@ class GraphRAGConfig:
     neo4j_password: str = ""
     max_triplets_per_chunk: int = 5
     graph_retrieval_top_k: int = 5
-    graph_rrf_weight: float = 0.2  # 图谱在 RRF 融合中的权重
     auto_build: bool = False  # 是否自动构建图谱
     auto_build_threshold: int = 10  # 自动构建阈值
     # 多模态配置
@@ -86,7 +87,6 @@ class GraphRAGConfig:
             neo4j_password=getattr(config, 'graph_neo4j_password', ''),
             max_triplets_per_chunk=getattr(config, 'graph_max_triplets_per_chunk', 5),
             graph_retrieval_top_k=getattr(config, 'graph_retrieval_top_k', 5),
-            graph_rrf_weight=getattr(config, 'graph_rrf_weight', None) or getattr(config, 'hybrid_alpha', 0.2),
             auto_build=getattr(config, 'graph_auto_build', False),
             auto_build_threshold=getattr(config, 'graph_auto_build_threshold', 10),
             multimodal_enabled=getattr(config, 'graph_multimodal_enabled', True),
@@ -475,46 +475,9 @@ class GraphRAGEngine:
             prefer_cloud: 为 True 时跳过本地 VLM，直接使用云端 Provider（适合 Cypher 生成）。
         """
         try:
-            from llama_index.llms.openai import OpenAI
-
-            # 优先使用本地VLM（与 HybridRAGEngine 保持一致）
-            if not prefer_cloud:
-                try:
-                    from provider.llama_cpp_vlm import get_llama_cpp_vlm_provider
-                    vlm_provider = get_llama_cpp_vlm_provider()
-                    if vlm_provider and not getattr(vlm_provider, '_initialized', False):
-                        logger.info("[GraphRAG] 本地VLM未初始化，尝试初始化...")
-                        await vlm_provider.initialize()
-                    if vlm_provider and getattr(vlm_provider, '_initialized', False):
-                        logger.info("[GraphRAG] 使用本地VLM Provider")
-                        model = 'local-vlm'
-                        return OpenAI(model=model, api_key='dummy', api_base='http://localhost:8080/v1')
-                except Exception as e:
-                    logger.debug(f"[GraphRAG] 本地VLM不可用: {e}")
-
-            # Cloud provider（fallback 或 prefer_cloud）
-            if self.context is None:
-                return None
-            provider = self.context.get_using_provider()
-            if provider is None:
-                return None
-            model = getattr(provider, 'model_name', '') or getattr(provider, 'provider_config', {}).get('model', '')
-            if not model:
-                return None
-            api_key = getattr(provider, 'chosen_api_key', None)
-            if not api_key:
-                try:
-                    api_key = provider.get_current_key()
-                except Exception:
-                    pass
-            if not api_key:
-                return None
-            api_base = getattr(provider, 'provider_config', {}).get('api_base', '')
-            kwargs = {"model": model, "api_key": api_key}
-            if api_base:
-                kwargs["api_base"] = api_base
-            logger.info(f"[GraphRAG] 创建 LlamaIndex LLM: model={model}")
-            return OpenAI(**kwargs)
+            from provider.llm_utils import get_llama_index_llm
+            llm = await get_llama_index_llm(self.context, prefer_cloud=prefer_cloud)
+            return llm
         except Exception as e:
             logger.warning(f"[GraphRAG] 创建 LlamaIndex LLM 失败: {e}")
             return None
@@ -621,7 +584,6 @@ class GraphRAGEngine:
                 logger.info(f"✅ Graph RAG 引擎已初始化 (存储类型: {self.config.storage_type})")
                 logger.info(f"   - 最大三元组/Chunk: {self.config.max_triplets_per_chunk}")
                 logger.info(f"   - 图谱检索TopK: {self.config.graph_retrieval_top_k}")
-                logger.info(f"   - 图谱RRF权重: {self.config.graph_rrf_weight}")
                 self._initialized = True
                 self._health_status = "healthy"
             else:
@@ -1092,6 +1054,7 @@ async def build_graph_from_documents(
 ) -> Dict[str, int]:
     """便捷函数：从文档列表构建图谱"""
     from .graph_builder import MultimodalGraphBuilder
+
     class SimpleNode:
         def __init__(self, text: str, metadata: Dict[str, Any]):
             self.text = text

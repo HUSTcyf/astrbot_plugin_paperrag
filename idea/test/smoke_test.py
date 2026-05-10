@@ -13,9 +13,11 @@
 
 import argparse
 import asyncio
-from unittest.mock import MagicMock, PropertyMock
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock, PropertyMock
+
+from idea.agentic_workflow import compile_workflow
 
 _plugin_root = Path(__file__).parent.parent.parent
 if str(_plugin_root) not in sys.path:
@@ -28,8 +30,6 @@ async def smoke_test_isolated():
     print("🧪 Agentic Idea 节点隔离冒烟测试")
     print("=" * 60)
 
-    from idea.agentic_workflow import compile_workflow
-    from unittest.mock import MagicMock
 
     app = compile_workflow()
     print(f"✅ workflow 编译成功: {type(app).__name__}")

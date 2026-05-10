@@ -14,6 +14,9 @@ import os
 import sys
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from llama_index.core import Document
+from collections import defaultdict
+import argparse
 
 # 添加插件目录到路径
 plugin_dir = Path(__file__).parent.resolve()
@@ -67,8 +70,6 @@ def chunks_to_documents(chunks: List[Dict[str, Any]]) -> List[Any]:
     print("📄 步骤 2: 转换为 LlamaIndex Document")
     print("=" * 60)
 
-    from llama_index.core import Document
-    from collections import defaultdict
 
     # 按 paper_id 分组
     papers: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -160,7 +161,6 @@ async def build_neo4j_graph(
 
             def complete(self, prompt: str, **kwargs) -> Any:
                 """同步 complete 接口"""
-                import json
                 messages = [
                     {"role": "system", "content": "You are a helpful assistant."},
                     {"role": "user", "content": prompt}
@@ -251,7 +251,6 @@ def verify_neo4j(graph_store) -> None:
 # ============================================================================
 
 def main():
-    import argparse
 
     parser = argparse.ArgumentParser(description="从 Milvus 构建 Neo4j 知识图谱")
     parser.add_argument(

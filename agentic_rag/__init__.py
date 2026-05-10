@@ -2,10 +2,13 @@
 agentic_rag — Agentic RAG workflow using LangGraph.
 """
 
+from __future__ import annotations
+
 from typing import Optional, Any
 
 from astrbot.api import logger
 from .workflow import compile_workflow
+from .react_workflow import compile_react_workflow
 
 __all__ = ["compile_workflow", "run_agentic_rag", "run_agentic_rag_stream", "run_react_rag"]
 __version__ = "0.2.0"
@@ -50,7 +53,6 @@ async def run_react_rag(query: str, context, top_k: int = 5, config: Optional[di
         top_k: 召回数（默认5）
         config: 可选，直接传入插件配置字典
     """
-    from .react_workflow import compile_react_workflow
     app = compile_react_workflow()
     initial_state = {
         "query": query,

@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Any, List, Optional, Dict
 
 from astrbot.api import logger
+import gc
+from huggingface_hub import hf_hub_download
+import concurrent.futures
+from llama_cpp import Llama
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LLAMA_VLM_N_CTX = int(os.environ.get("PAPERRAG_LLAMA_VLM_N_CTX", "16384"))
@@ -130,7 +134,6 @@ class LlamaCppVLMProvider:
 
     async def _ensure_models_downloaded(self) -> None:
         """检查模型文件是否存在，不存在则自动下载（9B优先，4B备用）"""
-        from huggingface_hub import hf_hub_download
 
         models_base_dir = self._get_plugin_models_dir()
 
@@ -188,7 +191,6 @@ class LlamaCppVLMProvider:
         download_dir: str,
     ) -> None:
         """下载单个模型的 GGUF 和 mmproj 文件"""
-        from huggingface_hub import hf_hub_download
 
         download_path = Path(download_dir)
         model_path = download_path / model_name
@@ -256,10 +258,8 @@ class LlamaCppVLMProvider:
 
     async def _try_load_model(self, model_path: str, mmproj_path: str) -> None:
         """在独立线程中加载 Llama 模型"""
-        import concurrent.futures
 
         def _load() -> Any:
-            from llama_cpp import Llama
             return Llama(
                 model_path=model_path,
                 mmproj=mmproj_path,
@@ -275,7 +275,6 @@ class LlamaCppVLMProvider:
 
     def _load_llama(self) -> Any:
         """在线程中加载 Llama 模型（同步版本，保留兼容性）"""
-        from llama_cpp import Llama
 
         llama = Llama(
             model_path=self.model_path,
@@ -579,7 +578,6 @@ def reset_llama_cpp_vlm_provider() -> None:
     _vlm_provider_instance = None
 
     # 强制垃圾回收
-    import gc
     gc.collect()
 
     logger.info("[Llama.cpp-VLM] Provider 单例已重置")
