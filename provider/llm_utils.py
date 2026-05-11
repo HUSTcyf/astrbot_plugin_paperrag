@@ -100,8 +100,8 @@ def get_llm_provider(context, config=None):
             vlm = get_llama_cpp_vlm_provider()
             if vlm and getattr(vlm, "_initialized", False):
                 provider = vlm
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[Provider] Step 2 (local VLM) failed: {e}")
 
     # Step 3: 当前会话的云端 provider
     if not provider and context is not None:
@@ -109,8 +109,8 @@ def get_llm_provider(context, config=None):
             fn = getattr(context, 'get_using_provider', None)
             if fn:
                 provider = fn()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[Provider] Step 3 (get_using_provider) failed: {e}")
 
     # Step 4: inst_map 中第一个有 text_chat 的 provider
     if not provider:
@@ -271,8 +271,8 @@ async def get_llama_index_llm(context: Any = None, prefer_cloud: bool = False):
                 await vlm.initialize()
             if vlm and getattr(vlm, '_initialized', False):
                 return _create_vlm_custom_llm(vlm)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[Provider] LlamaIndex Step 1 (local VLM) failed: {e}")
 
     # Step 2: Cloud provider
     from astrbot.api import logger
@@ -293,8 +293,8 @@ async def get_llama_index_llm(context: Any = None, prefer_cloud: bool = False):
     if not provider:
         try:
             provider = context.get_using_provider()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[Provider] LlamaIndex get_using_provider failed: {e}")
 
     # Fallback: first provider with text_chat from inst_map
     if not provider and isinstance(inst_map, dict):
@@ -314,8 +314,8 @@ async def get_llama_index_llm(context: Any = None, prefer_cloud: bool = False):
     if not api_key:
         try:
             api_key = provider.get_current_key()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[Provider] get_current_key failed: {e}")
     if not api_key:
         return None
 

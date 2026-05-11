@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import shutil
+import traceback
 import json
 from typing import List, Dict, Tuple, Any, Optional, Union, cast
 from pathlib import Path
@@ -1871,8 +1872,8 @@ class HybridRAGEngine:
             try:
                 if hasattr(graph_retriever, 'sub_retrievers') and graph_retriever.sub_retrievers:
                     graph_store = getattr(graph_retriever.sub_retrievers[0], '_graph_store', None)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[HybridRAGEngine] 无法从 PGRetriever 提取 graph_store: {e}")
 
             if graph_store is None:
                 logger.warning(
@@ -1903,6 +1904,7 @@ class HybridRAGEngine:
 
         except Exception as e:
             logger.warning(f"[HybridRAGEngine] graph论文召回失败: {e}")
+            logger.warning(traceback.format_exc())
             return []
 
     async def search(

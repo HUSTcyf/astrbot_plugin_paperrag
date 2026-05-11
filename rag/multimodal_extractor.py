@@ -997,8 +997,14 @@ class DoclingExtractor:
         由于 AstrBot 环境下 docling convert() 会触发 segfault，
         使用独立进程执行以隔离运行环境。
         """
-        pdf_path_obj = Path(pdf_path)
+        pdf_path_obj = Path(pdf_path).resolve()
         paper_id: str = pdf_path_obj.stem
+
+        # 防止路径遍历：确保 pdf 在插件数据目录内
+        plugin_root = Path(__file__).resolve().parent.parent
+        if not str(pdf_path_obj).startswith(str(plugin_root)):
+            logger.warning(f"[DoclingExtractor] PDF 路径超出插件目录范围，拒绝处理: {pdf_path_obj}")
+            raise ValueError(f"PDF path outside plugin directory: {pdf_path_obj}")
 
         figures_dir = self._figures_base / paper_id
         tables_dir = self._tables_base / paper_id

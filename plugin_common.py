@@ -33,6 +33,8 @@ class Neo4jServiceManager:
         self,
         neo4j_config: Optional[dict] = None
     ):
+        if neo4j_config is None:
+            logger.warning("[Neo4j] 使用默认 Neo4j 配置 (localhost:7687, password=password)，生产环境请通过 neo4j_config 参数显式配置")
         self.neo4j_config = neo4j_config or {
             "host": "localhost",
             "port": 7687,
@@ -53,7 +55,7 @@ class Neo4jServiceManager:
             )
             return "running" in result.stdout.lower() or result.returncode == 0
         except FileNotFoundError:
-            pass
+            logger.debug("[Neo4j] neo4j CLI not found in PATH, falling back to socket check")
 
         try:
             import socket
@@ -62,7 +64,8 @@ class Neo4jServiceManager:
             result = sock.connect_ex(("localhost", self.neo4j_config["port"]))
             sock.close()
             return result == 0
-        except Exception:
+        except Exception as e:
+            logger.debug(f"[Neo4j] Socket connectivity check failed: {e}")
             return False
 
     async def ensure_neo4j_running(self) -> bool:

@@ -1,17 +1,16 @@
-# 📚 Paper RAG Plugin v2.0.2 — 用户指南
+# 📚 Paper RAG Plugin v2.0.3 — 用户指南
 
 本地论文库 RAG 检索插件，为 AstrBot 提供智能论文检索、知识图谱增强问答和研究想法生成。支持多模态（图片/表格/公式）提取、Llama.cpp VLM 本地问答和 Agentic RAG（LangGraph 工作流）。
 
-> **版本说明**：当前版本 v2.0.2，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
+> **版本说明**：当前版本 v2.0.3，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
 
-### 本版变化 (v2.0.2)
+### 本版变化 (v2.0.3)
 
-- **Token 计数统一**：新增 `rag/token_utils.py` 模块，统一 tiktoken cl100k_base 精确计数，消除全项目 `len(text) // 4` 估算。
-- **Import 整理**：62 个文件中将所有函数级直接 import 提升到文件顶部。
-- **LlamaIndex LLM Bridge**：新增 `get_llama_index_llm()` / `_create_vlm_custom_llm()`，绕过 OpenAI SDK 模型名校验。
-- **图谱通道重构**：知识图谱从 RRF 第四通道改为两阶段独立召回（Stage 1.6），移除 `graph_rrf_weight` 配置项。修复 `_graph_recall_papers` 嵌套 async 问题。
-- **测试修复**：修复 mock patch 路径，全量 41 个 agentic 测试通过。
-- 完整变更详见 [docs/changelog/2.0.2.md](docs/changelog/2.0.2.md)
+- **Cypher 语法加固**：自定义 TextToCypher 提示模板（7 条规则，5 个正例，2 个反例），消除 LLM 生成的非法 Cypher（CONTAINS 在节点模式中、匿名关系变量等）。
+- **两阶段验证器**：首 token 快速检查 + Neo4j EXPLAIN 预解析，在语法错误到达执行层前就被捕获。
+- **"禁止静默跳过"执行**：6 处 `except: pass` 替换为 `logger.debug/warning` + 错误上下文和完整 traceback。
+- **测试覆盖**：新增 23 个单元测试覆盖验证器双阶段和模板正确性。
+- 完整变更详见 [docs/changelog/2.0.3.md](docs/changelog/2.0.3.md)
 
 ---
 

@@ -416,6 +416,80 @@ type(r) AS relation, coalesce(t.name,'') AS tail, labels(t)[0] AS tail_type LIMI
 """
 
 
+_TEXT_TO_CYPHER_TEMPLATE = """\
+## Cypher Query Generation for Academic Knowledge Graph
+
+Generate a Cypher statement to query the academic paper knowledge graph.
+
+### Schema
+{schema}
+
+Node labels and their semantics:
+- Method: algorithm, optimization method, training technique
+- Model: named architecture (BERT, GPT, Transformer, ResNet)
+- Task: research problem (classification, QA, generation)
+- Dataset: benchmark (GLUE, ImageNet, COCO)
+- Metric: evaluation measure (accuracy, F1, BLEU)
+- Component: layer, module, sub-architecture
+- Limitation: weakness, constraint, failure mode
+- Application: real-world use case, domain
+- Baseline: previous method, compared system
+
+Relationship semantics (h → t):
+- ADDRESSES: Method/Model → Task
+- PROPOSES: Method → new Component
+- USES_COMPONENT: Method → Component
+- EVALUATED_ON: Method → Dataset
+- ACHIEVES: Method → Metric
+- COMPARES_WITH: Method → Baseline
+- OUTPERFORMS: Method → Baseline
+- LIMITED_BY: Method → Limitation
+- APPLIES_TO: Method → Application
+- EXTENDS: Method → prior Method
+- TRAINS_ON: Model → Dataset
+- IMPLEMENTS: Model → repository
+- REQUIRES: Method → resource
+- ABLATES_ON: Method → Component
+
+### Rules
+1. **CRITICAL**: Bind EVERY relationship with a variable — in multi-hop `(a)-[r1:X]->(b)-[r2:Y]->(c)`, both `r1` and `r2` must be bound. NEVER use anonymous `-[:TYPE]->`.
+2. **CRITICAL**: CONTAINS is a WHERE-only operator. NEVER use it inside node property patterns `{{name: ...}}`. In node patterns, ONLY use exact equality: `{{name: 'exact value'}}`. Put all CONTAINS filters in a WHERE clause after MATCH.
+3. Cypher query MUST start with MATCH, CALL, MERGE, or RETURN — never start with WHERE
+4. Node patterns must use exact name matching only. For fuzzy matching, write: `MATCH (n:Label) WHERE n.name CONTAINS 'keyword' OR n.name CONTAINS 'keyword2'`
+5. Do NOT filter on description — it is often empty
+6. Use OR between alternatives, not AND, to maximize recall
+7. LIMIT 30
+
+### Required RETURN Format
+Return exactly (replace `h`, `r`, `t` with your bound node/relationship variables):
+
+RETURN coalesce(h.name,'') AS head, labels(h)[0] AS head_type, type(r) AS relation, coalesce(t.name,'') AS tail, labels(t)[0] AS tail_type
+
+### Examples
+
+Q: What methods are evaluated on Mip-NeRF360? (single-hop, WHERE on tail)
+MATCH (h)-[r:EVALUATED_ON]->(t) WHERE t.name CONTAINS 'Mip-NeRF360' RETURN coalesce(h.name,'') AS head, labels(h)[0] AS head_type, type(r) AS relation, coalesce(t.name,'') AS tail, labels(t)[0] AS tail_type LIMIT 30
+
+Q: How does InstantSplat achieve sparse-view reconstruction? (single-hop, WHERE on head)
+MATCH (h)-[r:ADDRESSES|USES_COMPONENT]->(t) WHERE h.name CONTAINS 'InstantSplat' RETURN coalesce(h.name,'') AS head, labels(h)[0] AS head_type, type(r) AS relation, coalesce(t.name,'') AS tail, labels(t)[0] AS tail_type LIMIT 30
+
+Q: Compare 3DGS with NeRF methods (single-hop, WHERE on both sides)
+MATCH (h)-[r:COMPARES_WITH|OUTPERFORMS]->(t) WHERE h.name CONTAINS '3DGS' OR t.name CONTAINS 'NeRF' RETURN coalesce(h.name,'') AS head, labels(h)[0] AS head_type, type(r) AS relation, coalesce(t.name,'') AS tail, labels(t)[0] AS tail_type LIMIT 30
+
+Q: How does MASt3R use Transformer for 3D tasks? (multi-hop with WHERE on tail)
+MATCH (h:Model {{name: 'MASt3R'}})-[r1:USES_COMPONENT]->(c:Component {{name: 'Transformer'}})-[r2:USES_COMPONENT|ADDRESSES]->(t:Task) WHERE t.name CONTAINS '3D' RETURN coalesce(h.name,'') AS head, labels(h)[0] AS head_type, type(r2) AS relation, coalesce(t.name,'') AS tail, labels(t)[0] AS tail_type LIMIT 30
+
+### WRONG — NEVER do this:
+MATCH ... (t:Task {{name: CONTAINS 'keyword'}})   ← CONTAINS in node pattern — WILL CAUSE SYNTAX ERROR
+MATCH ... -[:USES_COMPONENT]->(t)                  ← anonymous relationship — WILL CAUSE Cypher error
+
+### Question
+{question}
+
+Output ONLY the Cypher statement, no explanations, no backticks.
+"""
+
+
 def _parse_cypher_records(records: list[dict]) -> tuple[list[dict], list[dict]]:
     """将 Cypher 返回记录解析为 entities + triplets。"""
     entity_set: dict[str, str] = {}
@@ -438,6 +512,53 @@ def _parse_cypher_records(records: list[dict]) -> tuple[list[dict], list[dict]]:
             })
     entities = [{"name": n, "type": t} for n, t in entity_set.items()]
     return entities, triplets
+
+
+_VALID_CYPHER_STARTS: frozenset[str] = frozenset({
+    "MATCH", "CALL", "CREATE", "MERGE", "RETURN", "UNWIND",
+    "WITH", "OPTIONAL", "EXPLAIN", "PROFILE", "SHOW", "DROP",
+    "LOAD", "FOREACH", "USE", "REMOVE", "SET", "DETACH",
+})
+
+
+def _make_cypher_validator(graph_store: Any):
+    """Return a ``cypher_validator`` callable that validates LLM-generated Cypher.
+
+    Two-stage check:
+    1. Fast: first token must be a legal Cypher clause keyword.
+    2. Definitive: run ``EXPLAIN <query>`` through Neo4j's own parser.
+       Neo4j's parser is the gold standard — it rejects any syntactically
+       invalid Cypher before execution, so this catches 100% of syntax
+       errors (clause ordering, expression validity, etc.).
+
+    The returned function matches the ``cypher_validator`` callback
+    signature expected by ``TextToCypherRetriever``: ``(str) -> str``.
+    """
+    def _validate(cypher_query: str) -> str:
+        stripped = cypher_query.strip()
+        if not stripped:
+            raise ValueError("TextToCypherRetriever 返回空 Cypher")
+
+        # Stage 1 — fast first-token check (no network round-trip)
+        first_token = stripped.split(maxsplit=1)[0].upper()
+        if first_token not in _VALID_CYPHER_STARTS:
+            raise ValueError(
+                f"TextToCypherRetriever 生成了非法的 Cypher 语句，"
+                f"首 keyword={first_token}，完整内容:\n{stripped[:500]}"
+            )
+
+        # Stage 2 — definitive Neo4j EXPLAIN parse check
+        try:
+            graph_store.structured_query(f"EXPLAIN {stripped}")
+        except Exception as e:
+            raise ValueError(
+                f"TextToCypherRetriever 生成的 Cypher 未通过 Neo4j EXPLAIN 校验: "
+                f"{e}\n完整内容:\n{stripped[:500]}"
+            ) from e
+
+        return cypher_query
+
+    return _validate
 
 
 class GraphRAGEngine:
@@ -499,8 +620,8 @@ class GraphRAGEngine:
             driver.close()
             logger.info(f"[GraphRAG] Neo4j already reachable at {uri}")
             return
-        except Exception:
-            pass  # fall through to start attempt
+        except Exception as e:
+            logger.debug(f"[GraphRAG] Fast-path Neo4j connectivity check failed, falling through to start attempt: {e}")
 
         # Slow path: start via CLI
         neo4j_bin = shutil.which("neo4j")
@@ -650,6 +771,8 @@ class GraphRAGEngine:
                     graph_store=self._graph_store,
                     include_text=True,
                     llm=llm,
+                    cypher_validator=_make_cypher_validator(self._graph_store),
+                    text_to_cypher_template=_TEXT_TO_CYPHER_TEMPLATE,
                 ))
             except ImportError:
                 logger.warning("[GraphRAG] TextToCypherRetriever 不可用，仅使用同义检索")
@@ -705,9 +828,11 @@ class GraphRAGEngine:
                 graph_store=self._graph_store,
                 include_text=True,
                 llm=llm,
+                cypher_validator=_make_cypher_validator(self._graph_store),
+                text_to_cypher_template=_TEXT_TO_CYPHER_TEMPLATE,
             ))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[GraphRAG] TextToCypherRetriever 创建失败，仅使用同义检索: {e}")
 
         return self._index.as_retriever(sub_retrievers=sub_retrievers, include_text=True)
 
