@@ -79,8 +79,9 @@ def _make_plugin(tmp_path):
     graph_mod = __import__("astrbot_plugin_paperrag.commands.graph", fromlist=["_PLUGIN_DIR"])
     graph_mod._PLUGIN_DIR = tmp_path
 
+    from astrbot.api.star import Context
     plugin = main_mod.PaperRAGPlugin(
-        context=object(),
+        context=Context(),
         config={"enable_graph_rag": True, "graph_rag": {"storage_type": "neo4j"}},
     )
     plugin.enabled = True

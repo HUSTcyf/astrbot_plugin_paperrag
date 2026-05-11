@@ -8,10 +8,11 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from neo4j import GraphDatabase
+from test._test_utils import get_neo4j_password
 
 URI = "bolt://localhost:7687"
 USER = "neo4j"
-PASSWORD = "neo4j_M73770"
+PASSWORD = get_neo4j_password()
 MILVUS_DB = os.path.join(os.path.dirname(__file__), "data", "milvus_papers.db")
 BGE_PATH = os.path.join(os.path.dirname(__file__), "models", "bge-m3")
 

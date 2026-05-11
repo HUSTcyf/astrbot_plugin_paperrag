@@ -1,7 +1,7 @@
 name: "paper_rag"
 author: "HUSTcyf"
 description: "本地论文库 RAG 检索插件。支持 Unsloth BGE-M3 + Milvus Lite 混合检索，Agentic RAG（ReAct/静态DAG），知识图谱增强（Neo4j），研究想法生成与迭代优化，多模态（图片/表格/公式）提取和 Llama.cpp VLM 本地问答"
-version: "2.0.3"
+version: "2.0.4"
 logo: "arxiv-logomark@2x.png"
 repository: "https://github.com/HUSTcyf/astrbot_plugin_paperrag.git"
 tags:

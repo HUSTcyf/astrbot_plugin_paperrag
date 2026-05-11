@@ -1,16 +1,16 @@
-# 📚 Paper RAG Plugin v2.0.3 — 用户指南
+# 📚 Paper RAG Plugin v2.0.4 — 用户指南
 
 本地论文库 RAG 检索插件，为 AstrBot 提供智能论文检索、知识图谱增强问答和研究想法生成。支持多模态（图片/表格/公式）提取、Llama.cpp VLM 本地问答和 Agentic RAG（LangGraph 工作流）。
 
-> **版本说明**：当前版本 v2.0.3，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
+> **版本说明**：当前版本 v2.0.4，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
 
-### 本版变化 (v2.0.3)
+### 本版变化 (v2.0.4)
 
-- **Cypher 语法加固**：自定义 TextToCypher 提示模板（7 条规则，5 个正例，2 个反例），消除 LLM 生成的非法 Cypher（CONTAINS 在节点模式中、匿名关系变量等）。
-- **两阶段验证器**：首 token 快速检查 + Neo4j EXPLAIN 预解析，在语法错误到达执行层前就被捕获。
-- **"禁止静默跳过"执行**：6 处 `except: pass` 替换为 `logger.debug/warning` + 错误上下文和完整 traceback。
-- **测试覆盖**：新增 23 个单元测试覆盖验证器双阶段和模板正确性。
-- 完整变更详见 [docs/changelog/2.0.3.md](docs/changelog/2.0.3.md)
+- **Bug 修复**：修复 `paper_link_resolver.py` 中 `@staticmethod` 错误使用 `self` 导致的 `NameError`。
+- **测试套件清理**：删除 1 个过期测试文件、1 个过期测试函数、3 个引用已移除参数的测试；修复 3 个测试文件的 mock Context 兼容性；跳过 5 个环境依赖测试。
+- **安全加固**：移除 4 个测试文件中的硬编码 Neo4j 密码，统一通过 `test/_test_utils.py::get_neo4j_password()` 读取插件配置。
+- **Code Review**：删除空测试类 `TestGraphRAGConfigConstruction`，重写 `test_crag_json_parse.py` 使用正确导入。
+- 完整变更详见 [docs/changelog/2.0.4.md](docs/changelog/2.0.4.md)
 
 ---
 

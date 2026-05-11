@@ -194,7 +194,8 @@ def test_zero_abstract_detection_and_reparse_command():
 
         paper_mod._PLUGIN_DIR = tmp_path
 
-        plugin = main_mod.PaperRAGPlugin(context=object(), config={"papers_dir": str(papers_dir)})
+        from astrbot.api.star import Context
+        plugin = main_mod.PaperRAGPlugin(context=Context(), config={"papers_dir": str(papers_dir)})
         plugin.enabled = True
 
         result = plugin._get_papers_with_zero_abstracts()

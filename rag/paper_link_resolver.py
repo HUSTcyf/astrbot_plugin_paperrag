@@ -415,7 +415,7 @@ class PaperLinkResolver:
         arxiv_pattern = re.compile(r"\b(?:arxiv:)?(\d{4}\.\d{4,5})(?:v\d+)?\b", re.IGNORECASE)
 
         for raw in doi_pattern.findall(text):
-            doi = self._strip_identifier_noise(raw)
+            doi = PaperLinkResolver._strip_identifier_noise(raw)
             if doi and doi not in doi_candidates:
                 doi_candidates.append(doi)
 

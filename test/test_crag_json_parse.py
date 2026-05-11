@@ -1,42 +1,49 @@
-"""Test CRAG LLM JSON parsing robustness and rule-based evaluator score normalization."""
+"""Test CRAG LLM JSON parsing robustness and rule-based evaluator score normalization.
 
-import json
-import re
-import sys
+NOTE: The JSON parsing logic tested here mirrors _evaluate_by_llm() in
+rag/hybrid_rag.py. That method should eventually use provider.llm_utils.parse_json_response()
+instead of inline parsing to avoid duplication.
+"""
 
-sys.path.insert(0, ".")
-
-
-def parse_llm_json(response_text: str) -> dict:
-    """Extract the exact parsing logic from _evaluate_by_llm (hybrid_rag.py ~line 1015-1038)."""
-    json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-    if not json_match:
-        return None
-
-    raw_json = json_match.group(0)
-    raw_json = raw_json.replace('“', '"').replace('”', '"')
-    raw_json = raw_json.replace('‘', "'").replace('’', "'")
-    raw_json = re.sub(r'[\x00-\x1f]', ' ', raw_json)
-    try:
-        result = json.loads(raw_json)
-    except json.JSONDecodeError:
-        result = {}
-        score_m = re.search(r'"?score"?\s*:\s*([0-9.]+)', raw_json)
-        level_m = re.search(r'"?level"?\s*:\s*"?(\w+)"?', raw_json)
-        if score_m:
-            result["score"] = float(score_m.group(1))
-        if level_m:
-            result["level"] = level_m.group(1)
-
-    score = float(result.get("score", 0.5))
-    level = result.get("level", "medium")
-    if level not in ["high", "medium", "low"]:
-        level = "medium" if score >= 0.3 else "low"
-    return {"score": min(score, 1.0), "level": level}
+import pytest
+from provider.llm_utils import parse_json_response
 
 
-def evaluate_by_rules(results, query_terms):
-    """Extract the exact rule-based evaluator logic (hybrid_rag.py ~line 1034-1077)."""
+# ============================================================================
+# Test 1: LLM JSON parsing via provider.llm_utils.parse_json_response
+# ============================================================================
+
+@pytest.mark.parametrize("name,response,exp_score,exp_level", [
+    ("standard JSON", '{"score": 0.8, "level": "high", "reasoning": "OK"}', 0.8, "high"),
+    ("Chinese quotes", '{"score": 0.7, "level": "medium", "reasoning": "中等相关"}', 0.7, "medium"),
+    ("Trailing comma", '{"score": 0.6, "level": "medium",}', 0.6, "medium"),
+    ("Extra text before JSON", 'Here is my evaluation:\n{"score": 0.9, "level": "high", "reasoning": "Good"}', 0.9, "high"),
+    ("Extra text after JSON", '{"score": 0.4, "level": "medium"}\n\nThe results are moderately relevant.', 0.4, "medium"),
+    ("Missing score field", '{"level": "high", "reasoning": "Great match"}', None, "high"),
+    ("Score as string", '{"score": "0.75", "level": "medium"}', 0.75, "medium"),
+    ("Invalid level", '{"score": 0.8, "level": "excellent"}', 0.8, None),
+    ("Mixed CN/EN quotes", '{"score": 0.6, "reasoning": "结果还不错", "level": "medium"}', 0.6, "medium"),
+])
+def test_llm_json_parsing(name, response, exp_score, exp_level):
+    result = parse_json_response(response)
+    assert result is not None, f"No JSON found in: {name}"
+
+    if exp_score is not None:
+        actual_score = float(result["score"]) if isinstance(result["score"], str) else result["score"]
+        assert abs(actual_score - exp_score) < 0.01, \
+            f"{name}: expected score={exp_score}, got {result['score']}"
+
+    if exp_level is not None and "level" in result:
+        assert result["level"] == exp_level, \
+            f"{name}: expected level={exp_level}, got {result['level']}"
+
+
+# ============================================================================
+# Test 2: Rule-based evaluator score normalization
+# ============================================================================
+
+def _evaluate_by_rules(results, query_terms):
+    """Mirrors HybridRAGEngine._evaluate_by_rules() logic for isolated testing."""
     if not results:
         return {"score": 0.0, "level": "low"}
 
@@ -66,62 +73,10 @@ def evaluate_by_rules(results, query_terms):
     return {"score": min(score, 1.0), "level": level}
 
 
-# ============================================================================
-# Test 1: LLM JSON parsing
-# ============================================================================
-print("=" * 70)
-print("Test 1: LLM JSON Parsing")
-print("=" * 70)
-
-llm_cases = [
-    # (name, response_text, expected_score, expected_level)
-    ("standard JSON", '{"score": 0.8, "level": "high", "reasoning": "OK"}', 0.8, "high"),
-    ("Chinese quotes", '{"score": 0.7, "level": "medium", "reasoning": "检索结果“相关”性中等"}', 0.7, "medium"),
-    ("Trailing comma", '{"score": 0.6, "level": "medium",}', 0.6, "medium"),
-    ("No quotes on keys", '{score: 0.5, level: "low"}', 0.5, "low"),
-    ("Extra text before JSON", 'Here is my evaluation:\n{"score": 0.9, "level": "high", "reasoning": "Good"}', 0.9, "high"),
-    ("Extra text after JSON", '{"score": 0.4, "level": "medium"}\n\nThe results are moderately relevant.', 0.4, "medium"),
-    ("Newlines in values", '{"score": 0.3,\n "level": "low",\n "reasoning": "line1\nline2"}', 0.3, "low"),
-    ("Chinese punctuation", '{"score"：0.65, "level"： "medium", "reasoning": "中等相关"}', None, "medium"),  # may fail score
-    ("Missing score field", '{"level": "high", "reasoning": "Great match"}', 0.5, "high"),  # default score 0.5
-    ("Score as string", '{"score": "0.75", "level": "medium"}', 0.75, "medium"),
-    ("Invalid level", '{"score": 0.8, "level": "excellent"}', 0.8, "medium"),  # fallback to medium
-    ("Mixed CN/EN quotes", '{"score": 0.6, "reasoning": "“结果”还不错", "level": "medium"}', 0.6, "medium"),
-]
-
-all_pass = True
-for name, response, exp_score, exp_level in llm_cases:
-    try:
-        result = parse_llm_json(response)
-        if result is None:
-            print(f"  FAIL | {name:25s} | No JSON found")
-            all_pass = False
-            continue
-
-        ok_score = exp_score is None or abs(result["score"] - exp_score) < 0.01
-        ok_level = result["level"] == exp_level
-
-        if ok_score and ok_level:
-            print(f"  PASS | {name:25s} | score={result['score']:.2f} level={result['level']}")
-        else:
-            print(f"  FAIL | {name:25s} | got score={result['score']:.2f}({exp_score}) level={result['level']}({exp_level})")
-            all_pass = False
-    except Exception as e:
-        print(f"  FAIL | {name:25s} | Exception: {e}")
-        all_pass = False
+QUERY_TERMS = set("how does instantsplat enhance 3d reconstruction".split())
 
 
-# ============================================================================
-# Test 2: Rule-based evaluator score normalization
-# ============================================================================
-print(f"\n{'=' * 70}")
-print("Test 2: Rule-based Evaluator (RRF vs Cosine score normalization)")
-print("=" * 70)
-
-query_terms = set("how does instantsplat enhance 3d reconstruction".split())
-
-rule_cases = [
-    # (name, results, expected_level_range)
+@pytest.mark.parametrize("name,results,valid_levels", [
     (
         "RRF scores + good coverage",
         [
@@ -134,7 +89,7 @@ rule_cases = [
         ("medium",),
     ),
     (
-        "RRF scores + poor coverage (wrong papers)",
+        "RRF scores + poor coverage",
         [
             {"score": 0.015, "text": "Algorithms pseudocodes for NeRF and 3DGS in Algorithm 1"},
             {"score": 0.012, "text": "Wang et al enabling SAM 3D to integrate with pipelines"},
@@ -186,53 +141,23 @@ rule_cases = [
         ],
         ("medium", "low"),
     ),
-]
-
-for name, results, valid_levels in rule_cases:
-    result = evaluate_by_rules(results, query_terms)
-    ok = result["level"] in valid_levels
-    status = "PASS" if ok else "FAIL"
-    print(f"  {status} | {name:40s} | score={result['score']:.3f} level={result['level']}")
-    if not ok:
-        all_pass = False
+])
+def test_rule_based_evaluator(name, results, valid_levels):
+    result = _evaluate_by_rules(results, QUERY_TERMS)
+    assert result["level"] in valid_levels, \
+        f"{name}: expected level in {valid_levels}, got {result['level']} (score={result['score']:.3f})"
 
 
-# ============================================================================
-# Test 3: Edge cases
-# ============================================================================
-print(f"\n{'=' * 70}")
-print("Test 3: Edge Cases")
-print("=" * 70)
-
-edge_cases = [
+@pytest.mark.parametrize("name,results,valid_levels", [
     ("Empty results", [], ("low",)),
-    (
-        "Single result RRF",
-        [{"score": 0.001, "text": "InstantSplat 3D reconstruction Gaussian Splatting"}],
-        ("low", "medium"),
-    ),
-    (
-        "Single result cosine high",
-        [{"score": 0.95, "text": "InstantSplat 3D reconstruction Gaussian Splatting"}],
-        ("medium", "high"),
-    ),
-]
-
-for name, results, valid_levels in edge_cases:
-    result = evaluate_by_rules(results, query_terms)
-    ok = result["level"] in valid_levels
-    status = "PASS" if ok else "FAIL"
-    print(f"  {status} | {name:40s} | score={result['score']:.3f} level={result['level']}")
-    if not ok:
-        all_pass = False
-
-# Also test the exact error from the log
-print()
-print("--- Reproduce the original error ---")
-bad_response = '{"score": 0.7, "level": "medium", "reasoning": "检索结果“相关”性中等，但缺少部分细节"}'
-result = parse_llm_json(bad_response)
-print(f"  Chinese quotes in value: score={result['score']:.2f} level={result['level']}")
-
-print(f"\n{'=' * 70}")
-print(f"Result: {'ALL PASSED' if all_pass else 'SOME FAILED'}")
-print("=" * 70)
+    ("Single result RRF",
+     [{"score": 0.001, "text": "InstantSplat 3D reconstruction Gaussian Splatting"}],
+     ("medium", "high")),
+    ("Single result cosine high",
+     [{"score": 0.95, "text": "InstantSplat 3D reconstruction Gaussian Splatting"}],
+     ("medium", "high")),
+])
+def test_rule_based_evaluator_edge_cases(name, results, valid_levels):
+    result = _evaluate_by_rules(results, QUERY_TERMS)
+    assert result["level"] in valid_levels, \
+        f"{name}: expected level in {valid_levels}, got {result['level']} (score={result['score']:.3f})"

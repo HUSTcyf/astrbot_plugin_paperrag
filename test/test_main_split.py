@@ -190,7 +190,8 @@ def test_split_main_keeps_command_shell_and_paper_commands_callable():
         assert "@filter.command_group" not in source
         assert ".command(" not in source
 
-    plugin = main_mod.PaperRAGPlugin(context=object(), config={})
+    from astrbot.api.star import Context as Ctx
+    plugin = main_mod.PaperRAGPlugin(context=Ctx(), config={})
     for method_name in [
         "cmd_search",
         "cmd_graph_restore",
@@ -201,8 +202,8 @@ def test_split_main_keeps_command_shell_and_paper_commands_callable():
 
     calls = []
 
-    async def fake_paper_search(event, query="", mode="rag", top_k=5):
-        calls.append(("search", query, mode, top_k))
+    async def fake_paper_search(event, query="", top_k=5):
+        calls.append(("search", query, top_k))
         yield "search-ok"
 
     async def fake_graph_restore(event, backup_file=""):
@@ -223,12 +224,12 @@ def test_split_main_keeps_command_shell_and_paper_commands_callable():
     plugin._idea_list = fake_idea_list
 
     event = DummyEvent()
-    assert asyncio.run(_collect(plugin.cmd_search(event, "query", "retrieve", 7))) == ["search-ok"]
+    assert asyncio.run(_collect(plugin.cmd_search(event, "query", 7))) == ["search-ok"]
     assert asyncio.run(_collect(plugin.cmd_graph_restore(event, "demo.json.gz"))) == ["restore-ok"]
     assert asyncio.run(_collect(plugin.cmd_graph_link(event, "status"))) == ["link-ok"]
     assert asyncio.run(_collect(plugin.cmd_idea_list(event))) == ["idea-list-ok"]
     assert calls == [
-        ("search", "query", "retrieve", 7),
+        ("search", "query", 7),
         ("graph_restore", "demo.json.gz"),
         ("graph_link", "status"),
         ("idea_list",),

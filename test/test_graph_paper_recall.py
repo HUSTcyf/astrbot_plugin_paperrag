@@ -19,10 +19,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from neo4j import GraphDatabase
+from test._test_utils import get_neo4j_password
 
 URI = "bolt://localhost:7687"
 USER = "neo4j"
-PASSWORD = "neo4j_M73770"
+PASSWORD = get_neo4j_password()
 MILVUS_ABSTRACTS = str(Path(__file__).parent.parent / "data" / "milvus_abstracts.db")
 BGE_PATH = str(Path(__file__).parent.parent / "models" / "bge-m3")
 

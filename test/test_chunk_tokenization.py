@@ -57,104 +57,6 @@ def load_tokenizer():
         return None
 
 
-def test_chunk_tokenization():
-    """测试 1：直接测试 _get_token_count 和 _semantic_chunk 的 token 边界控制"""
-    print("\n" + "=" * 70)
-    print("测试 1：_get_token_count 和语义分块 token 边界控制")
-    print("=" * 70)
-
-    tokenizer = load_tokenizer()
-
-
-    parser = HybridPDFParser(
-        chunk_size=512,
-        chunk_overlap=50,
-        min_chunk_size=100,
-    )
-
-    if tokenizer:
-        parser._tokenizer = tokenizer
-        print("  [OK] parser 已注入真实 tokenizer\n")
-    else:
-        print("  [WARN] 无 tokenizer，回退到 len(text)//4\n")
-
-    # 准确性测试
-    test_texts = [
-        ("短英文", "This is a short sentence.", 10),
-        ("中等英文", " ".join(["word"] * 100), 110),
-        ("长英文", " ".join(["word"] * 500), 510),
-        # 中文约 1.6 chars/token（XLM-Roberta tokenizer），按 1020 容差 ±50
-        ("短中文", "这是中文字符。" * 20, 120),    # ~160 chars → ~101 tokens
-        ("长中文", "这是中文字符。" * 200, 1020),  # ~1600 chars → ~1001 tokens
-        ("中英混合", "This is English. 这是中文。 " * 50, 420),  # ~550 chars → ~401 tokens
-    ]
-
-    print("  _get_token_count 准确性测试（容差 ±20 tokens）：")
-    print("  注：无真实 tokenizer 时使用 len(text)//4 估算，部分偏差属正常现象")
-    all_pass = True
-    for desc, text, max_exp in test_texts:
-        tokens = parser._get_token_count(text)
-        ok = tokens <= max_exp + 20
-        status = "OK" if ok else "FAIL"
-        if not ok:
-            all_pass = False
-        print(f"    [{status}] {desc}: {tokens} tokens (expected ≤ {max_exp + 20})")
-
-    # 语义分块边界测试（使用 LlamaIndex SemanticSplitterNodeParser）
-    print("\n  LlamaIndex 语义分块边界测试：")
-    long_text = (
-        "Deep learning has revolutionized artificial intelligence in recent years. "
-        "Neural networks with many layers can learn complex patterns from data. "
-        "Transformer models have become the dominant architecture for NLP tasks. "
-        "Attention mechanisms allow models to focus on relevant information. "
-        "\n\n"
-        "Machine learning is a subset of artificial intelligence. "
-        "It enables computers to learn from experience without being explicitly programmed. "
-        "Supervised learning uses labeled data to train models. "
-        "Unsupervised learning discovers hidden patterns in unlabeled data. "
-        "\n\n"
-        "Computer vision systems can interpret and understand images and videos. "
-        "Object detection locates and classifies objects in images. "
-        "Semantic segmentation assigns labels to every pixel in an image. "
-        "Image generation models can create realistic photos from text descriptions. "
-    )
-
-    async def get_llamaindex_chunks():
-        llamaparser = await parser._get_llamaindex_semantic_parser()
-        if llamaparser is None:
-            return None
-        lldoc = LIDocument(text=long_text, metadata={"file_name": "synthetic_test.pdf"})
-        llnodes = llamaparser.get_nodes_from_documents([lldoc])
-        nodes = []
-        for i, n in enumerate(llnodes):
-            nodes.append(Node(text=n.get_text(), metadata={"chunk_index": i})) # type: ignore
-        return nodes
-
-    nodes = asyncio.run(get_llamaindex_chunks())
-    if nodes is None:
-        print("  [FAIL] LlamaIndex 语义分块不可用")
-        return False
-
-    print(f"    生成了 {len(nodes)} 个 chunks\n")
-    viz_chunks(nodes, parser, tokenizer)
-
-    over_limit = []
-    for i, node in enumerate(nodes):
-        t = parser._get_token_count(node.text)
-        if t > 512:
-            over_limit.append((i, t))
-
-    if over_limit:
-        print(f"    [FAIL] {len(over_limit)} 个 chunks 超过 512 tokens:")
-        for idx, tok in over_limit:
-            print(f"           chunk #{idx}: {tok} tokens")
-        all_pass = False
-    else:
-        print(f"    [OK] 所有 chunks ≤ 512 tokens")
-
-    return all_pass
-
-
 def test_colbert_storage_no_truncation():
     """测试 2：验证 ColBERT storage 的防截断断言"""
     print("\n" + "=" * 70)
@@ -561,8 +463,8 @@ Deep learning has revolutionized computer vision. The Segment Anything Model (SA
 
 def main():
     parser = argparse.ArgumentParser(description="PaperRAG Token 切分 & ColBERT Storage 截断测试")
-    parser.add_argument("-t", "--tests", nargs="+", choices=["1", "2", "3", "4"],
-                        help="选择要运行的测试 (如: -t 1 3 4)")
+    parser.add_argument("-t", "--tests", nargs="+", choices=["1", "2", "3"],
+                        help="选择要运行的测试 (如: -t 1 3)")
     parser.add_argument("-a", "--all", action="store_true", help="运行所有测试")
     parser.add_argument("--skip-llm", action="store_true", help="跳过 LLM 预处理（仅测分块逻辑，大幅加速）")
     args = parser.parse_args()
@@ -573,10 +475,9 @@ def main():
     print("=" * 70)
 
     all_tests = [
-        ("test1_chunk_tokenization", test_chunk_tokenization),
-        ("test2_colbert_no_truncation", test_colbert_storage_no_truncation),
-        ("test3_e2e_pdf", test_chunking_with_real_pdf),
-        ("test4_local_llm_preprocessing", test_local_llm_preprocessing),
+        ("test1_colbert_no_truncation", test_colbert_storage_no_truncation),
+        ("test2_e2e_pdf", test_chunking_with_real_pdf),
+        ("test3_local_llm_preprocessing", test_local_llm_preprocessing),
     ]
 
     # 确定要运行的测试
