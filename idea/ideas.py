@@ -458,3 +458,43 @@ class IdeaEngineIdeas(IdeaEngineUtils):
             logger.info(f"[IdeaEngine] 追加想法已保存: {file_path}")
 
         return results
+
+
+class IdeaWikiMixin:
+    """混入 IdeaEngine，提供 Wiki 读写能力（与现有 JSON 存储共存）"""
+
+    def _get_wiki_engine(self):
+        from .wiki import IdeaWikiEngine
+        return IdeaWikiEngine()
+
+    def load_wiki_context_for_topic(self, topic: str) -> str:
+        """
+        加载同 topic 下所有已保存 idea，格式化为 Wiki 风格上下文。
+        供 analyze 节点在生成前读取，实现"知道该 topic 已有哪些 idea"。
+        """
+        from .wiki import IdeaWikiEngine, slugify
+
+        wiki = self._get_wiki_engine()
+        topic_dir = wiki.topic_dir(topic)
+
+        parts = [f"# Wiki Context for: {topic}\n"]
+
+        index_path = topic_dir / "index.md"
+        if index_path.exists():
+            parts.append(index_path.read_text(encoding="utf-8"))
+
+        ctx_path = topic_dir / "context.md"
+        if ctx_path.exists():
+            parts.append("\n## Raw Context\n")
+            parts.append(ctx_path.read_text(encoding="utf-8"))
+
+        log_path = wiki.get_log_path()
+        if log_path.exists():
+            topic_slug = slugify(topic)
+            lines = log_path.read_text(encoding="utf-8").splitlines()
+            relevant = [l for l in lines if topic_slug in l.lower()][-20:]
+            if relevant:
+                parts.append("\n## Recent Activity\n")
+                parts.extend(relevant)
+
+        return "\n".join(parts)

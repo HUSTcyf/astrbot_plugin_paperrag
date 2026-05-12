@@ -63,18 +63,6 @@ from .ragas_generator import OpenAICompatibleLLM
 MULTIMODAL_DOC_MULTIPLIER = 2
 
 
-class _MinimalLLMProvider:
-    """最小化 LLM provider，用于评估时注入云端 LLM 凭据到 FakeContext。"""
-
-    def __init__(self, model: str, api_key: str, api_base: str):
-        self.model_name = model
-        self.chosen_api_key = api_key
-        self.provider_config = {"api_base": api_base}
-
-    def __repr__(self):
-        return f"_MinimalLLMProvider(model={self.model_name}, api_key=***)"
-
-
 class _EvalFakeContext:
     """用于评估脚本的模拟上下文，可选地注入 LLM provider 用于图谱检索。"""
 
@@ -623,24 +611,6 @@ def build_multimodal_documents(
     return documents
 
 
-MULTIMODAL_QUESTION_PROMPT = """你是一个学术论文问答对生成专家。请根据以下论文片段生成 {n} 个问答对。
-
-要求：
-1. 问题必须涉及图片或表格的具体内容
-2. 答案应直接来自图片标题、表格内容或图片中的数据
-3. 问题应该多样化，包括：描述图片内容、从表格中提取数据、比较表格数据、解释图表趋势等
-4. 【重要】答案中的论文引用必须使用标准 Markdown 链接格式，如 [论文名](url)，禁止用代码块包裹
-
-论文片段：
-{context}
-
-请生成 {n} 个问答对，格式为 JSON：
-{{
-  "question": "问题内容",
-  "answer": "答案内容"
-}}
-"""
-
 # 多模态文档前缀指令
 MULTIMODAL_DOC_PREFIX = """【重要格式要求】
 - 答案中的论文引用必须使用标准 Markdown 链接格式，如 [论文名](url)
@@ -939,12 +909,14 @@ async def run_evaluation(
     embedding_mode: str = "api",
     eval_embedding_mode: str = "api",
     answer_top_k: int = 5,
+    context=None,
+    config: Optional[dict] = None,
 ) -> Any:
     """执行 Ragas 评估"""
     print(f"\n{'='*60}")
     print("📊 步骤 3/4: 执行 Ragas 评估")
     print("=" * 60)
-
+    print(f"📊 指标评估: {llm_model} @ {llm_base_url}")
 
     evaluator = RagasEvaluator(
         llm_model=llm_model,
@@ -962,6 +934,8 @@ async def run_evaluation(
         testset_path=testset_path,
         output_path=output_path,
         max_concurrent=max_concurrent,
+        context=context,
+        config=config,
     )
 
     print(f"✅ 评估完成 -> {output_path}")
@@ -1041,6 +1015,53 @@ def generate_reports(
     print(f"   Markdown: {md_path}")
 
     return {"html": html_path, "markdown": md_path}
+
+
+def _build_rag_config(plugin_dir: Path, top_k: int | None = None) -> tuple:
+    """从插件配置文件构建 RAGConfig 和 raw config dict（两处调用共享）"""
+    config_path = plugin_dir.parent.parent / "config" / "astrbot_plugin_paperrag_config.json"
+
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8-sig") as f:
+            rag_cfg = json.load(f)
+    else:
+        rag_cfg = {}
+
+    config = RAGConfig(
+        embedding_mode=rag_cfg.get("embedding_mode", "unsloth"),
+        embedding_provider_id=rag_cfg.get("embedding_provider_id", ""),
+        compress_provider_id=rag_cfg.get("compress_provider_id", ""),
+        text_provider_id=rag_cfg.get("text_provider_id", ""),
+        milvus_lite_path=str(plugin_dir / "data" / "milvus_papers.db"),
+        address=rag_cfg.get("milvus", {}).get("address", ""),
+        db_name=rag_cfg.get("milvus", {}).get("db_name", "default"),
+        collection_name=rag_cfg.get("collection_name", "paper_embeddings"),
+        embed_dim=rag_cfg.get("embed_dim", 1024),
+        top_k=top_k if top_k is not None else rag_cfg.get("top_k", 5),
+        similarity_cutoff=rag_cfg.get("similarity_cutoff", 0.5),
+        chunk_size=rag_cfg.get("chunk_size", 512),
+        min_chunk_size=rag_cfg.get("min_chunk_size", 100),
+        use_semantic_chunking=rag_cfg.get("use_semantic_chunking", True),
+        enable_sparse_retrieval=rag_cfg.get("enable_sparse_retrieval", True),
+        enable_multi_vector_rerank=rag_cfg.get("enable_multi_vector_rerank", False),
+        sparse_top_k=rag_cfg.get("sparse_top_k", 20),
+        hybrid_alpha=rag_cfg.get("hybrid_alpha", 0.5),
+        hybrid_rrf_k=rag_cfg.get("hybrid_rrf_k", 60),
+        enable_bm25=rag_cfg.get("enable_bm25", True),
+        bm25_top_k=rag_cfg.get("bm25_top_k", 20),
+        enable_two_stage_retrieval=rag_cfg.get("enable_two_stage_retrieval", False),
+        enable_crag_quality_eval=rag_cfg.get("enable_crag_quality_eval", True),
+        crag_enable_correction=rag_cfg.get("crag_enable_correction", True),
+        crag_min_score=rag_cfg.get("crag_min_score", 0.5),
+        enable_graph_rag=rag_cfg.get("enable_graph_rag", False),
+        graph_storage_type=rag_cfg.get("graph_rag", {}).get("storage_type", "neo4j"),
+        graph_neo4j_uri=rag_cfg.get("graph_rag", {}).get("neo4j_uri", "bolt://localhost:7687"),
+        graph_neo4j_user=rag_cfg.get("graph_rag", {}).get("neo4j_user", "neo4j"),
+        graph_neo4j_password=rag_cfg.get("graph_rag", {}).get("neo4j_password", ""),
+        graph_retrieval_top_k=rag_cfg.get("graph_rag", {}).get("graph_retrieval_top_k", 5),
+        graph_max_triplets_per_chunk=rag_cfg.get("graph_rag", {}).get("max_triplets_per_chunk", 5),
+    )
+    return config, rag_cfg
 
 
 # ============================================================================
@@ -1145,49 +1166,9 @@ async def run_full_pipeline(
     # 使用插件现有配置创建引擎
 
     plugin_dir = Path(__file__).parent.parent
-    config_path = plugin_dir.parent.parent / "config" / "astrbot_plugin_paperrag_config.json"
-
-    with open(config_path, "r", encoding="utf-8-sig") as f:
-        rag_cfg = json.load(f)
-
-    config = RAGConfig(
-        embedding_mode=rag_cfg.get("embedding_mode", "unsloth"),
-        embedding_provider_id=rag_cfg.get("embedding_provider_id", ""),
-        compress_provider_id=rag_cfg.get("compress_provider_id", ""),
-        text_provider_id=rag_cfg.get("text_provider_id", ""),
-        milvus_lite_path=str(plugin_dir / "data" / "milvus_papers.db"),
-        address=rag_cfg.get("milvus", {}).get("address", ""),
-        db_name=rag_cfg.get("milvus", {}).get("db_name", "default"),
-        collection_name=rag_cfg.get("collection_name", "paper_embeddings"),
-        embed_dim=rag_cfg.get("embed_dim", 1024),
-        top_k=top_k if top_k is not None else rag_cfg.get("top_k", 5),
-        similarity_cutoff=rag_cfg.get("similarity_cutoff", 0.5),
-        chunk_size=rag_cfg.get("chunk_size", 512),
-        min_chunk_size=rag_cfg.get("min_chunk_size", 100),
-        use_semantic_chunking=rag_cfg.get("use_semantic_chunking", True),
-        enable_sparse_retrieval=rag_cfg.get("enable_sparse_retrieval", True),
-        enable_multi_vector_rerank=rag_cfg.get("enable_multi_vector_rerank", False),
-        sparse_top_k=rag_cfg.get("sparse_top_k", 20),
-        hybrid_alpha=rag_cfg.get("hybrid_alpha", 0.5),
-        hybrid_rrf_k=rag_cfg.get("hybrid_rrf_k", 60),
-        enable_bm25=rag_cfg.get("enable_bm25", True),
-        bm25_top_k=rag_cfg.get("bm25_top_k", 20),
-        enable_two_stage_retrieval=rag_cfg.get("enable_two_stage_retrieval", False),
-        enable_crag_quality_eval=rag_cfg.get("enable_crag_quality_eval", True),
-        crag_enable_correction=rag_cfg.get("crag_enable_correction", True),
-        crag_min_score=rag_cfg.get("crag_min_score", 0.5),
-        # 图谱 RAG 配置
-        enable_graph_rag=rag_cfg.get("enable_graph_rag", False),
-        graph_storage_type=rag_cfg.get("graph_rag", {}).get("storage_type", "neo4j"),
-        graph_neo4j_uri=rag_cfg.get("graph_rag", {}).get("neo4j_uri", "bolt://localhost:7687"),
-        graph_neo4j_user=rag_cfg.get("graph_rag", {}).get("neo4j_user", "neo4j"),
-        graph_neo4j_password=rag_cfg.get("graph_rag", {}).get("neo4j_password", ""),
-        graph_retrieval_top_k=rag_cfg.get("graph_rag", {}).get("graph_retrieval_top_k", 5),
-        graph_max_triplets_per_chunk=rag_cfg.get("graph_rag", {}).get("max_triplets_per_chunk", 5),
-    )
+    config, rag_cfg = _build_rag_config(plugin_dir, top_k)
 
     fake_context = _EvalFakeContext()
-
     engine = create_rag_engine(config, fake_context)
     print("✅ HybridRAG 引擎创建成功")
 
@@ -1206,6 +1187,8 @@ async def run_full_pipeline(
         embed_api_key=embed_api_key,
         embedding_mode=eval_embedding_mode,
         answer_top_k=answer_top_k,
+        context=fake_context,
+        config=rag_cfg,
     )
 
     # ========== 步骤 5: 生成报告 ==========
@@ -1364,8 +1347,10 @@ def main():
                 print(f"✅ 已从插件配置加载 freeapi: {llm_base_url}")
         else:
             llm_base_url = args.eval_llm_base_url or args.llm_base_url or "https://open.bigmodel.cn/api/paas/v4"
+            embed_base_url = llm_base_url
     else:
         llm_base_url = args.eval_llm_base_url or args.llm_base_url
+        embed_base_url = llm_base_url
 
     print(f"\n📊 配置信息:")
     print(f"   步骤: {args.step}")
@@ -1506,62 +1491,10 @@ def main():
 
             print(f"✅ 使用已有测试集: {testset_path}")
 
-            # 创建 RAG 引擎
-            from rag.rag_engine import create_rag_engine, RAGConfig
-
             plugin_dir = Path(__file__).parent.parent
-            config_path = plugin_dir.parent.parent / "config" / "astrbot_plugin_paperrag_config.json"
+            config, rag_cfg = _build_rag_config(plugin_dir, args.top_k)
 
-            if config_path.exists():
-                with open(config_path, "r", encoding="utf-8-sig") as f:
-                    rag_cfg = json.load(f)
-            else:
-                rag_cfg = {}
-
-            config = RAGConfig(
-                embedding_mode=rag_cfg.get("embedding_mode", "unsloth"),
-                embedding_provider_id=rag_cfg.get("embedding_provider_id", ""),
-                compress_provider_id=rag_cfg.get("compress_provider_id", ""),
-                text_provider_id=rag_cfg.get("text_provider_id", ""),
-                milvus_lite_path=str(plugin_dir / "data" / "milvus_papers.db"),
-                address=rag_cfg.get("milvus", {}).get("address", ""),
-                db_name=rag_cfg.get("milvus", {}).get("db_name", "default"),
-                collection_name=rag_cfg.get("collection_name", "paper_embeddings"),
-                embed_dim=rag_cfg.get("embed_dim", 1024),
-                top_k=args.top_k if args.top_k is not None else rag_cfg.get("top_k", 5),
-                similarity_cutoff=rag_cfg.get("similarity_cutoff", 0.5),
-                chunk_size=rag_cfg.get("chunk_size", 512),
-                min_chunk_size=rag_cfg.get("min_chunk_size", 100),
-                use_semantic_chunking=rag_cfg.get("use_semantic_chunking", True),
-                enable_sparse_retrieval=rag_cfg.get("enable_sparse_retrieval", True),
-                enable_multi_vector_rerank=rag_cfg.get("enable_multi_vector_rerank", False),
-                sparse_top_k=rag_cfg.get("sparse_top_k", 20),
-                hybrid_alpha=rag_cfg.get("hybrid_alpha", 0.5),
-                hybrid_rrf_k=rag_cfg.get("hybrid_rrf_k", 60),
-                enable_bm25=rag_cfg.get("enable_bm25", True),
-                bm25_top_k=rag_cfg.get("bm25_top_k", 20),
-                enable_two_stage_retrieval=rag_cfg.get("enable_two_stage_retrieval", False),
-                enable_crag_quality_eval=rag_cfg.get("enable_crag_quality_eval", True),
-                crag_enable_correction=rag_cfg.get("crag_enable_correction", True),
-                crag_min_score=rag_cfg.get("crag_min_score", 0.5),
-                # 图谱 RAG 配置
-                enable_graph_rag=rag_cfg.get("enable_graph_rag", False),
-                graph_storage_type=rag_cfg.get("graph_rag", {}).get("storage_type", "neo4j"),
-                graph_neo4j_uri=rag_cfg.get("graph_rag", {}).get("neo4j_uri", "bolt://localhost:7687"),
-                graph_neo4j_user=rag_cfg.get("graph_rag", {}).get("neo4j_user", "neo4j"),
-                graph_neo4j_password=rag_cfg.get("graph_rag", {}).get("neo4j_password", ""),
-                graph_retrieval_top_k=rag_cfg.get("graph_rag", {}).get("graph_retrieval_top_k", 5),
-                graph_max_triplets_per_chunk=rag_cfg.get("graph_rag", {}).get("max_triplets_per_chunk", 5),
-            )
-
-            # Fake context for engine
-            llm_provider = _MinimalLLMProvider(
-                model=args.eval_llm_model,
-                api_key=llm_api_key,
-                api_base=llm_base_url,
-            ) if llm_api_key else None
-            fake_context = _EvalFakeContext(llm_provider)
-
+            fake_context = _EvalFakeContext()
             print("🔧 初始化 HybridRAG 引擎...")
             engine = create_rag_engine(config, fake_context)
             print("✅ 引擎创建成功")
@@ -1580,6 +1513,8 @@ def main():
                 embed_api_key=embed_api_key,
                 eval_embedding_mode=args.eval_embedding_mode,
                 answer_top_k=args.answer_top_k,
+                context=fake_context,
+                config=rag_cfg,
             ))
 
         # 生成报告

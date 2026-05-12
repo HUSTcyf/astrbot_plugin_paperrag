@@ -76,9 +76,9 @@
         "maximum": 2.0
     },
     "llama_vlm_n_ctx": {
-        "description": "Llama.cpp VLM 上下文窗口大小",
+        "description": "本地 LLM 上下文窗口大小（通用，VLM 和文本 LLM 共用）",
         "type": "int",
-        "hint": "上下文窗口大小。较大值会占用更多内存。建议设置为 16384",
+        "hint": "本地模型上下文窗口大小，用于 token 预算管理和溢出检测。较大值会占用更多内存。建议设置为 16384",
         "default": 16384,
         "minimum": 512,
         "maximum": 32768

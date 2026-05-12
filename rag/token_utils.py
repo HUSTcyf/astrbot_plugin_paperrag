@@ -70,3 +70,18 @@ def get_embedding_tokenizer() -> Optional[Any]:
     """Return the currently configured embedding tokenizer (or None)."""
     with _et_lock:
         return _embedding_tokenizer
+
+
+def truncate_text_to_tokens(text: str, max_tokens: int) -> str:
+    """Truncate text so it contains at most max_tokens tokens.
+
+    Uses the same cl100k_base encoder as count_tokens for consistency.
+    Returns the original text if it already fits within the limit.
+    """
+    if not text or max_tokens <= 0:
+        return ""
+    enc = _ensure_encoder()
+    tokens = enc.encode(text)
+    if len(tokens) <= max_tokens:
+        return text
+    return enc.decode(tokens[:max_tokens])

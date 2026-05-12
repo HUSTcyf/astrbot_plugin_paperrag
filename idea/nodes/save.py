@@ -99,6 +99,53 @@ async def save_ideas_node(state: dict) -> dict:
         saved_paths = [(uid, str(path)) for uid, path in saved]
         logger.info(f"[save] 保存完成: {len(saved_paths)} 个文件")
 
+        # === Wiki 双写（非致命）===
+        try:
+            from idea.wiki import IdeaWikiEngine, slugify
+            wiki = IdeaWikiEngine()
+            wiki.ensure_schema()
+
+            topic_slug = slugify(topic)
+            wiki.add_topic_to_index(topic, topic_slug)
+            wiki.append_log("ingest", f"topic={topic}, ideas={len(ideas)}")
+            wiki.init_topic_index(topic, input_data.topic_analysis)
+
+            ctx_rel = None
+            if input_data.context_data:
+                ctx_path = wiki.save_context(topic, input_data.context_data)
+                ctx_rel = str(ctx_path.relative_to(wiki.root))
+
+            idea_scores = state.get("idea_scores")
+            for idea_dict, (uid, _) in zip(ideas, saved_paths):
+                scores = None
+                if idea_scores:
+                    for s in idea_scores:
+                        if s.get("title") == idea_dict.get("title"):
+                            scores = dict(s)
+                            # Normalize critique score (0-10) to feasibility (0-1)
+                            if "score" in scores and "feasibility" not in scores:
+                                scores["feasibility"] = scores["score"] / 10.0
+                            break
+
+                wiki.save_idea(
+                    topic=topic,
+                    idea_dict=idea_dict,
+                    idea_id=uid,
+                    context_path=ctx_rel,
+                    scores=scores,
+                    debate_rounds=state.get("debate_round", 0),
+                )
+                wiki.add_idea_to_topic_index(
+                    topic,
+                    slugify(idea_dict.get("title", "")) + "-" + uid[:8],
+                    idea_dict.get("title", ""),
+                    scores=scores,
+                )
+
+            logger.info(f"[save] Wiki 双写完成: {len(ideas)} ideas → {wiki.get_wiki_root()}")
+        except Exception as e:
+            logger.warning(f"[save] Wiki 写入失败（非致命）: {e}")
+
         return {
             "saved_paths": saved_paths,
             "steps": [f"save: OK ({len(saved_paths)} files saved)"],

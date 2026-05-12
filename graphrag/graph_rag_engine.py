@@ -419,7 +419,7 @@ type(r) AS relation, coalesce(t.name,'') AS tail, labels(t)[0] AS tail_type LIMI
 _TEXT_TO_CYPHER_TEMPLATE = """\
 ## Cypher Query Generation for Academic Knowledge Graph
 
-Generate a Cypher statement to query the academic paper knowledge graph.
+Generate a valid Cypher statement to query the academic paper knowledge graph.
 
 ### Schema
 {schema}
@@ -453,12 +453,13 @@ Relationship semantics (h → t):
 
 ### Rules
 1. **CRITICAL**: Bind EVERY relationship with a variable — in multi-hop `(a)-[r1:X]->(b)-[r2:Y]->(c)`, both `r1` and `r2` must be bound. NEVER use anonymous `-[:TYPE]->`.
-2. **CRITICAL**: CONTAINS is a WHERE-only operator. NEVER use it inside node property patterns `{{name: ...}}`. In node patterns, ONLY use exact equality: `{{name: 'exact value'}}`. Put all CONTAINS filters in a WHERE clause after MATCH.
-3. Cypher query MUST start with MATCH, CALL, MERGE, or RETURN — never start with WHERE
-4. Node patterns must use exact name matching only. For fuzzy matching, write: `MATCH (n:Label) WHERE n.name CONTAINS 'keyword' OR n.name CONTAINS 'keyword2'`
-5. Do NOT filter on description — it is often empty
-6. Use OR between alternatives, not AND, to maximize recall
-7. LIMIT 30
+2. **CRITICAL**: Pipe `|` is ONLY valid inside relationship types: `-[r:TYPE1|TYPE2]->` or `:TYPE1|TYPE2`. **NEVER write `|` inside a node property map** — `{{name: 'A'}}|{{name: 'B'}}` or `{{name: 'A'}}|{{...}}` inside `(node {{...}})` is a SYNTAX ERROR. To match multiple node values, use `WHERE n.name IN ['A', 'B']` or `WHERE n.name CONTAINS 'A' OR n.name CONTAINS 'B'`.
+3. **CRITICAL**: CONTAINS is a WHERE-only operator. NEVER use it inside node property patterns `{{name: ...}}`. In node patterns, ONLY use exact equality: `{{name: 'exact value'}}`. Put all CONTAINS filters in a WHERE clause after MATCH.
+4. Cypher query MUST start with MATCH, CALL, MERGE, or RETURN — never start with WHERE
+5. Node patterns must use exact name matching only. Only ever write one property map per node: `(n:Label {{prop: 'value'}})`. For fuzzy or multi-value matching, write: `MATCH (n:Label) WHERE n.name CONTAINS 'keyword' OR n.name CONTAINS 'keyword2'`
+6. Do NOT filter on description — it is often empty
+7. Use OR between alternatives, not AND, to maximize recall
+8. LIMIT 30
 
 ### Required RETURN Format
 Return exactly (replace `h`, `r`, `t` with your bound node/relationship variables):
@@ -479,9 +480,14 @@ MATCH (h)-[r:COMPARES_WITH|OUTPERFORMS]->(t) WHERE h.name CONTAINS '3DGS' OR t.n
 Q: How does MASt3R use Transformer for 3D tasks? (multi-hop with WHERE on tail)
 MATCH (h:Model {{name: 'MASt3R'}})-[r1:USES_COMPONENT]->(c:Component {{name: 'Transformer'}})-[r2:USES_COMPONENT|ADDRESSES]->(t:Task) WHERE t.name CONTAINS '3D' RETURN coalesce(h.name,'') AS head, labels(h)[0] AS head_type, type(r2) AS relation, coalesce(t.name,'') AS tail, labels(t)[0] AS tail_type LIMIT 30
 
+Q: Compare InstantSplat with Nope-NeRF and CF-3DGS (multi-value matching, use WHERE IN)
+MATCH (h:Method {{name: 'InstantSplat'}})-[r1:OUTPERFORMS]->(t:Baseline) WHERE t.name IN ['Nope-NeRF', 'CF-3DGS'] RETURN coalesce(h.name,'') AS head, labels(h)[0] AS head_type, type(r1) AS relation, coalesce(t.name,'') AS tail, labels(t)[0] AS tail_type LIMIT 30
+
 ### WRONG — NEVER do this:
 MATCH ... (t:Task {{name: CONTAINS 'keyword'}})   ← CONTAINS in node pattern — WILL CAUSE SYNTAX ERROR
 MATCH ... -[:USES_COMPONENT]->(t)                  ← anonymous relationship — WILL CAUSE Cypher error
+MATCH ... (t:Baseline {{name: 'A'}}|{{name: 'B'}}) ← | inside node pattern — WILL CAUSE SYNTAX ERROR
+MATCH ... (node {{prop: 'val1'}}|{{prop: 'val2'}}) ← | inside property map — WILL CAUSE SYNTAX ERROR
 
 ### Question
 {question}
@@ -514,6 +520,36 @@ def _parse_cypher_records(records: list[dict]) -> tuple[list[dict], list[dict]]:
     return entities, triplets
 
 
+def _sanitize_pipe_in_node_properties(cypher: str) -> str:
+    """Fix LLM hallucination: | inside node property maps.
+
+    The local VLM sometimes applies pipe alternation (valid for relationship
+    types like `:TYPE1|TYPE2`) to node property maps, producing invalid
+    patterns like ``(t:Label {name: 'A'}|{name: 'B'})``.
+
+    Strategy: strip the entire property-map block from the node pattern
+    (keeping the variable + label), because the LLM typically already
+    includes CONTAINS conditions in the WHERE clause for the same values.
+    """
+    # Match (var:Label {prop: 'A'}|{prop: 'B'}|...) or (var {prop: 'A'}|{prop: 'B'}|...)
+    # The LLM may chain N alternatives with pipe, e.g. {name: 'A'}|{name: 'B'}|{name: 'C'}
+    pattern = re.compile(
+        r'\((\w+)'            # node variable  (group 1)
+        r'(:[\w|]+)?'         # optional :Label with possible | for multi-label (group 2)
+        r'\s+\{'              # opening brace of property map
+        r'[^}]+'              # first property map content
+        r'\}'                 # closing brace
+        r'(\|\{[^}]+\})+'     # one or more |{...} repetitions (the LLM mistake)
+        r'\}*'                # any extra closing braces (from LLM escaping)
+        r'\)'                 # closing paren
+    )
+    def _fix(m: re.Match) -> str:
+        var = m.group(1)
+        label = m.group(2) or ""
+        return f"({var}{label})"
+    return pattern.sub(_fix, cypher)
+
+
 _VALID_CYPHER_STARTS: frozenset[str] = frozenset({
     "MATCH", "CALL", "CREATE", "MERGE", "RETURN", "UNWIND",
     "WITH", "OPTIONAL", "EXPLAIN", "PROFILE", "SHOW", "DROP",
@@ -535,6 +571,16 @@ def _make_cypher_validator(graph_store: Any):
     signature expected by ``TextToCypherRetriever``: ``(str) -> str``.
     """
     def _validate(cypher_query: str) -> str:
+        # --- Sanitize common LLM Cypher mistakes ---
+        # 1. Double braces → single (LLM over-escapes braces)
+        cypher_query = cypher_query.replace("{{", "{").replace("}}", "}")
+        # 2. | inside node property maps: {prop: 'A'}|{prop: 'B'} → remove property
+        #    maps and let the WHERE clause handle matching. The LLM typically already
+        #    has CONTAINS conditions in WHERE for these values.
+        cypher_query = _sanitize_pipe_in_node_properties(cypher_query)
+        # 3. Collapse any remaining }}+) → })
+        cypher_query = cypher_query.replace("}})", "})").replace("}}})", "})")
+
         stripped = cypher_query.strip()
         if not stripped:
             raise ValueError("TextToCypherRetriever 返回空 Cypher")

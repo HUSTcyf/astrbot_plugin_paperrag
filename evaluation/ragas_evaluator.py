@@ -24,7 +24,6 @@ from ragas.metrics._context_precision import ContextPrecision
 from ragas.metrics._context_recall import ContextRecall
 from ragas.metrics._nv_metrics import ContextRelevance
 from ragas.metrics._answer_correctness import AnswerCorrectness
-from llama_index.core import VectorStoreIndex, Document
 from langchain_core.prompt_values import StringPromptValue
 
 # 禁用 Ragas 遥测追踪（避免 SSL 证书过期错误）
@@ -34,6 +33,12 @@ from astrbot.api import logger
 
 sys.path.insert(0, str(Path(__file__).parent))
 from ragas_generator import EvalSample, OpenAICompatibleLLM, RagasTestsetGenerator
+
+# call_llm import（确保 plugin root 在 sys.path 中）
+_plugin_root = str(Path(__file__).parent.parent)
+if _plugin_root not in sys.path:
+    sys.path.insert(0, _plugin_root)
+from provider.llm_utils import call_llm  # noqa: E402
 
 
 # ============================================================================
@@ -74,112 +79,105 @@ class EvaluationResult:
 # ============================================================================
 
 class RAGQueryWrapper:
-    """
-    RAG 查询引擎包装器
-    统一 HybridRAGEngine 和标准 llama-index QueryEngine 的接口
-    """
+    """HybridRAGEngine 查询包装器，统一检索 + 答案生成接口"""
 
-    def __init__(self, query_engine: Any, llm_model: str = "", llm_base_url: str = "", llm_api_key: str = "", answer_top_k: int = 5):
+    def __init__(
+        self,
+        query_engine: Any,
+        llm_model: str = "",
+        llm_base_url: str = "",
+        llm_api_key: str = "",
+        answer_top_k: int = 5,
+        context=None,
+        config: Optional[dict] = None,
+    ):
         """
         Args:
-            query_engine: HybridRAGEngine 实例或 llama-index QueryEngine 实例
-            llm_model: LLM 模型名称（用于 hybrid 路径的 answer 生成）
+            query_engine: HybridRAGEngine 实例
+            llm_model: LLM 模型名称（fallback 云端 LLM 的 answer 生成）
             llm_base_url: LLM API 基础 URL
             llm_api_key: LLM API Key
             answer_top_k: 用 top-K 个检索 chunk 生成答案（默认5）
+            context: AstrBot Context（用于 call_llm() 调用系统 LLM）
+            config: 插件配置字典
         """
         self._engine = query_engine
         self._llm_model = llm_model
         self._llm_base_url = llm_base_url
         self._llm_api_key = llm_api_key
         self._answer_top_k = answer_top_k
+        self._context = context
+        self._config = config
 
-        # 检测引擎类型
-        self._is_hybrid = hasattr(query_engine, "search")
-        self._is_llama = hasattr(query_engine, "aquery") or hasattr(query_engine, "_query")
-
-        logger.info(f"RAG 引擎类型: {'HybridRAGEngine' if self._is_hybrid else 'llama-index QueryEngine'}")
+        if not hasattr(query_engine, "search"):
+            raise TypeError(f"query_engine 必须为 HybridRAGEngine（需有 search 方法），实际: {type(query_engine)}")
 
     async def aquery(self, query: str, force_english: bool = False) -> Dict[str, Any]:
-        """
-        执行异步查询
+        """执行异步查询，返回 sources、answer、images 字典"""
+        result = await self._engine.search(query)
 
-        Returns:
-            包含 sources、answer、images 的字典
-        """
-        if self._is_hybrid:
-            # HybridRAGEngine — search() 返回 QueryResult 对象
-            result = await self._engine.search(query)
+        nodes = getattr(result, "nodes", [])
+        scores = getattr(result, "scores", [1.0] * len(nodes))
 
-            nodes = getattr(result, "nodes", [])
-            scores = getattr(result, "scores", [1.0] * len(nodes))
+        source_nodes = []
+        for i, node in enumerate(nodes):
+            source_nodes.append({
+                "text": getattr(node, "text", ""),
+                "metadata": getattr(node, "metadata", {}),
+                "score": scores[i] if i < len(scores) else 0.0,
+            })
 
-            source_nodes = []
-            for i, node in enumerate(nodes):
-                source_nodes.append({
-                    "text": getattr(node, "text", ""),
-                    "metadata": getattr(node, "metadata", {}),
-                    "score": scores[i] if i < len(scores) else 0.0,
-                })
+        answer = ""
+        answer_chunks = source_nodes[:self._answer_top_k]
+        answer_texts = [n["text"] for n in answer_chunks if n["text"]]
+        if answer_texts and (self._context is not None or self._llm_base_url):
+            context_block = "\n\n".join(answer_texts)
+            prompt = (
+                "You are answering a research question using excerpts from academic papers. "
+                "Use the provided excerpts to give the most accurate and complete answer possible.\n\n"
+                "Rules:\n"
+                "- Answer in 4-8 sentences. Include ALL specific numbers, metrics, method names, "
+                "and dataset names found in the excerpts that are relevant to the question.\n"
+                "- If the exact term from the question does not appear in the excerpts, identify "
+                "the most closely related information and explain what the excerpts do say.\n"
+                "- Stay grounded in the excerpts; do not fabricate facts.\n\n"
+                f"Paper excerpts:\n{context_block}\n\n"
+                f"Question: {query}\n\nAnswer:"
+            )
+            answer = await self._generate_answer(prompt, fallback=context_block)
 
-            # 从检索结果中生成 answer（用 top-K chunk，K 可配置）
-            answer = ""
-            answer_chunks = source_nodes[:self._answer_top_k]
-            answer_texts = [n["text"] for n in answer_chunks if n["text"]]
-            if answer_texts and self._llm_base_url:
-                context_block = "\n\n".join(answer_texts)
-                prompt = (
-                    "You are a research paper assistant. "
-                    "Answer the question based ONLY on the provided paper excerpts.\n\n"
-                    "Rules:\n"
-                    "- Answer in 3-6 sentences. Be specific and direct.\n"
-                    "- Include specific numbers, metrics, method names, and dataset names from the excerpts.\n"
-                    "- Do NOT add information beyond the excerpts.\n"
-                    "- Do NOT provide generic background or generalizations.\n\n"
-                    f"Paper excerpts:\n{context_block}\n\n"
-                    f"Question: {query}\n\nAnswer:"
+        return {
+            "response": answer,
+            "answer": answer,
+            "sources": source_nodes,
+            "images": [],
+        }
+
+    async def _generate_answer(self, prompt: str, fallback: str = "") -> str:
+        """生成 answer（系统 LLM 优先，云端 LLM fallback，带 retry + fallback）"""
+
+        # 首选系统 LLM：通过 call_llm() 调用（VLM 或用户配置的 provider）
+        if self._context is not None:
+            try:
+                answer = await call_llm(
+                    prompt, self._context, self._config,
+                    temperature=0.3, max_tokens=2048,
                 )
-                answer = await self._generate_answer(prompt)
+                if answer and answer.strip():
+                    return answer
+                logger.warning("[RAGQueryWrapper] 系统 LLM 返回空答案，回退到云端 LLM")
+            except Exception as e:
+                logger.warning(f"[RAGQueryWrapper] 系统 LLM 调用失败: {type(e).__name__}: {e}，回退到云端 LLM")
 
-            return {
-                "response": answer,
-                "answer": answer,
-                "sources": source_nodes,
-                "images": [],
-            }
-        else:
-            # llama-index QueryEngine
-            if hasattr(self._engine, "aquery"):
-                response = await self._engine.aquery(query)
-            else:
-                response = self._engine.query(query)
-
-            source_nodes = []
-            if hasattr(response, "source_nodes"):
-                for node in response.source_nodes:
-                    source_nodes.append(node)
-            elif hasattr(response, "nodes"):
-                source_nodes = response.nodes
-
-            answer = getattr(response, "response", str(response))
-            return {
-                "response": answer,
-                "answer": answer,
-                "source_nodes": source_nodes,
-                "images": [],
-            }
-
-    async def _generate_answer(self, prompt: str) -> str:
-        """复用 OpenAICompatibleLLM 生成 answer（底层自动重试 3 次）"""
-
-        llm = OpenAICompatibleLLM(
-            model=self._llm_model or "gpt-4o-mini",
-            api_base=self._llm_base_url,
-            api_key=self._llm_api_key or "sk-placeholder",
-            temperature=0.2,
-            max_tokens=1024,
-        )
-        try:
+        # fallback: 云端 LLM 路径
+        async def _try_generate() -> str:
+            llm = OpenAICompatibleLLM(
+                model=self._llm_model or "gpt-4o-mini",
+                api_base=self._llm_base_url,
+                api_key=self._llm_api_key or "sk-placeholder",
+                temperature=0.3,
+                max_tokens=2048,
+            )
             llm_result = await llm.agenerate_text(StringPromptValue(text=prompt))
             text = llm_result.generations[0][0].text
             try:
@@ -189,12 +187,22 @@ class RAGQueryWrapper:
             except (json.JSONDecodeError, TypeError):
                 pass
             return text
-        except asyncio.TimeoutError:
-            logger.warning(f"[RAGQueryWrapper] LLM answer 生成超时 (3次尝试均失败): api_base={self._llm_base_url}, model={self._llm_model}")
-            return ""
-        except Exception as e:
-            logger.warning(f"[RAGQueryWrapper] LLM answer 生成失败 (3次尝试均失败): {type(e).__name__}: {e}")
-            return ""
+
+        # 外层 retry（底层 agenerate_text 内部已重试 3 次）
+        for attempt in range(2):
+            try:
+                result = await _try_generate()
+                if result.strip():
+                    return result
+                logger.warning(f"[RAGQueryWrapper] LLM 返回空内容 (attempt {attempt+1}/2): model={self._llm_model}")
+            except Exception as e:
+                logger.warning(f"[RAGQueryWrapper] LLM 失败 (attempt {attempt+1}/2): {type(e).__name__}: {e}")
+
+        # fallback: 返回 context 完整文本，避免空答案
+        if fallback:
+            logger.warning(f"[RAGQueryWrapper] 使用 fallback 文本 ({len(fallback)} chars)")
+            return fallback
+        return ""
 
 
 # ============================================================================
@@ -394,6 +402,8 @@ class RagasEvaluator:
         testset_path: str,
         output_path: str = "results/evaluation_results.csv",
         max_concurrent: int = 5,
+        context=None,
+        config: Optional[dict] = None,
     ) -> pd.DataFrame:
         """
         执行评估
@@ -403,6 +413,8 @@ class RagasEvaluator:
             testset_path: 测试集路径
             output_path: 结果输出路径
             max_concurrent: 最大并发数
+            context: AstrBot Context（用于系统 LLM 答案生成）
+            config: 插件配置字典
 
         Returns:
             评估结果 DataFrame
@@ -430,6 +442,8 @@ class RagasEvaluator:
             llm_base_url=self._llm_config["base_url"],
             llm_api_key=self._llm_config["api_key"],
             answer_top_k=self._answer_top_k,
+            context=context,
+            config=config,
         )
 
         # 准备数据
@@ -804,36 +818,3 @@ class RagasEvaluator:
         print("=" * 60)
 
 
-# ============================================================================
-# 使用示例
-# ============================================================================
-
-async def main():
-    """使用示例"""
-
-    # 初始化评估器（使用 freeapi）
-    evaluator = RagasEvaluator(
-        llm_model="gpt-4o-mini",
-        llm_base_url="https://free.v36.cm/v1/",
-        llm_api_key="your-api-key",
-        embedding_model="text-embedding-3-small",
-        embed_base_url="https://free.v36.cm/v1/",
-        embed_api_key="your-api-key",
-    )
-
-    # 创建测试查询引擎
-    documents = [Document(text="测试文档内容")]
-    index = VectorStoreIndex.from_documents(documents)
-    query_engine = index.as_query_engine()
-
-    # 执行评估
-    results = await evaluator.evaluate(
-        query_engine=query_engine,
-        testset_path="results/testset.json",
-        output_path="results/evaluation_results.csv",
-        max_concurrent=5,
-    )
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

@@ -9,8 +9,12 @@ from typing import Optional, Any
 from astrbot.api import logger
 from .workflow import compile_workflow
 from .react_workflow import compile_react_workflow
+from .knowledge_extractor import run_knowledge_extraction
 
-__all__ = ["compile_workflow", "run_agentic_rag", "run_agentic_rag_stream", "run_react_rag"]
+__all__ = [
+    "compile_workflow", "run_agentic_rag", "run_agentic_rag_stream", "run_react_rag",
+    "run_knowledge_extraction",
+]
 __version__ = "0.2.0"
 
 

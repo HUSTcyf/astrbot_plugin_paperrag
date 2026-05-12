@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -249,6 +250,12 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
                 answer = await self._generate_rag_answer(query, sources)
                 output = self._format_rag_response(answer, sources)
 
+                # 自动知识提取到 wiki（非阻塞，失败不影响主流程）
+                if self.config.get("auto_extract_knowledge", False):
+                    asyncio.create_task(
+                        self._extract_knowledge_to_wiki(query, answer, sources)
+                    )
+
             # Cache response
             self._set_cached_response(cache_key, output)
 
@@ -274,6 +281,29 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             logger.error(f"Search failed: {e}")
             yield event.plain_result(f"❌ Search failed: {e}")
 
+    async def _extract_knowledge_to_wiki(
+        self, query: str, answer: str, sources: list[dict]
+    ) -> None:
+        """Fire-and-forget: extract verifiable knowledge to wiki after Q&A."""
+        try:
+            from agentic_rag.knowledge_extractor import run_knowledge_extraction
+            result = await run_knowledge_extraction(
+                query=query,
+                answer=answer,
+                sources=sources,
+                context=self.context,
+                config=self.config,
+            )
+            logger.info(
+                f"[PaperRAG] Knowledge extraction: status={result.get('status')}, "
+                f"pages_written={result.get('pages_written', 0)}"
+            )
+            if result.get("status") == "rejected":
+                logger.info(
+                    f"[PaperRAG] Knowledge extraction rejected: {result.get('reason')}"
+                )
+        except Exception as e:
+            logger.warning(f"[PaperRAG] Knowledge extraction failed (non-fatal): {e}")
 
     async def _agentic_rag(self, event: AstrMessageEvent, query: str = '', top_k: int = 5):
         """Agentic RAG complex query (multi-hop reasoning / comparison / citation tracing)

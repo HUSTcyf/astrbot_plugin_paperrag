@@ -9,6 +9,7 @@
 from .datatypes import ResearchIdea, TopicAnalysis
 from .feishu_doc import IdeaEngineFeishuDoc
 from .agentic_workflow import run_agentic_ideas
+from .wiki import IdeaWikiEngine
 
 
 class IdeaEngine(IdeaEngineFeishuDoc):
@@ -36,6 +37,7 @@ class IdeaEngine(IdeaEngineFeishuDoc):
 
 __all__ = [
     "IdeaEngine",
+    "IdeaWikiEngine",
     "ResearchIdea",
     "TopicAnalysis",
     "run_agentic_ideas",

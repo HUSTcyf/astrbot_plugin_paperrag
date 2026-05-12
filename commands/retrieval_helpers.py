@@ -12,6 +12,7 @@ from astrbot.api import logger
 
 from .base import PluginCoreBase, _PLUGIN_DIR
 from astrbot.api.event import AstrMessageEvent
+from rag.token_utils import count_tokens
 
 
 class RetrievalHelpersMixin(PluginCoreBase):
@@ -227,8 +228,78 @@ class RetrievalHelpersMixin(PluginCoreBase):
 
         return sources
 
+    # prompt 模板（{context_text} 是 chunks 拼接结果的占位符，
+    # token 预算用 {context_text}=="" 计算固定开销）
+    _PROMPT_TEMPLATE = (
+        "你是一个严谨的论文阅读助手。请只基于下面给出的本地论文片段回答用户问题。\n\n"
+        "要求：\n"
+        "1. 如果证据不足，请明确说明\"不足以从当前检索片段得出结论\"，不要编造。\n"
+        "2. 回答要直接、结构清晰，优先总结方法、结论、实验或对比关系。\n"
+        "3. 需要引用证据时使用 [1]、[2] 这样的编号，对应下方论文片段。\n"
+        "4. 不要输出与论文片段无关的泛泛解释。\n"
+        "5. **噪声过滤**：部分片段可能包含图表的坐标轴刻度值（如连续的数字 0.0、0.2、0.4、2000、4000、6000 或百分比 0.75、0.50、0.25）、图表标签（如 PSNR、RMSE、Iteration）、散落的短数字序列。这些是图片文字提取的残留，不是论文正文。回答时自动忽略这些噪声片段，不要引用它们，也不要因它们的存在而影响答案质量。\n"
+        "6. **具体性优先**：优先提取论文中的具体数据（数值、指标、对比结果）、方法名称、数据集名称，而非泛泛解释概念。\n"
+        "7. **简洁回答**：回答控制在 3-5 句话以内，避免冗余扩展。如果用户问具体问题，直接给出具体答案。\n"
+        "\n用户问题：\n{query}\n\n检索到的论文片段：\n{context_text}\n\n请给出答案："
+    )
+
     def _build_rag_answer_prompt(self, query: str, sources: list) -> str:
-        """Build a grounded answer prompt from retrieved paper chunks."""
+        model_ctx_window = self.config.get("llama_vlm_n_ctx")
+
+        if isinstance(model_ctx_window, int) and model_ctx_window > 0:
+            output_max = self.config.get("text_llm_max_tokens", 2048)
+
+            # 固定开销：模板中除 {context_text} 以外的所有文本
+            base_prompt = self._PROMPT_TEMPLATE.format(query=query, context_text="")
+            base_tokens = count_tokens(base_prompt)
+            available = model_ctx_window - output_max - base_tokens
+
+            if available <= 0:
+                raise ValueError(
+                    f"上下文窗口不足以容纳 prompt 固定开销："
+                    f"context_window={model_ctx_window}, "
+                    f"output_max_tokens={output_max}, "
+                    f"base_tokens={base_tokens}, "
+                    f"available={available}。请增大 llama_vlm_n_ctx 或减小 text_llm_max_tokens。"
+                )
+
+            # 逐块装入，精确计数块文本 + 分隔符
+            blocks: list[str] = []
+            used = 0
+            for s in sources:
+                text = s.get("text", "")
+                if not text:
+                    continue
+                metadata = s.get("metadata", {}) or {}
+                display_name = s.get("display_name") or metadata.get("file_name", "unknown")
+                chunk_index = metadata.get("chunk_index", 0)
+                score = s.get("score", 0.0)
+                block = f"[{len(blocks) + 1}] {display_name} (chunk #{chunk_index}, score={score:.3f})\n{text}"
+
+                # 分隔符 + 块文本（第一个块前无分隔符）
+                sep = "" if not blocks else "\n\n"
+                t = count_tokens(sep + block)
+
+                if not blocks and t > available:
+                    raise ValueError(
+                        f"第一个 chunk 就需要 {t} tokens，但可用于 chunks 的空间只有 {available}。"
+                        f"请增大 llama_vlm_n_ctx 或调小 chunk 大小。"
+                    )
+                if used + t > available:
+                    break
+
+                blocks.append(block)
+                used += t
+
+            if len(blocks) < len(sources):
+                logger.info(
+                    f"[TokenBudget] {len(sources)} → {len(blocks)} chunks "
+                    f"({used}/{available} tokens)"
+                )
+
+            return self._PROMPT_TEMPLATE.format(query=query, context_text="\n\n".join(blocks))
+
+        # 无 context_window 配置：保持向后兼容，全量装入
         context_blocks = []
         for i, source in enumerate(sources, 1):
             metadata = source.get("metadata", {}) or {}
@@ -240,25 +311,7 @@ class RetrievalHelpersMixin(PluginCoreBase):
                 f"[{i}] {display_name} (chunk #{chunk_index}, score={score:.3f})\n{text}"
             )
 
-        context_text = "\n\n".join(context_blocks)
-        return f"""你是一个严谨的论文阅读助手。请只基于下面给出的本地论文片段回答用户问题。
-
-要求：
-1. 如果证据不足，请明确说明"不足以从当前检索片段得出结论"，不要编造。
-2. 回答要直接、结构清晰，优先总结方法、结论、实验或对比关系。
-3. 需要引用证据时使用 [1]、[2] 这样的编号，对应下方论文片段。
-4. 不要输出与论文片段无关的泛泛解释。
-5. **噪声过滤**：部分片段可能包含图表的坐标轴刻度值（如连续的数字 0.0、0.2、0.4、2000、4000、6000 或百分比 0.75、0.50、0.25）、图表标签（如 PSNR、RMSE、Iteration）、散落的短数字序列。这些是图片文字提取的残留，不是论文正文。回答时自动忽略这些噪声片段，不要引用它们，也不要因它们的存在而影响答案质量。
-6. **具体性优先**：优先提取论文中的具体数据（数值、指标、对比结果）、方法名称、数据集名称，而非泛泛解释概念。
-7. **简洁回答**：回答控制在 3-5 句话以内，避免冗余扩展。如果用户问具体问题，直接给出具体答案。
-
-用户问题：
-{query}
-
-检索到的论文片段：
-{context_text}
-
-请给出答案："""
+        return self._PROMPT_TEMPLATE.format(query=query, context_text="\n\n".join(context_blocks))
 
     async def _generate_rag_answer(self, query: str, sources: list) -> str:
         """Generate a grounded RAG answer from retrieved sources."""

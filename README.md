@@ -1,16 +1,19 @@
-# 📚 Paper RAG Plugin v2.0.4 — 用户指南
+# 📚 Paper RAG Plugin v2.1.0 — 用户指南
 
 本地论文库 RAG 检索插件，为 AstrBot 提供智能论文检索、知识图谱增强问答和研究想法生成。支持多模态（图片/表格/公式）提取、Llama.cpp VLM 本地问答和 Agentic RAG（LangGraph 工作流）。
 
-> **版本说明**：当前版本 v2.0.4，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
+> **版本说明**：当前版本 v2.1.0，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
 
-### 本版变化 (v2.0.4)
+### 本版变化 (v2.1.0)
 
-- **Bug 修复**：修复 `paper_link_resolver.py` 中 `@staticmethod` 错误使用 `self` 导致的 `NameError`。
-- **测试套件清理**：删除 1 个过期测试文件、1 个过期测试函数、3 个引用已移除参数的测试；修复 3 个测试文件的 mock Context 兼容性；跳过 5 个环境依赖测试。
-- **安全加固**：移除 4 个测试文件中的硬编码 Neo4j 密码，统一通过 `test/_test_utils.py::get_neo4j_password()` 读取插件配置。
-- **Code Review**：删除空测试类 `TestGraphRAGConfigConstruction`，重写 `test_crag_json_parse.py` 使用正确导入。
-- 完整变更详见 [docs/changelog/2.0.4.md](docs/changelog/2.0.4.md)
+- **Token 预算管理**：`_build_rag_answer_prompt()` 使用 `count_tokens()`（cl100k_base 编码器）精确计算 prompt 固定开销和 chunk 用量，基于 `llama_vlm_n_ctx` 上下文窗口动态分配 token 预算，避免上下文溢出。
+- **知识提取流水线**：RAG Q&A 后自动提取可验证事实到 Wiki（实体/概念/对比页），两阶段 LLM 独立校验（extract → critique → filter），仅高/中置信度写入，fire-and-forget 非阻塞 hook。
+- **Wiki 引擎**：`IdeaWikiEngine`（Karpathy 模式 Wiki 结构），支持实体/概念/对比/想法页的结构化写入，YAML frontmatter 块列表，index.md 自动注册。
+- **评估系统重构**：Ragas 答案生成与指标评分 LLM 分离 — 答案用系统 VLM（`call_llm()`），指标用云端 LLM（`--eval-llm-*`），评测系统自身检索+生成能力。
+- **Cypher 生成修复**：修复 Qwen3.5-9B VLM 生成 Cypher 的双重大括号转义（`{{}}`→`{}`）和 `|` 在节点属性模式中的语法幻觉，新增 sanitizer 自动纠错。
+- **死代码清理**：删除 llama-index 死分支、`_MinimalLLMProvider` 死类、`MULTIMODAL_QUESTION_PROMPT` 孤儿常量、`demo main()` 等。
+- **配置修复**：`llama_vlm_n_ctx` 描述更新为通用上下文窗口（VLM 和文本 LLM 共用），hint 明确说明用于 token 预算管理。
+- 完整变更详见 [docs/changelog/2.1.0.md](docs/changelog/2.1.0.md)
 
 ---
 

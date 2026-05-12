@@ -14,6 +14,8 @@ import json
 import re
 from typing import Any, Optional
 
+from astrbot.api import logger
+
 
 def extract_text_from_response(response) -> str:
     """从 LLM 响应中提取文本（兼容 VLM、AstrBot cloud provider、dict）。"""
