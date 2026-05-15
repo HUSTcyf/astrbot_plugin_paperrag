@@ -911,6 +911,7 @@ async def run_evaluation(
     answer_top_k: int = 5,
     context=None,
     config: Optional[dict] = None,
+    eval_llm_max_tokens: int = 16384,
 ) -> Any:
     """执行 Ragas 评估"""
     print(f"\n{'='*60}")
@@ -927,6 +928,7 @@ async def run_evaluation(
         embed_api_key=embed_api_key,
         embedding_mode=eval_embedding_mode,
         answer_top_k=answer_top_k,
+        llm_max_tokens=eval_llm_max_tokens,
     )
 
     results = await evaluator.evaluate(
@@ -954,6 +956,7 @@ async def run_evaluation_from_raw_answers(
     embed_api_key: str = "",
     embedding_mode: str = "api",
     answer_top_k: int = 5,
+    eval_llm_max_tokens: int = 16384,
 ) -> Any:
     """从已有 raw_answers.json 执行 Ragas 评估（跳过 RAG 推理）"""
     print(f"\n{'='*60}")
@@ -970,6 +973,7 @@ async def run_evaluation_from_raw_answers(
         embed_api_key=embed_api_key,
         embedding_mode=embedding_mode,
         answer_top_k=answer_top_k,
+        llm_max_tokens=eval_llm_max_tokens,
     )
 
     results = await evaluator.evaluate_from_raw_answers(
@@ -1091,6 +1095,7 @@ async def run_full_pipeline(
     multimodal_context_before: int = 1,
     multimodal_context_after: int = 1,
     answer_top_k: int = 5,
+    eval_llm_max_tokens: int = 16384,
 ) -> dict:
     """
     完整评测流程
@@ -1189,6 +1194,7 @@ async def run_full_pipeline(
         answer_top_k=answer_top_k,
         context=fake_context,
         config=rag_cfg,
+        eval_llm_max_tokens=eval_llm_max_tokens,
     )
 
     # ========== 步骤 5: 生成报告 ==========
@@ -1277,6 +1283,8 @@ def main():
     parser.add_argument("--eval-llm-model", default="gpt-4o-mini", help="评估用 LLM 模型名称")
     parser.add_argument("--eval-llm-base-url", default="https://open.bigmodel.cn/api/paas/v4", help="评估用 LLM API 基础 URL")
     parser.add_argument("--eval-llm-api-key", default="", help="评估用 LLM API Key")
+    parser.add_argument("--eval-llm-max-tokens", type=int, default=16384,
+                        help="评估用 LLM max_tokens（默认 16384，推理模型需更高值容纳 reasoning tokens）")
 
     # Embedding 配置
     parser.add_argument("--embedding-model", default="text-embedding-v4", help="Embedding 模型名称")
@@ -1394,6 +1402,7 @@ def main():
             multimodal_context_before=args.multimodal_context_before,
             multimodal_context_after=args.multimodal_context_after,
             answer_top_k=args.answer_top_k,
+            eval_llm_max_tokens=args.eval_llm_max_tokens,
         ))
 
     elif args.step == "extract":
@@ -1460,9 +1469,17 @@ def main():
                 print(f"❌ raw_answers.json 不存在: {raw_answers_path}")
                 print("请先运行带 RAG 推理的评估命令，生成该文件")
                 return
-            # 读取实际问题数量
+            # 读取实际问题数量（兼容新旧格式）
             with open(raw_answers_path, "r", encoding="utf-8") as f:
-                raw_data = json.load(f)
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                raw_data = loaded
+            elif isinstance(loaded, dict) and "results" in loaded:
+                raw_data = loaded["results"]
+            else:
+                print(f"❌ 无法识别的 raw_answers.json 格式: {type(loaded).__name__}")
+                print("   文件必须是旧格式（JSON 数组）或新格式（含 _metadata 和 results 的 JSON 对象）")
+                return
             actual_count = len(raw_data)
             print(f"✅ 跳过 RAG 推理，从已有结果评估")
             print(f"   raw_answers: {raw_answers_path}")
@@ -1479,6 +1496,7 @@ def main():
                 embed_api_key=embed_api_key,
                 embedding_mode=args.embedding_mode,
                 answer_top_k=args.answer_top_k,
+                eval_llm_max_tokens=args.eval_llm_max_tokens,
             ))
         else:
             # 正常流程：RAG 推理 + 评估
@@ -1515,6 +1533,7 @@ def main():
                 answer_top_k=args.answer_top_k,
                 context=fake_context,
                 config=rag_cfg,
+                eval_llm_max_tokens=args.eval_llm_max_tokens,
             ))
 
         # 生成报告

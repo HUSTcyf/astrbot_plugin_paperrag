@@ -1,19 +1,24 @@
-# 📚 Paper RAG Plugin v2.1.0 — 用户指南
+# 📚 Paper RAG Plugin v2.1.1 — 用户指南
 
 本地论文库 RAG 检索插件，为 AstrBot 提供智能论文检索、知识图谱增强问答和研究想法生成。支持多模态（图片/表格/公式）提取、Llama.cpp VLM 本地问答和 Agentic RAG（LangGraph 工作流）。
 
-> **版本说明**：当前版本 v2.1.0，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
+> **版本说明**：当前版本 v2.1.1，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
 
-### 本版变化 (v2.1.0)
+### 本版变化 (v2.1.1)
 
-- **Token 预算管理**：`_build_rag_answer_prompt()` 使用 `count_tokens()`（cl100k_base 编码器）精确计算 prompt 固定开销和 chunk 用量，基于 `llama_vlm_n_ctx` 上下文窗口动态分配 token 预算，避免上下文溢出。
-- **知识提取流水线**：RAG Q&A 后自动提取可验证事实到 Wiki（实体/概念/对比页），两阶段 LLM 独立校验（extract → critique → filter），仅高/中置信度写入，fire-and-forget 非阻塞 hook。
-- **Wiki 引擎**：`IdeaWikiEngine`（Karpathy 模式 Wiki 结构），支持实体/概念/对比/想法页的结构化写入，YAML frontmatter 块列表，index.md 自动注册。
-- **评估系统重构**：Ragas 答案生成与指标评分 LLM 分离 — 答案用系统 VLM（`call_llm()`），指标用云端 LLM（`--eval-llm-*`），评测系统自身检索+生成能力。
-- **Cypher 生成修复**：修复 Qwen3.5-9B VLM 生成 Cypher 的双重大括号转义（`{{}}`→`{}`）和 `|` 在节点属性模式中的语法幻觉，新增 sanitizer 自动纠错。
-- **死代码清理**：删除 llama-index 死分支、`_MinimalLLMProvider` 死类、`MULTIMODAL_QUESTION_PROMPT` 孤儿常量、`demo main()` 等。
-- **配置修复**：`llama_vlm_n_ctx` 描述更新为通用上下文窗口（VLM 和文本 LLM 共用），hint 明确说明用于 token 预算管理。
-- 完整变更详见 [docs/changelog/2.1.0.md](docs/changelog/2.1.0.md)
+- **增量保存机制**：Ragas 评估从批量写入改为逐样本增量保存，每完成一个样本立即写入 `raw_answers.json`，中途崩溃不丢失已计算结果。
+- **代码溯源元数据**：`raw_answers.json` 新增 `_metadata` 字段，自动嵌入 git commit hash、日期、dirty 状态及 LLM/Embedding 配置信息，提升结果可复现性。
+- **评估 LLM max_tokens 可配置**：新增 `--eval-llm-max-tokens` CLI 参数（默认 16384），线程化传递至 `InstructorLLM` 构造，适配推理模型的 reasoning tokens 需求。
+- **格式兼容性修复**：`raw_answers.json` 读写同时兼容旧格式（裸列表）和新格式（含 `_metadata` 的 JSON 对象），`--skip-rag` 路径统一格式检测。
+- 完整变更详见 [docs/changelog/2.1.1.md](docs/changelog/2.1.1.md)
+
+### 上版变化 (v2.1.0)
+
+- **Token 预算管理**：使用 `count_tokens()` 精确分配上下文窗口 token 预算，避免溢出。
+- **知识提取流水线 + Wiki 引擎**：RAG 问答后自动提取事实写入结构化 Wiki。
+- **评估系统重构**：答案生成与指标评分 LLM 分离。
+- **Cypher 生成修复**与死代码清理。
+- 详细变更见 [docs/changelog/2.1.0.md](docs/changelog/2.1.0.md)
 
 ---
 

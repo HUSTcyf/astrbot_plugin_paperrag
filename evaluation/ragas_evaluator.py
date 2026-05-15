@@ -7,9 +7,11 @@ import asyncio
 import copy
 import json
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Union, cast
 
@@ -30,6 +32,39 @@ from langchain_core.prompt_values import StringPromptValue
 os.environ["RAGAS_DO_NOT_TRACK"] = "True"
 
 from astrbot.api import logger
+
+
+def _get_git_info() -> dict:
+    """获取当前代码仓库的 git 信息，用于结果溯源"""
+    try:
+        repo_root = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=Path(__file__).resolve().parent,
+            text=True, stderr=subprocess.PIPE
+        ).strip()
+        commit_hash = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root, text=True, stderr=subprocess.PIPE
+        ).strip()
+        commit_date = subprocess.check_output(
+            ["git", "log", "-1", "--format=%ai", "HEAD"],
+            cwd=repo_root, text=True, stderr=subprocess.PIPE
+        ).strip()
+        is_dirty = bool(subprocess.check_output(
+            ["git", "diff", "--stat", "HEAD"],
+            cwd=repo_root, text=True, stderr=subprocess.PIPE
+        ).strip())
+        return {
+            "commit": commit_hash,
+            "commit_date": commit_date,
+            "dirty": is_dirty,
+        }
+    except FileNotFoundError:
+        logger.warning("git 未安装或不在 PATH 中，无法获取代码溯源信息")
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"git 命令执行失败（可能不在 git 仓库中），无法获取代码溯源信息: {e.stderr.strip() if e.stderr else e}")
+    return {"commit": "unknown", "commit_date": "unknown", "dirty": False}
+
 
 sys.path.insert(0, str(Path(__file__).parent))
 from ragas_generator import EvalSample, OpenAICompatibleLLM, RagasTestsetGenerator
@@ -223,6 +258,7 @@ class RagasEvaluator:
         embedding_mode: str = "api",
         max_concurrent: int = 3,
         answer_top_k: int = 5,
+        llm_max_tokens: int = 16384,
     ):
         """
         初始化评估器
@@ -235,6 +271,7 @@ class RagasEvaluator:
             embed_base_url: Embedding API URL
             embed_api_key: Embedding API Key
             embedding_mode: Embedding 模式 ("api")
+            llm_max_tokens: LLM max_tokens（默认 16384，推理模型需更高值容纳 reasoning tokens）
         """
         self._llm = None
         self._embed_model = None
@@ -245,6 +282,7 @@ class RagasEvaluator:
             "model": llm_model,
             "base_url": llm_base_url,
             "api_key": llm_api_key,
+            "max_tokens": llm_max_tokens,
         }
         self._embed_config = {
             "model": embedding_model,
@@ -272,6 +310,7 @@ class RagasEvaluator:
                     provider="openai",
                     client=client,
                     temperature=0,
+                    max_tokens=self._llm_config.get("max_tokens", 16384),
                 )
                 print(f"✅ LLM (InstructorLLM) 初始化成功: {self._llm_config['model']} @ {self._llm_config['base_url']}")
             else:
@@ -446,78 +485,127 @@ class RagasEvaluator:
             config=config,
         )
 
-        # 准备数据
+        # =====================================================================
+        # 增量保存：每完成一个样本就写入 raw_answers.json，确保中途崩溃不丢失已计算结果
+        # =====================================================================
+        raw_results_path = Path(output_path).parent / "raw_answers.json"
+        Path(raw_results_path).parent.mkdir(parents=True, exist_ok=True)
+
+        # 先写入初始状态（含元数据和空结果列表）
+        if raw_results_path.exists():
+            logger.warning(f"{raw_results_path} 已存在，将被覆盖")
+            print(f"⚠️  {raw_results_path} 已存在，将被覆盖")
+
+        git_info = _get_git_info()
+        base_payload = {
+            "_metadata": {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "git_commit": git_info["commit"],
+                "git_commit_date": git_info["commit_date"],
+                "git_dirty": git_info["dirty"],
+                "total_samples": len(samples),
+                "success_count": 0,
+                "llm_model": self._llm_config["model"],
+                "llm_base_url": self._llm_config["base_url"],
+                "embedding_model": self._embed_config["model"],
+                "embed_base_url": self._embed_config["base_url"],
+                "answer_top_k": self._answer_top_k,
+                "max_concurrent": max_concurrent,
+            },
+            "results": [],
+        }
+        with open(raw_results_path, "w", encoding="utf-8") as f:
+            json.dump(base_payload, f, ensure_ascii=False, indent=2)
+
+        commit_label = git_info["commit"][:8] if git_info["commit"] != "unknown" else "unknown"
+        print(f"📝 增量保存到: {raw_results_path}  (commit: {commit_label})")
+
+        semaphore = asyncio.Semaphore(max_concurrent)
+        results_by_idx: dict[int, dict] = {}
+        write_lock = asyncio.Lock()
+        total_samples = len(samples)
+
+        async def process_and_save(sample: EvalSample, idx: int) -> None:
+            """处理单个样本并立即增量保存到 raw_answers.json"""
+            try:
+                async with semaphore:
+                    result = await self._process_single_sample(rag_wrapper, sample, idx)
+            except Exception as e:
+                logger.error(f"样本 {idx} 处理失败: {e}")
+                return
+            if result is None or not isinstance(result, dict):
+                return
+
+            async with write_lock:
+                results_by_idx[idx] = result
+                _n = len(results_by_idx)
+
+                # 按原始顺序重建结果列表
+                ordered = []
+                for j in range(total_samples):
+                    if j in results_by_idx:
+                        r = results_by_idx[j]
+                        ordered.append({
+                            "question": r["question"],
+                            "answer": r["answer"],
+                            "contexts": r["contexts"],
+                            "ground_truth": r.get("ground_truth", ""),
+                            "latency_ms": r["latency_ms"],
+                            "question_type": r.get("question_type", "unknown"),
+                            "has_multimodal": r.get("has_multimodal", False),
+                            "used_images": r.get("used_images") or [],
+                        })
+
+                base_payload["_metadata"]["success_count"] = _n
+                base_payload["results"] = ordered
+                try:
+                    with open(raw_results_path, "w", encoding="utf-8") as f:
+                        json.dump(base_payload, f, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    logger.error(f"写入 raw_answers.json 失败 (已处理 {_n}/{total_samples}): {e}")
+
+            print(f"  [{_n}/{total_samples}] 已保存到 {raw_results_path.name}")
+
+        print(f"执行 RAG 查询（最大并发: {max_concurrent}）...")
+        tasks = [asyncio.create_task(process_and_save(s, i)) for i, s in enumerate(samples)]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 收集结果用于 Ragas 评估
+        success_count = len(results_by_idx)
+
+        if success_count == 0:
+            raise ValueError("没有成功处理任何样本")
+
+        print(f"成功处理 {success_count}/{len(samples)} 个样本")
+        print(f"✅ 原始回答已保存到: {raw_results_path}")
+
+        # 从 results_by_idx 按序重建列表，供后续 Ragas 评估使用
         questions = []
         answers = []
         contexts_list = []
         ground_truths = []
         latencies = []
         question_types = []
-
-        # 并发查询
-        semaphore = asyncio.Semaphore(max_concurrent)
-
-        async def process_sample(sample: EvalSample, idx: int) -> Optional[Dict[str, Any]]:
-            async with semaphore:
-                return await self._process_single_sample(rag_wrapper, sample, idx)
-
-        print(f"执行 RAG 查询（最大并发: {max_concurrent}）...")
-        tasks = [process_sample(s, i) for i, s in enumerate(samples)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        success_count = 0
         has_multimodal_count = 0
         used_images_all: list = []
 
-        for i, r in enumerate(results):
-            if isinstance(r, Exception):
-                logger.error(f"样本 {i} 处理失败: {r}")
+        for i in range(total_samples):
+            if i not in results_by_idx:
                 continue
-            if r is None or not isinstance(r, dict):
-                continue
-
+            r = results_by_idx[i]
             questions.append(r["question"])
             answers.append(r["answer"])
             contexts_list.append(r["contexts"])
-            ground_truths.append(r["ground_truth"])  # 字符串
+            ground_truths.append(r.get("ground_truth", ""))
             latencies.append(r["latency_ms"])
             question_types.append(r.get("question_type", "unknown"))
-
-            # 多模态统计
             if r.get("has_multimodal"):
                 has_multimodal_count += 1
             used_images = r.get("used_images") or []
             used_images_all.extend(used_images)
 
-            success_count += 1
-
-        print(f"成功处理 {success_count}/{len(samples)} 个样本")
         if has_multimodal_count > 0:
             print(f"🖼️ 其中 {has_multimodal_count} 个样本涉及图片/表格")
-
-        if success_count == 0:
-            raise ValueError("没有成功处理任何样本")
-
-        # 保存原始回答到 JSON
-        raw_results_path = Path(output_path).parent / "raw_answers.json"
-        raw_data = []
-        for i in range(len(questions)):
-            # 获取当前样本的多模态信息
-            r = cast(Dict[str, Any], results[i]) if isinstance(results[i], dict) else {}
-            raw_data.append({
-                "question": questions[i],
-                "answer": answers[i],
-                "contexts": contexts_list[i],
-                "ground_truth": ground_truths[i] if ground_truths[i] else "",
-                "latency_ms": latencies[i],
-                "question_type": question_types[i],
-                "has_multimodal": r.get("has_multimodal", False),
-                "used_images": r.get("used_images") or [],
-            })
-        Path(raw_results_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(raw_results_path, "w", encoding="utf-8") as f:
-            json.dump(raw_data, f, ensure_ascii=False, indent=2)
-        print(f"✅ 原始回答已保存到: {raw_results_path}")
 
         # 构建 Ragas 数据集
         print("构建 Ragas 数据集...")
@@ -581,13 +669,11 @@ class RagasEvaluator:
         scores_df["latency_ms"] = latencies
         scores_df["question_type"] = question_types
 
-        # 添加多模态信息
+        # 添加多模态信息（从 results_by_idx 按 scores_df 的顺序派生）
         multimodal_flags = []
-        for i, r in enumerate(results):
-            if isinstance(r, dict):
-                multimodal_flags.append(r.get("has_multimodal", False))
-            else:
-                multimodal_flags.append(False)
+        for i in range(total_samples):
+            if i in results_by_idx:
+                multimodal_flags.append(results_by_idx[i].get("has_multimodal", False))
         scores_df["has_multimodal"] = multimodal_flags
 
         # 保存结果
@@ -620,9 +706,22 @@ class RagasEvaluator:
         print("从已有 raw_answers.json 运行 Ragas 评估（跳过 RAG 推理）...")
         print(f"{'='*60}")
 
-        # 读取 raw_answers.json
+        # 读取 raw_answers.json（兼容新旧格式）
         with open(raw_answers_path, "r", encoding="utf-8") as f:
-            raw_data = json.load(f)
+            loaded = json.load(f)
+
+        if isinstance(loaded, list):
+            # 旧格式：裸列表，无元数据
+            raw_data = loaded
+            print("⚠️ 旧格式 raw_answers.json（无元数据），建议重新运行 RAG 推理以生成含溯源信息的版本")
+        elif isinstance(loaded, dict) and "results" in loaded:
+            raw_data = loaded["results"]
+            meta = loaded.get("_metadata", {})
+            commit_short = meta.get("git_commit", "unknown")[:8]
+            print(f"📋 元数据: commit={commit_short}, dirty={meta.get('git_dirty')}, "
+                  f"generated_at={meta.get('generated_at', 'unknown')}")
+        else:
+            raise ValueError(f"无法识别的 raw_answers.json 格式: {type(loaded)}")
 
         print(f"加载 {len(raw_data)} 个已有结果")
 
