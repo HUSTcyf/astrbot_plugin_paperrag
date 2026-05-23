@@ -313,7 +313,7 @@ class HybridPDFParser:
             # 提取并保存图片（获取图片路径映射）
             image_paths: Dict[str, Any] = {}
             image_pages: Dict[str, Any] = {}
-            table_paths: Dict[str, Tuple[str, str, str]] = {}
+            table_paths: Dict[str, Tuple[str, str, str, str]] = {}
             table_pages: Dict[str, int] = {}
             formula_refs: Dict[str, Any] = {}
             formula_pages: Dict[str, Any] = {}
@@ -1062,8 +1062,10 @@ class HybridPDFParser:
         if not image_paths:
             return nodes
 
-        # 构建图片引用映射：figure编号 -> (图片路径, 图注, 页码)
-        figure_refs: Dict[str, Tuple[str, str, int]] = {}
+        # 构建图片引用映射：figure编号 -> [(图片路径, 图注, 页码), ...]
+        # 同一 figure 编号可能对应多张不同页面的图片（docling 按页面独立编号），
+        # 全部保留，关联时选择文件存在且页码最匹配的。
+        figure_refs: Dict[str, List[Tuple[str, str, int]]] = {}
         for key, path in image_paths.items():
             # key 格式: "caption|page_num|idx"
             parts = key.split("|")
@@ -1072,7 +1074,11 @@ class HybridPDFParser:
             idx = int(parts[2]) if len(parts) > 2 else 0
             figure_num = self._extract_figure_number(caption_str)
             if figure_num:
-                figure_refs[figure_num] = (path, caption_str, page_num)
+                if figure_num not in figure_refs:
+                    figure_refs[figure_num] = []
+                # 去重：同一路径不重复添加
+                if not any(p == path for p, _, _ in figure_refs[figure_num]):
+                    figure_refs[figure_num].append((path, caption_str, page_num))
 
         if not figure_refs:
             logger.debug("⚠️ 未找到图片引用编号")
@@ -1104,13 +1110,38 @@ class HybridPDFParser:
             for pattern in figure_patterns:
                 for match in pattern.finditer(node.text):
                     fig_num = match.group(1)
-                    if fig_num in figure_refs:
-                        path, caption, fig_page = figure_refs[fig_num]
-                        # 检查页码相近（同一页或相邻2页内）
-                        page_match = (chunk_page > 0 and fig_page > 0 and abs(chunk_page - fig_page) <= 2)
-                        # 去重
-                        if path not in [img[0] for img in found_images]:
-                            found_images.append((path, caption, fig_num, page_match))
+                    if fig_num not in figure_refs:
+                        continue
+                    candidates = figure_refs[fig_num]
+                    if not candidates:
+                        continue
+
+                    # 从多个候选图片中选出最佳匹配：
+                    # 1. 优先选文件仍存在于磁盘的
+                    # 2. 其次选页码最接近的
+                    # 3. 都不行则保留第一个候选（后续 _append_figure_section 会跳过不存在的文件）
+                    best = None
+                    best_score = -2  # -1=存在+页码匹配, 0=存在+页码不匹配, -2=不存在
+                    for cand_path, cand_caption, cand_page in candidates:
+                        exists = os.path.exists(cand_path)
+                        page_ok = (chunk_page > 0 and cand_page > 0
+                                   and abs(chunk_page - cand_page) <= 2)
+                        if exists and page_ok:
+                            score = 1
+                        elif exists:
+                            score = 0
+                        else:
+                            score = -1
+                        if score > best_score:
+                            best_score = score
+                            best = (cand_path, cand_caption, fig_num, page_ok)
+
+                    if best is None:
+                        continue
+                    path, caption, fig_num_matched, page_match = best
+                    # 去重
+                    if path not in [img[0] for img in found_images]:
+                        found_images.append((path, caption, fig_num_matched, page_match))
 
             # 按匹配质量排序（页码匹配的优先）
             found_images.sort(key=lambda x: x[3], reverse=True)
@@ -1159,8 +1190,9 @@ class HybridPDFParser:
         if not table_paths:
             return nodes
 
-        # 构建表格引用映射：table编号 -> (csv_path, png_path, md_path, caption, 页码)
-        table_refs: Dict[str, Tuple[str, str, str, str, int]] = {}
+        # 构建表格引用映射：table编号 -> [(csv_path, png_path, md_path, caption, 页码), ...]
+        # 同一 table 编号可能对应多张不同页面的表格，全部保留。
+        table_refs: Dict[str, List[Tuple[str, str, str, str, int]]] = {}
         for key, paths in table_paths.items():
             # key 格式: "caption|page_num|idx"
             parts = key.split("|")
@@ -1169,7 +1201,11 @@ class HybridPDFParser:
             idx = int(parts[2]) if len(parts) > 2 else 0
             table_num = self._extract_table_number(caption_str)
             if table_num:
-                table_refs[table_num] = (paths[0], paths[1], paths[2], caption_str, page_num)
+                if table_num not in table_refs:
+                    table_refs[table_num] = []
+                csv_p = paths[0]
+                if not any(t[0] == csv_p for t in table_refs[table_num]):
+                    table_refs[table_num].append((paths[0], paths[1], paths[2], caption_str, page_num))
 
         if not table_refs:
             logger.debug("⚠️ 未找到表格引用编号")
@@ -1199,13 +1235,35 @@ class HybridPDFParser:
             for pattern in table_patterns:
                 for match in pattern.finditer(node.text):
                     tbl_num = match.group(1)
-                    if tbl_num in table_refs:
-                        csv_path, png_path, md_path, caption, tbl_page = table_refs[tbl_num]
-                        # 检查页码相近（同一页或相邻2页内）
-                        page_match = (chunk_page > 0 and tbl_page > 0 and abs(chunk_page - tbl_page) <= 2)
-                        # 去重
-                        if csv_path not in [tbl[0] for tbl in found_tables]:
-                            found_tables.append((csv_path, png_path, md_path, caption, tbl_num, page_match))
+                    if tbl_num not in table_refs:
+                        continue
+                    candidates = table_refs[tbl_num]
+                    if not candidates:
+                        continue
+
+                    # 从多个候选表格中选出最佳匹配（优先文件存在+页码匹配）
+                    best = None
+                    best_score = -2
+                    for csv_p, png_p, md_p, cap, tbl_page in candidates:
+                        exists = os.path.exists(png_p) if png_p else False
+                        page_ok = (chunk_page > 0 and tbl_page > 0
+                                   and abs(chunk_page - tbl_page) <= 2)
+                        if exists and page_ok:
+                            score = 1
+                        elif exists:
+                            score = 0
+                        else:
+                            score = -1
+                        if score > best_score:
+                            best_score = score
+                            best = (csv_p, png_p, md_p, cap, tbl_num, page_ok)
+
+                    if best is None:
+                        continue
+                    csv_path, png_path, md_path, caption, tbl_num_matched, page_match = best
+                    # 去重
+                    if csv_path not in [tbl[0] for tbl in found_tables]:
+                        found_tables.append((csv_path, png_path, md_path, caption, tbl_num_matched, page_match))
 
             # 按匹配质量排序（页码匹配的优先）
             found_tables.sort(key=lambda x: x[5], reverse=True)

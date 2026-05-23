@@ -48,6 +48,58 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
         """将 local 和 web 结果融合为文本上下文"""
         return fuse_knowledge_context(local_results, web_results)
 
+    def _build_verified_reference_index(self, local_results: List[Dict]) -> str:
+        """从 chunk metadata 中提取已验证的参考文献，构建权威引用索引。
+
+        chunk 的 cited_references 是 LLMReferenceParser + arXiv MCP 校验过的
+        结果，论文名称、作者、年份、DOI 均为正确值，天然免于 PDF OCR 噪声。
+        """
+        seen: set[str] = set()
+        refs: List[Dict] = []
+        for r in local_results:
+            metadata = r.get("metadata", {})
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+            for ref in (metadata.get("cited_references") or []):
+                ref_id = ref.get("ref_id", "")
+                if ref_id and ref_id not in seen:
+                    seen.add(ref_id)
+                    refs.append(ref)
+
+        if not refs:
+            logger.debug(f"_build_verified_reference_index: 无已验证参考文献 (检查了 {len(local_results)} 条 local_results)")
+            return ""
+
+        logger.info(f"_build_verified_reference_index: 构建 {len(refs)} 条已验证参考文献")
+
+        lines = ["## 已验证的参考文献索引（权威来源）："]
+        for ref in refs:
+            title = ref.get("ref_title", "")
+            authors = ref.get("ref_authors", "")
+            year = ref.get("ref_year", "")
+            venue = ref.get("ref_venue", "")
+            doi = ref.get("ref_doi", "")
+
+            first_author = (authors or "").split(",")[0].strip()
+            label = f"{first_author} et al., {year}" if first_author and year else ""
+
+            url = f"https://doi.org/{doi}" if doi else ""
+
+            parts = [f"- "]
+            if label:
+                parts.append(f"**{label}**: ")
+            parts.append(title)
+            if venue:
+                parts.append(f" ({venue})")
+            if url:
+                parts.append(f" [{url}]")
+            lines.append("".join(parts))
+
+        return "\n".join(lines)
+
     def _get_llm_provider(self):
         """获取LLM provider（统一 4 步解析链）。"""
         if not self.context:
@@ -55,7 +107,7 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
             return None
         try:
             from provider.llm_utils import get_llm_provider
-            return get_llm_provider(self.context, getattr(self, 'config', None))
+            return get_llm_provider(self.context, getattr(self, '_plugin_config', None))
         except ImportError:
             logger.warning("[IdeaEngine] 无法导入 get_llm_provider，使用内联回退")
             return None
@@ -143,7 +195,7 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
                     response_text = str(response)
             else:
                 from provider.llm_utils import call_llm
-                config = getattr(self, 'config', None)
+                config = getattr(self, '_plugin_config', None)
                 response_text = await call_llm(prompt, self.context, config, max_tokens=4096)
 
             result = self._parse_json_response(response_text)
@@ -461,16 +513,16 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
                         local_results.append({
                             "text": node.text if hasattr(node, 'text') else str(node),
                             "paper": src_metadata.get("file_name", "Unknown"),
-                            "page": str(src_metadata.get("page", "")),
                             "score": score,
                             "metadata": {
                                 "file_name": src_metadata.get("file_name", "Unknown"),
-                                "page": str(src_metadata.get("page", "")),
+                                "chunk_index": src_metadata.get("chunk_index", i),
                                 "image_path": src_metadata.get("image_path"),
                                 "image_caption": src_metadata.get("image_caption"),
                                 "table_csv_path": src_metadata.get("table_csv_path"),
                                 "table_png_path": src_metadata.get("table_png_path"),
                                 "table_caption": src_metadata.get("table_caption"),
+                                "cited_references": src_metadata.get("cited_references", []),
                             }
                         })
                 logger.info(f"[IdeaEngine] 本地RAG检索完成，找到 {len(local_results)} 条结果")
@@ -532,6 +584,8 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
         paper_urls = self._load_paper_urls()
         logger.info(f"[IdeaEngine] [DEBUG] 已加载论文URL映射，数量: {len(paper_urls)}")
 
+        verified_index = ""
+
         if knowledge:
             local_results = knowledge.get("local_results", [])
             if local_results:
@@ -572,6 +626,11 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
                         if text:
                             citations_context += f"- {text[:300]}\n"
                     citations_context += "\n"
+
+                # 追加已验证的参考文献索引
+                verified_index = self._build_verified_reference_index(local_results)
+                if verified_index:
+                    citations_context += verified_index + "\n\n"
 
                 # 添加图片信息（真实路径直接列出，caption 在上，路径在下）
                 caption_cache: Dict[str, Dict[str, str]] = {}  # paper_folder -> {filename -> caption}
@@ -676,11 +735,18 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
 3. **只有真正相关的图片才引用**，如果内容与某张图片无关，不要引用
 4. **引用网络资源**：在相关工作章节中，如果某些方法或观点来自网络搜索结果，请使用 `[标题](URL)` 格式引用
 5. **参考文献必须完整**：在"参考文献"章节中，**严格格式** `1. [**论文全名**](URL)` 列出所有本地论文和网络资源，**禁止裸URL或括号重复URL**
+
+**强制引用规则（必须严格遵守）**：
+- **所有论文引用必须使用上述"已验证的参考文献索引"中的标题和链接**
+- 该索引是经过 LLM+arXiv 校验的权威来源，论文名、作者、年份均为正确值
+- "本地论文引用"部分的正文可能包含 PDF 提取噪声，其论文名称不可直接使用
+- 正文中提到某篇论文时，查找索引中对应的条目，使用索引中的标题和 DOI 链接
+- 引用格式：使用索引中提供的作者-年份标签（如 Swinney et al., 2024）+ 索引中提供的链接
 """
 
         try:
             logger.info("[IdeaEngine] 使用 VLM 生成详细初始周报草稿...")
-            max_tokens_vlm = getattr(self, 'config', {}).get("llama_vlm_max_tokens", 25600)
+            max_tokens_vlm = getattr(self, '_plugin_config', {}).get("llama_vlm_max_tokens", 25600)
             draft = await self._vlm_chat_with_progress(
                 vlm_provider,
                 prompt=prompt,
@@ -703,6 +769,7 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
 - 去掉冗余的实验细节和重复信息
 - 用简洁的要点列表组织，每条不超过2句
 - 输出格式：直接输出压缩后的核心观点，不要加任何前缀说明
+- **注意**：引用资料末尾的"已验证的参考文献索引"是经过校验的权威来源，其论文名、作者、年份、链接均为正确值，压缩时务必完整保留这些信息
 
 引用资料：
 {citations_context}
@@ -723,10 +790,11 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
                 # --- 步骤2：用核心记忆 + 草稿润色 ---
                 if core_memory:
                     try:
+                        verified_section = f"\n\n## 已验证的参考文献索引（权威来源，必须使用这些标题和链接）：\n{verified_index}" if verified_index else ""
                         polish_prompt = f"""你是一个学术助手，负责对以下组会周报草稿进行润色和完善。
 
 参考资料（核心记忆）：
-{core_memory}
+{core_memory}{verified_section}
 
 原始草稿：
 {draft}
@@ -735,6 +803,12 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
 - 在原文基础上适当扩展：每个简短的要点/列表项扩展为1-2句连贯段落
 - 保持原文的整体结构和章节顺序，只做润色和扩展，不打乱框架
 - 充分利用核心记忆中的信息，但不要直接复制，要融会贯通
+
+**强制引用规则（必须严格遵守）**：
+- **所有论文引用必须使用上述"已验证的参考文献索引"中的标题和链接**
+- 该索引是经过 LLM+arXiv 校验的权威来源，论文名、作者、年份、DOI 均为正确值
+- "本地论文引用"正文可能含 PDF 噪声，其论文名称不可直接使用
+- 正文提到某篇论文时，必须在索引中查找对应条目，使用索引中的标题和 DOI 链接
 
 格式要求：
 - 包含章节：背景动机、相关工作、方法论、创新点、实验benchmark、挑战与解决方案、下一步计划、参考文献、论文图表

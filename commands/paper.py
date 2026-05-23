@@ -325,7 +325,8 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             )
             return
 
-        yield event.plain_result(f"🧠 Agentic RAG 查询中...\n问题: {query}")
+        yield event.plain_result("🔄 Running Agentic RAG query...")
+        logger.info(f"[PaperRAG] Agentic RAG query: {query}")
 
         try:
             try:
@@ -347,27 +348,29 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             logger.error(traceback.format_exc())
             yield event.plain_result(f"❌ Agentic RAG 执行失败: {e}")
 
-    async def _agentic_rag_tool(self, query: str, top_k: int = 5) -> str:
-        """LLM Tool 版本：同步返回字符串，供 context.register_llm_tool 使用。
+    async def _agentic_rag_tool(self, event: AstrMessageEvent, query: str, top_k: int = 5) -> str:
+        """LLM Tool wrapper: consumes the async generator and returns the final answer text.
+
+        AstrBot's call_local_llm_tool passes the real event as first positional arg.
+        We pass it directly to _agentic_rag. Because this is a coroutine (not an
+        async generator), the yields from _agentic_rag are consumed internally and
+        never reach the framework for user delivery.  Only the last meaningful yield
+        (final answer or error) is returned to the LLM.
 
         Args:
-            query: 查询字符串
-            top_k: 召回数
+            event: AstrMessageEvent (injected by framework)
+            query: query string
+            top_k: number of results to retrieve
 
         Returns:
-            final_answer 字符串
+            Final answer text (or error message) as a plain string for the LLM.
         """
-        class _FakeEvent:
-            """伪造事件对象，仅用于触发 _agentic_rag 内部逻辑。"""
-            def plain_result(self, text: str) -> str:
-                return text
-
-        fake_event = _FakeEvent()
         results: list[str] = []
-        async for result in self._agentic_rag(fake_event, query=query, top_k=top_k):
-            if isinstance(result, str):
-                results.append(result)
-        return "\n".join(results) if results else ""
+        async for result in self._agentic_rag(event, query=query, top_k=top_k):
+            text = result.get_plain_text() if hasattr(result, "get_plain_text") else str(result)
+            if text.strip():
+                results.append(text.strip())
+        return results[-1] if results else ""
 
     async def _react_rag(self, event: AstrMessageEvent, query: str = '', top_k: int = 5):
         """Tool-Using Agent (ReAct 模式) 复杂查询
@@ -388,7 +391,8 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             )
             return
 
-        yield event.plain_result(f"🤖 ReAct Agent 查询中...\n问题: {query}")
+        yield event.plain_result("🤖 Running ReAct Agent query...")
+        logger.info(f"[PaperRAG] ReAct Agent query: {query}")
 
         try:
             try:
@@ -410,18 +414,23 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             logger.error(traceback.format_exc())
             yield event.plain_result(f"❌ ReAct Agent 执行失败: {e}")
 
-    async def _react_rag_tool(self, query: str, top_k: int = 5) -> str:
-        """LLM Tool 版本：ReAct Agent，供 context.register_llm_tool 使用。"""
-        class _FakeEvent:
-            def plain_result(self, text: str) -> str:
-                return text
+    async def _react_rag_tool(self, event: AstrMessageEvent, query: str, top_k: int = 5) -> str:
+        """LLM Tool wrapper: consumes the React Agent async generator, returns final text.
 
-        fake_event = _FakeEvent()
+        Args:
+            event: AstrMessageEvent (injected by framework)
+            query: query string
+            top_k: number of results to retrieve
+
+        Returns:
+            Final answer text (or error message) as a plain string for the LLM.
+        """
         results: list[str] = []
-        async for result in self._react_rag(fake_event, query=query, top_k=top_k):
-            if isinstance(result, str):
-                results.append(result)
-        return "\n".join(results) if results else ""
+        async for result in self._react_rag(event, query=query, top_k=top_k):
+            text = result.get_plain_text() if hasattr(result, "get_plain_text") else str(result)
+            if text.strip():
+                results.append(text.strip())
+        return results[-1] if results else ""
 
 
     async def _paper_list(self, event: AstrMessageEvent):

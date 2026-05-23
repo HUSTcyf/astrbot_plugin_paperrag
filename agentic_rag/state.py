@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import Annotated, TypedDict, Any
 from typing_extensions import NotRequired
 
-from langgraph.graph import add_messages
+import operator
 
 
 def _keep_last_n(n: int):
@@ -49,7 +49,7 @@ class AgenticRAGState(TypedDict):
     final_answer: NotRequired[str]
 
     # 执行轨迹（可打印调试）
-    steps: Annotated[list[str], add_messages]
+    steps: Annotated[list[str], operator.add]
 
     # 重试保护
     retry_count: NotRequired[int]

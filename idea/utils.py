@@ -6,7 +6,9 @@
 
 import hashlib
 import json
+import os
 import re
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
 
@@ -15,7 +17,6 @@ import mistune
 from astrbot.api import logger
 
 from .base import IdeaEngineBase
-import os
 from urllib.parse import unquote
 from html.parser import HTMLParser
 from html import unescape
@@ -47,22 +48,6 @@ def strip_outer_markdown_style(text: str) -> str:
     if re.match(r'^(\*\*\*(.+?)\*\*\*|\*\*(.+?)\*\*|\*(.+?)\*|`(.+?)`)$', text):
         return strip_markdown_style(text)
     return text
-
-
-# ==================== Markdown 块解析 ====================
-
-def find_methodology_end_index(blocks: List[Dict]) -> int:
-    """从 Markdown 块列表中找到方法论章节的结束位置"""
-    for i, block in enumerate(blocks):
-        block_type = block.get("blockType", "")
-        content = block.get("options", {}).get("text", {}).get("text", "")
-        if block_type == "heading":
-            level = block.get("options", {}).get("heading", {}).get("level", 0)
-            if level >= 2:
-                return i
-            if level == 1:
-                return i
-    return len(blocks)
 
 
 # ==================== 路径/图片提取 ====================
@@ -376,6 +361,11 @@ def format_ideas_as_markdown(ideas: List["ResearchIdea"], topic: str) -> str:
 
 # ==================== IdeaEngineUtils 类（需要 self 的方法） ====================
 
+def _is_lark_cli_installed() -> bool:
+    """检查 lark-cli 是否已安装（供 feishu_doc.py 和 utils.py 共享）。"""
+    return shutil.which("lark-cli") is not None
+
+
 class IdeaEngineUtils(IdeaEngineBase):
     """
     Bright Data 配置检查与 Feishu 工具获取。
@@ -426,3 +416,25 @@ class IdeaEngineUtils(IdeaEngineBase):
                 logger.info(f"[IdeaEngine] 找到飞书工具: {tool.name}")
                 return tool
         return None
+
+    @staticmethod
+    def _check_lark_cli(domain: str) -> dict[str, Any]:
+        """检测 lark-cli 是否已安装并返回可用状态。
+
+        与 _get_feishu_tool() 不同，lark-cli 不通过 MCP 协议集成，
+        而是作为独立 CLI 通过 subprocess 调用。
+
+        Args:
+            domain: 业务域名称，如 "doc", "wiki", "calendar", "sheets"
+
+        Returns:
+            {"available": bool, "domain": str, "error": str | None}
+        """
+        if not _is_lark_cli_installed():
+            return {
+                "available": False,
+                "domain": domain,
+                "error": "lark-cli not found. Install: npx @larksuite/cli@latest install",
+            }
+        return {"available": True, "domain": domain, "error": None}
+

@@ -47,10 +47,11 @@ def _classify_by_keywords(query: str) -> tuple[str, float]:
 async def router_node(state: dict) -> dict:
     """查询分类 + 图谱权重决策。"""
     query_raw = state.get("query", "")
-    if not query_raw or not query_raw.strip():
-        raise ValueError("query cannot be empty")
-
+    if not isinstance(query_raw, str):
+        raise TypeError(f"query must be a string, got {type(query_raw).__name__}")
     query = query_raw.strip()
+    if not query:
+        raise ValueError("query cannot be empty")
     logger.debug(f"[router] 分类查询: {query}")
 
     context = state.get("_context")

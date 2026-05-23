@@ -14,6 +14,7 @@ import aiohttp
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from astrbot.api import logger
+from .paper_link_resolver import PaperLinkResolver
 
 
 @dataclass
@@ -824,7 +825,8 @@ class LLMReferenceParser:
     def __init__(
         self,
         llm_config: Dict[str, Any],
-        arxiv_client: Any = None
+        arxiv_client: Any = None,
+        link_resolver: Any = None,
     ):
         """
         初始化 LLM 参考文献解析器
@@ -834,10 +836,12 @@ class LLMReferenceParser:
                 - model: 模型名称（如 "gpt-4o"）
                 - api_base: API 基础 URL
                 - api_key: API Key
-            arxiv_client: arXiv MCP 客户端，用于查询论文详情
+            arxiv_client: arXiv MCP 客户端，用于查询论文详情（兜底方案）
+            link_resolver: PaperLinkResolver 实例，用于多源链接解析（首选方案）
         """
         self.llm_config = llm_config
         self.arxiv_client = arxiv_client
+        self._link_resolver = link_resolver
         self._semaphore = None
 
     async def _call_llm(self, prompt: str, max_retries: int = 3) -> Optional[str]:
@@ -957,11 +961,17 @@ class LLMReferenceParser:
             for j, ref in enumerate(all_results):
                 ref.ref_id = f"{ref_id_prefix}_{j + 1}"
 
+            # arXiv 富化：用 arXiv 官方元数据校验并补全 GPT-4o 的解析结果
+            await self._enrich_references(all_results)
+
             logger.info(f"📚 LLM 解析参考文献: 成功 {len(all_results)} 条")
             return all_results
 
         # 正常单次处理
-        return await self._parse_single_batch(ref_section, ref_id_prefix, 0)
+        results = await self._parse_single_batch(ref_section, ref_id_prefix, 0)
+        if results:
+            await self._enrich_references(results)
+        return results
 
     async def _parse_single_batch(
         self,
@@ -1127,9 +1137,8 @@ class LLMReferenceParser:
         # 过滤掉解析失败的
         valid_results = [r for r in results if r is not None]
 
-        # MCP 参考文献补全默认禁用（如需启用，取消注释以下代码）
-        # if self.arxiv_client and valid_results:
-        #     await self._enrich_from_arxiv(valid_results)
+        # arXiv 富化：用 arXiv 官方元数据校验并补全
+        await self._enrich_references(valid_results)
 
         logger.info(f"📚 LLM 解析参考文献: 成功 {len(valid_results)}/{total} 条")
         return valid_results
@@ -1251,9 +1260,119 @@ class LLMReferenceParser:
 
         return None
 
+    async def _enrich_references(self, references: List[Reference]) -> None:
+        """
+        多源参考文献链接解析 + 元数据校验。
+
+        策略（按优先级）：
+        1. PaperLinkResolver（Crossref → OpenAlex → arXiv library）— 模糊匹配
+        2. arXiv MCP（DOI 精确搜索）— 兜底
+        3. 都失败则保留 GPT-4o 原始解析结果，记录日志
+
+        Args:
+            references: Reference 对象列表（会被直接修改）
+        """
+        if not references:
+            return
+
+        enriched_by_link_resolver = 0
+        enriched_by_arxiv_mcp = 0
+
+        for ref in references:
+            if not ref:
+                continue
+
+            if not ref.ref_title or len(ref.ref_title) <= 5:
+                continue
+
+            author_hint = ref.ref_authors or ""
+
+            # ---- 第一优先：PaperLinkResolver 多源解析 ----
+            if self._link_resolver is not None:
+                try:
+                    resolution = await self._link_resolver.resolve_by_title(
+                        ref.ref_title, author_hint=author_hint
+                    )
+                    if resolution.has_any_url():
+                        if resolution.doi_url and not ref.ref_doi:
+                            # 从 doi_url 提取纯 DOI（如 https://doi.org/10.xxx → 10.xxx）
+                            ref.ref_doi = resolution.doi_url.replace("https://doi.org/", "")
+                        if resolution.matched_title and resolution.resolution_score >= 85:
+                            # 高置信度匹配时，用解析器的标题和链接补全
+                            ref.ref_title = resolution.matched_title
+                        enriched_by_link_resolver += 1
+                        logger.info(
+                            f"📝 [多源解析] {resolution.backend} 匹配成功 "
+                            f"(相似度 {resolution.resolution_score:.1f}%): "
+                            f"{ref.ref_title[:60]}"
+                        )
+                        continue  # 多源解析成功，跳过 arXiv MCP 兜底
+                    else:
+                        logger.info(
+                            f"📝 [多源解析] 未找到链接 "
+                            f"(最佳 {resolution.backend}, {resolution.resolution_score:.1f}%): "
+                            f"{ref.ref_title[:60]}"
+                        )
+                except Exception as e:
+                    logger.warning(f"📝 [多源解析] 异常: {ref.ref_title[:60]} — {e}")
+
+            # ---- 第二优先：arXiv MCP 兜底 ----
+            if self.arxiv_client:
+                try:
+                    search_query = ref.ref_doi or ref.ref_title
+                    result = await self.arxiv_client.call_tool_with_reconnect(
+                        tool_name="search_arxiv",
+                        arguments={"query": search_query, "max_results": 3}
+                    )
+
+                    if result is None:
+                        logger.warning(f"📝 [arXiv MCP] 客户端返回 None，保留原始解析: {ref.ref_title[:60]}")
+                        continue
+
+                    if not result.get("results"):
+                        logger.info(f"📝 [arXiv MCP] 未搜到结果，保留原始解析: {ref.ref_title[:60]}")
+                        continue
+
+                    matched = False
+                    for paper in result.get("results", []):
+                        paper_title = paper.get("title", "")
+                        ref_title = ref.ref_title if ref.ref_title else ""
+                        if not ref_title or not paper_title:
+                            continue
+                        if ref_title.lower() != paper_title.lower():
+                            continue
+
+                        if paper.get("authors"):
+                            ref.ref_authors = ", ".join(paper["authors"])
+                        if paper.get("published_date"):
+                            year_match = re.search(r'(\d{4})', paper["published_date"])
+                            if year_match:
+                                ref.ref_year = int(year_match.group(1))
+                        if paper.get("doi"):
+                            ref.ref_doi = paper.get("doi")
+
+                        enriched_by_arxiv_mcp += 1
+                        matched = True
+                        logger.debug(f"📝 [arXiv MCP] 已校验: {ref.ref_title[:60]}")
+                        break
+
+                    if not matched:
+                        logger.info(f"📝 [arXiv MCP] 标题未完全匹配，保留原始解析: {ref.ref_title[:60]}")
+
+                except Exception as e:
+                    logger.warning(f"📝 [arXiv MCP] 查询异常，保留原始解析: {ref.ref_title[:60]} — {e}")
+
+        logger.info(
+            f"📝 参考文献富化完成: 多源解析 {enriched_by_link_resolver} 条, "
+            f"arXiv MCP {enriched_by_arxiv_mcp} 条, "
+            f"总计 {len(references)} 条"
+        )
+
     async def _enrich_from_arxiv(self, references: List[Reference]) -> None:
         """
-        通过 arXiv MCP 补充论文信息
+        [已废弃] 仅通过 arXiv MCP 补充论文信息。
+
+        请使用 _enrich_references() 替代，它集成了多源链接解析 + arXiv MCP 兜底。
 
         Args:
             references: Reference 对象列表（会被直接修改）
@@ -1261,6 +1380,7 @@ class LLMReferenceParser:
         if not self.arxiv_client:
             return
 
+        enriched = 0
         for ref in references:
             if not ref:
                 continue
@@ -1273,6 +1393,7 @@ class LLMReferenceParser:
                 search_query = ref.ref_title
 
             if not search_query:
+                logger.info(f"📝 [arXiv] 跳过无查询条件的参考文献: {ref.ref_title[:60] if ref.ref_title else '(无标题)'}")
                 continue
 
             try:
@@ -1281,10 +1402,16 @@ class LLMReferenceParser:
                     arguments={"query": search_query, "max_results": 3}
                 )
 
-                if not result or not result.get("results"):
+                if result is None:
+                    logger.warning(f"📝 [arXiv] MCP 客户端返回 None，保留原始解析: {ref.ref_title[:60]}")
+                    continue
+
+                if not result.get("results"):
+                    logger.info(f"📝 [arXiv] 未搜到结果，保留原始解析: {ref.ref_title[:60]}")
                     continue
 
                 # 找到最匹配的论文
+                matched = False
                 for paper in result.get("results", []):
                     paper_title = paper.get("title", "")
                     ref_title = ref.ref_title if ref.ref_title else ""
@@ -1306,12 +1433,19 @@ class LLMReferenceParser:
                     if paper.get("doi"):
                         ref.ref_doi = paper.get("doi")
 
-                    logger.debug(f"📝 arXiv 补充论文信息: {ref.ref_title}")
+                    enriched += 1
+                    matched = True
+                    logger.debug(f"📝 [arXiv] 已校验: {ref.ref_title[:60]}")
                     break
 
+                if not matched:
+                    logger.info(f"📝 [arXiv] 标题未完全匹配，保留原始解析: {ref.ref_title[:60]}")
+
             except Exception as e:
-                logger.debug(f"⚠️ arXiv 查询失败: {e}")
+                logger.warning(f"📝 [arXiv] 查询异常，保留原始解析: {ref.ref_title[:60] if ref.ref_title else '(无标题)'} — {e}")
                 continue
+
+        logger.info(f"📝 [arXiv] 共校验 {enriched}/{len(references)} 条参考文献")
 
 
 async def process_references_with_llm(
@@ -1343,8 +1477,14 @@ async def process_references_with_llm(
         logger.debug("📝 未找到参考文献部分")
         return [], chunks
 
-    # 2. 如果有多个参考文献部分，按顺序处理
-    llm_parser = LLMReferenceParser(llm_config, arxiv_client)
+    # 2. 初始化多源链接解析器 + LLM 解析器
+    link_resolver = PaperLinkResolver(
+        enable_crossref=True,
+        enable_openalex=True,
+        enable_arxiv_library=True,
+        log_prefix="[PaperLinkResolver:ref]",
+    )
+    llm_parser = LLMReferenceParser(llm_config, arxiv_client, link_resolver=link_resolver)
     all_references = []
 
     # ref_1, ref_2, ref_3... 自然顺序已经是正确的处理顺序

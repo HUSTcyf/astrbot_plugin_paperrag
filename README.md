@@ -1,24 +1,25 @@
-# 📚 Paper RAG Plugin v2.1.1 — 用户指南
+# 📚 Paper RAG Plugin v2.1.2 — 用户指南
 
 本地论文库 RAG 检索插件，为 AstrBot 提供智能论文检索、知识图谱增强问答和研究想法生成。支持多模态（图片/表格/公式）提取、Llama.cpp VLM 本地问答和 Agentic RAG（LangGraph 工作流）。
 
-> **版本说明**：当前版本 v2.1.1，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
+> **版本说明**：当前版本 v2.1.2，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
 
-### 本版变化 (v2.1.1)
+### 本版变化 (v2.1.2)
 
-- **增量保存机制**：Ragas 评估从批量写入改为逐样本增量保存，每完成一个样本立即写入 `raw_answers.json`，中途崩溃不丢失已计算结果。
-- **代码溯源元数据**：`raw_answers.json` 新增 `_metadata` 字段，自动嵌入 git commit hash、日期、dirty 状态及 LLM/Embedding 配置信息，提升结果可复现性。
-- **评估 LLM max_tokens 可配置**：新增 `--eval-llm-max-tokens` CLI 参数（默认 16384），线程化传递至 `InstructorLLM` 构造，适配推理模型的 reasoning tokens 需求。
-- **格式兼容性修复**：`raw_answers.json` 读写同时兼容旧格式（裸列表）和新格式（含 `_metadata` 的 JSON 对象），`--skip-rag` 路径统一格式检测。
-- 完整变更详见 [docs/changelog/2.1.1.md](docs/changelog/2.1.1.md)
+- **PaperBanana 本地服务集成**：插件可启动和管理本地 PaperBanana 服务，新增 `paperbanana_project_path` 配置项，自动使用项目 `.venv` 中的 Python 启动方法图生成服务。
+- **Feishu 导出修复**：修复 lark-cli vs MCP 网关选择、PaperBanana 临时文件过早清理、`__import__('re')` 惰性导入等多项问题；长引用上下文支持 token 预算分批处理。
+- **Docling 逻辑图注编号**：使用 docling 原生 `caption_text()` API 提取论文真实图注编号（如 "Figure 3"），替代基于每页计数器的简单命名。
+- **Cypher 自动修复**：Neo4j 查询缺失 RETURN 子句时自动追加 `RETURN *` 并重试。
+- **已验证引用索引**：从 chunk metadata 提取 LLMReferenceParser + arXiv MCP 校验过的引用数据，构建权威引用索引供 LLM 生成使用。
+- **Agentic RAG Tool 修复**：移除 `_FakeEvent` 临时方案，改为传入真实 `AstrMessageEvent`，支持多模态响应文本提取。
+- 完整变更详见 [docs/changelog/2.1.2.md](docs/changelog/2.1.2.md)
 
-### 上版变化 (v2.1.0)
+### 上版变化 (v2.1.1)
 
-- **Token 预算管理**：使用 `count_tokens()` 精确分配上下文窗口 token 预算，避免溢出。
-- **知识提取流水线 + Wiki 引擎**：RAG 问答后自动提取事实写入结构化 Wiki。
-- **评估系统重构**：答案生成与指标评分 LLM 分离。
-- **Cypher 生成修复**与死代码清理。
-- 详细变更见 [docs/changelog/2.1.0.md](docs/changelog/2.1.0.md)
+- **增量保存机制**：Ragas 评估从批量写入改为逐样本增量保存，中途崩溃不丢失已计算结果。
+- **代码溯源元数据**：`raw_answers.json` 新增 `_metadata` 字段，嵌入 git commit hash 等元数据提升可复现性。
+- **评估 LLM max_tokens 可配置**：新增 `--eval-llm-max-tokens` CLI 参数（默认 16384）。
+- 详细变更见 [docs/changelog/2.1.1.md](docs/changelog/2.1.1.md)
 
 ---
 

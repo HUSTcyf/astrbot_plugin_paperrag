@@ -12,6 +12,10 @@ AstrBot Paper RAG Plugin
 """
 
 import os
+import sys
+
+# 确保插件根目录在 sys.path 中，使 rag 包可被绝对导入
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 os.environ['GRPC_VERBOSITY'] = 'ERROR'
 os.environ['GLOG_minloglevel'] = '2'
@@ -33,7 +37,7 @@ from .commands.base import PluginCoreBase
     "paper_rag",
     "HUSTcyf",
     "本地文档库RAG检索插件 (支持PDF/Word/TXT/HTML, Gemini + Milvus Lite)",
-    "1.12.5",
+    "1.12.6",
     "https://github.com/HUSTcyf/astrbot_plugin_paperrag.git"
 )
 class PaperRAGPlugin(PaperCommandsMixin, ArxivCommandsMixin, GraphCommandsMixin, IdeaCommandsMixin, PluginCoreBase):

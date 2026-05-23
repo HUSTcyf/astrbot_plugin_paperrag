@@ -5,12 +5,12 @@ Markdown 处理与图片工具方法
 import base64
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
 from pathlib import Path
 from astrbot.api import logger
 
-from .utils import strip_markdown_style, create_feishu_markdown, parse_html_with_html_parser, parse_inline_styles
+from .utils import strip_markdown_style, parse_inline_styles
 from .ideas import IdeaEngineIdeas
 
 
@@ -177,22 +177,27 @@ class IdeaEngineMarkdown(IdeaEngineIdeas):
                 j = idx - 1
                 found_paren = False
                 while j >= 0 and paren_count > 0:
-                    if text[j] == ')':
+                    if text[j] in (')', '）'):
                         paren_count += 1
-                    elif text[j] == '(':
+                    elif text[j] in ('(', '（'):
                         paren_count -= 1
                         if paren_count == 0:
                             found_paren = True
                             break
                     j -= 1
 
-                if found_paren and j >= 2:
-                    if text[j-1] == ']' and text[j-2] == '!':
+                if found_paren and j >= 2 and text[j-1] == ']':
+                    # Must be ![...](path), not [...](url).  rfind alone is not
+                    # enough: an earlier ![ could be matched for a later link,
+                    # so we also verify that the closing bracket paired with
+                    # this ![ is exactly the ] at j-1.
+                    caption_start = text.rfind('![', 0, j-1)
+                    closing = text.find(']', caption_start + 2) if caption_start >= 0 else -1
+                    if caption_start >= 0 and closing == j - 1:
                         path = text[j+1:idx+len(ext)+2]
                         path = path[:-1]
                         path = unquote(path)
-                        caption_start = text.rfind('![', 0, j-2)
-                        caption = text[caption_start+2:text.find(']', caption_start)] if caption_start >= 0 else ''
+                        caption = text[caption_start+2:text.find(']', caption_start)]
                         if path.startswith('/') and len(path) > 5:
                             results.append((path, caption))
                             start = idx + len(found_marker)
@@ -231,9 +236,9 @@ class IdeaEngineMarkdown(IdeaEngineIdeas):
     def _normalize_figure_references(self, markdown_text: str) -> str:
         """
         前处理：
-        1. 将论文图表章节中的各种图片格式转换为标准 markdown 图片语法
-        2. 将正文中的 markdown 图片语法转换为纯文字引用
-        3. 如果没有论文图表章节，则在全文查找图片并移到末尾
+        1. 将论文图表章节中的裸路径转换为标准 markdown 图片语法
+        2. 正文图片保持不动（已由 _append_figure_section 嵌入正确位置）
+        3. 如果没有论文图表章节，直接返回
         """
         logger.info(f"[IdeaEngine] normalize 输入长度: {len(markdown_text)}")
         markdown_text = unquote(markdown_text)
@@ -249,15 +254,8 @@ class IdeaEngineMarkdown(IdeaEngineIdeas):
             logger.info(f"[IdeaEngine] ✅ 找到论文图表章节: 位置={figure_match.start()}, 正文长度={len(before)}, 章节长度={len(section)}")
             logger.debug(f"[IdeaEngine] 论文图表章节: {section}")
 
-            body_images = self._extract_markdown_image_from_text(before)
-            logger.info(f"[IdeaEngine] 正文中找到 {len(body_images)} 张 markdown 图片")
-
-            body_images_removed = before
-            for path, caption in body_images:
-                md_pattern = re.escape(f'![{caption}]({path})')
-                body_images_removed = re.sub(md_pattern, f'{caption} ({path})', body_images_removed)
-                logger.debug(f"[IdeaEngine] 移除正文图片: {caption} ({path})")
-
+            # Do NOT remove body images — _append_figure_section already placed them correctly.
+            # Only normalize the figure section: convert bare paths to markdown images.
             fig_images = self._extract_markdown_image_from_text(section)
             logger.info(f"[IdeaEngine] 论文图表章节中找到 {len(fig_images)} 张图片: {fig_images}")
 
@@ -287,86 +285,75 @@ class IdeaEngineMarkdown(IdeaEngineIdeas):
 
                 result.append(line)
 
-            logger.info(f"[IdeaEngine] normalize 完成: 正文移除图片={len(body_images)}, 章节转换图片={len(found_images)}")
-            logger.debug(f"[IdeaEngine] normalize 输出末尾200字符: {(body_images_removed + chr(10).join(result))[-200:]}")
-            return body_images_removed + '\n'.join(result)
+            logger.info(f"[IdeaEngine] normalize 完成: 章节转换图片={len(found_images)}")
+            logger.debug(f"[IdeaEngine] normalize 输出末尾200字符: {(before + chr(10).join(result))[-200:]}")
+            return before + '\n'.join(result)
 
         else:
-            logger.warning("[IdeaEngine] 未找到论文图表章节，将在全文查找图片并移到末尾")
-
-            images = self._extract_markdown_image_from_text(markdown_text)
-
-            if not images:
-                logger.info("[IdeaEngine] 全篇无 markdown 图片，跳过处理")
-                return markdown_text
-
-            logger.info(f"[IdeaEngine] 全篇找到 {len(images)} 张图片: {images}")
-
-            text_only = markdown_text
-            for path, caption in images:
-                md_pattern = re.escape(f'![{caption}]({path})')
-                text_only = re.sub(md_pattern, f'{caption} ({path})', text_only)
-
-            fig_section = "\n\n## 论文图表\n"
-            for i, (path, caption) in enumerate(images, 1):
-                if not caption:
-                    caption = os.path.splitext(os.path.basename(path))[0]
-                fig_section += f"\n![{caption}]({path})\n"
-                logger.info(f"[IdeaEngine] 添加图片到末尾: caption='{caption}', path='{path}'")
-
-            logger.info(f"[IdeaEngine] normalize 完成: 移动 {len(images)} 张图片到末尾")
-            return text_only + fig_section
+            logger.info("[IdeaEngine] 未找到论文图表章节，图片已由 _append_figure_section 嵌入，跳过")
+            return markdown_text
 
     def _append_figure_section(self, text: str, knowledge: Optional[Dict[str, Any]] = None) -> str:
-        """
-        在参考文献章节之后追加论文图表章节。
-        用真实图片路径和 caption，不依赖LLM生成。
-        """
+        """将论文图表嵌入相关工作章节（插入到该章节末尾）。"""
         if not knowledge:
-            logger.warning("[IdeaEngine] [_append_figure_section] knowledge 为空，跳过")
             return text
 
         local_results = knowledge.get("local_results", [])
-        logger.info(f"[IdeaEngine] [_append_figure_section] local_results 数量: {len(local_results)}")
         if not local_results:
             return text
 
         caption_cache: Dict[str, Dict[str, str]] = {}
-        figure_entries: List[tuple[str, str]] = []
+        figure_entries: List[tuple[str, str, str]] = []
 
         for r in local_results:
             metadata = r.get('metadata', {})
+            paper = r.get('paper', 'Unknown')
+
             img_path = metadata.get('image_path', '')
             img_caption = metadata.get('image_caption', '')
-            if not img_path or not os.path.exists(img_path):
-                continue
-            img_filename = Path(img_path).name
-            paper_folder = Path(img_path).parent.name
-            if paper_folder not in caption_cache:
-                caption_cache[paper_folder] = self._load_figure_captions(img_path)
-            fname_to_caption = caption_cache[paper_folder]
-            real_caption = fname_to_caption.get(img_filename) or img_caption or img_filename
-            figure_entries.append((real_caption, img_path))
+            if img_path and os.path.exists(img_path):
+                img_filename = Path(img_path).name
+                paper_folder = Path(img_path).parent.name
+                if paper_folder not in caption_cache:
+                    caption_cache[paper_folder] = self._load_figure_captions(img_path)
+                fname_to_caption = caption_cache[paper_folder]
+                real_caption = fname_to_caption.get(img_filename) or img_caption or img_filename
+                figure_entries.append((real_caption, img_path, "fig"))
+
+            table_png = metadata.get('table_png_path', '')
+            if table_png and os.path.exists(table_png):
+                table_caption = metadata.get('table_caption', '') or Path(table_png).stem
+                figure_entries.append((table_caption, table_png, "table"))
 
         if not figure_entries:
-            logger.warning(f"[IdeaEngine] [_append_figure_section] figure_entries 为空，共检查 {len(local_results)} 条 local_results")
             return text
 
-        logger.info(f"[IdeaEngine] [_append_figure_section] 成功构建 {len(figure_entries)} 个图表条目")
-        fig_section = "\n## 9. 论文图表\n"
-        for i, (caption, path) in enumerate(figure_entries, 1):
-            fig_section += f"![图 {i}：{caption}]({path})\n\n"
+        fig_md_parts = []
+        fig_idx = 0
+        tbl_idx = 0
+        for caption, path, label_type in figure_entries:
+            if label_type == "table":
+                tbl_idx += 1
+                fig_md_parts.append(f"![表 {tbl_idx}：{caption}]({path})")
+            else:
+                fig_idx += 1
+                fig_md_parts.append(f"![图 {fig_idx}：{caption}]({path})")
+        fig_md = "\n\n".join(fig_md_parts) + "\n"
 
-        ref_match = re.search(r'(##\s*参考文献.*?)(?=##\s|\Z)', text, re.DOTALL)
-        if ref_match:
-            insert_pos = ref_match.end()
-            text = text[:insert_pos] + fig_section + text[insert_pos:]
-            logger.info(f"[IdeaEngine] 论文图表章节已追加，共 {len(figure_entries)} 张图片")
-        else:
-            text += fig_section
-            logger.info(f"[IdeaEngine] 未找到参考文献章节，直接在末尾追加论文图表，共 {len(figure_entries)} 张图片")
-
-        return text
+        # Insert after 相关工作 / Related Work section
+        related_match = re.search(
+            r'(##\s*(?:相关工作|Related\s*Work|相关工作与进展|背景与相关工作).*?)(?=##\s|\Z)',
+            text, re.DOTALL | re.IGNORECASE
+        )
+        if related_match:
+            insert_pos = related_match.end()
+            return text[:insert_pos] + "\n" + fig_md + text[insert_pos:]
+        # Fallback: find any heading containing 实验/方法/创新 and insert before it
+        fallback = re.search(r'(?=##\s*(?:实验|方法|创新|Method|Experiment))', text)
+        if fallback:
+            return text[:fallback.start()] + "\n" + fig_md + text[fallback.start():]
+        # Last resort: append
+        return text + "\n" + fig_md
 
     def _replace_placeholder_paths_by_caption(self, text: str, local_results: List[Dict]) -> str:
         """
@@ -382,7 +369,7 @@ class IdeaEngineMarkdown(IdeaEngineIdeas):
         caption_cache: Dict[str, Dict[str, str]] = {}
         real_images: List[tuple[str, str]] = []
         for r in local_results:
-            img_path = r.get('image_path', '')
+            img_path = r.get('metadata', {}).get('image_path', '')
             if not img_path:
                 continue
             img_filename = Path(img_path).name
@@ -437,7 +424,6 @@ class IdeaEngineMarkdown(IdeaEngineIdeas):
         while i < len(text):
             if text[i] == '(' and i + 1 < len(text) and text[i + 1] == '/':
                 found_ext = None
-                ext_end = -1
                 for ext in _EXTENSIONS:
                     end_marker = f'.{ext})'
                     pos = text.find(end_marker, i + 1)
@@ -511,19 +497,29 @@ class IdeaEngineMarkdown(IdeaEngineIdeas):
             text
         )
 
+        _IMG_EXTS = ('.png', '.jpg', '.jpeg', '.webp', '.gif')
+
         segments = []
         stripped = text.strip()
-        if stripped.startswith('![') and '.png' in stripped.lower():
+        if stripped.startswith('![') and any(ext in stripped.lower() for ext in _IMG_EXTS):
             last_paren = stripped.rfind(')')
             open_bracket = stripped.rfind('](', 0, last_paren)
             if open_bracket > 0:
                 caption = stripped[2:open_bracket]
                 path = stripped[open_bracket+2:last_paren]
-                path = unquote(path)
+                # Try raw path first (may contain URL-encoded chars on disk),
+                # then fall back to decoded path.
                 if os.path.exists(path):
-                    segments.append({"type": "image", "path": path, "caption": caption})
+                    pass
                 else:
-                    logger.warning(f"[_extract_inline_images] 图片不存在: {path}")
+                    decoded = unquote(path)
+                    if decoded != path and os.path.exists(decoded):
+                        path = decoded
+                    else:
+                        logger.warning(f"[_extract_inline_images] 图片不存在: {path}")
+                        path = ""
+                if path:
+                    segments.append({"type": "image", "path": path, "caption": caption})
         if not segments:
             segments.append({"type": "text", "content": text})
         return segments

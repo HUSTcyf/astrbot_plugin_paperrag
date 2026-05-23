@@ -10,6 +10,7 @@ import sys
 import os
 import io
 import json
+import re
 import traceback
 from pathlib import Path
 
@@ -29,13 +30,48 @@ from docling_core.types.doc.document import PictureItem, TableItem, FormulaItem
 import fitz  # PyMuPDF
 
 
+def _extract_logical_num(caption_text: str, prefix: str) -> str | None:
+    """从真实图注/表注中提取逻辑编号。
+
+    例: "Figure 3: System Overview" + prefix="Figure" → "3"
+        "Table 2: Results"           + prefix="Table"  → "2"
+
+    返回 None 表示无法提取。
+    """
+    if not caption_text or not caption_text.strip():
+        return None
+    # 匹配 "Figure 3", "Fig. 3", "Fig 3", "Figure 3:", "Figure 3a", "图 1", "表 2" 等
+    _zh = {"Figure": "图", "Table": "表"}
+    zh_char = _zh.get(prefix, "")
+    patterns = [
+        rf'{prefix}\s*([A-Za-z]?\d+[A-Za-z]?)',
+        rf'{prefix[:3]}\.?\s*([A-Za-z]?\d+[A-Za-z]?)',  # "Fig. 3" / "Fig 3" / "Tab. 1"
+    ]
+    if zh_char:
+        patterns.append(rf'{zh_char}\s*([A-Za-z]?\d+[A-Za-z]?)')
+    for pat in patterns:
+        m = re.search(pat, caption_text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _cell_to_text(cell) -> str:
+    """从 docling 表格单元格提取纯文本。"""
+    if hasattr(cell, '_get_text'):
+        return cell._get_text(doc=None) or ""
+    if isinstance(cell, list):
+        return str(cell)
+    return str(cell) if cell is not None else ""
+
+
 def _table_data_to_csv(data):
     """将表格数据转换为 CSV 格式字符串"""
     if hasattr(data, 'export_to_dataframe'):
         try:
             df = data.export_to_dataframe(doc=None)
             buf = io.StringIO()
-            df.to_csv(buf, index=False, header=True, encoding='utf-8')
+            df.to_csv(buf, index=False, header=True)
             return buf.getvalue()
         except Exception:
             pass
@@ -49,15 +85,10 @@ def _table_data_to_csv(data):
     for row in rows:
         cells = []
         for cell in row:
-            if hasattr(cell, '_get_text'):
-                cell_text = cell._get_text(doc=None) or ""
-            elif isinstance(cell, list):
-                cell_text = str(cell)
-            else:
-                cell_text = str(cell) if cell is not None else ""
-            cell_text = cell_text.replace('"', '""')
+            cell_text = _cell_to_text(cell)
+            cell_text = cell_text.replace("\n", " ").replace("\r", "").replace('"', '""')
             cells.append(cell_text)
-        escaped_cells = ['"' + c + '"' if ',' in c or '"' in c else c for c in cells]
+        escaped_cells = ['"' + c + '"' if ',' in c or '"' in c or '\n' in c else c for c in cells]
         line = ",".join(escaped_cells)
         lines.append(line)
     return "\n".join(lines)
@@ -79,7 +110,7 @@ def _csv_to_markdown(data):
             lines.append("| " + " | ".join(str(c) for c in cols) + " |")
             lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
             for _, row in df.iterrows():
-                cells = [str(v).replace("|", chr(124)).replace(chr(10), " ") for v in row]
+                cells = [str(v).replace("|", "\\|").replace("\n", " ") for v in row]
                 lines.append("| " + " | ".join(cells) + " |")
             return "\n".join(lines)
         except Exception:
@@ -96,13 +127,8 @@ def _csv_to_markdown(data):
     for i, row in enumerate(rows):
         cells = []
         for cell in row:
-            if hasattr(cell, '_get_text'):
-                cell_str = cell._get_text(doc=None) or ""
-            elif isinstance(cell, list):
-                cell_str = str(cell)
-            else:
-                cell_str = str(cell) if cell is not None else ""
-            cell_str = cell_str.replace("|", chr(124)).replace(chr(10), " ")
+            cell_str = _cell_to_text(cell)
+            cell_str = cell_str.replace("|", "\\|").replace("\n", " ")
             cells.append(cell_str)
         lines.append("| " + " | ".join(cells) + " |")
         if i == 0:
@@ -136,15 +162,13 @@ def _table_to_png_bytes(table_item, pdf_path: str):
             pdf_page = doc[page_no - 1]
             page_height = pdf_page.rect.height
 
-            left = bbox.l
-            bottom = bbox.t
-            right = bbox.r
-            top = bbox.b
-
-            x0 = left
-            y0 = page_height - top
-            x1 = right
-            y1 = page_height - bottom
+            # bbox uses PDF coordinate system (origin at bottom-left).
+            # PyMuPDF uses screen coordinates (origin at top-left).
+            # Convert: screen_y = page_height - pdf_y
+            x0 = bbox.l
+            y0 = page_height - bbox.b
+            x1 = bbox.r
+            y1 = page_height - bbox.t
 
             if x0 > x1:
                 x0, x1 = x1, x0
@@ -216,31 +240,80 @@ def main():
     for element, _level in result.document.iterate_items():
         if isinstance(element, PictureItem):
             page_no = element.prov[0].page_no
-            figure_idx = figure_counters.get(page_no, 0) + 1
-            figure_counters[page_no] = figure_idx
             if element.image is None:
                 continue
+
+            # 使用 docling 原生 caption 解析获取真实图注文本
+            try:
+                real_caption = element.caption_text(result.document) or ""
+            except Exception:
+                real_caption = ""
+
+            # 从真实图注提取逻辑编号，失败则回退到每页计数器
+            logical_num = _extract_logical_num(real_caption, "Figure") if real_caption else None
+            if logical_num:
+                # 使用论文真实编号作为文件名
+                label = f"Figure{logical_num}"
+                # 处理同编号冲突：同一逻辑编号 + 同一页码 → 加后缀
+                # （通常不会出现，但处理 figure 跨页或补充材料的情况）
+                global_key = f"{page_no}-{label}"
+                collision = figure_counters.get(global_key, 0) + 1
+                figure_counters[global_key] = collision
+                if collision > 1:
+                    label = f"Figure{logical_num}_v{collision}"
+            else:
+                # 回退：每页计数器
+                per_page_idx = figure_counters.get(f"_pp_{page_no}", 0) + 1
+                figure_counters[f"_pp_{page_no}"] = per_page_idx
+                label = f"Figure{per_page_idx}"
+                logical_num = str(per_page_idx)
+
+            caption = real_caption or f"Figure {logical_num}"
+
+            filename = f"{page_no}-{label}.png"
+            save_path = figures_dir_arg / filename
             pil_image = element.image.pil_image
             assert pil_image is not None
-            filename = f"{page_no}-Figure{figure_idx}.png"
-            save_path = figures_dir_arg / filename
             pil_image.save(save_path, format="PNG")
             images.append({
                 "page_number": page_no,
-                "image_index": figure_idx,
+                "image_index": 0,  # 不再使用每页计数器作为主标识
+                "logical_num": logical_num,
                 "bbox": [0, 0, 0, 0],
-                "caption": f"Figure {figure_idx}",
+                "caption": caption,
                 "saved_path": str(save_path),
             })
         elif isinstance(element, TableItem):
             page_no = element.prov[0].page_no
-            table_idx = table_counters.get(page_no, 0) + 1
-            table_counters[page_no] = table_idx
+
+            # 使用 docling 原生 caption 解析获取真实表注文本
+            try:
+                real_caption = element.caption_text(result.document) or ""
+            except Exception:
+                real_caption = ""
+
+            # 从真实表注提取逻辑编号，失败则回退到每页计数器
+            logical_num = _extract_logical_num(real_caption, "Table") if real_caption else None
+            if logical_num:
+                label = f"Table{logical_num}"
+                global_key = f"{page_no}-{label}"
+                collision = table_counters.get(global_key, 0) + 1
+                table_counters[global_key] = collision
+                if collision > 1:
+                    label = f"Table{logical_num}_v{collision}"
+            else:
+                per_page_idx = table_counters.get(f"_pp_{page_no}", 0) + 1
+                table_counters[f"_pp_{page_no}"] = per_page_idx
+                label = f"Table{per_page_idx}"
+                logical_num = str(per_page_idx)
+
+            caption = real_caption or f"Table {logical_num}"
+
             table_csv = _table_data_to_csv(element)
             table_markdown = _csv_to_markdown(element)
-            csv_filename = f"{page_no}-Table{table_idx}.csv"
-            md_filename = f"{page_no}-Table{table_idx}.md"
-            png_filename = f"{page_no}-Table{table_idx}.png"
+            csv_filename = f"{page_no}-{label}.csv"
+            md_filename = f"{page_no}-{label}.md"
+            png_filename = f"{page_no}-{label}.png"
             csv_path = tables_dir_arg / csv_filename
             md_path = tables_dir_arg / md_filename
             png_path = tables_dir_arg / png_filename
@@ -255,11 +328,12 @@ def main():
                 saved_png_path = str(png_path)
             tables.append({
                 "page_number": page_no,
-                "table_index": table_idx,
+                "table_index": 0,
+                "logical_num": logical_num,
                 "bbox": [0, 0, 0, 0],
                 "csv": table_csv,
                 "markdown": table_markdown,
-                "caption": f"Table {table_idx}",
+                "caption": caption,
                 "saved_csv_path": str(csv_path),
                 "saved_md_path": str(md_path),
                 "saved_png_path": saved_png_path,

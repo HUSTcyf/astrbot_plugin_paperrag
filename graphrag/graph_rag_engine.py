@@ -594,15 +594,29 @@ def _make_cypher_validator(graph_store: Any):
             )
 
         # Stage 2 — definitive Neo4j EXPLAIN parse check
+        cypher_to_validate = stripped
         try:
-            graph_store.structured_query(f"EXPLAIN {stripped}")
+            graph_store.structured_query(f"EXPLAIN {cypher_to_validate}")
         except Exception as e:
-            raise ValueError(
-                f"TextToCypherRetriever 生成的 Cypher 未通过 Neo4j EXPLAIN 校验: "
-                f"{e}\n完整内容:\n{stripped[:500]}"
-            ) from e
+            err_msg = str(e)
+            # Auto-repair: MATCH queries often miss RETURN clause
+            if "cannot conclude with" in err_msg or "must conclude with" in err_msg:
+                cypher_to_validate = stripped.rstrip() + "\nRETURN *"
+                try:
+                    graph_store.structured_query(f"EXPLAIN {cypher_to_validate}")
+                    logger.info("[CypherValidator] 自动追加 RETURN * 修复缺失 RETURN 的查询")
+                except Exception as e2:
+                    raise ValueError(
+                        f"TextToCypherRetriever 生成的 Cypher 未通过 Neo4j EXPLAIN 校验"
+                        f"（自动追加 RETURN * 也失败）: {e2}\n完整内容:\n{stripped[:500]}"
+                    ) from e2
+            else:
+                raise ValueError(
+                    f"TextToCypherRetriever 生成的 Cypher 未通过 Neo4j EXPLAIN 校验: "
+                    f"{e}\n完整内容:\n{stripped[:500]}"
+                ) from e
 
-        return cypher_query
+        return cypher_to_validate
 
     return _validate
 

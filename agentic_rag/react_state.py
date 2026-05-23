@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import Annotated, Any
 from typing_extensions import NotRequired, TypedDict
 
-from langgraph.graph import add_messages
+import operator
 
 from .state import _keep_last_n
 
@@ -50,7 +50,7 @@ class ReActRAGState(TypedDict):
     _pending_action: NotRequired[dict]  # {"tool": str, "args": str}
 
     # 执行轨迹
-    steps: Annotated[list[str], add_messages]
+    steps: Annotated[list[str], operator.add]
 
     # 外部依赖
     _context: NotRequired[Any]

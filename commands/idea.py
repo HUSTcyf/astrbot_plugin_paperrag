@@ -17,13 +17,13 @@ if TYPE_CHECKING:
     from ..idea import IdeaEngine
 
 
-def _create_idea_engine(context, rag_engine):
+def _create_idea_engine(context, rag_engine, config: dict | None = None):
     try:
         from ..idea import IdeaEngine
     except ImportError:
         from idea import IdeaEngine
 
-    return IdeaEngine(context=context, rag_engine=rag_engine)
+    return IdeaEngine(context=context, rag_engine=rag_engine, config=config)
 
 
 class IdeaCommandsMixin(PluginCoreBase):
@@ -51,7 +51,7 @@ class IdeaCommandsMixin(PluginCoreBase):
 
         try:
             rag_engine = self._get_engine()
-            idea_engine = _create_idea_engine(self.context, rag_engine)
+            idea_engine = _create_idea_engine(self.context, rag_engine, self.config)
 
             # 1. 分析主题
             yield event.plain_result("📊 正在分析研究主题...")
@@ -126,7 +126,7 @@ class IdeaCommandsMixin(PluginCoreBase):
                 yield event.plain_result("❌ RAG引擎未初始化")
                 return
 
-            idea_engine = _create_idea_engine(self.context, rag_engine)
+            idea_engine = _create_idea_engine(self.context, rag_engine, self.config)
             topics = idea_engine.list_all_topics()
 
             if not topics:
@@ -166,7 +166,7 @@ class IdeaCommandsMixin(PluginCoreBase):
                 yield event.plain_result("❌ RAG引擎未初始化")
                 return
 
-            idea_engine = _create_idea_engine(self.context, rag_engine)
+            idea_engine = _create_idea_engine(self.context, rag_engine, self.config)
 
             # identifier 可能是 folder hash 或 topic 名称，统一解析为 folder hash
             ideas_dir = idea_engine._get_ideas_dir()
@@ -221,7 +221,7 @@ class IdeaCommandsMixin(PluginCoreBase):
                 yield event.plain_result("❌ RAG引擎未初始化")
                 return
 
-            idea_engine = _create_idea_engine(self.context, rag_engine)
+            idea_engine = _create_idea_engine(self.context, rag_engine, self.config)
 
             yield event.plain_result(f"💡 正在为 topic「{topic}」追加 {num_ideas} 个想法...\n⏳ 复用现有知识上下文生成新想法")
 
@@ -284,7 +284,7 @@ class IdeaCommandsMixin(PluginCoreBase):
                 yield event.plain_result("❌ RAG引擎未初始化")
                 return
 
-            idea_engine = _create_idea_engine(self.context, rag_engine)
+            idea_engine = _create_idea_engine(self.context, rag_engine, self.config)
 
             deleted, topic = idea_engine.delete_ideas_by_uuids(uuids)
 
@@ -324,7 +324,7 @@ class IdeaCommandsMixin(PluginCoreBase):
                 yield event.plain_result("❌ RAG引擎未初始化")
                 return
 
-            idea_engine = _create_idea_engine(self.context, rag_engine)
+            idea_engine = _create_idea_engine(self.context, rag_engine, self.config)
 
             success, topic, folder_hash = idea_engine.delete_topic_by_hash(topic_or_hash)
 
@@ -356,7 +356,7 @@ class IdeaCommandsMixin(PluginCoreBase):
                 yield event.plain_result("❌ RAG引擎未初始化")
                 return
 
-            idea_engine = _create_idea_engine(self.context, rag_engine)
+            idea_engine = _create_idea_engine(self.context, rag_engine, self.config)
 
             deleted_count, actual_topic = idea_engine.clear_ideas_by_topic(topic)
 
@@ -405,7 +405,11 @@ class IdeaCommandsMixin(PluginCoreBase):
                 )
                 # 流式输出各阶段
                 for step in result.get("steps", []):
-                    yield event.plain_result(step)
+                    # 兼容 add_messages 残留的 HumanMessage 对象
+                    text = getattr(step, 'content', None) if not isinstance(step, str) else step
+                    if text is None:
+                        text = str(step)
+                    yield event.plain_result(text)
                 # 输出最终结果
                 final = result.get("final_output", "")
                 if final:
@@ -431,7 +435,7 @@ class IdeaCommandsMixin(PluginCoreBase):
             rag_engine = self._get_engine()
 
             # 创建创意引擎
-            idea_engine = _create_idea_engine(self.context, rag_engine)
+            idea_engine = _create_idea_engine(self.context, rag_engine, self.config)
 
             # 1. 分析主题
             yield event.plain_result("📊 正在分析研究领域...")
@@ -527,7 +531,7 @@ class IdeaCommandsMixin(PluginCoreBase):
 
         try:
             rag_engine = self._get_engine()
-            idea_engine = _create_idea_engine(self.context, rag_engine)
+            idea_engine = _create_idea_engine(self.context, rag_engine, self.config)
 
             analysis = await idea_engine.analyze_topic(topic, depth)
 
@@ -584,7 +588,7 @@ class IdeaCommandsMixin(PluginCoreBase):
 
         try:
             rag_engine = self._get_engine()
-            idea_engine = _create_idea_engine(self.context, rag_engine)
+            idea_engine = _create_idea_engine(self.context, rag_engine, self.config)
 
             knowledge = await idea_engine.search_knowledge(query_list, local_rag_top_k=local_k, web_top_k=web_k)
 
@@ -639,7 +643,7 @@ class IdeaCommandsMixin(PluginCoreBase):
 
         try:
             rag_engine = self._get_engine()
-            idea_engine = _create_idea_engine(self.context, rag_engine)
+            idea_engine = _create_idea_engine(self.context, rag_engine, self.config)
 
             ideas = await idea_engine.generate_ideas(
                 knowledge_context=context,
@@ -731,7 +735,7 @@ class IdeaCommandsMixin(PluginCoreBase):
                 return
 
             # 初始化 IdeaEngine
-            idea_engine = _create_idea_engine(self.context, rag_engine)
+            idea_engine = _create_idea_engine(self.context, rag_engine, self.config)
 
             # 判断是 UUID 列表还是 topic
             if "," in ids:
@@ -909,7 +913,7 @@ class IdeaCommandsMixin(PluginCoreBase):
         """
         try:
             rag_engine = self._get_engine()
-            idea_engine = _create_idea_engine(self.context, rag_engine)
+            idea_engine = _create_idea_engine(self.context, rag_engine, self.config)
 
             yield event.plain_result("正在创建测试飞书文档（列表样式+图片+引用）...")
             result = await idea_engine.test_feishu_markdown_formats(folder_token=folder_token)
@@ -979,7 +983,7 @@ Examples:
                 yield event.plain_result("❌ RAG引擎未初始化")
                 return
 
-            idea_engine = _create_idea_engine(self.context, rag_engine)
+            idea_engine = _create_idea_engine(self.context, rag_engine, self.config)
 
             # 检查 folder 是否存在
             ideas_dir = idea_engine._get_ideas_dir()

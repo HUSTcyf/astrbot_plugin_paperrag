@@ -17,17 +17,19 @@ class IdeaEngineBase:
     3. to_feishu_markdown - 格式化输出
     """
 
-    def __init__(self, context, rag_engine=None, **kwargs):
+    def __init__(self, context, rag_engine=None, config: dict | None = None, **kwargs):
         """
         初始化创意引擎
 
         Args:
             context: AstrBot上下文（用于LLM/VLM调用）
             rag_engine: RAG引擎实例
+            config: 插件配置字典（可选，用于 PaperBanana 等功能）
         """
         super().__init__(**kwargs)
         self.context = context
         self._rag_engine = rag_engine
+        self._plugin_config = config or {}
 
     def _get_ideas_dir(self) -> Path:
         """获取想法存储根目录，不存在则创建"""

@@ -1824,13 +1824,6 @@ class HybridRAGEngine:
 
         return result
 
-    @staticmethod
-    def _graph_retrieve_sync(graph_retriever, query: str):
-        """Run graph retrieval in a thread-safe manner with nest_asyncio."""
-        import nest_asyncio
-        nest_asyncio.apply()
-        return graph_retriever.retrieve(query)
-
     async def _graph_recall_papers(self, query: str) -> List[str]:
         """Recall paper IDs from knowledge graph to supplement abstract search."""
         if not getattr(self.config, 'enable_graph_rag', False):
@@ -1842,9 +1835,7 @@ class HybridRAGEngine:
             if not graph_retriever:
                 return []
 
-            graph_result = await asyncio.to_thread(
-                self._graph_retrieve_sync, graph_retriever, query
-            )
+            graph_result = await graph_retriever.aretrieve(query)
             if not graph_result:
                 return []
 

@@ -4,9 +4,8 @@ Agentic Idea State — TypedDict for Agentic Idea Engine LangGraph workflow.
 
 from __future__ import annotations
 
+import operator
 from typing import Annotated, Any, Literal, NotRequired, TypedDict
-
-from langgraph.graph import add_messages
 
 
 class AgenticIdeaState(TypedDict):
@@ -33,13 +32,16 @@ class AgenticIdeaState(TypedDict):
     missing_evidence: NotRequired[list[str]]  # 缺失证据列表
     idea_scores: NotRequired[list[dict] | None]  # 每个 idea 的评分
 
+    # 保存结果
+    saved_paths: NotRequired[list[str]]  # 已保存的想法文件路径
+
     # 辩论模式（Ideator ↔ Critic）
     debate_round: NotRequired[int]  # 当前辩论轮次
     debate_history: NotRequired[list[str]]  # 辩论历史记录
 
     # 工作流状态
     phase: NotRequired[Literal["analyze", "search", "generate", "critique", "refine", "done"]]
-    steps: Annotated[list[str], add_messages]
+    steps: Annotated[list[str], operator.add]
 
     # 外部依赖（LangGraph State 需声明才传递）
     _context: NotRequired[Any]

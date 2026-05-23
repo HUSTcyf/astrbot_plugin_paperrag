@@ -47,3 +47,11 @@ async def test_router_whitespace_query():
     state = {"query": "   ", "_context": None}
     with pytest.raises(ValueError):
         await router_node(state)
+
+
+@pytest.mark.asyncio
+async def test_router_non_string_query():
+    """非字符串 query 抛出 TypeError。"""
+    state = {"query": object(), "_context": None}
+    with pytest.raises(TypeError, match="query must be a string"):
+        await router_node(state)

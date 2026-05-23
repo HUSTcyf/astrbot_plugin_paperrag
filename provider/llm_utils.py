@@ -213,7 +213,12 @@ def _create_vlm_custom_llm(vlm_provider):
     accepts the instance.  Avoids llama_index.llms.openai.OpenAI which
     validates model names against OpenAI's known list and rejects 'local-vlm'.
     """
+    from llama_index.core.base.llms.generic_utils import (
+        completion_response_to_chat_response,
+    )
+    from llama_index.core.base.llms.types import ChatMessage, ChatResponse
     from llama_index.core.llms import CustomLLM, CompletionResponse, LLMMetadata
+    from typing import Sequence
     import asyncio
 
     class _Impl(CustomLLM):
@@ -235,8 +240,12 @@ def _create_vlm_custom_llm(vlm_provider):
             raise NotImplementedError
 
         def complete(self, prompt: str, formatted: bool = False, **kwargs):
-            return asyncio.get_event_loop().run_until_complete(
-                self.acomplete(prompt, formatted, **kwargs)
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return asyncio.run(self.acomplete(prompt, formatted, **kwargs))
+            raise RuntimeError(
+                "complete() called inside running event loop — use acomplete() or achat() instead"
             )
 
         async def acomplete(self, prompt: str, formatted: bool = False, **kwargs):
@@ -249,6 +258,16 @@ def _create_vlm_custom_llm(vlm_provider):
             return CompletionResponse(
                 text=resp.content if hasattr(resp, "content") else str(resp)
             )
+
+        async def achat(
+            self,
+            messages: Sequence[ChatMessage],
+            **kwargs: Any,
+        ) -> ChatResponse:
+            assert self.messages_to_prompt is not None
+            prompt = self.messages_to_prompt(messages)
+            completion_response = await self.acomplete(prompt, formatted=True, **kwargs)
+            return completion_response_to_chat_response(completion_response)
 
     return _Impl()
 

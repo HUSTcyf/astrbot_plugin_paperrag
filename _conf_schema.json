@@ -582,5 +582,12 @@
         "hint": "启用后，将根据方法论章节内容生成方法流程图。图片会插入到方法论章节末尾。Caption优先从 data/captions/ 目录读取，若无则由VLM生成",
         "obvious_hint": true,
         "default": false
+    },
+    "paperbanana_project_path": {
+        "description": "PaperBanana 项目路径（启用方法图生成时需填写）",
+        "type": "string",
+        "hint": "本地 PaperBanana 项目的绝对路径。插件启动时将使用该路径下的 .venv 中的 Python 来启动本地生成服务。默认使用 AstrBot/data/PaperBanana",
+        "obvious_hint": true,
+        "default": ""
     }
 }
