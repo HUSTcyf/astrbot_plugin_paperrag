@@ -157,7 +157,6 @@ JSON："""
                 lambda: llama.create_chat_completion(
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.1,
-                    max_tokens=4096,
                 )
             )
 

@@ -8,10 +8,14 @@
 
 - **PaperBanana 本地服务集成**：插件可启动和管理本地 PaperBanana 服务，新增 `paperbanana_project_path` 配置项，自动使用项目 `.venv` 中的 Python 启动方法图生成服务。
 - **Feishu 导出修复**：修复 lark-cli vs MCP 网关选择、PaperBanana 临时文件过早清理、`__import__('re')` 惰性导入等多项问题；长引用上下文支持 token 预算分批处理。
-- **Docling 逻辑图注编号**：使用 docling 原生 `caption_text()` API 提取论文真实图注编号（如 "Figure 3"），替代基于每页计数器的简单命名。
+- **Docling 逻辑图注编号**：使用 docling 原生 `caption_text()` API 提取论文真实图注编号（如 "Figure 3"），替代基于每页计数器的简单命名；caption 缺失时回退到全局 `unknown` 计数器（`{page}-unknown_{N}.png`）。
 - **Cypher 自动修复**：Neo4j 查询缺失 RETURN 子句时自动追加 `RETURN *` 并重试。
 - **已验证引用索引**：从 chunk metadata 提取 LLMReferenceParser + arXiv MCP 校验过的引用数据，构建权威引用索引供 LLM 生成使用。
 - **Agentic RAG Tool 修复**：移除 `_FakeEvent` 临时方案，改为传入真实 `AstrMessageEvent`，支持多模态响应文本提取。
+- **正则表达式移除**：`_find_figure_anchor` 和 `_clean_figure_references` 彻底移除正则，改用 `str.find()` + 逐字符扫描，消除正则引擎隐含语义导致的 bug。
+- **规范化章节体系**：8 个 canonical 章节标题，prompt 强制要求 + 运行态空白归一化容错（如 "实验 Benchmark" → "实验Benchmark"）。
+- **双锚点图表定位**：引用图表固定插入相关工作末尾，方法论图表固定插入方法论末尾，`str.find()` 精确定位章节边界。
+- **锚点重新计算**：从 `clean_text`（去图片行后）计算锚点，确保锚点文本在实际上传文档中存在，修复 `--selection-with-ellipsis` 匹配失败。
 - 完整变更详见 [docs/changelog/2.1.2.md](docs/changelog/2.1.2.md)
 
 ### 上版变化 (v2.1.1)
@@ -71,6 +75,16 @@ cd ~/AstrBot/data/plugins/astrbot_plugin_paperrag
 pip install -r requirements.txt
 ```
 
+### 1.1 安装飞书 CLI（可选，用于 `/idea tofeishu` 导出）
+
+`/idea tofeishu` 支持通过 [lark-cli](https://www.npmjs.com/package/@larksuite/cli) 一键创建飞书文档。lark-cli 原生支持 Markdown 格式（包括 `[text](url)` 可点击链接和行内样式），优于纯 MCP 块管线。未安装时自动回退到 MCP 模式。
+
+```bash
+npx @larksuite/cli@latest install
+```
+
+安装后按提示完成飞书账号授权登录即可。
+
 ### 2. 配置插件
 
 在 **AstrBot WebUI → 插件 → paper_rag → 插件配置** 中：
@@ -89,16 +103,159 @@ pip install -r requirements.txt
 
 ### 3. 使用
 
+以下是从零构建向量数据库和知识图谱、再到查询和飞书撰写的完整流水线。
+
+---
+
+#### 第一步：论文导入与向量化
+
+将 PDF 论文放入 `./papers` 目录（或插件配置中指定的 `论文文件存放目录`），然后执行导入：
+
 ```bash
-# 添加论文
+# 批量导入目录下所有 PDF（首次构建）
 /paper add ./papers
 
-# 搜索问答
+# 导入单篇论文
+/paper addf ./papers/2303.05499v5.pdf
+
+# 清空并重建（更新全部论文时使用，需 confirm）
+/paper rebuild ./papers confirm
+
+# 重建单篇论文
+/paper rebuildf ./papers/2303.05499v5.pdf confirm
+```
+
+导入过程中，插件自动完成：
+1. **PDF 解析**（Docling + PyMuPDF）：提取文本、图片、表格、公式
+2. **图表保存**：有 caption 的图表以逻辑编号命名（如 `3-Figure3.png`），无 caption 的标记为 `unknown`（如 `9-unknown_1.png`）
+3. **文本分块**（语义分块，512 token/块）
+4. **向量嵌入**（BGE-M3，1024 维）→ 写入 Milvus
+5. **稀疏索引**（ABSPEC + BM25）用于混合检索
+
+```bash
+# 查看已导入论文列表
+/paper list
+
+# 检查参考文献解析状态
+/paper refstats        # 引用频次统计
+/paper refstats -1     # 列出零引用论文
+/paper abstractstats    # 摘要提取统计
+/paper abstractstats -1 # 列出未提取摘要的论文
+
+# 修复解析问题
+/paper reparse_zero_ref confirm       # 重解析零引用论文
+/paper reparse_zero_abstract confirm  # 重提取缺失摘要
+```
+
+---
+
+#### 第二步：知识图谱构建（可选，需在配置中开启 `enable_graph_rag`）
+
+向量检索完成后，构建知识图谱可增强跨论文关联查询能力：
+
+```bash
+# 构建知识图谱（9 类实体 + 14 类关系）
+/paper graph_build
+
+# 查看图谱统计
+/paper graph_stats
+# 输出示例：实体 1234 个，关系 3456 条，涉及 89 篇论文
+```
+
+图谱构建过程：
+1. **三元组抽取**：LLM 从论文 chunk 中提取 `(Head, Relation, Tail)` 知识三元组
+2. **实体规范化**：自动将 "our method"/"the proposed approach" 替换为论文专属标识符，避免不同论文的通用自指代词被错误合并
+3. **别名去重**：4 层去重体系（`Full Name (ACRONYM)` 解析 → 同论文共现 → 跨论文首字母匹配 → `:ALIAS_OF` 关系链接）
+4. **Neo4j 写入**：实体节点 + 关系边，支持 Cypher 查询
+
+```bash
+# 图谱维护
+/paper graph_rebuild confirm   # 重建图谱（清空后重新构建）
+/paper graph_clear confirm     # 清空图谱
+/paper graph_backup offline    # 备份图谱到本地文件
+/paper graph_restore <文件>    # 从备份恢复
+/paper graph_backup_list       # 列出可用备份
+```
+
+> **使用云端大模型构建图谱**：在 AstrBot WebUI 中将当前会话 Provider 设为云端模型（如 DeepSeek、Qwen），`graph_build` 会自动使用该 Provider，且不设 `max_tokens` 限制。
+
+---
+
+#### 第三步：检索与问答
+
+```bash
+# 基础 RAG 检索（3 通道混合检索：稠密向量 + ABSPEC 稀疏 + BM25）
 /paper search transformer 的核心创新点是什么？
 
-# Agentic 复杂查询（需在配置中开启 enable_agentic_rag）
+# 仅检索不生成回答
+/paper search attention mechanism 的最新进展 retrieve
+
+# Agentic RAG 复杂查询（需在配置中开启 enable_agentic_rag）
+# 静态 DAG：router → 并行检索 → 综合 → 质量检查
 /paper arag 3D Gaussian Splatting 和 NeRF 的优劣对比
+
+# ReAct Agent 自主查询（LLM 自主选择工具 + 多轮推理）
 /paper react 本地论文库中关于扩散模型的最新进展
+```
+
+**检索模式对比**：
+
+| 模式 | 命令 | 适用场景 | 特点 |
+|------|------|---------|------|
+| 基础 RAG | `/paper search` | 简单问答、事实查询 | 快速，单轮检索 |
+| Agentic DAG | `/paper arag` | 对比分析、多跳推理 | 并行检索 + 反馈循环 |
+| ReAct Agent | `/paper react` | 开放式探索、复杂推理 | LLM 自主决策，7 个工具 |
+
+---
+
+#### 第四步：研究想法生成与飞书导出
+
+基于已索引的论文库生成研究想法，可导出为飞书文档：
+
+```bash
+# 生成研究想法（线性流水线）
+/idea gen 3D Gaussian Splatting 的改进方向
+
+# Agentic 迭代优化（自反思 critique→debate→refine 循环）
+/idea explore Novel View Synthesis 的最新趋势
+
+# 查看已生成的想法
+/idea list
+/idea show "3D Gaussian Splatting 的改进方向"
+
+# 导出为飞书文档（需先安装 lark-cli）
+/idea tofeishu "3D Gaussian Splatting 的改进方向"
+
+# 导出到指定飞书文件夹
+/idea tofeishu "3D Gaussian Splatting 的改进方向" <folder_token>
+```
+
+**飞书导出前提**：
+```bash
+# 安装 lark-cli（一次性，自动支持 Markdown 可点击链接）
+npx @larksuite/cli@latest install
+# 按提示完成飞书账号授权登录
+```
+
+飞书文档包含完整的 8 章节结构（背景动机、相关工作、方法论、创新点、实验 Benchmark、挑战与解决方案、下一步计划、参考文献），图表自动嵌入对应章节。
+
+---
+
+#### 完整流水线示例
+
+```bash
+# 1) 导入论文 → 向量数据库
+/paper add ./papers
+
+# 2) 构建知识图谱
+/paper graph_build
+
+# 3) 查询
+/paper search 扩散模型的加速采样方法有哪些？
+
+# 4) 生成想法并导出飞书
+/idea gen diffusion model acceleration
+/idea tofeishu "diffusion model acceleration"
 ```
 
 ---
@@ -170,7 +327,7 @@ pip install -r requirements.txt
 | `/idea del <UUID>` | 公开 | 删除指定想法 |
 | `/idea delete <主题>` | 公开 | 删除主题 + 文件夹 |
 | `/idea clear <主题>` | 公开 | 清空主题（保留文件夹） |
-| `/idea tofeishu <主题> [folder_token]` | 公开 | 导出飞书文档 |
+| `/idea tofeishu <主题> [folder_token]` | 公开 | 导出飞书文档（lark-cli 优先，支持可点击链接） |
 | `/idea regen <UUID>` | 公开 | 重新生成指定想法 |
 
 ---
@@ -274,6 +431,14 @@ pip install -r requirements.txt
 CMAKE_ARGS="-DGGML_METAL=on -DLLAMA_MTMD=on" pip install llama-cpp-python
 ```
 
+### /idea tofeishu 飞书文档创建失败
+
+插件使用双路径架构：**lark-cli 优先**（`npx @larksuite/cli@latest install` 安装），**MCP 回退**。常见问题：
+
+- **lark-cli 未安装**：自动回退到 MCP 模式（通过 `batch_create_feishu_blocks` 创建），功能正常但链接渲染为纯文本格式
+- **飞书 MCP 未授权**：在飞书开放平台重新授权 MCP 应用，或安装 lark-cli 后重试
+- **图片过多超时**：`+media-insert` 默认 30s 超时，可在日志中查看具体失败原因
+
 ---
 
 ## 📚 详细文档
@@ -284,6 +449,7 @@ CMAKE_ARGS="-DGGML_METAL=on -DLLAMA_MTMD=on" pip install llama-cpp-python
 | [docs/AGENTIC_ARCHITECTURE.md](docs/AGENTIC_ARCHITECTURE.md) | Agentic RAG + Agentic Ideas 工作流详解 |
 | [docs/CHANGELOG.md](docs/CHANGELOG.md) | 变更记录 |
 | [docs/changelog/INDEX.md](docs/changelog/INDEX.md) | 按版本拆分的变更索引 |
+| [docs/FEISHU_BLOCK_STYLING.md](docs/FEISHU_BLOCK_STYLING.md) | 飞书导出技术方案（lark-cli + MCP 双路径） |
 | [docs/cypher_queries.md](docs/cypher_queries.md) | Neo4j Cypher 查询参考 |
 | [docs/INDEX.md](docs/INDEX.md) | 文档索引 |
 

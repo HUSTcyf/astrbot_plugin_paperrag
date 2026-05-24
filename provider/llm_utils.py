@@ -140,13 +140,16 @@ async def call_llm(
     context: Any,
     config: Optional[dict] = None,
     temperature: float = 0.7,
-    max_tokens: int = 2048,
+    max_tokens: int | None = None,
     **kwargs,
 ) -> str:
     """
     完整 LLM 调用：解析 provider → text_chat → 提取文本。
 
-    temperature / max_tokens 优先级：调用方显式传入 > config 配置 > 函数默认。
+    max_tokens 优先级：调用方显式传入 > config 配置 > 不传（由 provider 自行决定）。
+
+    云端大模型不传 max_tokens，让其使用 provider 默认值（通常足够大）。
+    本地 VLM 调用方应显式传入合适的 max_tokens。
 
     Returns:
         LLM 响应文本
@@ -158,23 +161,24 @@ async def call_llm(
     if provider is None:
         raise RuntimeError("无可用 LLM provider")
 
-    # 调用方显式传入优先，否则从 config 读取，最后用函数默认
     eff_temp = temperature
     eff_tokens = max_tokens
     if config:
-        # 仅当调用方未显式覆盖时使用 config 值
         if temperature == 0.7 and "text_llm_temperature" in config:
             eff_temp = config["text_llm_temperature"]
-        if max_tokens == 2048 and "text_llm_max_tokens" in config:
+        if max_tokens is None and "text_llm_max_tokens" in config:
             eff_tokens = config["text_llm_max_tokens"]
 
-    response = await provider.text_chat(
-        prompt=prompt,
-        contexts=[],
-        temperature=eff_temp,
-        max_tokens=eff_tokens,
+    chat_kwargs: dict = {
+        "prompt": prompt,
+        "contexts": [],
+        "temperature": eff_temp,
         **kwargs,
-    )
+    }
+    if eff_tokens is not None:
+        chat_kwargs["max_tokens"] = eff_tokens
+
+    response = await provider.text_chat(**chat_kwargs)
     return extract_text_from_response(response)
 
 
@@ -183,14 +187,13 @@ async def call_llm_json(
     context: Any,
     config: Optional[dict] = None,
     temperature: float = 0.1,
-    max_tokens: int = 2048,
+    max_tokens: int | None = None,
     **kwargs,
 ) -> Optional[dict]:
     """
     LLM 调用 + JSON 解析。
 
-    temperature / max_tokens 优先使用调用方传入值；
-    若 config 中有 text_llm_temperature / text_llm_max_tokens 则覆盖默认值。
+    max_tokens 优先级：调用方显式传入 > config 配置 > 不传（由 provider 自行决定）。
 
     Returns:
         解析后的 dict，或 None（解析失败）
@@ -223,7 +226,7 @@ def _create_vlm_custom_llm(vlm_provider):
 
     class _Impl(CustomLLM):
         model_name: str = "local-vlm"
-        _ctx_window: int = 16384
+        _ctx_window: int = getattr(vlm_provider, 'n_ctx', 16384)
 
         class Config:
             arbitrary_types_allowed = True

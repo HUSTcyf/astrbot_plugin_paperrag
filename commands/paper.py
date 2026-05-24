@@ -626,7 +626,7 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
                 if auto_built:
                     logger.info("📚 图谱自动构建已触发，将在后台运行")
             else:
-                error_msg = result.get("message", "Unknown error")
+                error_msg = result.get("error") or result.get("message", "Unknown error")
                 yield event.plain_result(f"❌ {file_name}\n   └─ {error_msg}")
 
         except Exception as e:
@@ -1226,13 +1226,14 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             yield event.plain_result(f"❌ Failed to clear: {e}")
             return
 
-        # Delete figures and tables folders
-        yield event.plain_result("🔄 Step 2/5: Clearing figures...")
+        # Delete figures, tables, and captions folders
+        yield event.plain_result("🔄 Step 2/5: Clearing figures, tables, and captions...")
         plugin_dir = _PLUGIN_DIR
         figures_dir = plugin_dir / "data" / "figures"
         tables_dir = plugin_dir / "data" / "tables"
+        captions_dir = plugin_dir / "data" / "captions"
 
-        for target_dir, name in [(figures_dir, "figures"), (tables_dir, "tables")]:
+        for target_dir, name in [(figures_dir, "figures"), (tables_dir, "tables"), (captions_dir, "captions")]:
             if target_dir.exists() and target_dir.is_dir():
                 try:
                     import shutil
@@ -1273,7 +1274,7 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
                     total_chunks += result.get("chunks_added", 0)
                 else:
                     failed += 1
-                    logger.warning(f"Failed to add {doc_file.name}: {result.get('message', 'Unknown error')}")
+                    logger.warning(f"Failed to add {doc_file.name}: {result.get('error') or result.get('message', 'Unknown error')}")
 
                 # Progress update every 5 files or at the end
                 if idx % 5 == 0 or idx == total_files:
@@ -1374,7 +1375,7 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
                     f"   📊 Chunks: {chunks_added}"
                 )
             else:
-                yield event.plain_result(f"❌ Rebuild failed: {add_result.get('message', 'Unknown error')}")
+                yield event.plain_result(f"❌ Rebuild failed: {add_result.get('error') or add_result.get('message', 'Unknown error')}")
 
         except Exception as e:
             logger.error(f"Failed to rebuild paper: {e}")

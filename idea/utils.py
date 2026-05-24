@@ -1,23 +1,21 @@
 """
-工具函数模块：纯函数工具 + Mistune解析 + BrightData配置检查 + 飞书工具获取
+工具函数模块：纯函数工具 + Mistune解析 + BrightData配置检查
 
 所有不依赖 self 的函数均在此作为模块级函数提供。
 """
 
 import hashlib
 import json
-import os
 import re
 import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
 import mistune
 
 from astrbot.api import logger
 
 from .base import IdeaEngineBase
-from urllib.parse import unquote
 from html.parser import HTMLParser
 from html import unescape
 
@@ -48,62 +46,6 @@ def strip_outer_markdown_style(text: str) -> str:
     if re.match(r'^(\*\*\*(.+?)\*\*\*|\*\*(.+?)\*\*|\*(.+?)\*|`(.+?)`)$', text):
         return strip_markdown_style(text)
     return text
-
-
-# ==================== 路径/图片提取 ====================
-
-def extract_path_from_paren(line: str) -> str | None:
-    """从裸路径行中提取括号包围的路径"""
-    depth = 0
-    start = None
-    for i, ch in enumerate(line):
-        if ch == '(':
-            if depth == 0:
-                start = i + 1
-            depth += 1
-        elif ch == ')':
-            depth -= 1
-            if depth == 0 and start is not None:
-                return line[start:i]
-    return None
-
-
-def extract_markdown_image_from_text(text: str) -> List[Tuple[str, str]]:
-    """从文本中提取所有 Markdown 图片引用。Returns: List of (url_or_path, alt_text)"""
-    results: List[Tuple[str, str]] = []
-    for match in re.finditer(r'!\[([^\]]*)\]\(([^)]+)\)', text):
-        url = match.group(2)
-        if url:
-            results.append((url, match.group(1) or ''))
-    return results
-
-
-def convert_paren_paths_to_markdown(text: str) -> Tuple[str, int]:
-    """
-    将裸路径转换为 Markdown 图片引用格式（逐行版本）。
-
-    Args:
-        text: 输入文本
-    Returns:
-        (转换后的文本, 转换的裸路径数量)
-    """
-    converted_count = 0
-    lines = text.split('\n')
-    result_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith('(') and stripped.endswith(')'):
-            path = extract_path_from_paren(stripped)
-            if path and (path.startswith('/') or path.startswith('~')):
-                unquoted = unquote(path)
-                if os.path.exists(unquoted):
-                    ext = os.path.splitext(unquoted)[1].lower()
-                    if ext in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg'):
-                        result_lines.append(f'![{os.path.basename(unquoted)}]({unquoted})')
-                        converted_count += 1
-                        continue
-        result_lines.append(line)
-    return '\n'.join(result_lines), converted_count
 
 
 # ==================== Mistune Markdown 解析 ====================
@@ -209,13 +151,13 @@ def parse_html_with_html_parser(html: str) -> List[Dict[str, Any]]:
             if self._in_eq:
                 self._eq_text += unescape(f'&{name};')
             else:
-                self._eq_text += unescape(f'&{name};')
+                self.current_text += unescape(f'&{name};')
 
         def handle_charref(self, name):
             if self._in_eq:
                 self._eq_text += unescape(f'&#{name};')
             else:
-                self._eq_text += unescape(f'&#{name};')
+                self.current_text += unescape(f'&#{name};')
 
     html = html.replace('<p>', '').replace('</p>', '').strip()
     parser = FeishuHTMLParser()
@@ -368,7 +310,7 @@ def _is_lark_cli_installed() -> bool:
 
 class IdeaEngineUtils(IdeaEngineBase):
     """
-    Bright Data 配置检查与 Feishu 工具获取。
+    Bright Data 配置检查与 lark-cli 可用性。
 
     继承链：IdeaEngineBase → IdeaEngineUtils
     运行时属性（来自 IdeaEngineBase via MRO）：
@@ -396,33 +338,11 @@ class IdeaEngineUtils(IdeaEngineBase):
             logger.warning(f"[IdeaEngine] 检查 Bright Data 配置失败: {e}")
             return False
 
-    def _get_feishu_tool(self):
-        """获取飞书MCP工具"""
-        if not self.context:
-            logger.error("[IdeaEngine] context 为 None")
-            return None
-        provider_manager = getattr(self.context, 'provider_manager', None)
-        if not provider_manager:
-            logger.error("[IdeaEngine] provider_manager 为 None")
-            return None
-        llm_tools = getattr(provider_manager, 'llm_tools', None)
-        if not llm_tools:
-            logger.error("[IdeaEngine] llm_tools 为 None")
-            return None
-        func_list = getattr(llm_tools, 'func_list', [])
-        logger.debug(f"[IdeaEngine] func_list 长度: {len(func_list)}")
-        for tool in func_list:
-            if 'feishu' in tool.name.lower():
-                logger.info(f"[IdeaEngine] 找到飞书工具: {tool.name}")
-                return tool
-        return None
-
     @staticmethod
     def _check_lark_cli(domain: str) -> dict[str, Any]:
         """检测 lark-cli 是否已安装并返回可用状态。
 
-        与 _get_feishu_tool() 不同，lark-cli 不通过 MCP 协议集成，
-        而是作为独立 CLI 通过 subprocess 调用。
+        lark-cli 作为独立 CLI 通过 subprocess 调用，不依赖 MCP 协议。
 
         Args:
             domain: 业务域名称，如 "doc", "wiki", "calendar", "sheets"

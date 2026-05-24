@@ -2,7 +2,6 @@
 飞书文档集成：测试方法与文档创建
 """
 
-import base64
 import json
 import os
 import re
@@ -10,295 +9,19 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import unquote
 
 from astrbot.api import logger
 
 from .utils import _is_lark_cli_installed, topic_hash
 from provider.llm_utils import extract_text_from_response
 from .paperbanana import IdeaEnginePaperBanana
-from astrbot.core.agent.run_context import ContextWrapper
 
 
 class IdeaEngineFeishuDoc(IdeaEnginePaperBanana):
-    """飞书文档集成。继承链：... → IdeaEnginePaperBanana → IdeaEngineFeishuDoc"""
+    """飞书文档集成。继承链：... → IdeaEnginePaperBanana → IdeaEngineFeishuDoc
 
-    async def test_feishu_markdown_formats(self, folder_token: str = "") -> Dict[str, Any]:
-        """
-        测试用：列表样式 + 图片插入 + 引用链接
-        """
-        ctx_wrapper = ContextWrapper(context=self.context)
-
-        provider_manager = getattr(self.context, 'provider_manager', None)
-        if not provider_manager:
-            return {"success": False, "error": "provider_manager 不可用"}
-
-        llm_tools = getattr(provider_manager, 'llm_tools', None)
-
-        # 收集工具
-        feishu_tool = add_blocks_tool = upload_image_tool = update_text_tool = get_blocks_tool = None
-        if llm_tools:
-            for tool in getattr(llm_tools, 'func_list', []):
-                if tool.name == 'create_feishu_document':
-                    feishu_tool = tool
-                elif tool.name == 'batch_create_feishu_blocks':
-                    add_blocks_tool = tool
-                elif tool.name == 'upload_and_bind_image_to_block':
-                    upload_image_tool = tool
-                elif tool.name == 'batch_update_feishu_block_text':
-                    update_text_tool = tool
-                elif tool.name == 'get_feishu_document_blocks':
-                    get_blocks_tool = tool
-
-        if not feishu_tool or not add_blocks_tool:
-            return {"success": False, "error": "缺少必要工具"}
-
-        # 从 initial_draft.md 读取内容测试
-        draft_path = "/Users/chenyifeng/AstrBot/data/plugin_data/astrbot_plugin_paperrag/ideas/8a160941c48c813c/initial_draft.md"
-        try:
-            with open(draft_path, "r", encoding="utf-8") as f:
-                test_markdown = f.read()
-            test_markdown = unquote(test_markdown)  # URL解码
-            logger.info(f"[Test] 读取测试文档: {draft_path}, 长度={len(test_markdown)}")
-        except Exception as e:
-            logger.error(f"[Test] 读取文件失败: {e}")
-            return {"success": False, "error": f"读取文件失败: {e}"}
-
-        # 转换为块
-        all_blocks = self._markdown_to_feishu_blocks(test_markdown)
-        image_count = sum(1 for b in all_blocks if b.get("blockType") == "image")
-        list_count = sum(1 for b in all_blocks if b.get("blockType") == "list")
-        list_with_styles = sum(1 for b in all_blocks if b.get("blockType") == "list" and b.get("_textStyles"))
-        logger.info(f"[Test] 转换 {len(all_blocks)} 个块: {image_count} 图片, {list_count} 列表(其中 {list_with_styles} 个含样式)")
-
-        # 创建飞书文档
-        create_result = await feishu_tool.call(ctx_wrapper, title="[测试] 列表样式+图片+引用", folderToken=folder_token or "")
-
-        doc_info = {}
-        if hasattr(create_result, 'content') and create_result.content:
-            result_text = getattr(create_result.content[0], 'text', None) or str(create_result.content[0])
-            try:
-                doc_info = json.loads(result_text)
-            except json.JSONDecodeError:
-                pass
-
-        document_id = (
-            doc_info.get("document", {}).get("document_id")
-            or doc_info.get("document_id")
-            or doc_info.get("objToken")
-            or doc_info.get("obj_token")
-        )
-        if not document_id:
-            return {"success": False, "error": f"文档创建失败: {create_result}"}
-
-        # 插入块（交错：文本批量，图片逐张两步上传）
-        images_uploaded = 0
-        current_index = 0
-        text_batch: list = []
-        batch_start_index = 0
-        # 记录哪些 all_blocks 索引对应到列表块（需要后续更新样式）
-        # (原始文本内容, _textStyles)
-        list_items_to_update: list[tuple[str, dict]] = []
-
-        async def flush_batch():
-            nonlocal text_batch, batch_start_index
-            if not text_batch:
-                return
-            result = await add_blocks_tool.call(
-                ctx_wrapper, documentId=document_id,
-                parentBlockId=document_id, index=batch_start_index, blocks=text_batch
-            )
-            if hasattr(result, 'isError') and result.isError:
-                raw_text = ""
-                if hasattr(result, 'content') and result.content:
-                    raw_text = getattr(result.content[0], 'text', '') or str(result.content[0])
-                logger.error(f"[Test] 文本块插入失败: {raw_text}")
-            else:
-                logger.info(f"[Test] 插入 {len(text_batch)} 个块 (index={batch_start_index})")
-            text_batch = []
-
-        for b in all_blocks:
-            if b.get("blockType") == "image":
-                await flush_batch()
-
-                opts = b.get("options", {}).get("image", {})
-                img_path = opts.get("image_path", "")
-                img_base64 = opts.get("base64", "")
-                is_temp_file = False
-                if not img_path and img_base64:
-                    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-                    tmp.write(base64.b64decode(img_base64))
-                    tmp.close()
-                    img_path = tmp.name
-                    is_temp_file = True
-
-                if img_path and os.path.exists(img_path):
-                    img_path = self._ensure_png(img_path)
-                    img_caption = opts.get("caption", "")
-                    logger.info(f"[Test] caption='{img_caption}'")
-                    try:
-                        from PIL import Image as PILImage
-                        with PILImage.open(img_path) as pil_img:
-                            orig_w, orig_h = pil_img.size
-                        img_width, img_height = orig_w, orig_h
-                        logger.info(f"[Test] 图片: {img_width}x{img_height}")
-                    except Exception as e:
-                        img_width, img_height = 768, 768
-                    img_result = await add_blocks_tool.call(
-                        ctx_wrapper, documentId=document_id,
-                        parentBlockId=document_id, index=current_index,
-                        blocks=[{"blockType": "image", "align": 2, "options": {"image": {}}}]
-                    )
-                    image_block_id = None
-                    try:
-                        if hasattr(img_result, 'content') and img_result.content:
-                            r_text = getattr(img_result.content[0], 'text', None) or str(img_result.content[0])
-                            r_data = json.loads(r_text)
-                            image_info = r_data.get('imageBlocksInfo', {})
-                            if isinstance(image_info, dict):
-                                block_ids = image_info.get('blockIds', [])
-                                if block_ids:
-                                    image_block_id = block_ids[0]
-                    except Exception as e:
-                        logger.error(f"[Test] 解析图片块ID失败: {e}")
-
-                    if image_block_id and upload_image_tool:
-                        upload_res = await upload_image_tool.call(
-                            ctx_wrapper, documentId=document_id,
-                            images=[{"blockId": image_block_id, "imagePathOrUrl": img_path}]
-                        )
-                        if upload_res and not getattr(upload_res, 'isError', True):
-                            images_uploaded += 1
-                            logger.info(f"[Test] 图片上传成功，添加caption: '{img_caption}'")
-                            # 追加 caption 文本块（同级，不是子块）
-                            if img_caption and add_blocks_tool:
-                                caption_block = [{
-                                    "blockType": "text",
-                                    "options": {
-                                        "text": {
-                                            "textStyles": [{"text": img_caption, "style": {"bold": True, "text_color": 7}}],
-                                            "align": 2
-                                        }
-                                    }
-                                }]
-                                cap_res = await add_blocks_tool.call(
-                                    ctx_wrapper, documentId=document_id,
-                                    parentBlockId=document_id,
-                                    index=current_index + 1,
-                                    blocks=caption_block
-                                )
-                                if hasattr(cap_res, 'isError') and cap_res.isError:
-                                    err = getattr(cap_res.content[0], 'text', str(cap_res))[:200] if hasattr(cap_res, 'content') and cap_res.content else str(cap_res)
-                                    logger.error(f"[Test] caption块追加失败: {err}")
-                                else:
-                                    logger.info(f"[Test] caption块追加成功")
-                                    current_index += 1  # caption占一个block位置
-
-                    # 上传完成后清理临时文件
-                    if is_temp_file and os.path.exists(img_path):
-                        try:
-                            os.unlink(img_path)
-                        except OSError:
-                            pass
-
-                current_index += 1
-                batch_start_index = current_index
-            else:
-                # 记录带样式的列表块（使用原始 content 作为匹配键）
-                if b.get("blockType") == "list" and b.get("_textStyles"):
-                    list_content = b.get("options", {}).get("list", {}).get("content", "")
-                    list_items_to_update.append((list_content, b.get("_textStyles") or {}))
-                text_batch.append(b)
-                current_index += 1
-
-        await flush_batch()
-
-        # 通过 get_feishu_document_blocks 获取所有块的 ID，按文本内容匹配列表块
-        updated_lists = 0
-        if list_items_to_update and update_text_tool and get_blocks_tool:
-            try:
-                blocks_result = await get_blocks_tool.call(ctx_wrapper, documentId=document_id)
-                blocks_text = ""
-                if hasattr(blocks_result, 'content') and blocks_result.content:
-                    blocks_text = getattr(blocks_result.content[0], 'text', '') or str(blocks_result.content[0])
-
-                # 解析 JSON：get_feishu_document_blocks 返回 JSON 数组，后面追加了特殊块提示文本
-                # 使用 json.JSONDecoder().raw_decode() 自动忽略尾部内容（找到第一个完整 JSON 数组）
-                all_doc_blocks = []
-                try:
-                    if blocks_text:
-                        decoder = json.JSONDecoder()
-                        all_doc_blocks, end_pos = decoder.raw_decode(blocks_text)
-                        logger.info(f"[Test] JSON 解析成功，{len(all_doc_blocks)} 个块，忽略尾部 {len(blocks_text) - end_pos} 字符")
-                except Exception as e:
-                    logger.warning(f"[Test] JSON 解析失败: {e}")
-                logger.info(f"[Test] 文档共有 {len(all_doc_blocks)} 个块")
-
-                # 匹配：按文本内容找到列表块（空白符归一化后比较）
-                def _normalize_text(t: str) -> str:
-                    """归一化空白符：将多个连续空白符合并为一个，去除首尾空白"""
-                    return re.sub(r'\s+', ' ', t).strip()
-
-                updates = []
-                matched_block_ids = set()  # 防止重复匹配同一块
-                for list_text, text_styles in list_items_to_update:
-                    norm_list_text = _normalize_text(list_text)
-                    for block in all_doc_blocks:
-                        block_id = block.get("block_id", "")
-                        if block_id in matched_block_ids:
-                            continue
-                        block_type = block.get("block_type", 0)
-                        # block_type 12=bullet, 13=ordered
-                        if block_type not in (12, 13):
-                            continue
-                        # 从 block 中提取文本内容
-                        block_data = block.get("bullet") or block.get("ordered") or {}
-                        elements = block_data.get("elements", [])
-                        block_text = ""
-                        for elem in elements:
-                            tr = elem.get("text_run", {})
-                            if tr.get("content"):
-                                block_text += tr["content"]
-                        if _normalize_text(block_text) == norm_list_text:
-                            block_id = block.get("block_id", "")
-                            matched_block_ids.add(block_id)
-                            logger.info(f"[Test] 匹配到列表块: block_id={block_id}, text={block_text[:50]}")
-                            # 构建 textElements
-                            text_elements = []
-                            for ts in text_styles:
-                                if ts.get("equation"):
-                                    text_elements.append({"equation": ts["equation"], "style": ts.get("style", {})})
-                                else:
-                                    text_elements.append({"text": ts.get("text", ""), "style": ts.get("style", {})})
-                            updates.append({"blockId": block_id, "textElements": text_elements})
-                            break
-
-                if updates:
-                    logger.info(f"[Test] 更新 {len(updates)} 个列表块样式")
-                    upd_result = await update_text_tool.call(
-                        ctx_wrapper, documentId=document_id, updates=updates
-                    )
-                    if hasattr(upd_result, 'isError') and upd_result.isError:
-                        err = ""
-                        if hasattr(upd_result, 'content') and upd_result.content:
-                            err = getattr(upd_result.content[0], 'text', '') or str(upd_result.content[0])
-                        logger.error(f"[Test] 列表样式更新失败: {err}")
-                    else:
-                        updated_lists = len(updates)
-                        logger.info(f"[Test] 列表样式更新成功 ({updated_lists} 个)")
-            except Exception as e:
-                logger.error(f"[Test] 获取或更新块样式失败: {e}")
-
-        url = f"https://feishu.cn/docx/{document_id}"
-        return {
-            "success": True,
-            "document_id": document_id,
-            "url": url,
-            "blocks_created": len(all_blocks),
-            "image_count": images_uploaded,
-            "list_styles_updated": updated_lists,
-        }
-
+    文档创建仅使用 lark-cli 路径。MCP 路径已移至 legacy/feishu_mcp.py。
+    """
 
     def _extract_methodology_section(self, text: str) -> str:
         """从周报文本中提取方法论章节内容"""
@@ -338,8 +61,8 @@ class IdeaEngineFeishuDoc(IdeaEnginePaperBanana):
                         first_key = next(iter(data.keys()), None)
                         if first_key and "caption" in data[first_key]:
                             return data[first_key]["caption"]
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"[IdeaEngine] 读取 caption 文件失败: {caption_file} ({e})")
         return None
 
     async def _generate_caption_with_vlm(self, topic: str, methodology_text: str) -> Optional[str]:
@@ -356,9 +79,10 @@ class IdeaEngineFeishuDoc(IdeaEnginePaperBanana):
 3. 直接输出名称，不要加任何前缀说明
 Caption："""
         try:
-            response = await vlm_provider.text_chat(prompt=prompt, contexts=[], temperature=0.3, max_tokens=128)
+            response = await vlm_provider.text_chat(prompt=prompt, contexts=[], temperature=0.3)
             return extract_text_from_response(response).strip() if extract_text_from_response(response) else None
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[IdeaEngine] VLM caption 生成失败: {e}")
             return None
 
     async def _refactor_for_paperbanana(self, methodology_text: str, topic: str) -> str:
@@ -376,10 +100,12 @@ Caption："""
 方法论原文：{methodology_text}
 请直接输出转述后的 Markdown 文本，不要添加任何说明："""
         try:
-            response = await vlm_provider.text_chat(prompt=prompt, contexts=[], temperature=0.3, max_tokens=4096)
+            max_tokens_vlm = self._compute_vlm_max_tokens(vlm_provider, prompt)
+            response = await vlm_provider.text_chat(prompt=prompt, contexts=[], temperature=0.3, max_tokens=max_tokens_vlm)
             result = extract_text_from_response(response)
             return result.strip() if result else methodology_text
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[IdeaEngine] PaperBanana 重述 VLM 调用失败: {e}")
             return methodology_text
 
     async def create_feishu_document(
@@ -461,9 +187,11 @@ Caption："""
 
             # Plan B: 分步处理引用——步骤1生成核心记忆，步骤2用核心记忆润色
             if citations_context and len(citations_context) > 50:
-                llm_provider = await self._get_vlm_provider_async()
+                cloud_provider = self.context.get_using_provider() if hasattr(self.context, 'get_using_provider') else None
+                llm_provider = cloud_provider or await self._get_vlm_provider_async()
+                use_cloud = cloud_provider is not None
                 if llm_provider:
-                    # --- 步骤1：生成核心记忆（超长引用分批处理）---
+                    # --- 步骤1：生成核心记忆（云端 LLM 单次处理，本地 VLM 分批处理）---
                     core_memory = ""
                     try:
                         from rag.token_utils import count_tokens, truncate_text_to_tokens
@@ -485,68 +213,77 @@ Caption："""
 
 核心观点记忆："""
 
-                        n_ctx = getattr(llm_provider, 'n_ctx', 16384)
                         BATCH_MAX_TOKENS = 3072     # 批次摘要输出上限
                         MERGE_MAX_TOKENS = 4096      # 合并摘要输出上限
                         SAFETY_MARGIN = 100          # misc tokens 余量
 
-                        template_body = memory_prompt_template.replace("{chunk}", "")
-                        template_tokens = count_tokens(template_body)
-                        available_tokens = n_ctx - template_tokens - BATCH_MAX_TOKENS - SAFETY_MARGIN
-
-                        citations_tokens = count_tokens(citations_context)
-
-                        if citations_tokens <= available_tokens:
-                            # 单次就能放下
+                        if use_cloud:
+                            # 云端 LLM 上下文远超引用长度，无需分批，直接单次处理；不传 max_tokens，由 provider 自行决定
                             prompt = memory_prompt_template.format(chunk=citations_context)
-                            prompt_tokens = count_tokens(prompt)
-                            logger.info(f"[IdeaEngine] 单次处理, prompt: {prompt_tokens} tokens")
+                            logger.info(f"[IdeaEngine] 使用云端 LLM, 单次处理 {count_tokens(citations_context)} tokens")
                             memory_response = await llm_provider.text_chat(
                                 prompt=prompt, contexts=[], temperature=0.2,
-                                max_tokens=BATCH_MAX_TOKENS,
                             )
                             core_memory = extract_text_from_response(memory_response) or ""
                         else:
-                            # 分批处理
-                            logger.info(f"[IdeaEngine] 引用过长 ({citations_tokens} tokens > "
-                                        f"available {available_tokens}), n_ctx={n_ctx}, 启动分批处理")
-                            citations = self._split_citations_into_batches(
-                                citations_context, available_tokens
-                            )
-                            logger.info(f"[IdeaEngine] 分为 {len(citations)} 批")
+                            n_ctx = getattr(llm_provider, 'n_ctx', 16384)
+                            template_body = memory_prompt_template.replace("{chunk}", "")
+                            template_tokens = count_tokens(template_body)
+                            available_tokens = n_ctx - template_tokens - BATCH_MAX_TOKENS - SAFETY_MARGIN
 
-                            partial_summaries = []
-                            for i, chunk in enumerate(citations, 1):
-                                prompt = memory_prompt_template.format(chunk=chunk)
+                            citations_tokens = count_tokens(citations_context)
+
+                            if citations_tokens <= available_tokens:
+                                # 单次就能放下
+                                prompt = memory_prompt_template.format(chunk=citations_context)
                                 prompt_tokens = count_tokens(prompt)
-                                logger.info(f"[IdeaEngine] 批次 {i}/{len(citations)}, "
-                                            f"chunk: {count_tokens(chunk)} tokens, "
-                                            f"prompt: {prompt_tokens} tokens")
-                                try:
-                                    resp = await llm_provider.text_chat(
-                                        prompt=prompt, contexts=[], temperature=0.2,
-                                        max_tokens=BATCH_MAX_TOKENS,
-                                    )
-                                    summary = extract_text_from_response(resp) or ""
-                                    if summary.strip():
-                                        partial_summaries.append(summary.strip())
-                                    logger.info(f"[IdeaEngine] 批次 {i}/{len(citations)} 完成, "
-                                                f"摘要: {len(summary)} chars")
-                                except Exception as batch_err:
-                                    logger.warning(f"[IdeaEngine] 批次 {i}/{len(citations)} 失败: {batch_err}")
-                                    continue
-
-                            if not partial_summaries:
-                                core_memory = truncate_text_to_tokens(citations_context, 2000)
-                            elif len(partial_summaries) == 1:
-                                core_memory = partial_summaries[0]
+                                logger.info(f"[IdeaEngine] 单次处理, prompt: {prompt_tokens} tokens")
+                                memory_response = await llm_provider.text_chat(
+                                    prompt=prompt, contexts=[], temperature=0.2,
+                                    max_tokens=BATCH_MAX_TOKENS,
+                                )
+                                core_memory = extract_text_from_response(memory_response) or ""
                             else:
-                                # 合并多批摘要
-                                merge_parts = []
-                                for i, s in enumerate(partial_summaries):
-                                    merge_parts.append(f"--- 第{i+1}段 ---\n{s}")
-                                merge_body = "\n".join(merge_parts)
-                                merge_prompt = f"""请将以下 {len(partial_summaries)} 段学术观点摘要合并为一段统一的"核心观点记忆"（不超过1200字）。
+                                # 分批处理
+                                logger.info(f"[IdeaEngine] 引用过长 ({citations_tokens} tokens > "
+                                            f"available {available_tokens}), n_ctx={n_ctx}, 启动分批处理")
+                                citations = self._split_citations_into_batches(
+                                    citations_context, available_tokens
+                                )
+                                logger.info(f"[IdeaEngine] 分为 {len(citations)} 批")
+
+                                partial_summaries = []
+                                for i, chunk in enumerate(citations, 1):
+                                    prompt = memory_prompt_template.format(chunk=chunk)
+                                    prompt_tokens = count_tokens(prompt)
+                                    logger.info(f"[IdeaEngine] 批次 {i}/{len(citations)}, "
+                                                f"chunk: {count_tokens(chunk)} tokens, "
+                                                f"prompt: {prompt_tokens} tokens")
+                                    try:
+                                        resp = await llm_provider.text_chat(
+                                            prompt=prompt, contexts=[], temperature=0.2,
+                                            max_tokens=BATCH_MAX_TOKENS,
+                                        )
+                                        summary = extract_text_from_response(resp) or ""
+                                        if summary.strip():
+                                            partial_summaries.append(summary.strip())
+                                        logger.info(f"[IdeaEngine] 批次 {i}/{len(citations)} 完成, "
+                                                    f"摘要: {len(summary)} chars")
+                                    except Exception as batch_err:
+                                        logger.warning(f"[IdeaEngine] 批次 {i}/{len(citations)} 失败: {batch_err}")
+                                        continue
+
+                                if not partial_summaries:
+                                    core_memory = truncate_text_to_tokens(citations_context, 2000)
+                                elif len(partial_summaries) == 1:
+                                    core_memory = partial_summaries[0]
+                                else:
+                                    # 合并多批摘要
+                                    merge_parts = []
+                                    for i, s in enumerate(partial_summaries):
+                                        merge_parts.append(f"--- 第{i+1}段 ---\n{s}")
+                                    merge_body = "\n".join(merge_parts)
+                                    merge_prompt = f"""请将以下 {len(partial_summaries)} 段学术观点摘要合并为一段统一的"核心观点记忆"（不超过1200字）。
 
 要求：
 - 去重：相同论文的观点只保留一次
@@ -558,19 +295,19 @@ Caption："""
 {merge_body}
 
 统一核心观点记忆："""
-                                merge_prompt_tokens = count_tokens(merge_prompt)
-                                logger.info(f"[IdeaEngine] 合并 prompt: {merge_prompt_tokens} tokens")
-                                try:
-                                    resp = await llm_provider.text_chat(
-                                        prompt=merge_prompt, contexts=[], temperature=0.2,
-                                        max_tokens=MERGE_MAX_TOKENS,
-                                    )
-                                    core_memory = extract_text_from_response(resp) or ""
-                                    logger.info(f"[IdeaEngine] 合并 {len(partial_summaries)} 段完成, "
-                                                f"最终: {len(core_memory)} chars")
-                                except Exception as merge_err:
-                                    logger.warning(f"[IdeaEngine] 合并失败: {merge_err}")
-                                    core_memory = "\n\n".join(partial_summaries)
+                                    merge_prompt_tokens = count_tokens(merge_prompt)
+                                    logger.info(f"[IdeaEngine] 合并 prompt: {merge_prompt_tokens} tokens")
+                                    try:
+                                        resp = await llm_provider.text_chat(
+                                            prompt=merge_prompt, contexts=[], temperature=0.2,
+                                            max_tokens=MERGE_MAX_TOKENS,
+                                        )
+                                        core_memory = extract_text_from_response(resp) or ""
+                                        logger.info(f"[IdeaEngine] 合并 {len(partial_summaries)} 段完成, "
+                                                    f"最终: {len(core_memory)} chars")
+                                    except Exception as merge_err:
+                                        logger.warning(f"[IdeaEngine] 合并失败: {merge_err}")
+                                        core_memory = "\n\n".join(partial_summaries)
 
                         logger.info(f"[IdeaEngine] 核心记忆生成完成，"
                                     f"长度: {len(core_memory)} chars, {count_tokens(core_memory)} tokens")
@@ -600,39 +337,46 @@ Caption："""
 - 正文提到某篇论文时，必须在索引中查找对应条目，使用索引中的标题和 DOI 链接
 
 格式要求：
-- 包含章节：背景动机、相关工作、方法论、创新点、实验benchmark、挑战与解决方案、下一步计划、参考文献、论文图表
+- 包含章节：背景动机、相关工作、方法论、创新点、实验Benchmark、挑战与解决方案、下一步计划、参考文献
+- **章节标题必须使用如下精确格式，不得自行修改**：
+  `## 1. 背景动机`、`## 2. 相关工作`、`## 3. 方法论`、`## 4. 创新点`、`## 5. 实验Benchmark`、`## 6. 挑战与解决方案`、`## 7. 下一步计划`、`## 8. 参考文献`
 - **扩展原则**：将简短的要点列表扩展为连贯段落，但不能变成全新的内容
 - **列表格式**：创新点和挑战与解决方案部分使用数字序号列表（如"1. 挑战一：xxx"）
 
-**正文引用格式（重要）**：
-- 正文中的引用：使用论文简称加markdown链接，如 [FLARE](https://arxiv.org/abs/2502.12138)、[NoPoSplat](https://arxiv.org/abs/2505.23716)
+**正文引用格式（重要，严格遵守）**：
+- **在方法名/论文名首次出现的位置直接替换为 markdown 链接**，如文中提到 PanoGS 应写为 `[PanoGS](url)`，提到 FLARE 应写为 `[FLARE](url)`
+- **禁止**在句子末尾追加论文全名！错误示例：`PanoGS 提出了xxx。PanoGS: Gaussian-based Panoptic Segmentation...` ← 这种格式绝对不允许
+- 正确示例：`[PanoGS](url) 提出利用金字塔三平面构建连续参数化特征空间...`
+- 论文全名只允许出现在参考文献章节
 - **禁止在正文中使用论文全名或裸URL**
-- **正文及正文中所有涉及引用的地方（论文简称如FLARE、方法名称、引用标记如[4][5]等）一律加粗**，不得有的加粗有的不加粗
-
 **参考文献格式（重要，严格遵守）**：
 - 放在最后一个章节
-- 每行一条，**严格格式**：`1. [**论文全名**](URL)`
-- 数字序号列表，全名加粗，URL作为markdown链接
+- 每行一条，**严格格式**：`1. [论文全名](URL)`
+- 数字序号列表，URL作为markdown链接
 - **禁止**：禁止裸URL、禁止括号内重复URL（如 `URL (URL)` ）、禁止纯文本URL
 
 **图表引用格式（重要，严格遵守）**：
 - **禁止在正文中使用任何图片语法**：`!(..)`、`` ![](..) ``、`[图片:...](...)` 一律禁止
-- 正文引用图片时只用文字描述，如"如图1所示"、"如图2所示"
+- **禁止在正文中编造具体的图/表编号**（如"如图1所示"、"如图2所示"），因为你还不知道哪些图表实际存在
+- 如需引用图表，只使用泛指描述（如"相关实验结果如图所示"、"方法流程如图表所示"），不指定编号
 - **参考文献章节中禁止出现任何图片路径**，参考文献中的方法图引用一律改为纯文字描述（如"NoPoSplat 方法流程图"），不得出现 /Users/ 等路径
-- **不要生成"论文图表"章节**，论文图表已自动嵌入相关工作章节
 
 请直接输出润色后的内容："""
 
                     try:
                         polish_total = len(core_memory) + len(weekly_report)
                         logger.info(f"[IdeaEngine] 步骤2：润色草稿，核心记忆: {len(core_memory)}, 草稿: {len(weekly_report)}, 总prompt: ~{polish_total}")
-                        response = await llm_provider.text_chat(
-                            prompt=polish_prompt,
-                            contexts=[],
-                            temperature=0.3,
-                            max_tokens=32768
-                        )
-                        polished = extract_text_from_response(response)
+                        polish_provider = self.context.get_using_provider() if hasattr(self.context, 'get_using_provider') else None
+                        if polish_provider:
+                            response = await polish_provider.text_chat(
+                                prompt=polish_prompt,
+                                contexts=[],
+                                temperature=0.3,
+                            )
+                            polished = extract_text_from_response(response)
+                        else:
+                            logger.warning("[IdeaEngine] Plan B 步骤2 无 polish provider，保持原内容")
+                            polished = ""
                         if polished and len(polished) > 100:
                             weekly_report = polished
                             logger.info(f"[IdeaEngine] Plan B 润色完成，长度: {len(polished)}")
@@ -659,38 +403,45 @@ Caption："""
 - 保持原文的整体结构和章节顺序，只做润色和扩展，不打乱框架
 
 格式要求：
-- 包含章节：背景动机、相关工作、方法论、创新点、实验benchmark、挑战与解决方案、下一步计划、参考文献
+- 包含章节：背景动机、相关工作、方法论、创新点、实验Benchmark、挑战与解决方案、下一步计划、参考文献
+- **章节标题必须使用如下精确格式，不得自行修改**：
+  `## 1. 背景动机`、`## 2. 相关工作`、`## 3. 方法论`、`## 4. 创新点`、`## 5. 实验Benchmark`、`## 6. 挑战与解决方案`、`## 7. 下一步计划`、`## 8. 参考文献`
 - **扩展原则**：将简短的要点列表扩展为连贯段落，但不能变成全新的内容
 - **列表格式**：创新点和挑战与解决方案部分使用数字序号列表（如"1. 挑战一：xxx"）
 
-**正文引用格式（重要）**：
-- 正文中的引用：使用论文简称加markdown链接，如 [FLARE](https://arxiv.org/abs/2502.12138)、[NoPoSplat](https://arxiv.org/abs/2505.23716)
+**正文引用格式（重要，严格遵守）**：
+- **在方法名/论文名首次出现的位置直接替换为 markdown 链接**，如文中提到 PanoGS 应写为 `[PanoGS](url)`，提到 FLARE 应写为 `[FLARE](url)`
+- **禁止**在句子末尾追加论文全名！错误示例：`PanoGS 提出了xxx。PanoGS: Gaussian-based Panoptic Segmentation...` ← 这种格式绝对不允许
+- 正确示例：`[PanoGS](url) 提出利用金字塔三平面构建连续参数化特征空间...`
+- 论文全名只允许出现在参考文献章节
 - **禁止在正文中使用论文全名或裸URL**
-- **正文及正文中所有涉及引用的地方（论文简称如FLARE、方法名称、引用标记如[4][5]等）一律加粗**，不得有的加粗有的不加粗
-
 **参考文献格式（重要，严格遵守）**：
 - 放在最后一个章节
-- 每行一条，**严格格式**：`1. [**论文全名**](URL)`
-- 数字序号列表，全名加粗，URL作为markdown链接
+- 每行一条，**严格格式**：`1. [论文全名](URL)`
+- 数字序号列表，URL作为markdown链接
 - **禁止**：禁止裸URL、禁止括号内重复URL（如 `URL (URL)` ）、禁止纯文本URL
 
 **图表引用格式（重要，严格遵守）**：
 - **禁止在正文中使用任何图片语法**：`!(..)`、`` ![](..) ``、`[图片:...](...)` 一律禁止
-- 正文引用图片时只用文字描述，如"如图1所示"、"如图2所示"
+- **禁止在正文中编造具体的图/表编号**（如"如图1所示"、"如图2所示"），因为你还不知道哪些图表实际存在
+- 如需引用图表，只使用泛指描述（如"相关实验结果如图所示"、"方法流程如图表所示"），不指定编号
 - **参考文献章节中禁止出现任何图片路径**，参考文献中的方法图引用一律改为纯文字描述（如"NoPoSplat 方法流程图"），不得出现 /Users/ 等路径
-- **不要生成"论文图表"章节**，论文图表已自动嵌入相关工作章节
 
 请直接输出润色后的内容："""
 
                     try:
                         logger.info(f"[IdeaEngine] 直接润色草稿，原始长度: {len(weekly_report)}")
-                        response = await llm_provider.text_chat(
-                            prompt=simplify_prompt,
-                            contexts=[],
-                            temperature=0.3,
-                            max_tokens=32768
-                        )
-                        polished = extract_text_from_response(response)
+                        polish_provider = self.context.get_using_provider() if hasattr(self.context, 'get_using_provider') else None
+                        if polish_provider:
+                            response = await polish_provider.text_chat(
+                                prompt=simplify_prompt,
+                                contexts=[],
+                                temperature=0.3,
+                            )
+                            polished = extract_text_from_response(response)
+                        else:
+                            logger.warning("[IdeaEngine] 直接润色无 polish provider，保持原内容")
+                            polished = ""
                         if polished and len(polished) > 100:
                             weekly_report = polished
                             logger.info(f"[IdeaEngine] 直接润色完成，长度: {len(polished)}")
@@ -701,8 +452,14 @@ Caption："""
                 else:
                     logger.info("[IdeaEngine] 无LLM provider，跳过润色")
 
-            # 手动追加论文图表章节（用真实路径，不依赖LLM生成）
-            weekly_report = self._append_figure_section(weekly_report, knowledge)
+            # 后处理2：移除虚构的图表引用（"如图 X 所示"等，在 prompt 禁止之外加一层保障）
+            weekly_report, cleaned_count = self._clean_figure_references(weekly_report)
+
+            # 后处理3：规范化章节标题，确保 str.find() 能精确定位
+            weekly_report = self._normalize_section_headings(weekly_report)
+
+            # 手动收集图表信息并确定插入锚点（不修改原文，无占位符）
+            figure_infos_from_section, figure_anchors = self._append_figure_section(weekly_report, knowledge)
 
             # --- PaperBanana 方法图生成（可选）---
             figure_blocks = []
@@ -759,7 +516,6 @@ Caption："""
                         prompt=title_prompt,
                         contexts=[],
                         temperature=0.7,
-                        max_tokens=256
                     )
                     generated_title = extract_text_from_response(title_response)
                     generated_title = generated_title.strip() if generated_title else topic
@@ -768,13 +524,34 @@ Caption："""
                     logger.warning(f"[IdeaEngine] 生成标题失败: {e}，使用原始主题")
                     generated_title = topic
 
-            # 5. 获取飞书工具
-            feishu_tool = self._get_feishu_tool()
-            if not feishu_tool:
-                return {"error": "未找到飞书 MCP 工具，请确认飞书 MCP 已配置并启用", "polished_content": weekly_report}
+            # 用 chunk 上下文丰富图表 caption（LLM 纯文本）
+            if figure_infos_from_section and llm_provider:
+                figure_infos_from_section = await self._enrich_figure_captions(
+                    figure_infos_from_section, knowledge.get("local_results", []), llm_provider
+                )
 
-            from astrbot.core.agent.run_context import ContextWrapper
-            ctx_wrapper = ContextWrapper(context=self.context)
+            # 5. 分离 markdown 图片（lark-cli 路径需单独上传图片）
+            clean_text, image_infos = self._strip_markdown_images(weekly_report)
+            logger.info(f"[IdeaEngine] 分离出 {len(image_infos)} 张图片，clean_text 长度: {len(clean_text)}")
+
+            # 重新从 clean_text 计算锚点。_append_figure_section 在原稿（含图片行）
+            # 上计算的锚点可能落在图片行尾，但图片行已被 strip 移除，导致锚点文本
+            # 在实际上传的文档中不存在，--selection-with-ellipsis 匹配失败。
+            figure_anchors = self._find_figure_anchors(clean_text)
+
+            # 将 _append_figure_section 收集的图表合并到 image_infos（→ 相关工作末尾）
+            if figure_infos_from_section:
+                for fi in figure_infos_from_section:
+                    image_infos.append({
+                        "path": fi["path"],
+                        "caption": fi["caption"],
+                        "anchor_key": "related_work",
+                        "width": None,
+                        "height": None,
+                        "base64": "",
+                    })
+                logger.info(f"[IdeaEngine] 合并引用图表: {len(figure_infos_from_section)} 个, "
+                            f"锚点: {figure_anchors.get('related_work', 'N/A')!r}")
 
             # 6. 保存草稿（提前保存，防止飞书API失败丢失）
             try:
@@ -787,416 +564,137 @@ Caption："""
             except Exception as e:
                 logger.warning(f"[IdeaEngine] 提前保存草稿失败: {e}")
 
-            # 7. 创建文档
-            logger.info(f"[IdeaEngine] 创建飞书文档: {generated_title}, folder_token: {folder_token}")
-            create_result = await feishu_tool.call(ctx_wrapper, title=generated_title, folderToken=folder_token)
+            # 7. 创建文档（仅使用 lark-cli）
+            if not self._lark_cli_available():
+                return {"error": "lark-cli 未安装，无法创建飞书文档。请安装: npx @larksuite/cli@latest install", "polished_content": weekly_report}
 
-            # 7. 解析响应
-            result_text = ""
-            if hasattr(create_result, 'content') and create_result.content:
-                result_text = getattr(create_result.content[0], 'text', None) or str(create_result.content[0])
-
-            # 检测授权过期/未授权（飞书 MCP 返回授权提示而非文档信息）
-            if "请在浏览器打开以下链接进行授权" in result_text or "authorize" in result_text.lower():
-                auth_url_match = re.search(r'https://accounts\.feishu\.cn/open-apis/authen/v1/authorize\S+', result_text)
-                auth_url = auth_url_match.group(0) if auth_url_match else ""
-                logger.error("[IdeaEngine] 飞书 MCP 未授权或授权已过期")
-                return {
-                    "error": "飞书授权已过期，请在浏览器中打开授权链接完成授权后重试",
-                    "auth_url": auth_url,
-                    "polished_content": weekly_report,
-                }
-
-            doc_info = {}
+            _plugin_root = Path(__file__).parent.parent
+            logger.info("[IdeaEngine] lark-cli 一键 markdown 创建飞书文档")
             try:
-                doc_info = json.loads(result_text)
-            except json.JSONDecodeError:
-                pass
+                tmp = tempfile.NamedTemporaryFile(
+                    mode='w', suffix='.md', prefix='feishu_',
+                    dir=str(_plugin_root), delete=False, encoding='utf-8'
+                )
+                tmp.write(clean_text)
+                tmp.close()
+                rel_path = os.path.relpath(tmp.name, start=_plugin_root)
 
-            document_id = (
-                doc_info.get("document", {}).get("document_id")
-                or doc_info.get("document_id")
-                or doc_info.get("objToken")
-                or doc_info.get("obj_token")
-            )
-            if not document_id:
-                return {"error": f"文档创建失败: {result_text[:300]}", "polished_content": weekly_report}
+                lark_args = ["+create", "--title", generated_title, "--markdown", f"@{rel_path}"]
+                if folder_token:
+                    lark_args += ["--folder-token", folder_token]
 
-            logger.info(f"[IdeaEngine] 文档创建成功: {document_id}")
+                lark_res = self._call_lark_cli("docs", lark_args, timeout=30, cwd=str(_plugin_root))
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
 
-            # 8. 获取根块 ID 并插入内容
-            root_block_id = document_id
+                document_id = None
+                if lark_res["success"] and lark_res.get("data"):
+                    data = lark_res["data"]
+                    if isinstance(data, dict):
+                        inner = data.get("data", {}) if isinstance(data.get("data"), dict) else {}
+                        document_id = data.get("document_id") or inner.get("doc_id") or data.get("objToken")
+                    if not document_id and isinstance(data, str):
+                        document_id = data.strip()
+                    if document_id:
+                        logger.info(f"[IdeaEngine] lark-cli 创建文档成功: {document_id}")
+                    else:
+                        logger.warning(f"[IdeaEngine] lark-cli 创建成功但未返回 document_id: {lark_res['data']}")
 
-            # 9. 将周报内容转换为飞书块格式（含行内样式）
-            provider_manager = getattr(self.context, 'provider_manager', None)
-            all_blocks = []
-            if weekly_report:
-                logger.info(f"[IdeaEngine] 周报内容长度: {len(weekly_report)}, 转换块数量: {len(weekly_report.split(chr(10)))}")
-                logger.debug(f"[IdeaEngine] 原始内容末尾200字符: '''{weekly_report[-200:]}'''")
-                weekly_report = self._normalize_figure_references(weekly_report)
-                logger.debug(f"[IdeaEngine] normalize后内容末尾200字符: '''{weekly_report[-200:]}'''")
-                figure_refs = re.findall(r'图\s*\d+', weekly_report)
-                logger.info(f"[IdeaEngine] 正文图表引用: {len(figure_refs)}处，引用: {figure_refs}")
-                # Prevent accidental markdown image rendering of bare paths
-                weekly_report = self._convert_paren_paths_to_markdown(weekly_report)
-                # Strip any stray ![image](path) the LLM may have generated
-                weekly_report = re.sub(r'!\[image\]\(([/][^)]+\.(?:png|jpg|jpeg|webp|gif))\)', r'[\1]', weekly_report)
-                logger.debug(f"[IdeaEngine] 路径替换后内容末尾200字符: '''{weekly_report[-200:]}'''")
+                if not document_id:
+                    return {"error": f"lark-cli 创建文档失败: {lark_res.get('error', '')[:200]}", "polished_content": weekly_report}
+            except Exception as e:
+                logger.error(f"[IdeaEngine] lark-cli 创建文档异常: {e}")
+                return {"error": f"lark-cli 创建文档异常: {e}", "polished_content": weekly_report}
 
-                # Count markdown images — these should all become image blocks
-                markdown_image_count = len(re.findall(r'!\[.*?\]\(/', weekly_report))
-                logger.info(f"[IdeaEngine] markdown 图片总数: {markdown_image_count}")
+            # 8. 收集 PaperBanana 方法图（→ 方法论末尾）
+            images_uploaded = 0
+            for fb in figure_blocks:
+                img_path = fb.get("path", "")
+                if img_path:
+                    image_infos.append({
+                        "path": img_path,
+                        "caption": fb.get("caption", ""),
+                        "anchor_key": "methodology",
+                        "width": None,
+                        "height": None,
+                        "base64": "",
+                    })
 
-                all_blocks = self._markdown_to_feishu_blocks(weekly_report)
-                image_block_count = sum(1 for b in all_blocks if b.get("blockType") == "image")
-                logger.info(f"[IdeaEngine] 转换后的块数量: {len(all_blocks)}，其中图片块: {image_block_count}")
-                if markdown_image_count != image_block_count:
-                    logger.warning(f"[IdeaEngine] ⚠️ markdown图片数({markdown_image_count})与飞书图片块数({image_block_count})不匹配（图片文件可能不存在）")
-                if figure_refs and image_block_count < len(figure_refs):
-                    logger.info(f"[IdeaEngine] 正文引用{len(figure_refs)}处图表，图片块{image_block_count}个 — 若引用数远大于图片块数，请检查知识库中论文的图表文件是否已提取")
-                for i, b in enumerate(all_blocks):
-                    if b.get("blockType") == "image":
-                        opts = b.get("options", {}).get("image", {})
-                        logger.info(f"[IdeaEngine] 图片块[{i}]: path='{opts.get('image_path', 'N/A')}', caption='{opts.get('caption', 'N/A')}'")
+            # 9. 插入所有图片（仅使用 lark-cli +media-insert）
+            if image_infos:
+                logger.info(f"[IdeaEngine] 开始插入 {len(image_infos)} 张图片")
+                for img_info in image_infos:
+                    img_path = img_info.get("path", "")
+                    img_caption = img_info.get("caption", "")
+                    img_width = img_info.get("width")
+                    img_height = img_info.get("height")
+                    is_temp_file = img_path and os.path.exists(img_path) and "data/temp" in img_path
 
-            # 将 PaperBanana 生成的方法图插入到方法论章节末尾
-            if figure_blocks:
-                method_insert_idx = self._find_methodology_end_index(all_blocks)
-                logger.info(f"[IdeaEngine] 将 {len(figure_blocks)} 张方法图插入到索引 {method_insert_idx}")
-                for i, fb in enumerate(figure_blocks):
-                    all_blocks.insert(method_insert_idx + i, fb)
+                    if not img_path or not os.path.exists(img_path):
+                        logger.error(f"[IdeaEngine] 图片路径不存在，跳过: {img_path!r}")
+                        continue
 
-            if all_blocks:
-                add_blocks_tool = None
-                upload_image_tool = None
-                update_text_tool = None
-                get_blocks_tool = None
-                if provider_manager:
-                    llm_tools = getattr(provider_manager, 'llm_tools', None)
-                    if llm_tools:
-                        for tool in getattr(llm_tools, 'func_list', []):
-                            if tool.name == 'batch_create_feishu_blocks':
-                                add_blocks_tool = tool
-                            elif tool.name == 'upload_and_bind_image_to_block':
-                                upload_image_tool = tool
-                            elif tool.name == 'batch_update_feishu_block_text':
-                                update_text_tool = tool
-                            elif tool.name == 'get_feishu_document_blocks':
-                                get_blocks_tool = tool
-
-                if add_blocks_tool:
-                    # 交错插入：按原始顺序遍历，文本块批量插入，图片块逐张两步上传
-                    images_uploaded = 0
-                    current_index = 0
-                    text_batch: list = []
-                    batch_start_index = 0
-                    list_items_to_update: list[tuple[str, dict]] = []
-
-                    async def _flush_text_batch_async():
-                        """异步刷出累积的文本块"""
-                        nonlocal text_batch, batch_start_index, get_blocks_tool
-                        if not text_batch:
-                            return
-                        CHUNK_SIZE = 20
-                        for chunk_start in range(0, len(text_batch), CHUNK_SIZE):
-                            chunk = text_batch[chunk_start:chunk_start + CHUNK_SIZE]
-                            chunk_index = batch_start_index + chunk_start
-                            result = await add_blocks_tool.call(
-                                ctx_wrapper,
-                                documentId=document_id,
-                                parentBlockId=root_block_id,
-                                index=chunk_index,
-                                blocks=chunk
-                            )
-                            if hasattr(result, 'isError') and result.isError:
-                                err = getattr(result.content[0], 'text', str(result))[:300] if hasattr(result, 'content') and result.content else str(result)
-                                logger.error(f"[IdeaEngine] 文本块插入失败 (chunk {chunk_start}, index={chunk_index}): {err}")
-                            else:
-                                logger.info(f"[IdeaEngine] 插入 {len(chunk)} 个文本块 (index={chunk_index})")
-                        text_batch = []
-
-                    _plugin_root = Path(__file__).parent.parent
-                    _use_larkcli = self._lark_cli_available()
-
-                    def _extract_block_plain_text(block: dict) -> str:
-                        """Extract plain text from any text-like feishu block for use as an anchor."""
-                        opts = block.get("options", {})
-                        # Heading / list / bullet / ordered: direct "content" field
-                        for key in ("heading", "list", "bullet", "ordered"):
-                            inner = opts.get(key, {})
-                            if isinstance(inner, dict):
-                                t = inner.get("content", "")
-                                if t:
-                                    return t
-                        # Text block: text is in textStyles array
-                        text_opts = opts.get("text", {})
-                        if isinstance(text_opts, dict):
-                            styles = text_opts.get("textStyles", [])
-                            if styles:
-                                parts = [s["text"] for s in styles if isinstance(s, dict) and s.get("text")]
-                                return "".join(parts)
-                        return ""
-
-                    _last_anchor = ""
-                    for b in all_blocks:
-                        if b.get("blockType") == "image":
-                            # Extract anchor from the last text block before flushing.
-                            # Accept any non-empty text (even short headings);
-                            # start...end disambiguation handles uniqueness.
-                            _anchor = ""
-                            for _tb in reversed(text_batch):
-                                _t = _extract_block_plain_text(_tb)
-                                if _t:
-                                    _anchor = _t
-                                    _last_anchor = _t
-                                    break
-                            if not _anchor:
-                                _anchor = _last_anchor
-
-                            await _flush_text_batch_async()
-
-                            opts = b.get("options", {}).get("image", {})
-                            img_path = opts.get("image_path", "")
-                            img_base64 = opts.get("base64", "")
-                            is_temp_file = False
-                            if img_base64 and (not img_path or not os.path.exists(img_path)):
-                                if img_path:
-                                    logger.info(f"[IdeaEngine] 图片文件已被清理，从 base64 恢复: {img_path}")
-                                tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-                                tmp.write(base64.b64decode(img_base64))
-                                tmp.close()
-                                img_path = tmp.name
-                                is_temp_file = True
-                            elif img_path and os.path.exists(img_path) and "data/temp" in img_path:
-                                # PaperBanana images in data/temp/ are ephemeral
-                                is_temp_file = True
-
-                            if img_path and os.path.exists(img_path):
-                                img_path = self._ensure_png(img_path)
-                                img_width = opts.get("width")
-                                img_height = opts.get("height")
-                                if not img_width or not img_height:
-                                    try:
-                                        from PIL import Image as PILImage
-                                        with PILImage.open(img_path) as pil_img:
-                                            orig_w, orig_h = pil_img.size
-                                        img_width, img_height = orig_w, orig_h
-                                        logger.info(f"[IdeaEngine] 图片尺寸: {img_path} → {img_width}x{img_height}")
-                                    except Exception:
-                                        img_width, img_height = 768, 768
-                                else:
-                                    logger.info(f"[IdeaEngine] 图片尺寸 [来自block]: {img_width}x{img_height}")
-
-                                img_caption = opts.get("caption", "")
-                                inserted = False
-
-                                # All images go through lark-cli with --selection-with-ellipsis
-                                if _use_larkcli:
-                                    rel_path = os.path.relpath(img_path, start=_plugin_root)
-                                    if not rel_path.startswith("..") and not os.path.isabs(rel_path):
-                                        try:
-                                            lark_args = [
-                                                "+media-insert",
-                                                "--doc", f"https://feishu.cn/docx/{document_id}",
-                                                "--type", "image",
-                                                "--file", rel_path,
-                                                "--width", str(img_width),
-                                                "--height", str(img_height),
-                                            ]
-                                            if img_caption:
-                                                lark_args += ["--caption", img_caption]
-                                            if _anchor:
-                                                # Use start...end disambiguation:
-                                                # lark-cli matches BOTH prefix and suffix,
-                                                # preventing false matches on common substrings
-                                                text = _anchor.strip()
-                                                if len(text) > 80:
-                                                    anchor_key = f"{text[:40]}...{text[-40:]}"
-                                                elif len(text) > 30:
-                                                    anchor_key = f"{text[:15]}...{text[-15:]}"
-                                                else:
-                                                    anchor_key = text
-                                                lark_args += ["--selection-with-ellipsis", anchor_key]
-                                                logger.info(f"[IdeaEngine] lark-cli 定位插入 (anchor={anchor_key[:60]}...)")
-                                            else:
-                                                logger.info(f"[IdeaEngine] lark-cli 追加到末尾 (无锚点文本)")
-
-                                            lark_res = self._call_lark_cli(
-                                                "docs", lark_args, timeout=30,
-                                                cwd=str(_plugin_root),
-                                            )
-                                            if lark_res["success"]:
-                                                images_uploaded += 1
-                                                inserted = True
-                                                logger.info(f"[IdeaEngine] lark-cli 图片插入成功: {rel_path}")
-                                            else:
-                                                logger.warning(f"[IdeaEngine] lark-cli 图片插入失败: {lark_res.get('error', '')[:150]}")
-                                        except Exception as e:
-                                            logger.warning(f"[IdeaEngine] lark-cli 图片插入异常: {e}")
-                                    else:
-                                        logger.warning(f"[IdeaEngine] 图片路径不在插件目录内，跳过 lark-cli: {img_path}")
-
-                                # Fallback: MCP only when lark-cli is not available
-                                if not inserted:
-                                    logger.info(f"[IdeaEngine] lark-cli 不可用，回退到 MCP")
-                                    img_result = await add_blocks_tool.call(
-                                        ctx_wrapper,
-                                        documentId=document_id,
-                                        parentBlockId=root_block_id,
-                                        index=current_index,
-                                        blocks=[{"blockType": "image", "align": 2, "options": {"image": {}}}]
-                                    )
-                                    image_block_id = None
-                                    try:
-                                        if hasattr(img_result, 'content') and img_result.content:
-                                            r_text = getattr(img_result.content[0], 'text', None) or str(img_result.content[0])
-                                            r_data = json.loads(r_text)
-                                            image_info = r_data.get('imageBlocksInfo', {})
-                                            if isinstance(image_info, dict):
-                                                block_ids = image_info.get('blockIds', [])
-                                                if block_ids:
-                                                    image_block_id = block_ids[0]
-                                    except Exception as e:
-                                        logger.error(f"[IdeaEngine] 解析图片块ID失败: {e}")
-
-                                    if image_block_id and upload_image_tool:
-                                        upload_res = await upload_image_tool.call(
-                                            ctx_wrapper,
-                                            documentId=document_id,
-                                            images=[{"blockId": image_block_id, "imagePathOrUrl": img_path}]
-                                        )
-                                        if upload_res and not getattr(upload_res, 'isError', True):
-                                            images_uploaded += 1
-                                            if img_caption and add_blocks_tool:
-                                                caption_block = [{
-                                                    "blockType": "text",
-                                                    "options": {
-                                                        "text": {
-                                                            "textStyles": [{"text": img_caption, "style": {"bold": True, "text_color": 7}}],
-                                                            "align": 2
-                                                        }
-                                                    }
-                                                }]
-                                                await add_blocks_tool.call(
-                                                    ctx_wrapper, documentId=document_id,
-                                                    parentBlockId=document_id,
-                                                    index=current_index + 1,
-                                                    blocks=caption_block
-                                                )
-                                                current_index += 1
-                                        else:
-                                            err_msg = ""
-                                            if hasattr(upload_res, 'content') and upload_res.content:
-                                                err_msg = getattr(upload_res.content[0], 'text', str(upload_res))[:200]
-                                            logger.error(f"[IdeaEngine] MCP 图片上传失败: {err_msg}")
-                                    else:
-                                        if not image_block_id:
-                                            logger.error(f"[IdeaEngine] 未获取到图片块ID，跳过上传")
-                                        elif not upload_image_tool:
-                                            logger.error(f"[IdeaEngine] upload_image_tool 不可用")
-
-                                # 上传完成后清理临时文件
-                                if is_temp_file and os.path.exists(img_path):
-                                    try:
-                                        os.unlink(img_path)
-                                    except OSError:
-                                        pass
-                            else:
-                                logger.error(
-                                    f"[IdeaEngine] 图片块缺少有效数据 "
-                                    f"(image_path={img_path!r}, has_base64={bool(img_base64)})，跳过"
-                                )
-
-                            current_index += 1
-                            batch_start_index = current_index
-                        else:
-                            if b.get("blockType") == "list" and b.get("_textStyles"):
-                                list_content = b.get("options", {}).get("list", {}).get("content", "")
-                                list_items_to_update.append((list_content, b.get("_textStyles") or {}))
-                            text_batch.append(b)
-                            current_index += 1
-
-                    await _flush_text_batch_async()
-
-                    # 通过 get_feishu_document_blocks 获取块 ID，再更新列表样式
-                    if list_items_to_update and update_text_tool and get_blocks_tool:
+                    img_path = self._ensure_png(img_path)
+                    if not img_width or not img_height:
                         try:
-                            blocks_result = await get_blocks_tool.call(ctx_wrapper, documentId=document_id)
-                            blocks_text = ""
-                            if hasattr(blocks_result, 'content') and blocks_result.content:
-                                blocks_text = getattr(blocks_result.content[0], 'text', '') or str(blocks_result.content[0])
-                            all_doc_blocks = []
-                            try:
-                                if blocks_text:
-                                    decoder = json.JSONDecoder()
-                                    all_doc_blocks, end_pos = decoder.raw_decode(blocks_text)
-                                    logger.info(f"[IdeaEngine] JSON 解析成功，{len(all_doc_blocks)} 个块，忽略尾部 {len(blocks_text) - end_pos} 字符")
-                            except Exception as e:
-                                logger.warning(f"[IdeaEngine] JSON 解析失败: {e}")
-                            logger.info(f"[IdeaEngine] 获取到 {len(all_doc_blocks)} 个文档块，准备更新 {len(list_items_to_update)} 个列表样式")
+                            from PIL import Image as PILImage
+                            with PILImage.open(img_path) as pil_img:
+                                orig_w, orig_h = pil_img.size
+                            img_width, img_height = orig_w, orig_h
+                        except Exception:
+                            img_width, img_height = 768, 768
 
-                            def _normalize_text(t: str) -> str:
-                                return re.sub(r'\s+', ' ', t).strip()
+                    rel_path = os.path.relpath(img_path, start=_plugin_root)
+                    if rel_path.startswith("..") or os.path.isabs(rel_path):
+                        logger.warning(f"[IdeaEngine] 图片路径不在插件目录内，跳过: {img_path}")
+                        continue
 
-                            updates = []
-                            matched_block_ids = set()
-                            for list_text, text_styles in list_items_to_update:
-                                norm_list_text = _normalize_text(list_text)
-                                for block in all_doc_blocks:
-                                    block_id = block.get("block_id", "")
-                                    if block_id in matched_block_ids:
-                                        continue
-                                    block_type = block.get("block_type", 0)
-                                    if block_type not in (12, 13):
-                                        continue
-                                    block_data = block.get("bullet") or block.get("ordered") or {}
-                                    elements = block_data.get("elements", [])
-                                    block_text = ""
-                                    for elem in elements:
-                                        tr = elem.get("text_run", {})
-                                        if tr.get("content"):
-                                            block_text += tr["content"]
-                                    if _normalize_text(block_text) == norm_list_text:
-                                        matched_block_ids.add(block_id)
-                                        text_elements = []
-                                        for ts in text_styles:
-                                            if ts.get("equation"):
-                                                text_elements.append({"equation": ts["equation"], "style": ts.get("style", {})})
-                                            else:
-                                                text_elements.append({"text": ts.get("text", ""), "style": ts.get("style", {})})
-                                        updates.append({"blockId": block_id, "textElements": text_elements})
-                                        logger.info(f"[IdeaEngine] 匹配列表块: block_id={block_id}, text={block_text[:30]}")
-                                        break
+                    try:
+                        lark_args = [
+                            "+media-insert",
+                            "--doc", f"https://feishu.cn/docx/{document_id}",
+                            "--type", "image",
+                            "--file", rel_path,
+                            "--width", str(img_width),
+                            "--height", str(img_height),
+                        ]
+                        anchor_key = img_info.get("anchor_key", "related_work")
+                        anchor = figure_anchors.get(anchor_key) if figure_anchors else None
+                        if anchor:
+                            lark_args += ["--selection-with-ellipsis", anchor]
+                        if img_caption:
+                            lark_args += ["--caption", img_caption]
+                        logger.info(f"[IdeaEngine] lark-cli 图片插入 (section={anchor_key}, "
+                                    f"anchor={anchor!r})")
 
-                            if updates:
-                                logger.info(f"[IdeaEngine] 更新 {len(updates)} 个列表块样式")
-                                for i in range(0, len(updates), 50):
-                                    batch = updates[i:i + 50]
-                                    upd_result = await update_text_tool.call(
-                                        ctx_wrapper,
-                                        documentId=document_id,
-                                        updates=batch
-                                    )
-                                    if hasattr(upd_result, 'isError') and upd_result.isError:
-                                        err = getattr(upd_result.content[0], 'text', str(upd_result))[:300] if hasattr(upd_result, 'content') and upd_result.content else str(upd_result)
-                                        logger.error(f"[IdeaEngine] 列表样式更新失败: {err}")
-                                    else:
-                                        logger.info(f"[IdeaEngine] 列表样式更新成功 ({len(batch)} 个块)")
-                        except Exception as e:
-                            logger.error(f"[IdeaEngine] 获取或更新块样式失败: {e}")
+                        lark_res = self._call_lark_cli(
+                            "docs", lark_args, timeout=30,
+                            cwd=str(_plugin_root),
+                        )
+                        if lark_res["success"]:
+                            images_uploaded += 1
+                            logger.info(f"[IdeaEngine] lark-cli 图片插入成功: {rel_path}")
+                        else:
+                            logger.warning(f"[IdeaEngine] lark-cli 图片插入失败: {lark_res.get('error', '')[:150]}")
+                    except Exception as e:
+                        logger.warning(f"[IdeaEngine] lark-cli 图片插入异常: {e}")
 
-                    logger.info(f"[IdeaEngine] 文档写入完成: {images_uploaded} 张图片已上传, 总块数: {len(all_blocks)}")
-                else:
-                    logger.warning("[IdeaEngine] 未找到 batch_create_feishu_blocks 工具")
-            else:
-                logger.warning("[IdeaEngine] all_blocks 为空，跳过块插入")
+                    if is_temp_file and os.path.exists(img_path):
+                        try:
+                            os.unlink(img_path)
+                        except OSError:
+                            pass
+
+                logger.info(f"[IdeaEngine] 图片插入完成: {images_uploaded}/{len(image_infos)} 张")
 
             url = f"https://feishu.cn/docx/{document_id}"
             return {
                 "success": True,
                 "document_id": document_id,
                 "url": url,
-                "blocks_created": len(all_blocks),
+                "images_uploaded": images_uploaded,
                 "polished_content": weekly_report
             }
 
@@ -1206,9 +704,121 @@ Caption："""
             logger.error(traceback.format_exc())
             return {"error": str(e), "polished_content": ""}
 
+    # ==================== 图表引用清洗（不用正则） ====================
+
+    @classmethod
+    def _clean_figure_references(cls, text: str) -> tuple[str, int]:
+        """移除文本中所有"如图 X 所示"引用（逐字符扫描，不用正则）。
+
+        支持：如图 1 所示、如图1所示、(如图 1 所示)、（如图 1 所示）、
+        如图 1-3 所示、如图 1、2、3 所示 等变体。
+        不匹配泛指描述（"相关实验结果如图所示"）——必须有数字。
+        """
+        removed = 0
+        i = 0
+        n = len(text)
+        # 从后往前处理，避免索引偏移
+        spans_to_remove: list[tuple[int, int]] = []
+
+        while i < n:
+            # 找 "如图"
+            pos = text.find('如图', i)
+            if pos == -1:
+                break
+
+            # 跳过 "如图" 本身
+            j = pos + 2
+
+            # 跳过空白
+            while j < n and text[j] in (' ', '\t', '　'):
+                j += 1
+
+            # 必须有数字
+            if j >= n or not text[j].isdigit():
+                i = pos + 2
+                continue
+
+            # 扫描数字及分隔符
+            j += 1
+            while j < n:
+                ch = text[j]
+                if ch.isdigit():
+                    j += 1
+                elif ch in ('-', '–', ',', '，', '、'):
+                    # 范围或列表分隔符，后面必须有数字
+                    j += 1
+                    while j < n and text[j] in (' ', '\t', '　'):
+                        j += 1
+                    if j < n and text[j].isdigit():
+                        j += 1
+                    else:
+                        break
+                else:
+                    break
+
+            # 期望 "所示"
+            k = j
+            while k < n and text[k] in (' ', '\t', '　'):
+                k += 1
+            if k + 2 > n or text[k:k+2] != '所示':
+                i = pos + 2
+                continue
+
+            # 确定移除范围
+            remove_start = pos
+            remove_end = k + 2
+
+            # 扩展：前导开括号
+            if remove_start > 0 and text[remove_start - 1] in ('(', '（'):
+                remove_start -= 1
+            # 扩展：尾随闭括号
+            if remove_end < n and text[remove_end] in (')', '）'):
+                remove_end += 1
+            # 扩展：尾随分隔标点（不含句号，避免断句残留逗号）
+            if remove_end < n and text[remove_end] in (',', '，', ';', '；'):
+                remove_end += 1
+
+            spans_to_remove.append((remove_start, remove_end))
+            i = remove_end
+
+        # 从后往前删除
+        result = text
+        for start, end in reversed(spans_to_remove):
+            result = result[:start] + result[end:]
+            removed += 1
+
+        if removed:
+            logger.info(f"[IdeaEngine] _clean_figure_references: 移除 {removed} 个虚构图表引用")
+        return result, removed
+
     # ==================== larksuite/cli 集成 ====================
 
     _LARK_CLI_SUBCMDS = frozenset({"doc", "docs", "wiki", "calendar", "sheets", "base", "im", "help"})
+
+    _IMG_MD_RE = re.compile(r'!\[(.*?)\]\(([/][^)]+\.(?:png|jpg|jpeg|webp|gif))\)')
+
+    @classmethod
+    def _strip_markdown_images(cls, text: str) -> tuple[str, list[dict]]:
+        """去除 markdown 中的 ![...](path) 图片行，返回 (clean_text, image_infos).
+
+        每行如果匹配到完整图片语法则整行移除，其余文本原样保留。
+        从 caption 中提取图/表编号作为定位锚点。
+        """
+        images = []
+        clean_lines = []
+        for line in text.split('\n'):
+            stripped = line.strip()
+            m = cls._IMG_MD_RE.match(stripped)
+            if m:
+                caption = m.group(1)
+                path = m.group(2)
+                if not os.path.exists(path):
+                    logger.warning(f"[IdeaEngine] _strip_markdown_images: 图片路径不存在，从 clean_text 移除但不加入上传队列: {path}")
+                    continue
+                images.append({"path": path, "caption": caption, "anchor_key": "related_work"})
+                continue
+            clean_lines.append(line)
+        return '\n'.join(clean_lines), images
 
     @staticmethod
     def _lark_cli_available() -> bool:

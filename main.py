@@ -342,6 +342,12 @@ class PaperRAGPlugin(PaperCommandsMixin, ArxivCommandsMixin, GraphCommandsMixin,
         async for result in self._idea_clear(event, topic=topic):
             yield result
 
+    @idea_commands.command("clean")
+    async def cmd_idea_clean(self, event: AstrMessageEvent, action: str = "", confirm: str = ""):
+        """扫描并清理孤立/空的 topic 文件夹"""
+        async for result in self._idea_clean(event, action=action, confirm=confirm):
+            yield result
+
     @idea_commands.command("explore")
     async def cmd_idea_explore(self, event: AstrMessageEvent, topic: str = "", depth: str = "standard", num_ideas: int = 3):
         """探索研究想法（完整流程）"""

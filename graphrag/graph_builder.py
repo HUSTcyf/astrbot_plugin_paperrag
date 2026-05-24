@@ -75,6 +75,71 @@ RELATION_ALIASES: Dict[str, str] = {
     "studies": "ABLATES_ON",
 }
 
+_GENERIC_SELF_REFERENCES: frozenset[str] = frozenset({
+    # "our X" family
+    "our method", "our model", "our approach", "our framework",
+    "our work", "our technique", "our system", "our pipeline",
+    "our scheme", "our study", "our research",
+    # "the proposed X" family
+    "the proposed method", "the proposed model", "the proposed approach",
+    "the proposed framework", "the proposed technique", "the proposed scheme",
+    "the proposed system", "the proposed pipeline",
+    # bare "proposed X" family
+    "proposed method", "proposed model", "proposed approach",
+    "proposed framework", "proposed technique",
+    # standalone self-references
+    "ours", "our",
+    "this work", "this paper", "this study", "this research", "this approach",
+    "the proposed", "proposed",
+})
+
+# Matches "Full Name (ACRONYM)" — e.g. "3D Gaussian Splatting (3DGS)"
+# This is a deterministic syntactic pattern, NOT a heuristic guess.
+_FULL_NAME_WITH_ACRONYM: re.Pattern = re.compile(r'^(.+?)\s*\(([A-Za-z0-9\-]{2,8})\)$')
+
+
+def _is_short_name(name: str) -> bool:
+    """Trivial check: could this be an acronym/abbreviation? (length only)
+
+    Short names are candidates for acronym matching, but the actual
+    dedup decision requires contextual evidence (registry or co-occurrence).
+    This is intentionally NOT a regex heuristic — it's just a length gate.
+    """
+    return 2 <= len(name) <= 8 and " " not in name
+
+
+def _normalize_acronym_key(name: str) -> str:
+    """Strip hyphens/dots and uppercase for reliable acronym comparison.
+
+    "GPT-3" → "GPT3", "3D.GS" → "3DGS", "NeRF" → "NERF"
+    """
+    return re.sub(r'[^A-Za-z0-9]', '', name).upper()
+
+
+def _initials_of(name: str) -> str:
+    """Extract acronym-like initials from a full name.
+
+    "3D Gaussian Splatting" → "3DGS"
+    "Neural Radiance Fields" → "NRF"
+    "Generative Pre-trained Transformer 3" → "GPTT3"
+
+    NOTE: Hyphenated compounds ("Pre-trained") split into two segments,
+    each contributing an initial ("P" + "T"). This means "GPTT3" won't
+    match "GPT3". Same-paper co-occurrence (Layer 4) handles this case
+    when the LLM uses "Full Name (ACRONYM)" format per rule 10.
+    """
+    stripped = _FULL_NAME_WITH_ACRONYM.sub(r'\1', name)
+    result = []
+    for part in re.split(r'[\s-]+', stripped):
+        if not part:
+            continue
+        # Segments starting with digit or all-uppercase: keep all alpha+digit chars
+        if part[0].isdigit() or part.isupper():
+            result.append(''.join(c.upper() for c in part if c.isalnum()))
+        else:
+            result.append(part[0].upper())
+    return ''.join(result)
+
 ENTITY_TYPE_ALIASES: Dict[str, str] = {
     "model/architecture": "Model",
     "method/technique": "Method",
@@ -198,6 +263,8 @@ Extract meaningful content-level relationship triplets from the given paper text
 6. **STRICT LIMIT**: Maximum {{max_triplets}} triplets TOTAL for ALL chunks combined
 7. **IMPORTANT**: evidence field must ONLY contain "[Chunk X]" — do NOT include original text
 8. Keep entity names concise (max 30 chars), use abbreviations if needed
+9. NEVER use generic self-references ("our method", "our model", "the proposed approach", etc.) as entity names. Use the ACTUAL method/model name from the paper. If the paper names its method "DynamicConv", use "DynamicConv" — not "our method".
+10. When an entity has a common acronym (e.g., "3DGS" for "3D Gaussian Splatting"), always use the FULL canonical name followed by the acronym in parentheses: "3D Gaussian Splatting (3DGS)". Use this same full form consistently throughout.
 
 ## Example
 Chunks:
@@ -302,6 +369,8 @@ Extract meaningful content-level relationship triplets from the given paper text
 6. **STRICT LIMIT**: Maximum {{max_triplets}} triplets TOTAL
 7. **IMPORTANT**: evidence field must be a SHORT phrase (max 50 chars) — do NOT include long text snippets
 8. Keep entity names concise (max 30 chars)
+9. NEVER use generic self-references ("our method", "our model", "the proposed approach", etc.) as entity names. Use the ACTUAL method/model name from the paper. If the paper names its method "DynamicConv", use "DynamicConv" — not "our method".
+10. When an entity has a common acronym (e.g., "3DGS" for "3D Gaussian Splatting"), always use the FULL canonical name followed by the acronym in parentheses: "3D Gaussian Splatting (3DGS)". Use this same full form consistently throughout.
 
 ## Example
 Input: "BERT is based on the Transformer encoder architecture and achieves 86.4% accuracy on GLUE benchmark, outperforming all previous models."
@@ -389,6 +458,8 @@ Image: (provided as image input)
 1. IGNORE ALL METADATA: authors, institutions, venues, dates, grants, affiliations
 2. text_triplets: relation_type MUST be from the closed set above
 3. cross_modal_triplets: relation_type can be any string (e.g., "visualizes", "shows_results")
+4. NEVER use generic self-references ("our method", "our model", "the proposed approach", etc.) as entity names. Use the ACTUAL method/model name from the paper. If the paper names its method "DynamicConv", use "DynamicConv" — not "our method".
+5. When an entity has a common acronym (e.g., "3DGS" for "3D Gaussian Splatting"), always use the FULL canonical name followed by the acronym in parentheses: "3D Gaussian Splatting (3DGS)". Use this same full form consistently throughout.
 
 ## Output Format
 ```json
@@ -504,6 +575,12 @@ class MultimodalGraphBuilder:
         self._llm_config = self._get_llm_config()
         self._triplet_grammar: Optional[Any] = None
         self._multimodal_grammar: Optional[Any] = None
+        # Entity dedup: maps lower(acronym) → canonical full name
+        self._canonical_registry: dict[str, str] = {}
+        # Entity dedup: tracks all entity names by type for cross-paper initials matching
+        self._entity_registry_by_type: dict[str, set[str]] = {}
+        # Entity dedup: tracks entity names per paper for same-paper co-occurrence matching
+        self._entity_registry_by_paper: dict[str, set[str]] = {}
 
     def _get_llm_config(self) -> LocalLLMConfig:
         """获取 LLM 配置"""
@@ -670,6 +747,10 @@ class MultimodalGraphBuilder:
             f"有效块={stats['chunks_processed']}, "
             f"空块={stats['chunks_empty']}"
         )
+
+        # Post-build: detect and link acronym aliases
+        alias_count = self._post_build_merge_aliases(graph_store)
+        stats["alias_relationships_created"] = alias_count
 
         return stats
 
@@ -853,7 +934,7 @@ class MultimodalGraphBuilder:
             # Deterministic Chunk→Media edges from metadata (survives VLM failure)
             for node in valid_nodes:
                 meta = node.metadata if hasattr(node, 'metadata') else {}
-                if meta.get("has_image") and meta.get("image_path"):
+                if meta.get("has_image") and meta.get("image_path") and Path(meta["image_path"]).exists():
                     graph_store.add_media_link(
                         chunk_id=meta.get("chunk_id", meta.get("file_name", "")),
                         media_path=meta["image_path"],
@@ -890,6 +971,8 @@ class MultimodalGraphBuilder:
                 contributing_chunks.add(chunk_idx)
                 metadata = node.metadata if hasattr(node, 'metadata') else {}
                 chunk_id = metadata.get("chunk_id", metadata.get("file_name", ""))
+                head = self._normalize_entity_name(head, triplet.get("head_type", ""), chunk_id)
+                tail = self._normalize_entity_name(tail, triplet.get("tail_type", ""), chunk_id)
 
                 graph_store.add_entity(
                     name=head,
@@ -1076,9 +1159,9 @@ class MultimodalGraphBuilder:
             counted_entities: set = set()
 
             for triplet in triplets:
-                head = triplet.get("head", "").strip()
+                head = self._normalize_entity_name(triplet.get("head", "").strip(), triplet.get("head_type", ""), chunk_id)
                 relation = triplet.get("relation", "").strip()
-                tail = triplet.get("tail", "").strip()
+                tail = self._normalize_entity_name(triplet.get("tail", "").strip(), triplet.get("tail_type", ""), chunk_id)
 
                 if not head or not relation or not tail:
                     continue
@@ -1177,9 +1260,9 @@ class MultimodalGraphBuilder:
         text_triplets = data.get("text_triplets", [])
         counted_entities: set = set()
         for triplet in text_triplets[:self.config.max_triplets_per_chunk]:
-            head = triplet.get("head", "").strip()
+            head = self._normalize_entity_name(triplet.get("head", "").strip(), triplet.get("head_type", ""), chunk_id)
             relation = triplet.get("relation", "").strip()
-            tail = triplet.get("tail", "").strip()
+            tail = self._normalize_entity_name(triplet.get("tail", "").strip(), triplet.get("tail_type", ""), chunk_id)
             if not head or not relation or not tail:
                 continue
             graph_store.add_entity(
@@ -1252,11 +1335,11 @@ class MultimodalGraphBuilder:
         for triplet in cross_triplets:
             head = figure_id
             relation = triplet.get("relation", "").strip()
-            tail = triplet.get("tail", "").strip()
+            tail_type = triplet.get("tail_type", "Application")
+            tail = self._normalize_entity_name(triplet.get("tail", "").strip(), tail_type, chunk_id)
             if not relation or not tail:
                 continue
             # Ensure tail entity exists in Neo4j (add_entity uses MERGE, idempotent)
-            tail_type = triplet.get("tail_type", "Application")
             if tail.lower() not in graph_store:
                 graph_store.add_entity(
                     name=tail,
@@ -1464,7 +1547,175 @@ Extract triplets:"""
         logger.warning(f"[Graph-LLM] Unknown relation_type '{relation_type}', defaulting to 'USES_COMPONENT'")
         return "USES_COMPONENT"
 
+    def _normalize_entity_name(self, name: str, entity_type: str = "", chunk_id: str = "") -> str:
+        """Normalize entity name: denylist + acronym dedup.
 
+        1. Replace generic self-references ("our method") with paper_id.
+        2. If name is "Full Name (ACRONYM)", register mapping, return full.
+        3. If name is short (potential acronym), check canonical registry.
+        4. Same-paper co-occurrence: match short name against full names from the
+           SAME paper (most reliable automated method, ~93% recall).
+        5. Cross-paper initials matching (fallback, only when same-paper fails).
+        """
+        cleaned = name.strip()
+        if not cleaned:
+            return cleaned
+        paper_id = Path(chunk_id).stem if chunk_id else ""
+
+        # ── Layer 1: Generic self-reference denylist ──────────────────────
+        if cleaned.lower() in _GENERIC_SELF_REFERENCES:
+            if paper_id:
+                logger.info(
+                    f"[Graph-LLM] Replaced generic self-reference '{cleaned}' "
+                    f"with paper_id '{paper_id}'"
+                )
+                return paper_id
+            else:
+                logger.warning(
+                    f"[Graph-LLM] Generic self-reference '{cleaned}' not replaced "
+                    f"— no chunk_id available to derive paper_id"
+                )
+
+        # ── Layer 2: "Full Name (ACRONYM)" → register mapping, return full ──
+        m = _FULL_NAME_WITH_ACRONYM.match(cleaned)
+        if m:
+            full_name = m.group(1).strip()
+            acronym = m.group(2).upper()
+            # Guard: skip if full_name is an entity type string itself
+            _ENTITY_TYPE_GUARD = frozenset({
+                "method", "model", "task", "dataset", "metric",
+                "component", "limitation", "application", "baseline",
+            })
+            if full_name.lower() not in _ENTITY_TYPE_GUARD:
+                self._canonical_registry[acronym.lower()] = full_name
+                self._canonical_registry[full_name.lower()] = full_name
+                logger.debug(
+                    f"[Graph-LLM] Registered acronym '{acronym}' → '{full_name}'"
+                )
+            cleaned = full_name
+
+        # ── Layer 3: Short name → check canonical registry ────────────────
+        if _is_short_name(cleaned):
+            canonical = self._canonical_registry.get(cleaned.lower())
+            if canonical:
+                logger.info(
+                    f"[Graph-LLM] Normalized acronym '{cleaned}' → '{canonical}'"
+                )
+                cleaned = canonical
+
+        # ── Layer 4: Same-paper co-occurrence (MOST RELIABLE) ─────────────
+        # Research shows same-document acronym detection achieves ~93% recall.
+        # If a short name appears in the same paper as a full name with matching
+        # initials, they almost certainly refer to the same entity.
+        if _is_short_name(cleaned) and entity_type and paper_id:
+            same_paper = self._entity_registry_by_paper.get(paper_id, set())
+            for existing in same_paper:
+                if _initials_of(existing).upper() == _normalize_acronym_key(cleaned):
+                    self._canonical_registry[cleaned.lower()] = existing
+                    logger.info(
+                        f"[Graph-LLM] Same-paper co-occurrence: "
+                        f"'{cleaned}' → '{existing}' (paper={paper_id})"
+                    )
+                    cleaned = existing
+                    break
+
+        # ── Layer 5: Cross-paper initials matching (FALLBACK) ─────────────
+        if _is_short_name(cleaned) and entity_type:
+            known = self._entity_registry_by_type.get(entity_type, set())
+            for existing in known:
+                if _initials_of(existing).upper() == _normalize_acronym_key(cleaned):
+                    self._canonical_registry[cleaned.lower()] = existing
+                    logger.info(
+                        f"[Graph-LLM] Cross-paper initials match: "
+                        f"'{cleaned}' → '{existing}'"
+                    )
+                    cleaned = existing
+                    break
+
+        # ── Track entity name in registries ───────────────────────────────
+        if entity_type and cleaned:
+            self._entity_registry_by_type.setdefault(entity_type, set()).add(cleaned)
+        if paper_id and cleaned:
+            self._entity_registry_by_paper.setdefault(paper_id, set()).add(cleaned)
+
+        return cleaned
+
+    def _post_build_merge_aliases(self, graph_store: Any) -> int:
+        """Post-build: detect acronym→full-name aliases and create :ALIAS_OF relationships.
+
+        Queries Neo4j for all same-type entity pairs and applies the initials heuristic:
+        if the shorter name's letters match the first letters of the longer name's words,
+        create (alias)-[:ALIAS_OF]->(canonical).
+
+        Returns number of alias relationships created.
+        """
+        driver = getattr(graph_store, '_driver', None)
+        if driver is None:
+            logger.warning("[Graph-LLM] No Neo4j driver available, skipping post-build alias merge")
+            return 0
+
+        try:
+            with driver.session(database="neo4j") as session:
+                # Fetch all entities with their labels and names
+                result = session.run(
+                    "MATCH (n) WHERE n.name IS NOT NULL "
+                    "RETURN labels(n) AS labels, n.name AS name ORDER BY labels, name"
+                )
+                records = list(result)
+        except Exception as e:
+            logger.warning(f"[Graph-LLM] Failed to query entities for alias merge: {e}")
+            return 0
+
+        # Group names by type (use first label as type)
+        by_type: dict[str, list[str]] = {}
+        for rec in records:
+            labels = rec["labels"]
+            name = rec["name"]
+            if not labels or not name:
+                continue
+            entity_type = labels[0]
+            by_type.setdefault(entity_type, []).append(name)
+
+        # ── Phase 1: Collect alias pairs ─────────────────────────────────
+        alias_pairs: list[tuple[str, str, str]] = []  # (shorter, longer, entity_type)
+        for entity_type, names in by_type.items():
+            if len(names) < 2:
+                continue
+            for i, shorter in enumerate(names):
+                if not _is_short_name(shorter):
+                    continue
+                for j, longer in enumerate(names):
+                    if i == j:
+                        continue
+                    if len(longer) <= len(shorter):
+                        continue
+                    if _initials_of(longer) == _normalize_acronym_key(shorter):
+                        alias_pairs.append((shorter, longer, entity_type))
+
+        # ── Phase 2: Batch-write in a single session ─────────────────────
+        aliases_created = 0
+        if alias_pairs:
+            try:
+                with driver.session(database="neo4j") as session:
+                    for shorter, longer, entity_type in alias_pairs:
+                        session.run(
+                            "MATCH (alias {name: $alias_name}) "
+                            "MATCH (canon {name: $canon_name}) "
+                            "MERGE (alias)-[:ALIAS_OF]->(canon)",
+                            alias_name=shorter,
+                            canon_name=longer,
+                        )
+                        aliases_created += 1
+                        logger.info(
+                            f"[Graph-LLM] Post-build alias: '{shorter}' "
+                            f"→ :ALIAS_OF → '{longer}' ({entity_type})"
+                        )
+            except Exception as e:
+                logger.warning(f"[Graph-LLM] Batch :ALIAS_OF creation failed: {e}")
+
+        if aliases_created > 0:
+            logger.info(f"[Graph-LLM] Post-build merge: created {aliases_created} :ALIAS_OF relationships")
+        return aliases_created
 
     def _parse_json_response(self, response: str) -> List[Dict[str, Any]]:
         """解析 JSON 响应。Grammar 已约束输出，理论上应该合法。"""

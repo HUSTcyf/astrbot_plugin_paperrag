@@ -2,7 +2,6 @@
 Markdown 处理与图片工具方法
 """
 
-import base64
 import os
 import re
 from typing import Any, Dict, List, Optional
@@ -10,117 +9,27 @@ from urllib.parse import unquote
 from pathlib import Path
 from astrbot.api import logger
 
-from .utils import strip_markdown_style, parse_inline_styles
 from .ideas import IdeaEngineIdeas
+
+# Canonical section structure.  Order matters — used for anchor placement.
+# (canonical_heading, keyword_for_normalization)
+CANONICAL_SECTIONS = [
+    ("## 1. 背景动机", "背景动机"),
+    ("## 2. 相关工作", "相关工作"),
+    ("## 3. 方法论", "方法论"),
+    ("## 4. 创新点", "创新点"),
+    ("## 5. 实验Benchmark", "实验Benchmark"),
+    ("## 6. 挑战与解决方案", "挑战与解决方案"),
+    ("## 7. 下一步计划", "下一步计划"),
+    ("## 8. 参考文献", "参考文献"),
+]
+
+# Map keyword → canonical heading for fast lookup
+_SECTION_KEYWORD_TO_HEADING = {kw: h for h, kw in CANONICAL_SECTIONS}
 
 
 class IdeaEngineMarkdown(IdeaEngineIdeas):
     """Markdown 处理与图片工具方法。继承链：... → IdeaEngineIdeas → IdeaEngineMarkdown"""
-
-    def _markdown_to_feishu_blocks(self, markdown_text: str) -> List[Dict]:
-        """将 Markdown 文本转换为飞书块格式
-
-        对于含行内图片的段落，将图片前后的文本合并为一个文本块，
-        图片紧跟在文本块后面（与飞书文档阅读体验一致）。
-        """
-        blocks = []
-        lines = markdown_text.split("\n")
-
-        for line in lines:
-            line = line.rstrip()
-
-            if line.startswith("# ") and not line.startswith("## "):
-                content = strip_markdown_style(line[2:].strip())
-                blocks.append({
-                    "blockType": "heading",
-                    "options": {"heading": {"level": 1, "content": content}}
-                })
-            elif line.startswith("## ") and not line.startswith("### "):
-                content = strip_markdown_style(line[3:].strip())
-                blocks.append({
-                    "blockType": "heading",
-                    "options": {"heading": {"level": 2, "content": content}}
-                })
-            elif line.startswith("### "):
-                content = strip_markdown_style(line[4:].strip())
-                blocks.append({
-                    "blockType": "heading",
-                    "options": {"heading": {"level": 3, "content": content}}
-                })
-            elif line.startswith("---"):
-                blocks.append({
-                    "blockType": "text",
-                    "options": {"text": {"textStyles": [{"text": "─────────────────────────────────", "style": {}}]}}
-                })
-            elif line.startswith("- ") or line.startswith("* "):
-                raw_content = line[2:].strip()
-                if raw_content:
-                    blocks.append({
-                        "blockType": "list",
-                        "options": {"list": {"content": raw_content, "isOrdered": False}},
-                        "_textStyles": parse_inline_styles(raw_content)
-                    })
-            elif re.match(r'^\d+[\.\)]\s', line):
-                match = re.match(r'^(\d+[\.\)])\s+(.*)$', line)
-                if match:
-                    raw_content = match.group(2).strip()
-                    if raw_content:
-                        blocks.append({
-                            "blockType": "list",
-                            "options": {"list": {"content": raw_content, "isOrdered": True}},
-                            "_textStyles": parse_inline_styles(raw_content)
-                        })
-            elif line.strip() == "":
-                pass
-            else:
-                text_content = line.strip()
-                if text_content:
-                    segments = self._extract_inline_images(text_content)
-                    text_parts = []
-                    image_blocks = []
-                    for seg in segments:
-                        if seg["type"] == "text":
-                            text_parts.append(seg["content"])
-                        elif seg["type"] == "image":
-                            img_block = self._make_image_block(seg["path"], seg["caption"])
-                            if img_block is not None:
-                                image_blocks.append(img_block)
-                    merged_text = "".join(text_parts)
-                    if merged_text.strip():
-                        blocks.append({
-                            "blockType": "text",
-                            "options": {"text": {"textStyles": parse_inline_styles(merged_text)}}
-                        })
-                    blocks.extend(image_blocks)
-
-        return blocks
-
-    def _find_methodology_end_index(self, blocks: List[Dict]) -> int:
-        """找到方法论章节的结束位置（下一个同级/更高级标题之前），返回插入索引。
-        如果找不到方法论章节，返回 blocks 末尾。"""
-        method_start = -1
-        method_level = 3
-        for i, b in enumerate(blocks):
-            if b.get("blockType") == "heading":
-                opts = b.get("options", {}).get("heading", {})
-                content = opts.get("content", "")
-                level = opts.get("level", 0)
-                if level <= 3 and re.search(r'方法|method', content, re.IGNORECASE):
-                    method_start = i
-                    method_level = level
-                    break
-
-        if method_start < 0:
-            return len(blocks)
-
-        for i in range(method_start + 1, len(blocks)):
-            b = blocks[i]
-            if b.get("blockType") == "heading":
-                opts = b.get("options", {}).get("heading", {})
-                level = opts.get("level", 0)
-                if level <= method_level:
-                    return i
-        return len(blocks)
 
     def _extract_path_from_paren(self, line: str) -> str | None:
         """从一行中提取 (path) 格式的路径，支持路径中含括号如 2502.12138v4(nopo)，
@@ -293,67 +202,335 @@ class IdeaEngineMarkdown(IdeaEngineIdeas):
             logger.info("[IdeaEngine] 未找到论文图表章节，图片已由 _append_figure_section 嵌入，跳过")
             return markdown_text
 
-    def _append_figure_section(self, text: str, knowledge: Optional[Dict[str, Any]] = None) -> str:
-        """将论文图表嵌入相关工作章节（插入到该章节末尾）。"""
+    @staticmethod
+    def _normalize_section_headings(text: str) -> str:
+        """逐行扫描，将含已知章节名的标题行替换为标准 ``## N. 章节名``。
+
+        归一化空白后比较，容错 LLM 在中文与英文之间插入空格（如
+        "实验 Benchmark" → "实验Benchmark"）。仅处理以 ``#`` 开头的行，
+        避免正文中提及章节名导致的误替换。
+        """
+        lines = text.split('\n')
+        result = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('#'):
+                stripped_nospace = stripped.replace(' ', '').replace('\t', '')
+                for kw, canonical in _SECTION_KEYWORD_TO_HEADING.items():
+                    if kw in stripped_nospace:
+                        result.append(canonical)
+                        break
+                else:
+                    result.append(line)
+            else:
+                result.append(line)
+        return '\n'.join(result)
+
+    @staticmethod
+    def _find_section_anchor(text: str, heading: str, next_heading: str | None) -> str | None:
+        """用 ``str.find()`` 精确定位两个章节标题之间的最后一句话作为锚点。
+
+        Args:
+            text: 规范化后的文档文本
+            heading: 当前章节的标准标题，如 ``"## 2. 相关工作"``
+            next_heading: 下一章节的标准标题，如 ``"## 3. 方法论"``。
+                          为 None 时取文档末尾。
+
+        Returns:
+            锚点文本（最后一句），或 None
+        """
+        start = text.find(heading)
+        if start == -1:
+            return None
+
+        body_start = start + len(heading)
+        if next_heading is not None:
+            end = text.find(next_heading, body_start)
+            if end != -1:
+                body = text[body_start:end]
+            else:
+                # Next heading not found — take rest of text
+                body = text[body_start:]
+        else:
+            body = text[body_start:]
+
+        # 取最后一段非空文字的最后 60 个字符
+        content_lines = [l.strip() for l in body.split('\n') if l.strip() and not l.strip().startswith('#')]
+        if not content_lines:
+            # 章节无正文，用标题本身作锚点
+            anchor = heading.lstrip('#').strip()
+            logger.info(f"[IdeaEngine] ⚠️ 锚点回退（章节无正文）: {anchor[:60]!r}")
+            return anchor
+
+        last_line = content_lines[-1]
+        anchor = last_line[-60:].lstrip().rstrip('，；：！？, ;:!?')
+        if len(anchor) >= 5:
+            logger.info(f"[IdeaEngine] ✅ 锚点: {heading} 末尾 → {anchor[:60]!r}")
+            return anchor
+
+        logger.warning(f"[IdeaEngine] ❌ 锚点文本过短: {last_line!r}")
+        return None
+
+    @staticmethod
+    def _find_figure_anchors(text: str) -> dict:
+        """返回引用图表和方法论图表的插入锚点。
+
+        用 ``str.find()`` 精确定位章节边界，不依赖正则或模糊匹配。
+        调用前应先用 ``_normalize_section_headings`` 规范化章节标题。
+
+        Returns:
+            {"related_work": str | None, "methodology": str | None}
+        """
+        return {
+            "related_work": IdeaEngineMarkdown._find_section_anchor(
+                text, "## 2. 相关工作", "## 3. 方法论"
+            ),
+            "methodology": IdeaEngineMarkdown._find_section_anchor(
+                text, "## 3. 方法论", "## 4. 创新点"
+            ),
+        }
+
+    def _append_figure_section(self, text: str, knowledge: Optional[Dict[str, Any]] = None) -> tuple[list[dict], dict]:
+        """收集图表信息并找到插入锚点。
+
+        Returns:
+            (figure_infos, anchors) 其中 anchors = {"related_work": str|None, "methodology": str|None}
+        """
+        empty_anchors = {"related_work": None, "methodology": None}
+
         if not knowledge:
-            return text
+            return [], empty_anchors
 
         local_results = knowledge.get("local_results", [])
         if not local_results:
-            return text
+            return [], empty_anchors
 
-        caption_cache: Dict[str, Dict[str, str]] = {}
-        figure_entries: List[tuple[str, str, str]] = []
+        caption_cache: Dict[str, Dict[str, Any]] = {}
+        figure_infos: list[dict] = []
 
         for r in local_results:
             metadata = r.get('metadata', {})
-            paper = r.get('paper', 'Unknown')
 
             img_path = metadata.get('image_path', '')
             img_caption = metadata.get('image_caption', '')
-            if img_path and os.path.exists(img_path):
-                img_filename = Path(img_path).name
-                paper_folder = Path(img_path).parent.name
-                if paper_folder not in caption_cache:
-                    caption_cache[paper_folder] = self._load_figure_captions(img_path)
-                fname_to_caption = caption_cache[paper_folder]
-                real_caption = fname_to_caption.get(img_filename) or img_caption or img_filename
-                figure_entries.append((real_caption, img_path, "fig"))
+            img_figure_num = str(metadata.get('image_figure_num', '') or '')
+            if img_path:
+                if os.path.exists(img_path):
+                    img_filename = Path(img_path).name
+                    paper_folder = Path(img_path).parent.name
+                    if paper_folder not in caption_cache:
+                        caption_cache[paper_folder] = self._load_figure_captions(img_path)
+                    caps = caption_cache[paper_folder]
+                    by_filename = caps.get("by_filename", {})
+                    by_number = caps.get("by_number", {})
+                    # Multi-strategy: by_filename → by_number → metadata → fallback
+                    real_caption = by_filename.get(img_filename, "")
+                    if not real_caption and img_figure_num:
+                        real_caption = by_number.get(f"fig:{img_figure_num}", "")
+                    if not real_caption:
+                        real_caption = img_caption or img_filename
+                    figure_infos.append({
+                        "path": img_path,
+                        "caption": real_caption,
+                        "type": "fig",
+                        "figure_num": img_figure_num,
+                    })
+                else:
+                    logger.warning(f"[IdeaEngine] 图片路径不存在，跳过: {img_path}")
 
             table_png = metadata.get('table_png_path', '')
-            if table_png and os.path.exists(table_png):
-                table_caption = metadata.get('table_caption', '') or Path(table_png).stem
-                figure_entries.append((table_caption, table_png, "table"))
+            if table_png:
+                if os.path.exists(table_png):
+                    table_filename = Path(table_png).name
+                    table_num = str(metadata.get('table_num', '') or '')
+                    paper_folder = Path(table_png).parent.name
+                    if paper_folder not in caption_cache:
+                        caption_cache[paper_folder] = self._load_figure_captions(table_png)
+                    caps = caption_cache[paper_folder]
+                    by_filename = caps.get("by_filename", {})
+                    by_number = caps.get("by_number", {})
+                    # Multi-strategy: by_filename → by_number → metadata → fallback
+                    table_caption = by_filename.get(table_filename, "")
+                    if not table_caption and table_num:
+                        table_caption = by_number.get(f"table:{table_num}", "")
+                    if not table_caption:
+                        table_caption = metadata.get('table_caption', '') or Path(table_png).stem
+                    figure_infos.append({
+                        "path": table_png,
+                        "caption": table_caption,
+                        "type": "table",
+                        "table_num": table_num,
+                    })
+                else:
+                    logger.warning(f"[IdeaEngine] 表格图片路径不存在，跳过: {table_png}")
 
-        if not figure_entries:
-            return text
+        if not figure_infos:
+            logger.info("[IdeaEngine] 所有图表路径均不存在于磁盘")
+            return [], empty_anchors
 
-        fig_md_parts = []
+        # Number figures and tables
         fig_idx = 0
         tbl_idx = 0
-        for caption, path, label_type in figure_entries:
-            if label_type == "table":
+        for fi in figure_infos:
+            if fi["type"] == "table":
                 tbl_idx += 1
-                fig_md_parts.append(f"![表 {tbl_idx}：{caption}]({path})")
+                fi["caption"] = f"表 {tbl_idx}：{fi['caption']}"
             else:
                 fig_idx += 1
-                fig_md_parts.append(f"![图 {fig_idx}：{caption}]({path})")
-        fig_md = "\n\n".join(fig_md_parts) + "\n"
+                fi["caption"] = f"图 {fig_idx}：{fi['caption']}"
+        logger.info(f"[IdeaEngine] 有效图表: {fig_idx} 张图, {tbl_idx} 张表 (共 {len(figure_infos)} 个)")
 
-        # Insert after 相关工作 / Related Work section
-        related_match = re.search(
-            r'(##\s*(?:相关工作|Related\s*Work|相关工作与进展|背景与相关工作).*?)(?=##\s|\Z)',
-            text, re.DOTALL | re.IGNORECASE
-        )
-        if related_match:
-            insert_pos = related_match.end()
-            return text[:insert_pos] + "\n" + fig_md + text[insert_pos:]
-        # Fallback: find any heading containing 实验/方法/创新 and insert before it
-        fallback = re.search(r'(?=##\s*(?:实验|方法|创新|Method|Experiment))', text)
-        if fallback:
-            return text[:fallback.start()] + "\n" + fig_md + text[fallback.start():]
-        # Last resort: append
-        return text + "\n" + fig_md
+        # 规范化章节标题后用 str.find() 找锚点
+        normalized = IdeaEngineMarkdown._normalize_section_headings(text)
+        anchors = IdeaEngineMarkdown._find_figure_anchors(normalized)
+        return figure_infos, anchors
+
+    async def _enrich_figure_captions(
+        self,
+        figure_infos: list[dict],
+        local_results: list[dict],
+        llm_provider,
+    ) -> list[dict]:
+        """用 chunk 上下文通过 LLM 丰富图表 caption。
+
+        figure_infos 的 caption 已含编号前缀（"图 1：Table 1"），
+        此方法剥离前缀 → LLM 生成 → 重新加上前缀。LLM 失败时保留原 caption。
+        """
+        if not figure_infos or not local_results or not llm_provider:
+            return figure_infos
+
+        # 1. 构建 paper_folder → accumulated chunk text
+        paper_chunks: dict[str, str] = {}
+        for r in local_results:
+            metadata = r.get('metadata', {})
+            # 从 image_path 或 table_png_path 推导 paper folder
+            for key in ('image_path', 'table_png_path'):
+                p = metadata.get(key, '')
+                if p:
+                    paper_folder = Path(p).parent.name
+                    break
+            else:
+                continue
+            text = r.get('text', '')
+            if not text:
+                continue
+            if paper_folder not in paper_chunks:
+                paper_chunks[paper_folder] = ''
+            paper_chunks[paper_folder] += text + '\n'
+
+        # 1b. 构建 paper_folder → by_number（从 captions JSON）
+        paper_by_number: dict[str, dict[str, str]] = {}
+        for fi in figure_infos:
+            fi_path = fi.get('path', '')
+            if not fi_path:
+                continue
+            paper_folder = Path(fi_path).parent.name
+            if paper_folder not in paper_by_number:
+                caps = self._load_figure_captions(fi_path)
+                paper_by_number[paper_folder] = caps.get("by_number", {})
+
+        # 2. 逐个图表请求 LLM 生成 caption
+        for fi in figure_infos:
+            fi_path = fi.get('path', '')
+            if not fi_path:
+                continue
+
+            paper_folder = Path(fi_path).parent.name
+            chunk_text = paper_chunks.get(paper_folder, '')
+            if not chunk_text:
+                logger.info(f"[IdeaEngine] caption 跳过（无 chunk 上下文）: {Path(fi_path).name}")
+                continue
+
+            # 剥离编号前缀 "图 N：" / "表 N："
+            prefix = ''
+            numbering_match = re.match(r'^((?:图|表)\s*\d+[：:])', fi['caption'])
+            if numbering_match:
+                prefix = numbering_match.group(1)
+                raw_caption = fi['caption'][numbering_match.end():].strip()
+            else:
+                raw_caption = fi['caption']
+
+            filename = Path(fi_path).name
+
+            # 区分两种场景：
+            #   有实质原始 caption → 以原始 caption 为准，chunk 仅作上下文参考
+            #   原始 caption 为空/仅编号 → 先尝试 by_number，再谨慎从 chunk 推断
+            has_substantive_caption = bool(raw_caption and len(raw_caption) > 20)
+            if not has_substantive_caption:
+                # 尝试 by_number 查找（从 captions JSON 的 logical number）
+                fi_type = fi.get('type', 'fig')
+                logical_num = fi.get('figure_num', '') if fi_type == 'fig' else fi.get('table_num', '')
+                by_number = paper_by_number.get(paper_folder, {})
+                if logical_num:
+                    typed_key = f"fig:{logical_num}" if fi_type == 'fig' else f"table:{logical_num}"
+                    if typed_key in by_number:
+                        raw_caption = by_number[typed_key]
+                        has_substantive_caption = True
+                        logger.info(f"[IdeaEngine] caption by_number 命中: {filename} "
+                                    f"key={typed_key} → {raw_caption[:50]}...")
+
+            if has_substantive_caption:
+                prompt = f"""请将以下英文学术图表描述改写为简洁的中文描述（1-2句话，不超过80字）。
+
+原始描述（以此为准，不得偏离原意）：
+{raw_caption}
+
+论文上下文（仅供参考，帮助理解背景）：
+{chunk_text}
+
+要求：
+1. 严格以原始描述为准，保留其核心信息
+2. 论文上下文仅用于帮助理解术语和背景，不得改变原始描述的含义
+3. 将英文改写为中文，精简到1-2句话
+4. 直接输出中文描述，不要加"如图"、"该图展示"等引导语
+5. 不要输出"图 X"、"表 X"、"Figure X"、"Table X"等编号，直接描述内容"""
+            else:
+                prompt = f"""以下图表缺少原始描述，请根据论文上下文推断其内容，给出简洁的中文描述（1-2句话，不超过80字）。
+
+图表文件：{filename}
+
+论文上下文：
+{chunk_text}
+
+要求：
+1. 从上下文找出与该图表最相关的信息，推断图表内容
+2. 若上下文提到相邻编号的图表（如 Figure 3、Table 2），可据此推断该图表在论文中的位置和作用
+3. 仅基于上下文已有信息，不编造未提及的内容
+4. 直接输出中文描述，不要加"如图"、"该图展示"等引导语
+5. 不要输出"图 X"、"表 X"、"Figure X"、"Table X"等编号，直接描述内容"""
+
+            try:
+                response = await llm_provider.text_chat(
+                    prompt=prompt,
+                    temperature=0.3,
+                    max_tokens=128,
+                )
+                new_caption = ''
+                if hasattr(response, 'content'):
+                    new_caption = response.content
+                elif isinstance(response, dict):
+                    new_caption = response.get('content', '') or response.get('text', '')
+                else:
+                    new_caption = str(response)
+
+                new_caption = new_caption.strip().strip('"').strip("'").strip()
+                # Strip redundant figure/table numbering from LLM output
+                # (the prefix "图 N：" / "表 N：" is already applied above)
+                new_caption = re.sub(
+                    r'^(?:图|表|Figure|Fig\.?|Table)\s*[A-Za-z]?\d+[A-Za-z]?(?:[：:\s]+|$)',
+                    '', new_caption
+                ).strip()
+                if new_caption:
+                    old = fi['caption']
+                    fi['caption'] = f"{prefix}{new_caption}" if prefix else new_caption
+                    logger.info(f"[IdeaEngine] caption 已丰富: "
+                                f"{old[:40]}... → {fi['caption'][:60]}...")
+                else:
+                    logger.warning(f"[IdeaEngine] LLM 返回空 caption，保留原值: {filename}")
+            except Exception as e:
+                logger.warning(f"[IdeaEngine] caption 丰富失败 ({filename}): {e}")
+
+        return figure_infos
 
     def _replace_placeholder_paths_by_caption(self, text: str, local_results: List[Dict]) -> str:
         """
@@ -366,7 +543,7 @@ class IdeaEngineMarkdown(IdeaEngineIdeas):
         if not fig_match:
             return text
 
-        caption_cache: Dict[str, Dict[str, str]] = {}
+        caption_cache: Dict[str, Dict[str, Any]] = {}
         real_images: List[tuple[str, str]] = []
         for r in local_results:
             img_path = r.get('metadata', {}).get('image_path', '')
@@ -376,8 +553,9 @@ class IdeaEngineMarkdown(IdeaEngineIdeas):
             paper_folder = Path(img_path).parent.name
             if paper_folder not in caption_cache:
                 caption_cache[paper_folder] = self._load_figure_captions(img_path)
-            fname_to_caption = caption_cache[paper_folder]
-            real_caption = fname_to_caption.get(img_filename, img_filename)
+            caps = caption_cache[paper_folder]
+            by_filename = caps.get("by_filename", {})
+            real_caption = by_filename.get(img_filename, img_filename)
             real_images.append((img_path, real_caption))
 
         if not real_images:
@@ -409,121 +587,6 @@ class IdeaEngineMarkdown(IdeaEngineIdeas):
 
         return result_text
 
-    def _convert_paren_paths_to_markdown(self, text: str) -> str:
-        """
-        将裸括号路径 (/abs/path/img.ext) 转为标准 markdown 图片格式 ![image](path)。
-        使用平衡括号计数，支持路径中包含括号如 2502.12138v4(nopo)。
-        """
-        logger.debug(f"[_convert_paren_paths_to_markdown] 输入长度: {len(text)}")
-
-        _EXTENSIONS = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'PNG', 'JPG', 'JPEG', 'WEBP', 'GIF']
-
-        result = []
-        i = 0
-        converted_count = 0
-        while i < len(text):
-            if text[i] == '(' and i + 1 < len(text) and text[i + 1] == '/':
-                found_ext = None
-                for ext in _EXTENSIONS:
-                    end_marker = f'.{ext})'
-                    pos = text.find(end_marker, i + 1)
-                    if pos >= 0:
-                        if found_ext is None or pos < found_ext[0]:
-                            found_ext = (pos, len(ext), ext)
-
-                if found_ext:
-                    ext_pos, ext_len, ext = found_ext
-                    start = i + 1
-                    inner = text[start:ext_pos + ext_len + 1]
-                    paren_count = 1
-                    for ch in inner:
-                        if ch == '(':
-                            paren_count += 1
-                        elif ch == ')':
-                            paren_count -= 1
-
-                    if paren_count == 1:
-                        path = text[start:ext_pos + ext_len + 1]
-                        path = path[:-1]
-                        if i > 0 and text[i - 1] == ']':
-                            result.append(text[i])
-                            i += 1
-                            continue
-                        result.append(f'![image]({path})')
-                        converted_count += 1
-                        logger.info(f"[_convert_paren_paths_to_markdown] ✅ 转换裸路径为图片: {path}")
-                        i = ext_pos + ext_len + 1
-                        continue
-
-            result.append(text[i])
-            i += 1
-
-        logger.info(f"[_convert_paren_paths_to_markdown] 完成: 转换了 {converted_count} 个裸路径为图片格式")
-        return ''.join(result)
-
-    def _extract_inline_images(self, text: str) -> List[Dict[str, str]]:
-        """
-        从文本中提取行内图片引用，返回分段列表。
-        支持三种格式：
-          1. 标准 markdown 图片: ![caption](path)
-          2. 图片引用格式: [图片: caption](path) 或 [图片:caption](path)
-          3. 中文括号格式: （详见：/path/to/file.png）
-          4. 裸路径格式（自动转换）: caption (/abs/path/to/file.png)
-        Returns:
-            [{"type": "text"|"image", "content"|"path"|"caption": str}, ...]
-        """
-        logger.debug(f"[_extract_inline_images] 输入长度: {len(text)}")
-        if len(text) < 300:
-            logger.debug(f"[_extract_inline_images] 输入文本: {text}")
-
-        text_after_preprocess = self._convert_paren_paths_to_markdown(text)
-        logger.debug(f"[_extract_inline_images] 预处理后文本长度: {len(text_after_preprocess)}")
-        if text_after_preprocess != text:
-            logger.info(f"[_extract_inline_images] ⚠️ 预处理有变化，长度变化: {len(text)} -> {len(text_after_preprocess)}")
-            if len(text_after_preprocess) < 500:
-                logger.debug(f"[_extract_inline_images] 预处理后文本: {text_after_preprocess}")
-        text = text_after_preprocess
-
-        _EXT = r'png|jpg|jpeg|webp|gif'
-        text = re.sub(
-            r'(图\s*\d+[：:]\s*)(.+?)\s*\[(.+?\.(?:' + _EXT + r'))\]',
-            r'![\1\2](\3)',
-            text
-        )
-
-        text = re.sub(
-            r'(本地图-\d+[：:]\s*)(.+?)\s*\[(.+?\.(?:' + _EXT + r'))\]',
-            r'![\1\2](\3)',
-            text
-        )
-
-        _IMG_EXTS = ('.png', '.jpg', '.jpeg', '.webp', '.gif')
-
-        segments = []
-        stripped = text.strip()
-        if stripped.startswith('![') and any(ext in stripped.lower() for ext in _IMG_EXTS):
-            last_paren = stripped.rfind(')')
-            open_bracket = stripped.rfind('](', 0, last_paren)
-            if open_bracket > 0:
-                caption = stripped[2:open_bracket]
-                path = stripped[open_bracket+2:last_paren]
-                # Try raw path first (may contain URL-encoded chars on disk),
-                # then fall back to decoded path.
-                if os.path.exists(path):
-                    pass
-                else:
-                    decoded = unquote(path)
-                    if decoded != path and os.path.exists(decoded):
-                        path = decoded
-                    else:
-                        logger.warning(f"[_extract_inline_images] 图片不存在: {path}")
-                        path = ""
-                if path:
-                    segments.append({"type": "image", "path": path, "caption": caption})
-        if not segments:
-            segments.append({"type": "text", "content": text})
-        return segments
-
     def _ensure_png(self, img_path: str) -> str:
         """webp/其他非PNG格式转为PNG，返回可用图片路径"""
         if not img_path:
@@ -540,25 +603,3 @@ class IdeaEngineMarkdown(IdeaEngineIdeas):
         except Exception as e:
             logger.warning(f"[IdeaEngine] 图片格式转换失败: {e}")
         return img_path
-
-    def _make_image_block(self, image_path: str, caption: str = "") -> Optional[Dict]:
-        """根据本地图片路径构造飞书图片块。文件不存在或读取失败时返回 None。"""
-        try:
-            if not os.path.exists(image_path):
-                logger.warning(f"[IdeaEngine] 图片文件不存在: {image_path}")
-                return None
-            with open(image_path, "rb") as f:
-                img_base64 = base64.b64encode(f.read()).decode("utf-8")
-            return {
-                "blockType": "image",
-                "options": {
-                    "image": {
-                        "base64": img_base64,
-                        "caption": caption,
-                        "image_path": image_path
-                    }
-                }
-            }
-        except Exception as e:
-            logger.warning(f"[IdeaEngine] 读取图片失败 {image_path}: {e}")
-            return None

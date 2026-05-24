@@ -59,7 +59,13 @@ Agentic 查询 /paper arag|react → LangGraph workflow
 ### 4. graphrag/ — 知识图谱 RAG
 
 - **`graph_builder.py`** — 多模态知识图谱构建器（JSON Schema + closed-set）
-- **`graph_rag_engine.py`** — Graph RAG 引擎（Neo4j 后端）
+  - **实体名称去重**（4 层体系）：
+    - Layer 1 — 构建时规范化：`_normalize_entity_name()` 5 级流水线（自指代词拒绝 → `Full Name (ACRONYM)` 确定性解析 → 规范注册表 → 同论文共现 → 跨论文首字母匹配）
+    - Layer 2 — Prompt 增强：3 类提取 prompt 要求 LLM 使用 `Full Name (ACRONYM)` 规范格式
+    - Layer 3 — 构建后合并：`_post_build_merge_aliases()` 扫描同类型实体对，首字母启发式创建 `:ALIAS_OF` 关系
+    - Layer 4 — 检索时展开：`_expand_keyword_via_aliases()` 跟随 `:ALIAS_OF` 边展开关键词别名
+  - 辅助函数：`_is_short_name()`、`_initials_of()`、`_normalize_acronym_key()`、`_FULL_NAME_WITH_ACRONYM`（详见 `graph_builder.py`）
+- **`graph_rag_engine.py`** — Graph RAG 引擎（Neo4j 后端，含别名展开）
 - **`graph_rag_router.py`** — 图谱查询路由
 - **`triplet_schema.json`** — 9 类实体 + 14 类关系 schema
 - **`multimodal_schema.json`** — 多模态三元组 schema

@@ -102,7 +102,7 @@ RETURN n.name, labels(n)[0] AS type, n.description LIMIT 20;
 
 ### 3.1 当前图谱支持的关系类型
 
-> 由 GBNF grammar 约束的 closed-set 9 类关系谓词，LLM 输出被限制为以下类型之一。
+> 由 GBNF grammar 约束的 closed-set 14 类关系谓词，LLM 输出被限制为以下类型之一。
 > 跨模态关系（cross-modal triplets）使用自由文本关系类型（如 `visualizes`、`shows_results`）。
 
 | 关系类型 | 语义 | 示例 |
@@ -116,6 +116,11 @@ RETURN n.name, labels(n)[0] AS type, n.description LIMIT 20;
 | `LIMITED_BY` | 方法 → 它所受的局限 | Method → Computational Cost |
 | `APPLIES_TO` | 方法 → 目标应用领域 | Method → Medical Diagnosis |
 | `EXTENDS` | 方法 → 它所基于的先前工作或模型 | BERT → Transformer |
+| `TRAINS_ON` | 模型 → 用于训练的数据集 | GPT → WebText |
+| `IMPLEMENTS` | 模型 → 代码仓库 | BERT → GitHub Repo |
+| `OUTPERFORMS` | 方法 → 显著超越的基线方法 | BERT → ELMo |
+| `REQUIRES` | 方法 → 硬件或资源需求 | Method → GPU Cluster |
+| `ABLATES_ON` | 方法 → 被消融研究的组件贡献 | Method → Attention Head |
 
 **确定性关系类型**（由代码逻辑创建，非 LLM 抽取）：
 
@@ -174,18 +179,19 @@ RETURN p;
 ## 4. 图表与多模态查询
 
 ```cypher
+-- 查询所有 Figure 实体（标签为 Figure_image / Figure_diagram / Figure_chart 等）
+MATCH (n) WHERE labels(n)[0] STARTS WITH "Figure"
+RETURN labels(n)[0] AS figure_type, n.name, n.description, n.image_path LIMIT 30;
+
 -- 查询所有表格
-MATCH (n:`Figure:table`) RETURN n.name, n.description LIMIT 30;
+MATCH (n:Table) RETURN n.name, n.description LIMIT 30;
 
--- 查询所有架构图
-MATCH (n:`Figure:diagram`) RETURN n.name, n.description LIMIT 30;
-
--- 查询图表关联的文本分块
+-- 查询 Figure 关联的文本分块
 MATCH (fig)-[r]-(chunk:Chunk)
-WHERE fig:Figure OR labels(fig)[0] STARTS WITH "Figure"
+WHERE labels(fig)[0] STARTS WITH "Figure"
 RETURN fig.name, type(r), chunk.id LIMIT 30;
 
--- 查询图片路径（存储在 Figure 节点的 image_path 属性中）
+-- 查询图片路径
 MATCH (n) WHERE labels(n)[0] STARTS WITH "Figure"
 RETURN n.name, n.image_path, n.figure_type LIMIT 30;
 ```
@@ -281,4 +287,69 @@ RETURN id(n), labels(n), properties(n) LIMIT 20;
 
 -- 自环检测（节点指向自己的关系）
 MATCH (n)-[r]->(n) RETURN n.name, type(r);
+```
+
+---
+
+## 9. 实体别名查询 (`:ALIAS_OF`)
+
+> `:ALIAS_OF` 关系用于链接实体的缩写/别名与其规范全名（如 `3DGS` → `3D Gaussian Splatting`），由构建后合并（Layer 3）自动创建。
+
+### 9.1 别名统计
+
+```cypher
+-- 别名关系总数
+MATCH ()-[r:ALIAS_OF]->() RETURN count(r) AS alias_count;
+
+-- 按实体类型统计别名数（降序）
+MATCH (alias)-[:ALIAS_OF]->(canon)
+RETURN labels(alias)[0] AS type, count(*) AS alias_count
+ORDER BY alias_count DESC;
+```
+
+### 9.2 查询别名链
+
+```cypher
+-- 查询某方法的所有别名
+MATCH (alias:Method)-[:ALIAS_OF]->(canon:Method)
+WHERE canon.name = '3D Gaussian Splatting'
+RETURN alias.name AS alias, canon.name AS canonical;
+
+-- 反向查询：给定缩写，查规范全名
+MATCH (alias:Method {name: '3DGS'})-[:ALIAS_OF]->(canon:Method)
+RETURN alias.name AS alias, canon.name AS canonical;
+
+-- 查询某类型下所有别名对
+MATCH (alias:Method)-[:ALIAS_OF]->(canon:Method)
+RETURN alias.name, canon.name ORDER BY canon.name;
+```
+
+### 9.3 检索时别名展开
+
+```cypher
+-- 从关键词出发，0-1 跳展开所有表面形式（无方向性）
+MATCH (n)-[:ALIAS_OF*0..1]-(m)
+WHERE n.name = '3DGS'
+RETURN DISTINCT m.name AS surface_form;
+
+-- 批量展开多个关键词
+UNWIND ['3DGS', 'NeRF', 'CNN'] AS kw
+MATCH (n)-[:ALIAS_OF*0..1]-(m)
+WHERE n.name = kw
+RETURN kw, collect(DISTINCT m.name) AS expansions;
+```
+
+### 9.4 清理别名
+
+```cypher
+-- 删除所有别名关系（重新构建前）
+MATCH ()-[r:ALIAS_OF]->() DELETE r;
+
+-- 删除特定类型的别名
+MATCH (alias:Method)-[r:ALIAS_OF]->(canon:Method) DELETE r;
+
+-- 查看孤立别名（规范名已被删除）
+MATCH (alias)-[r:ALIAS_OF]->(canon)
+WHERE NOT EXISTS { MATCH (canon)--() WHERE type(r) <> 'ALIAS_OF' }
+RETURN alias.name, canon.name;
 ```

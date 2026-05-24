@@ -161,7 +161,7 @@ async def run_knowledge_extraction(
         _log_context_overflow(count_tokens(extract_prompt), 4096, ctx_window, "Extract")
 
     try:
-        raw = await call_llm(extract_prompt, context, config, temperature=0.2, max_tokens=4096)
+        raw = await call_llm(extract_prompt, context, config, temperature=0.2)
     except Exception as e:
         logger.error(f"[KnowledgeExtract] Extract LLM failed: {e}")
         return {"status": "error", "pages_written": 0, "reason": str(e)}
@@ -190,7 +190,7 @@ async def run_knowledge_extraction(
         _log_context_overflow(count_tokens(critique_prompt), 4096, ctx_window, "Critique")
 
     try:
-        raw = await call_llm(critique_prompt, context, config, temperature=0.1, max_tokens=4096)
+        raw = await call_llm(critique_prompt, context, config, temperature=0.1)
     except Exception as e:
         logger.error(f"[KnowledgeExtract] Critique LLM failed: {e}")
         return {"status": "error", "pages_written": 0, "reason": str(e)}

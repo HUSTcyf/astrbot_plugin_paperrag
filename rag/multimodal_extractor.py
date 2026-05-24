@@ -909,6 +909,7 @@ class DoclingExtractor:
         self._plugin_dir = Path(__file__).parent
         self._figures_base = self._plugin_dir.parent / "data" / "figures"
         self._tables_base = self._plugin_dir.parent / "data" / "tables"
+        self._captions_base = self._plugin_dir.parent / "data" / "captions"
 
         # 配置本地模型目录（全局配置，只在首次执行）
         if self._available:
@@ -917,6 +918,7 @@ class DoclingExtractor:
         if self._available:
             self._figures_base.mkdir(parents=True, exist_ok=True)
             self._tables_base.mkdir(parents=True, exist_ok=True)
+            self._captions_base.mkdir(parents=True, exist_ok=True)
 
         # 调试日志：检查模型状态
         if self._available:
@@ -998,16 +1000,14 @@ class DoclingExtractor:
         使用独立进程执行以隔离运行环境。
         """
         pdf_path_obj = Path(pdf_path).resolve()
-        paper_id: str = pdf_path_obj.stem
+        if not pdf_path_obj.exists():
+            raise FileNotFoundError(f"PDF file not found: {pdf_path_obj}")
 
-        # 防止路径遍历：确保 pdf 在插件数据目录内
-        plugin_root = Path(__file__).resolve().parent.parent
-        if not str(pdf_path_obj).startswith(str(plugin_root)):
-            logger.warning(f"[DoclingExtractor] PDF 路径超出插件目录范围，拒绝处理: {pdf_path_obj}")
-            raise ValueError(f"PDF path outside plugin directory: {pdf_path_obj}")
+        paper_id: str = pdf_path_obj.stem
 
         figures_dir = self._figures_base / paper_id
         tables_dir = self._tables_base / paper_id
+        captions_dir = self._captions_base
         figures_dir.mkdir(parents=True, exist_ok=True)
         tables_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1022,7 +1022,7 @@ class DoclingExtractor:
                 [sys.executable, str(script_path),
                  str(Path(pdf_path)), paper_id,
                  str(figures_dir), str(tables_dir),
-                 str(models_dir)],
+                 str(models_dir), str(captions_dir)],
                 capture_output=True,
                 text=True,
                 cwd=str(plugin_dir),
@@ -1253,14 +1253,17 @@ class PDFParserAdvanced:
         extracted = self.docling_extractor.extract(pdf_path)
 
         # 2. PyMuPDF 提取完整文本（用于 chunks 和参考文献解析）
-        pymupdf_text, _ = self._parse_with_pymupdf(pdf_path)
+        pymupdf_text, pymupdf_metadata = self._parse_with_pymupdf(pdf_path)
 
-        # 3. 构建增强文本（Docling 文本用于 chunking，已排除表格；PyMuPDF 仅用于参考文献）
+        # 3. 构建增强文本（Docling 优先；Docling 失败时回退到 PyMuPDF 文本）
         text_parts = []
 
         # 使用 Docling 提取的文本（已排除 TableItem，含 [Page N] 标记）
         if extracted.text:
             text_parts.append(extracted.text)
+        elif pymupdf_text:
+            text_parts.append(pymupdf_text)
+            logger.warning(f"[PDFParser] Docling 文本为空, 回退到 PyMuPDF 文本: {extracted.file_name or Path(pdf_path).name}")
 
         # 表格 markdown 不再追加（已单独保存为 CSV/MD/PNG 文件）
 
@@ -1273,7 +1276,7 @@ class PDFParserAdvanced:
 
         metadata = {
             "file_name": extracted.file_name,
-            "total_pages": len(extracted.text.split('[Page ')) - 1 if extracted.text and '[Page ' in extracted.text else 0,
+            "total_pages": len(extracted.text.split('[Page ')) - 1 if extracted.text and '[Page ' in extracted.text else pymupdf_metadata.get("total_pages", 0),
             "parser": "Docling-Multimodal",
             "images_count": len(extracted.images),
             "tables_count": len(extracted.tables),

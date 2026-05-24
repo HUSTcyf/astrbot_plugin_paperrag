@@ -8,7 +8,7 @@
 | [AGENTIC_ARCHITECTURE.md](AGENTIC_ARCHITECTURE.md) | Agentic RAG + Agentic Ideas LangGraph 工作流详解 |
 | [CHANGELOG.md](CHANGELOG.md) | 变更记录（版本索引见 [docs/changelog/](changelog/INDEX.md)） |
 | [cypher_queries.md](cypher_queries.md) | Neo4j Cypher 查询参考 |
-| [FEISHU_BLOCK_STYLING.md](FEISHU_BLOCK_STYLING.md) | 飞书文档块样式更新技术方案 |
+| [FEISHU_BLOCK_STYLING.md](FEISHU_BLOCK_STYLING.md) | 飞书文档导出技术方案（lark-cli 优先 + MCP 回退双路径） |
 
 ## 命令速查
 
@@ -68,6 +68,7 @@
 | `/idea del <UUID>` | 公开 | 删除指定想法 |
 | `/idea delete <主题>` | 公开 | 删除整个主题 + 文件夹 |
 | `/idea clear <主题>` | 公开 | 清空主题下想法（保留文件夹） |
+| `/idea clean <confirm>` | 公开 | 清理孤立主题数据（扫描/执行） |
 | `/idea tofeishu <主题>` | 公开 | 创建飞书文档 |
 | `/idea regen <UUID>` | 公开 | 重新生成指定想法 |
 
@@ -102,8 +103,10 @@
 | `agentic_rag/react_workflow.py` | ReAct 工作流 |
 | `graphrag/graph_builder.py` | 知识图谱构建器 |
 | `graphrag/graph_rag_engine.py` | Graph RAG 引擎 (Neo4j) |
+| `idea/feishu_doc.py` | 飞书文档导出（lark-cli 优先 + MCP 回退双路径） |
 | `idea/generation.py` | 线性 Idea 生成 |
 | `idea/agentic_workflow.py` | Agentic Idea 工作流 |
+| `idea/utils.py` | 工具函数（Markdown 解析、飞书 HTML 解析、行内样式） |
 | `embedding/unsloth_embedding.py` | BGE-M3 本地 Embedding |
 
 ## 测试
@@ -113,9 +116,9 @@ python -m pytest test/ agentic_rag/test/ idea/test/ -v
 ```
 
 - `test/` — 核心 RAG 测试（17 个文件）
-- `agentic_rag/test/` — Agentic RAG 节点测试（8 个文件）
-- `idea/test/` — Idea 生成测试（2 个文件）
+- `agentic_rag/test/` — Agentic RAG 节点测试（9 个文件）
+- `idea/test/` — Idea 生成测试（3 个文件）
 
 ---
 
-**最后更新**: 2026-05-07
+**最后更新**: 2026-05-23

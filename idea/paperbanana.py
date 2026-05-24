@@ -220,12 +220,8 @@ class IdeaEnginePaperBanana(IdeaEngineGeneration):
                 figure_caption=figure_caption
             )
             if image_path and os.path.exists(image_path):
-                block = self._make_image_block(image_path, figure_caption)
-                if block:
-                    blocks.append(block)
-                    logger.info(f"[IdeaEngine] 方法图生成成功: {topic[:30]}")
-                # NOTE: 不要在这里删除临时文件，feishu_doc.py 上传图片时还需要它。
-                # feishu_doc.py 会在上传完成后清理临时文件。
+                blocks.append({"path": image_path, "caption": figure_caption or ""})
+                logger.info(f"[IdeaEngine] 方法图生成成功: {topic[:30]}")
         except Exception as e:
             logger.warning(f"[IdeaEngine] 方法图生成失败 [{topic[:20]}]: {e}")
         return blocks

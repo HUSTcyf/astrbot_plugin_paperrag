@@ -15,11 +15,15 @@ from astrbot.api import logger
 
 
 def slugify(text: str) -> str:
-    """将任意文本转为合法的 slug"""
+    """将任意文本转为合法的 slug。长文本使用 hash 后缀保证唯一性。"""
+    import hashlib
     text = text.lower().strip()
     text = re.sub(r'[^\w\s-]', '', text)
     text = re.sub(r'[-\s]+', '-', text)
-    return text[:80]
+    if len(text) > 80:
+        suffix = hashlib.md5(text.encode()).hexdigest()[:8]
+        text = text[:80] + "-" + suffix
+    return text
 
 
 def _escape_yaml(text: str) -> str:

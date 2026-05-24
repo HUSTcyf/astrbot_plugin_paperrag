@@ -4,6 +4,7 @@ Ideas CRUD 管理与 Topic/Context 管理
 
 import hashlib
 import json
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -30,38 +31,55 @@ class IdeaEngineIdeas(IdeaEngineUtils):
         # 未知属性返回 None 而非抛异常，保持 getattr 惯用模式
         return None
 
-    def _load_figure_captions(self, image_path: str) -> Dict[str, str]:
+    def _load_figure_captions(self, image_path: str) -> Dict[str, Any]:
         """
-        从 captions JSON 加载指定图片的 caption。
+        从 captions JSON 加载指定论文的全部图表 caption，返回双向索引。
 
         Args:
             image_path: 图片完整路径，如 /.../data/figures/2502.12138v4(nopo)/14-Figure1.png
 
         Returns:
-            Dict: key = 图片文件名 (如 "14-Figure1.png"), value = caption 文本
-                空 dict 表示文件不存在或解析失败
+            {"by_filename": {filename: caption}, "by_number": {logical_num: caption}}
+            空 dict 表示文件不存在或解析失败
         """
         path = Path(image_path)
         if not path.exists():
             return {}
-        # 从路径提取 paper_name: .../figures/{paper_name}/{N-FigureM}.png
         figures_dir = path.parent
-        paper_name = figures_dir.name  # 如 "2502.12138v4(nopo)"
+        paper_name = figures_dir.name
         caption_file = figures_dir.parent.parent / "captions" / f"{paper_name}.json"
         if not caption_file.exists():
             return {}
         try:
             with open(caption_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            # data: { "14-Figure5": {"caption": "...", "filename": "14-Figure1.png", ...}, ... }
-            # 建立 filename -> caption 的反向索引
-            fname_to_caption = {}
+            by_filename: dict[str, str] = {}
+            by_number: dict[str, str] = {}
             for v in data.values():
                 fname = v.get("filename", "")
                 caption = v.get("caption", "")
+                number = v.get("number")
+                is_table = v.get("type") == "table"
                 if fname and caption:
-                    fname_to_caption[fname] = caption
-            return fname_to_caption
+                    by_filename[fname] = caption
+                    # by_number: 使用 "fig:N" / "table:N" 区分同名图表
+                    # 1. number 非空且 caption 非空
+                    # 2. number 作为 Figure/Table 引用出现在 caption 中
+                    # 3. caption 不是裸 "Figure N" / "Table N"（无描述文本的合成回退）
+                    if number and caption:
+                        num_str = str(number)
+                        is_bare = re.match(
+                            r'^(?:Figure|Fig\.?|Table|Tab\.?|图|表)\s*[A-Za-z]?\d+[A-Za-z]?\s*$',
+                            caption, re.IGNORECASE
+                        )
+                        if not is_bare:
+                            if re.search(
+                                rf'(?:Figure|Fig\.?|Table|Tab\.?|图|表)\s*{re.escape(num_str)}\b',
+                                caption, re.IGNORECASE
+                            ):
+                                key = f"table:{num_str}" if is_table else f"fig:{num_str}"
+                                by_number[key] = caption
+            return {"by_filename": by_filename, "by_number": by_number}
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"[IdeaEngine] 读取 caption 文件失败: {caption_file} ({e})")
             return {}
@@ -84,8 +102,8 @@ class IdeaEngineIdeas(IdeaEngineUtils):
                     if isinstance(data, dict):
                         return data
                     logger.warning("[IdeaEngine] topic_index.json 格式错误（非 dict）")
-            except (json.JSONDecodeError, IOError):
-                pass
+            except (json.JSONDecodeError, IOError) as e:
+                logger.error(f"[IdeaEngine] 读取 topic_index.json 失败: {e}")
         return {}
 
     def _save_topic_index(self, index: Dict[str, str]) -> None:
@@ -417,6 +435,263 @@ class IdeaEngineIdeas(IdeaEngineUtils):
             self._save_topic_index(index)
 
         return True, actual_topic, folder_name
+
+    def _clean_wiki_for_topic(self, topic: str) -> bool:
+        """Remove wiki entries for a topic. Returns True if anything was removed.
+
+        Tries both new slug (with hash suffix for long names) and legacy slug
+        (hard-truncated at 80 chars) for backward compatibility with wiki
+        directories created before the slugify fix.
+        """
+        try:
+            from .wiki import IdeaWikiEngine, slugify
+        except ImportError:
+            logger.warning("[IdeaEngine] 无法导入 wiki 模块，跳过 wiki 清理")
+            return False
+
+        wiki = IdeaWikiEngine()
+        topic_slug = slugify(topic)
+        # Backward compat: old slugify hard-truncated at 80 chars without hash suffix
+        legacy_slug = topic_slug[:80] if len(topic_slug) > 80 else topic_slug
+
+        removed = False
+
+        # Remove the topic directory from wiki (try both slug formats)
+        slugs_to_check = {topic_slug, legacy_slug}
+        for slug in slugs_to_check:
+            topic_dir = wiki.ideas_dir() / slug
+            if topic_dir.exists() and not topic_dir.is_symlink():
+                shutil.rmtree(topic_dir)
+                removed = True
+                logger.info(f"[IdeaEngine] 已清理 wiki 主题目录: {topic_dir}")
+
+        # Remove the topic entry from global index.md (try both slug formats)
+        index_path = wiki.root / "index.md"
+        if index_path.exists():
+            try:
+                content = index_path.read_text(encoding="utf-8")
+                for slug in slugs_to_check:
+                    pattern = f"[[{slug}/"
+                    if pattern in content:
+                        lines = content.splitlines()
+                        new_lines = [l for l in lines if pattern not in l]
+                        if new_lines:
+                            index_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+                        else:
+                            logger.warning(f"[IdeaEngine] wiki index.md 中所有行均匹配 {topic}，内容已清空")
+                        content = "\n".join(new_lines) + "\n"  # update for next slug check
+                        removed = True
+                        logger.info(f"[IdeaEngine] 已从 wiki index.md 移除: {topic} (slug: {slug})")
+            except Exception as e:
+                logger.warning(f"[IdeaEngine] 清理 wiki index.md 失败: {e}")
+
+        return removed
+
+    def _extract_topic_from_folder(self, folder: Path) -> Optional[str]:
+        """Try to extract the topic name from files in a folder.
+
+        Checks context.json first (canonical source), then falls back to
+        scanning individual idea JSON files.
+        """
+
+        def _try_read_topic(path: Path) -> Optional[str]:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and data.get("topic"):
+                    return data["topic"]
+            except (json.JSONDecodeError, IOError):
+                pass
+            return None
+
+        ctx_file = folder / "context.json"
+        if ctx_file.exists():
+            topic = _try_read_topic(ctx_file)
+            if topic:
+                return topic
+
+        for json_file in folder.glob("*.json"):
+            if json_file.name == "context.json":
+                continue
+            topic = _try_read_topic(json_file)
+            if topic:
+                return topic
+        return None
+
+    def clean_orphaned_topics(self, dry_run: bool = True) -> dict:
+        """Scan for and clean up orphaned/empty topic folders and stale index entries.
+
+        Scans three categories:
+          1. orphaned: folder exists on disk but not in topic_index.json
+          2. empty: folder exists and in index, but has no idea JSON files
+          3. stale_index: index entry exists but folder does not exist on disk
+
+        Also cleans corresponding Wiki entries (ideas/<topic-slug>/ directory
+        and index.md reference).
+
+        Args:
+            dry_run: If True, only report without deleting.
+
+        Returns:
+            dict with ``orphaned``, ``empty``, ``stale_index``, ``wiki_cleaned``,
+            ``total_removed`` keys and counts.
+        """
+        ideas_dir = self._get_ideas_dir()
+        index = self._get_topic_index()
+
+        orphaned: List[tuple] = []      # (folder_name, topic_name or None)
+        empty: List[tuple] = []          # (folder_name, topic_name)
+        stale_index: List[tuple] = []    # (folder_name, topic_name)
+
+        for entry in ideas_dir.iterdir():
+            if not entry.is_dir() or entry.name.startswith('.'):
+                continue
+            if entry.name == "topic_index.json":
+                continue
+
+            in_index = entry.name in index
+            json_files = [f for f in entry.glob("*.json") if f.name != "context.json"]
+            is_empty = len(json_files) == 0
+
+            if not in_index:
+                topic = self._extract_topic_from_folder(entry)
+                orphaned.append((entry.name, topic))
+            elif is_empty:
+                empty.append((entry.name, index.get(entry.name, entry.name)))
+
+        # Reverse scan: index entries whose folder does not exist on disk
+        for folder_name, topic in index.items():
+            folder = ideas_dir / folder_name
+            if not folder.exists():
+                stale_index.append((folder_name, topic))
+
+        if not dry_run:
+            # Safety guard: if index is empty but folders exist, the index may be corrupt
+            if not index and orphaned:
+                logger.error(
+                    f"[IdeaEngine] topic_index.json 为空但发现 {len(orphaned)} 个疑似孤立文件夹，"
+                    "可能是索引损坏，拒绝自动删除。请检查 topic_index.json。"
+                )
+                return {
+                    "error": "topic_index.json 为空但存在文件夹，可能是索引损坏。"
+                    "请手动检查 data/plugin_data/astrbot_plugin_paperrag/ideas/topic_index.json",
+                    "orphaned": len(orphaned),
+                    "empty": len(empty),
+                    "stale_index": len(stale_index),
+                    "total_removed": 0,
+                    "wiki_cleaned": 0,
+                }
+
+            removed_files = 0
+            wiki_cleaned = 0
+
+            for folder_name, topic in orphaned:
+                folder = ideas_dir / folder_name
+                if folder.exists() and not folder.is_symlink():
+                    shutil.rmtree(folder)
+                    removed_files += 1
+                    logger.info(f"[IdeaEngine] 已清理孤立 topic 文件夹: {folder_name}")
+                    if topic and self._clean_wiki_for_topic(topic):
+                        wiki_cleaned += 1
+
+            for folder_name, topic in empty:
+                folder = ideas_dir / folder_name
+                if folder.exists() and not folder.is_symlink():
+                    shutil.rmtree(folder)
+                    removed_files += 1
+                    if folder_name in index:
+                        del index[folder_name]
+                    logger.info(f"[IdeaEngine] 已清理空 topic 文件夹: {folder_name} ({topic})")
+                    if self._clean_wiki_for_topic(topic):
+                        wiki_cleaned += 1
+
+            for folder_name, topic in stale_index:
+                del index[folder_name]
+                logger.info(f"[IdeaEngine] 已清理陈旧索引条目: {folder_name} ({topic})")
+                if topic and self._clean_wiki_for_topic(topic):
+                    wiki_cleaned += 1
+
+            if empty or stale_index:
+                self._save_topic_index(index)
+
+            return {
+                "orphaned": len(orphaned),
+                "empty": len(empty),
+                "stale_index": len(stale_index),
+                "total_removed": removed_files,
+                "wiki_cleaned": wiki_cleaned,
+            }
+
+        orphaned_names = [t or fn for fn, t in orphaned]
+        empty_names = [t for _, t in empty]
+        stale_names = [t for _, t in stale_index]
+        return {
+            "orphaned": len(orphaned),
+            "empty": len(empty),
+            "stale_index": len(stale_index),
+            "total_removed": 0,
+            "wiki_cleaned": 0,
+            "orphaned_names": orphaned_names,
+            "empty_names": empty_names,
+            "stale_names": stale_names,
+        }
+
+    def clean_all_topics(self, dry_run: bool = True) -> dict:
+        """Remove all topic folders, index entries, and wiki data.
+
+        Args:
+            dry_run: If True, only report without deleting.
+
+        Returns:
+            dict with ``total``, ``topic_names``, ``wiki_cleaned`` keys.
+        """
+        ideas_dir = self._get_ideas_dir()
+        index = self._get_topic_index()
+
+        # Collect all topics: from index + disk folders not in index
+        topic_names: List[str] = []
+        for folder_name, topic in index.items():
+            topic_names.append(topic)
+
+        for entry in ideas_dir.iterdir():
+            if not entry.is_dir() or entry.name.startswith('.'):
+                continue
+            if entry.name == "topic_index.json":
+                continue
+            if entry.name not in index:
+                topic = self._extract_topic_from_folder(entry)
+                if topic:
+                    topic_names.append(topic)
+
+        if not dry_run:
+            wiki_cleaned = 0
+            for topic in set(topic_names):
+                if self._clean_wiki_for_topic(topic):
+                    wiki_cleaned += 1
+
+            # Remove all topic folders
+            for entry in ideas_dir.iterdir():
+                if not entry.is_dir() or entry.name.startswith('.'):
+                    continue
+                if entry.name == "topic_index.json":
+                    continue
+                if entry.exists() and not entry.is_symlink():
+                    shutil.rmtree(entry)
+                    logger.info(f"[IdeaEngine] 已清理 topic 文件夹: {entry.name}")
+
+            # Clear index
+            self._save_topic_index({})
+
+            return {
+                "total": len(topic_names),
+                "wiki_cleaned": wiki_cleaned,
+            }
+
+        return {
+            "total": len(topic_names),
+            "topic_names": list(topic_names),
+            "wiki_cleaned": 0,
+        }
 
     def _save_ideas_append(
         self,

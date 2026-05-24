@@ -4,7 +4,7 @@ Docling PDF 提取子进程脚本
 由 DoclingExtractor._extract_with_docling 调用，运行在独立进程中以隔离环境。
 
 用法:
-    python _docling_subprocess.py <pdf_path> <paper_id> <figures_dir> <tables_dir> <models_dir>
+    python _docling_subprocess.py <pdf_path> <paper_id> <figures_dir> <tables_dir> <models_dir> [captions_dir]
 """
 import sys
 import os
@@ -189,13 +189,14 @@ def _table_to_png_bytes(table_item, pdf_path: str):
 
 def main():
     if len(sys.argv) < 5:
-        print(json.dumps({"error": "Usage: python _docling_subprocess.py <pdf_path> <paper_id> <figures_dir> <tables_dir>"}), file=sys.stdout)
+        print(json.dumps({"error": "Usage: python _docling_subprocess.py <pdf_path> <paper_id> <figures_dir> <tables_dir> [models_dir] [captions_dir]"}), file=sys.stdout)
         sys.exit(1)
 
     pdf_path_arg = sys.argv[1]
     paper_id_arg = sys.argv[2]
     figures_dir_arg = Path(sys.argv[3])
     tables_dir_arg = Path(sys.argv[4])
+    captions_dir_arg = Path(sys.argv[6]) if len(sys.argv) > 6 else None
     figures_dir_arg.mkdir(parents=True, exist_ok=True)
     tables_dir_arg.mkdir(parents=True, exist_ok=True)
 
@@ -249,8 +250,8 @@ def main():
             except Exception:
                 real_caption = ""
 
-            # 从真实图注提取逻辑编号，失败则回退到每页计数器
-            logical_num = _extract_logical_num(real_caption, "Figure") if real_caption else None
+            # 从真实图注提取逻辑编号，失败则标记为 unknown
+            logical_num = _extract_logical_num(real_caption, "Figure") if real_caption else ""
             if logical_num:
                 # 使用论文真实编号作为文件名
                 label = f"Figure{logical_num}"
@@ -262,13 +263,13 @@ def main():
                 if collision > 1:
                     label = f"Figure{logical_num}_v{collision}"
             else:
-                # 回退：每页计数器
-                per_page_idx = figure_counters.get(f"_pp_{page_no}", 0) + 1
-                figure_counters[f"_pp_{page_no}"] = per_page_idx
-                label = f"Figure{per_page_idx}"
-                logical_num = str(per_page_idx)
+                # 无有效 caption：全局 unknown 计数器
+                unknown_idx = figure_counters.get("_unknown", 0) + 1
+                figure_counters["_unknown"] = unknown_idx
+                label = f"unknown_{unknown_idx}"
+                logical_num = ""
 
-            caption = real_caption or f"Figure {logical_num}"
+            caption = real_caption or label
 
             filename = f"{page_no}-{label}.png"
             save_path = figures_dir_arg / filename
@@ -277,7 +278,7 @@ def main():
             pil_image.save(save_path, format="PNG")
             images.append({
                 "page_number": page_no,
-                "image_index": 0,  # 不再使用每页计数器作为主标识
+                "image_index": 0,  # 保留字段；有效图表以 logical_num+saved_path 标识，unknown 以 saved_path 标识
                 "logical_num": logical_num,
                 "bbox": [0, 0, 0, 0],
                 "caption": caption,
@@ -292,8 +293,8 @@ def main():
             except Exception:
                 real_caption = ""
 
-            # 从真实表注提取逻辑编号，失败则回退到每页计数器
-            logical_num = _extract_logical_num(real_caption, "Table") if real_caption else None
+            # 从真实表注提取逻辑编号，失败则标记为 unknown
+            logical_num = _extract_logical_num(real_caption, "Table") if real_caption else ""
             if logical_num:
                 label = f"Table{logical_num}"
                 global_key = f"{page_no}-{label}"
@@ -302,12 +303,13 @@ def main():
                 if collision > 1:
                     label = f"Table{logical_num}_v{collision}"
             else:
-                per_page_idx = table_counters.get(f"_pp_{page_no}", 0) + 1
-                table_counters[f"_pp_{page_no}"] = per_page_idx
-                label = f"Table{per_page_idx}"
-                logical_num = str(per_page_idx)
+                # 无有效 caption：全局 unknown 计数器
+                unknown_idx = table_counters.get("_unknown", 0) + 1
+                table_counters["_unknown"] = unknown_idx
+                label = f"unknown_{unknown_idx}"
+                logical_num = ""
 
-            caption = real_caption or f"Table {logical_num}"
+            caption = real_caption or label
 
             table_csv = _table_data_to_csv(element)
             table_markdown = _csv_to_markdown(element)
@@ -362,6 +364,38 @@ def main():
 
     # 不再使用 result.document.texts（可能包含表格文本）
     # 文本已从 iterate_items 循环中收集（排除了 TableItem）
+
+    # Save captions JSON for downstream consumers (idea engine, etc.)
+    if captions_dir_arg is not None:
+        try:
+            captions_dir_arg.mkdir(parents=True, exist_ok=True)
+            captions: dict = {}
+            for img in images:
+                filename = Path(img["saved_path"]).name
+                key = filename.rsplit(".", 1)[0]  # e.g. "1-Figure3"
+                captions[key] = {
+                    "caption": img["caption"],
+                    "filename": filename,
+                    "page": img["page_number"],
+                    "number": img.get("logical_num") or "",
+                }
+            for tbl in tables:
+                if tbl.get("saved_png_path"):
+                    filename = Path(tbl["saved_png_path"]).name
+                    key = filename.rsplit(".", 1)[0]
+                    captions[key] = {
+                        "caption": tbl["caption"],
+                        "filename": filename,
+                        "page": tbl["page_number"],
+                        "number": tbl.get("logical_num") or "",
+                        "type": "table",
+                    }
+            captions_path = captions_dir_arg / f"{paper_id_arg}.json"
+            with open(captions_path, "w", encoding="utf-8") as f:
+                json.dump(captions, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            # Non-fatal: captions save failure should not block the pipeline
+            print(f"Warning: failed to save captions JSON: {e}", file=sys.stderr)
 
     result_json = json.dumps({
         "file_name": Path(pdf_path_arg).name,

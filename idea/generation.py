@@ -25,6 +25,7 @@ from provider.llm_utils import (
     parse_json_response,
     extract_text_from_response,
 )
+from rag.token_utils import count_tokens
 from .vm import IdeaEngineVM
 from .websearch import IdeaEngineWebSearch
 import uuid as uuid_module
@@ -112,6 +113,21 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
             logger.warning("[IdeaEngine] 无法导入 get_llm_provider，使用内联回退")
             return None
 
+    def _compute_vlm_max_tokens(self, vlm_provider, prompt: str, max_cap: int = 4096) -> int:
+        """Dynamically compute output token budget from VLM n_ctx minus prompt tokens.
+
+        Args:
+            max_cap: upper bound for output tokens (default 4096, use 8192 for long-form generation).
+        """
+        n_ctx = getattr(vlm_provider, 'n_ctx', 16384)
+        prompt_tokens = count_tokens(prompt)
+        if prompt_tokens > n_ctx - max_cap - 512:
+            logger.warning(
+                f"[IdeaEngine] Prompt ({prompt_tokens} tokens) nearly fills "
+                f"context window ({n_ctx}); output may be truncated or fail"
+            )
+        return max(1024, min(n_ctx - prompt_tokens - 512, max_cap))
+
     def _load_paper_urls(self) -> Dict[str, Any]:
         """从 milvus_abstracts_doc_stats.json 加载论文完整信息"""
         return load_paper_urls()
@@ -196,7 +212,7 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
             else:
                 from provider.llm_utils import call_llm
                 config = getattr(self, '_plugin_config', None)
-                response_text = await call_llm(prompt, self.context, config, max_tokens=4096)
+                response_text = await call_llm(prompt, self.context, config)
 
             result = self._parse_json_response(response_text)
 
@@ -434,7 +450,7 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
             response = await vlm_provider.text_chat(
                 prompt=prompt,
                 temperature=0.1,
-                max_tokens=1024
+                max_tokens=self._compute_vlm_max_tokens(vlm_provider, prompt)
             )
 
             response_text = ""
@@ -599,6 +615,27 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
                     img_caption = img.get('image_caption', '')
                     logger.info(f"[IdeaEngine] [DEBUG] 图片{i}: path={img_path}, caption={img_caption}")
 
+                # 用 chunk 上下文丰富图表 caption（LLM 纯文本）
+                if filtered_images and vlm_provider:
+                    temp_figure_infos = []
+                    for img in filtered_images:
+                        img_path = img.get('image_path', '')
+                        if img_path:
+                            temp_figure_infos.append({
+                                "path": img_path,
+                                "caption": img.get('image_caption', '') or Path(img_path).name,
+                                "type": "table" if "Table" in Path(img_path).name else "fig",
+                            })
+                    temp_figure_infos = await self._enrich_figure_captions(
+                        temp_figure_infos, local_results, vlm_provider
+                    )
+                    # 用丰富后的 caption 更新 filtered_images
+                    enriched_map = {fi['path']: fi['caption'] for fi in temp_figure_infos}
+                    for img in filtered_images:
+                        p = img.get('image_path', '')
+                        if p in enriched_map:
+                            img['image_caption'] = enriched_map[p]
+
                 # 构建本地论文引用上下文（包含正文内容和URL）
                 citations_context += "## 本地论文引用：\n"
                 papers: Dict[str, List] = {}
@@ -633,7 +670,7 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
                     citations_context += verified_index + "\n\n"
 
                 # 添加图片信息（真实路径直接列出，caption 在上，路径在下）
-                caption_cache: Dict[str, Dict[str, str]] = {}  # paper_folder -> {filename -> caption}
+                caption_cache: Dict[str, Dict[str, Any]] = {}  # paper_folder -> {by_filename, by_number}
                 media_lines: List[str] = ["\n## 可用图片（必须使用这些真实路径，不要生成新路径）：\n"]
                 no_caption_images: List[Dict[str, int | str]] = []  # 供 VLM fallback
 
@@ -643,15 +680,22 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
                     paper_folder = Path(img_path).parent.name
                     if paper_folder not in caption_cache:
                         caption_cache[paper_folder] = self._load_figure_captions(img_path)
-                    fname_to_caption = caption_cache[paper_folder]
-                    real_caption = fname_to_caption.get(img_filename, '')
+                    caps = caption_cache[paper_folder]
+                    by_filename = caps.get("by_filename", {})
+                    real_caption = by_filename.get(img_filename, '')
                     if real_caption:
                         img_caption = real_caption
                         logger.info(f"[IdeaEngine] [DEBUG] 图片{i} 使用真实caption: {img_filename} -> {real_caption[:50]}...")
                     else:
-                        img_caption = img_filename
-                        logger.warning(f"[IdeaEngine] [DEBUG] 图片{i} 无真实caption: {img_filename}")
-                        no_caption_images.append({"index": i, "path": img_path, "filename": img_filename})
+                        # Try enriched caption from prior _enrich_figure_captions call
+                        enriched = img.get('image_caption', '')
+                        if enriched and enriched != img_filename and len(enriched) > 10:
+                            img_caption = enriched
+                            logger.info(f"[IdeaEngine] [DEBUG] 图片{i} 使用LLM丰富caption: {img_filename} -> {enriched[:50]}...")
+                        else:
+                            img_caption = img_filename
+                            logger.warning(f"[IdeaEngine] [DEBUG] 图片{i} 无真实caption: {img_filename}")
+                            no_caption_images.append({"index": i, "path": img_path, "filename": img_filename})
                     media_lines.append(f"图 {i}：{img_caption}\n{img_path}\n")
 
                 # VLM fallback：批量为无 caption 的图片生成描述
@@ -702,37 +746,35 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
 请生成一个详细完整的组会周报，包含以下章节，每个章节都要有详细展开：
 1. 背景动机：详细说明问题的背景、重要性、现有方法的不足（5-8句）
 2. 相关工作：详细综述相关方法和论文，引用论文的具体贡献（5-8句）
+
 3. 方法论：详细描述方法细节、工作流程、技术路线（5-10句）
 4. 创新点：明确列出2-3个具体创新点，并解释为什么这些创新有效（5-8句）
 5. 实验benchmark：详细说明实验设置、数据集、对比方法、评价指标（5-8句）
 6. 挑战与解决方案：每个挑战都要详细说明原因和对应的具体解决方案（5-8句）
 7. 下一步计划：具体的下一步研究方向和可行的改进思路（3-5句）
 8. 参考文献：列出所有引用的论文和网页资源，**严格格式**：
-`1. [**论文全名**](URL)`
-- 数字序号列表，论文全名加粗，URL作为markdown链接
+`1. [论文全名](URL)`
+
+**章节标题格式（必须严格遵守）**：每个章节必须使用如下精确标题，不得自行修改或添加额外修饰：
+- `## 1. 背景动机`
+- `## 2. 相关工作`
+- `## 3. 方法论`
+- `## 4. 创新点`
+- `## 5. 实验Benchmark`
+- `## 6. 挑战与解决方案`
+- `## 7. 下一步计划`
+- `## 8. 参考文献`
+- 数字序号列表，URL作为markdown链接
 - **禁止**：禁止裸URL、禁止括号内重复URL（如 `URL (URL)` ）、禁止纯文本URL、禁止不使用markdown链接
 
 **重要**：
 1. 参考资料中包含丰富的细节信息，请充分利用这些信息生成详细内容，不要简略！
-2. **图表引用（核心规则，必须严格遵守）**：
-   - **禁止在正文/方法论中使用 markdown 图片语法**，`![...](...)` 一律禁止出现！
-   - 正文引用图片时，只用文字描述，如"如图1所示"、"如图2的实验结果"
-   - **参考文献章节（8. 参考文献）中绝对禁止出现任何图片路径**，参考文献中如果需要引用方法图，只写纯文字如"NoPoSplat 方法流程图"，不得出现 /Users/ 或任何 .png .jpg 路径
-   - **所有图片必须统一放在最后一个章节（9. 论文图表）**，放在参考文献之后，**每个图片占两行**（第一行是图号和caption，第二行是图片真实绝对路径），格式如下：
-
-```
-图 1 方法流程
-/Users/xxx/data/figures/xxx/fig1.png
-图 2 实验结果
-/Users/xxx/data/figures/xxx/fig2.png
-```
-
-   - **必须使用可用图片中的真实路径**，直接复制粘贴，不要修改、不要生成新路径
-
-   - 根据"可用图片"中提供的路径和caption，按上述格式填写
-   - **序号必须连续**：图1、图2、图3...
-   - 示例：`如图1所示，NoPoSplat在稀疏视图下展现出高质量的深度估计能力`（正文引用，不带图片语法）
-3. **只有真正相关的图片才引用**，如果内容与某张图片无关，不要引用
+2. **图表引用格式（重要，严格遵守）**：
+   - **禁止在正文中使用任何图片语法**：`!(..)`、`` ![](..) ``、`[图片:...](...)` 一律禁止
+   - **禁止在正文中编造具体的图/表编号**（如"如图1所示"、"如图2所示"、"如图3所示"），因为你还不知道哪些图表实际存在
+   - 如需引用图表，只使用泛指描述（如"相关实验结果如图所示"、"方法流程如图表所示"），不指定编号
+   - **参考文献章节中禁止出现任何图片路径**
+3. **不要引用不相关的图片**，如果内容与某张图片无关，不要引用
 4. **引用网络资源**：在相关工作章节中，如果某些方法或观点来自网络搜索结果，请使用 `[标题](URL)` 格式引用
 5. **参考文献必须完整**：在"参考文献"章节中，**严格格式** `1. [**论文全名**](URL)` 列出所有本地论文和网络资源，**禁止裸URL或括号重复URL**
 
@@ -741,12 +783,17 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
 - 该索引是经过 LLM+arXiv 校验的权威来源，论文名、作者、年份均为正确值
 - "本地论文引用"部分的正文可能包含 PDF 提取噪声，其论文名称不可直接使用
 - 正文中提到某篇论文时，查找索引中对应的条目，使用索引中的标题和 DOI 链接
-- 引用格式：使用索引中提供的作者-年份标签（如 Swinney et al., 2024）+ 索引中提供的链接
+- 引用格式：在方法名/论文名**首次出现的位置**直接替换为 markdown 链接，如 `[PanoGS](url)`、`[FLARE](url)`
+- **禁止**在句子末尾追加论文全名！错误示例：`PanoGS 提出了xxx。PanoGS: Gaussian-based Panoptic Segmentation...` ← 这种格式绝对不允许。全名只允许出现在参考文献章节
 """
 
         try:
             logger.info("[IdeaEngine] 使用 VLM 生成详细初始周报草稿...")
-            max_tokens_vlm = getattr(self, '_plugin_config', {}).get("llama_vlm_max_tokens", 25600)
+            max_tokens_vlm = self._compute_vlm_max_tokens(vlm_provider, prompt, max_cap=8192)
+            logger.info(
+                f"[IdeaEngine] VLM 草稿 max_tokens={max_tokens_vlm} "
+                f"(n_ctx={getattr(vlm_provider, 'n_ctx', 16384)}, prompt={count_tokens(prompt)} tokens)"
+            )
             draft = await self._vlm_chat_with_progress(
                 vlm_provider,
                 prompt=prompt,
@@ -775,11 +822,12 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
 {citations_context}
 
 核心观点记忆："""
+                    mem_max_tokens = self._compute_vlm_max_tokens(vlm_provider, memory_prompt)
                     memory_response = await vlm_provider.text_chat(
                         prompt=memory_prompt,
                         contexts=[],
                         temperature=0.2,
-                        max_tokens=2048
+                        max_tokens=mem_max_tokens
                     )
                     core_memory = extract_text_from_response(memory_response) or ""
                     logger.info(f"[IdeaEngine] Plan B 核心记忆生成完成，长度: {len(core_memory)}")
@@ -811,36 +859,38 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
 - 正文提到某篇论文时，必须在索引中查找对应条目，使用索引中的标题和 DOI 链接
 
 格式要求：
-- 包含章节：背景动机、相关工作、方法论、创新点、实验benchmark、挑战与解决方案、下一步计划、参考文献、论文图表
+- 包含章节：背景动机、相关工作、方法论、创新点、实验benchmark、挑战与解决方案、下一步计划、参考文献
 - **扩展原则**：将简短的要点列表扩展为连贯段落，但不能变成全新的内容
 - **列表格式**：创新点和挑战与解决方案部分使用数字序号列表（如"1. 挑战一：xxx"）
 
 **正文引用格式（重要）**：
 - 正文中的引用：使用论文简称加markdown链接，如 [FLARE](https://arxiv.org/abs/2502.12138)、[NoPoSplat](https://arxiv.org/abs/2505.23716)
 - **禁止在正文中使用论文全名或裸URL**
-- **正文及正文中所有涉及引用的地方（论文简称如FLARE、方法名称、引用标记如[4][5]等）一律加粗**
-
 **参考文献格式（重要，严格遵守）**：
 - 放在最后一个章节
-- 每行一条，**严格格式**：`1. [**论文全名**](URL)`
-- 数字序号列表，全名加粗，URL作为markdown链接
+- 每行一条，**严格格式**：`1. [论文全名](URL)`
+- 数字序号列表，URL作为markdown链接
 - **禁止**：禁止裸URL、禁止括号内重复URL
 
 **图表引用格式（重要，严格遵守）**：
 - **禁止在正文中使用任何图片语法**
-- 正文引用图片时只用文字描述，如"如图1所示"
+- **禁止在正文中引用具体图号**（如"如图1所示"），图表将由系统追加到文档末尾
 - **参考文献章节中禁止出现任何图片路径**
-- **不要生成"论文图表"章节**，该章节会在后续流程中自动添加
+- **不要生成"论文图表"章节**，图表由系统自动追加到末尾
 
 请直接输出润色后的内容："""
                         logger.info(f"[IdeaEngine] Plan B 步骤2：润色草稿")
-                        response = await vlm_provider.text_chat(
-                            prompt=polish_prompt,
-                            contexts=[],
-                            temperature=0.3,
-                            max_tokens=32768
-                        )
-                        polished = extract_text_from_response(response)
+                        polish_provider = self.context.get_using_provider() if hasattr(self.context, 'get_using_provider') else None
+                        if polish_provider:
+                            response = await polish_provider.text_chat(
+                                prompt=polish_prompt,
+                                contexts=[],
+                                temperature=0.3,
+                            )
+                            polished = extract_text_from_response(response)
+                        else:
+                            logger.warning("[IdeaEngine] Plan B 步骤2 无 polish provider，保持原内容")
+                            polished = ""
                         if polished and len(polished) > 100:
                             draft = polished
                             logger.info(f"[IdeaEngine] Plan B 润色完成，长度: {len(polished)}")
@@ -868,23 +918,26 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
 **正文引用格式（重要）**：
 - 使用论文简称加markdown链接，如 [FLARE](https://arxiv.org/abs/2502.12138)
 - **禁止在正文中使用论文全名或裸URL**
-- **正文及正文中所有涉及引用的地方一律加粗**
 
 **参考文献格式（重要，严格遵守）**：
-- 每行一条，**严格格式**：`1. [**论文全名**](URL)`
+- 每行一条，**严格格式**：`1. [论文全名](URL)`
 
 **图表引用格式（重要，严格遵守）**：
 - **禁止在正文中使用任何图片语法**
 - **不要生成"论文图表"章节**
 
 请直接输出润色后的内容："""
-                    response = await vlm_provider.text_chat(
-                        prompt=simplify_prompt,
-                        contexts=[],
-                        temperature=0.3,
-                        max_tokens=32768
-                    )
-                    polished = extract_text_from_response(response)
+                    polish_provider = self.context.get_using_provider() if hasattr(self.context, 'get_using_provider') else None
+                    if polish_provider:
+                        response = await polish_provider.text_chat(
+                            prompt=simplify_prompt,
+                            contexts=[],
+                            temperature=0.3,
+                        )
+                        polished = extract_text_from_response(response)
+                    else:
+                        logger.warning("[IdeaEngine] 直接润色无 polish provider，保持原内容")
+                        polished = ""
                     if polished and len(polished) > 100:
                         draft = polished
                         logger.info(f"[IdeaEngine] 直接润色完成，长度: {len(polished)}")
@@ -989,10 +1042,11 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
 请直接输出润色后的Markdown内容，不要包含其他解释或说明。"""
 
         try:
+            polish_max_tokens = self._compute_vlm_max_tokens(vlm_provider, polish_prompt)
             polished_response = await vlm_provider.text_chat(
                 prompt=polish_prompt,
                 temperature=0.3,
-                max_tokens=4096
+                max_tokens=polish_max_tokens
             )
 
             if hasattr(polished_response, 'content'):

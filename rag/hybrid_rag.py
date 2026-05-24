@@ -994,7 +994,6 @@ class CragEvaluator:
                 prompt=prompt,
                 contexts=[],
                 temperature=0.1,
-                max_tokens=1024
             )
 
             response_text = ""
@@ -1135,7 +1134,6 @@ class CragCorrector:
                 prompt=rewrite_prompt,
                 contexts=[],
                 temperature=0.3,
-                max_tokens=200
             )
 
             rewritten = ""
@@ -1408,7 +1406,6 @@ class HybridRAGEngine:
                     prompt=prompt,
                     contexts=[],
                     temperature=0.1,
-                    max_tokens=64,
                 )
                 content = ""
                 if hasattr(response, "content"):
@@ -2519,9 +2516,9 @@ class HybridRAGEngine:
             except Exception as e:
                 logger.warning(f"⚠️ 清空摘要 ColBERT 存储失败: {e}")
 
-            # 清理物理文件：figures、tables
+            # 清理物理文件：figures、tables、captions
             plugin_data_dir = Path(__file__).parent.parent / "data"
-            for subdir in ["figures", "tables"]:
+            for subdir in ["figures", "tables", "captions"]:
                 subdir_path = plugin_data_dir / subdir
                 if subdir_path.exists():
                     shutil.rmtree(subdir_path)

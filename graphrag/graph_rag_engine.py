@@ -995,6 +995,36 @@ class GraphRAGEngine:
         # Fallback: 关键词匹配
         return await self._fetch_subgraph_keywords(query)
 
+    def _expand_keyword_via_aliases(self, keyword: str) -> list[str]:
+        """Expand a keyword to include all alias forms via :ALIAS_OF traversal.
+
+        Returns [keyword] if no aliases found, or [keyword, alias1, alias2, ...].
+        """
+        driver = self._adapter._driver if self._adapter else None
+        if driver is None:
+            return [keyword]
+        try:
+            with driver.session() as session:
+                # Follow :ALIAS_OF edges to find all surface forms
+                result = session.run(
+                    "MATCH (n)-[:ALIAS_OF*0..1]-(m) "
+                    "WHERE coalesce(n.name, '') CONTAINS $kw OR coalesce(m.name, '') CONTAINS $kw "
+                    "WITH collect(DISTINCT coalesce(n.name, '')) + collect(DISTINCT coalesce(m.name, '')) AS names "
+                    "UNWIND names AS name "
+                    "WITH name WHERE name <> '' "
+                    "RETURN DISTINCT name",
+                    kw=keyword,
+                )
+                names = {keyword}
+                for r in result:
+                    name = r["name"]
+                    if name:
+                        names.add(name)
+                return list(names)
+        except Exception as e:
+            logger.warning(f"[GraphRAG] Alias expansion failed for keyword '{keyword}': {e}")
+            return [keyword]
+
     async def _fetch_subgraph_keywords(self, query: str) -> tuple[list[dict], list[dict]]:
         """关键词匹配提取子图（fallback）。"""
         entities: list[dict] = []
@@ -1042,6 +1072,12 @@ class GraphRAGEngine:
             if not any(w != o and w in o for o in raw):
                 filtered.append(w)
         keywords = filtered[:5]
+
+        # Expand keywords via :ALIAS_OF relationships for acronym dedup
+        expanded = []
+        for kw in keywords:
+            expanded.extend(self._expand_keyword_via_aliases(kw))
+        keywords = list(dict.fromkeys(expanded))[:10]  # dedup, cap at 10
 
         if not keywords:
             return entities, triplets

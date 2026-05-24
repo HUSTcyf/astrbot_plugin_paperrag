@@ -369,6 +369,98 @@ class IdeaCommandsMixin(PluginCoreBase):
         except Exception as e:
             logger.error(f"[IdeaEngine] 清空想法失败: {e}")
             yield event.plain_result(f"❌ 清空失败: {e}")
+
+    async def _idea_clean(self, event: AstrMessageEvent, action: str = "", confirm: str = ""):
+        """
+        扫描并清理 topic 数据（含 Wiki 条目）
+
+        使用方式:
+        /idea clean                  # 扫描模式（仅报告孤立/空/陈旧，不删除）
+        /idea clean confirm          # 执行清理（孤立/空/陈旧）
+        /idea clean all              # 扫描模式（列出所有 topic，不删除）
+        /idea clean all confirm      # 清空所有 ideas（topic 文件夹 + 索引 + Wiki）
+        """
+        try:
+            rag_engine = self._get_engine()
+            if not rag_engine:
+                yield event.plain_result("❌ RAG引擎未初始化")
+                return
+
+            idea_engine = _create_idea_engine(self.context, rag_engine, self.config)
+
+            action_lower = action.lower()
+            clean_all = "all" in action_lower.split()
+            do_confirm = "confirm" in action_lower.split() or confirm.lower() == "confirm"
+
+            if clean_all:
+                if not do_confirm:
+                    result = idea_engine.clean_all_topics(dry_run=True)
+                    lines = ["**🔍 Idea 全部数据扫描**\n"]
+                    if result.get("error"):
+                        lines.append(f"⚠️ {result['error']}")
+                    elif result["total"] == 0:
+                        lines.append("没有找到任何 topic 数据。")
+                    else:
+                        lines.append(f"将删除 **所有 {result['total']} 个 topic**（含对应文件夹和 Wiki 条目）：")
+                        for name in result.get("topic_names", []):
+                            lines.append(f"  - {name}")
+                        lines.append(f"\n⚠️ 此操作不可逆！")
+                        lines.append("使用 `/idea clean all confirm` 执行清空。")
+                    yield event.plain_result("\n".join(lines))
+                    return
+
+                result = idea_engine.clean_all_topics(dry_run=False)
+                if result.get("error"):
+                    yield event.plain_result(f"❌ {result['error']}")
+                    return
+                lines = ["**🧹 Idea 全部清理完成**\n"]
+                lines.append(f"- 移除 topic 文件夹: {result['total']} 个")
+                lines.append(f"- 清理 Wiki 条目: {result['wiki_cleaned']} 个")
+                yield event.plain_result("\n".join(lines))
+                return
+
+            if not do_confirm:
+                result = idea_engine.clean_orphaned_topics(dry_run=True)
+                lines = ["**🔍 Idea 数据扫描**\n"]
+                if result.get("error"):
+                    lines.append(f"⚠️ {result['error']}")
+                elif result["orphaned"] == 0 and result["empty"] == 0 and result.get("stale_index", 0) == 0:
+                    lines.append("一切正常，没有发现孤立或空的 topic 文件夹。")
+                else:
+                    if result["orphaned"] > 0:
+                        lines.append(f"**孤立文件夹**: {result['orphaned']} 个（磁盘存在但不在索引中）")
+                        for name in result.get("orphaned_names", []):
+                            lines.append(f"  - `{name}`")
+                    if result["empty"] > 0:
+                        lines.append(f"**空文件夹**: {result['empty']} 个（在索引中但无想法文件）")
+                        for name in result.get("empty_names", []):
+                            lines.append(f"  - {name}")
+                    if result.get("stale_index", 0) > 0:
+                        lines.append(f"**陈旧索引条目**: {result['stale_index']} 个（索引存在但磁盘文件夹不存在）")
+                        for name in result.get("stale_names", []):
+                            lines.append(f"  - {name}")
+                    total = result['orphaned'] + result['empty'] + result.get('stale_index', 0)
+                    lines.append(f"\n共 {total} 项可清理（含对应 Wiki 条目）。")
+                    lines.append("使用 `/idea clean confirm` 执行清理。")
+                yield event.plain_result("\n".join(lines))
+                return
+
+            result = idea_engine.clean_orphaned_topics(dry_run=False)
+            if result.get("error"):
+                yield event.plain_result(f"❌ {result['error']}")
+                return
+            lines = ["**🧹 Idea 清理完成**\n"]
+            lines.append(f"- 移除孤立文件夹: {result['orphaned']} 个")
+            lines.append(f"- 移除空文件夹: {result['empty']} 个")
+            lines.append(f"- 移除陈旧索引条目: {result.get('stale_index', 0)} 个")
+            lines.append(f"- 清理 Wiki 条目: {result['wiki_cleaned']} 个")
+            lines.append(f"- 总计移除: {result.get('total_removed', 0)} 项")
+            yield event.plain_result("\n".join(lines))
+
+        except Exception as e:
+            logger.error(f"[IdeaEngine] clean 失败: {e}")
+            yield event.plain_result(f"❌ 清理失败: {e}")
+
     async def _idea_explore(self, event: AstrMessageEvent,
                                 topic: str = '',
                                 depth: str = "standard",
@@ -905,7 +997,7 @@ class IdeaCommandsMixin(PluginCoreBase):
             yield event.plain_result(f"❌ 创建失败: {e}")
     async def _idea_testblocks(self, event: AstrMessageEvent, folder_token: str = ""):
         """
-        测试 Markdown 转飞书块的转换逻辑并实际创建飞书文档
+        测试 Markdown 转飞书块的转换逻辑（legacy MCP 路径）
 
         使用方式:
         /idea testblocks <folder_token>
@@ -915,8 +1007,10 @@ class IdeaCommandsMixin(PluginCoreBase):
             rag_engine = self._get_engine()
             idea_engine = _create_idea_engine(self.context, rag_engine, self.config)
 
-            yield event.plain_result("正在创建测试飞书文档（列表样式+图片+引用）...")
-            result = await idea_engine.test_feishu_markdown_formats(folder_token=folder_token)
+            from legacy.feishu_mcp import test_feishu_markdown_formats
+
+            yield event.plain_result("正在创建测试飞书文档（legacy MCP 路径）...")
+            result = await test_feishu_markdown_formats(idea_engine, folder_token=folder_token)
 
             if result.get("success"):
                 url = result.get("url", "")
