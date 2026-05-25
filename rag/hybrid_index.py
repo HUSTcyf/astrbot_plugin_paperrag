@@ -146,7 +146,7 @@ class HybridIndexManager:
             self._doc_stats = {}
 
     def _save_doc_stats(self):
-        """保存文档统计到 JSON 文件"""
+        """保存文档统计到 JSON 文件，合并保留其他写入方的字段。"""
         if not self._doc_stats_file:
             return
 
@@ -154,6 +154,24 @@ class HybridIndexManager:
             db_dir = os.path.dirname(self._doc_stats_file)
             if db_dir and not os.path.exists(db_dir):
                 os.makedirs(db_dir, exist_ok=True)
+
+            # 读取磁盘已有数据（可能被 reference_processor 等写入方更新过）
+            disk_stats: dict = {}
+            if os.path.exists(self._doc_stats_file):
+                try:
+                    with open(self._doc_stats_file, 'r', encoding='utf-8') as f:
+                        disk_stats = json.load(f)
+                except Exception:
+                    disk_stats = {}
+
+            # 合并：内存数据为主，但保留磁盘中内存没有的 key
+            for paper_key, disk_entry in disk_stats.items():
+                if paper_key not in self._doc_stats:
+                    self._doc_stats[paper_key] = disk_entry
+                else:
+                    for k, v in disk_entry.items():
+                        if k not in self._doc_stats[paper_key]:
+                            self._doc_stats[paper_key][k] = v
 
             with open(self._doc_stats_file, 'w', encoding='utf-8') as f:
                 json.dump(self._doc_stats, f, ensure_ascii=False, indent=2)
@@ -907,99 +925,24 @@ class HybridIndexManager:
 
     async def get_all_references(self, allow_duplicates: bool = True) -> Dict[str, Any]:
         """
-        从数据库中提取所有参考文献，统计论文名称出现频次
+        直接从 paper_doc_stats.json 提取参考文献频次统计，无需查询 Milvus。
+
+        每篇论文每个引用只计一次（同一论文多次引用同一文献不重复计数）。
+        按标题归一化后跨论文聚合。
 
         Args:
-            allow_duplicates: 是否允许同一篇论文对同一参考文献重复统计
+            allow_duplicates: 保留参数兼容旧接口，当前始终为论文级去重
 
         Returns:
-            {"references": [...], "total_refs": int, "total_chunks": int}
+            {"references": [...], "total_refs": int, "total_papers": int}
         """
+        from rag.reference_processor import compute_refstats
+
         try:
-            all_chunks = await self.get_all_chunks()
-            if not all_chunks:
-                return {"references": [], "total_refs": 0, "total_chunks": 0}
-
-            title_counter: Dict[str, Dict[str, Any]] = {}
-            total_refs = 0
-
-            if allow_duplicates:
-                for chunk in all_chunks:
-                    metadata = chunk.get("metadata", {})
-                    if not isinstance(metadata, dict):
-                        continue
-                    references = metadata.get("cited_references", [])
-                    if not references:
-                        continue
-                    for ref in references:
-                        if not isinstance(ref, dict):
-                            continue
-                        title = ref.get("ref_title", "").strip()
-                        if not title or len(title) < 5:
-                            continue
-                        title_norm = " ".join(title.lower().split())
-                        if title_norm in title_counter:
-                            title_counter[title_norm]["count"] += 1
-                        else:
-                            title_counter[title_norm] = {
-                                "count": 1,
-                                "raw_title": title,
-                                "ref_authors": ref.get("ref_authors", ""),
-                                "ref_year": ref.get("ref_year"),
-                                "ref_doi": ref.get("ref_doi", "")
-                            }
-                        total_refs += 1
-            else:
-                title_to_papers: Dict[str, set] = {}
-                for chunk in all_chunks:
-                    metadata = chunk.get("metadata", {})
-                    if not isinstance(metadata, dict):
-                        continue
-                    citing_paper = metadata.get("file_name", "") or metadata.get("paper_id", "")
-                    references = metadata.get("cited_references", [])
-                    if not references:
-                        continue
-                    for ref in references:
-                        if not isinstance(ref, dict):
-                            continue
-                        title = ref.get("ref_title", "").strip()
-                        if not title or len(title) < 5:
-                            continue
-                        title_norm = " ".join(title.lower().split())
-                        if title_norm not in title_counter:
-                            title_counter[title_norm] = {
-                                "count": 0,
-                                "raw_title": title,
-                                "ref_authors": ref.get("ref_authors", ""),
-                                "ref_year": ref.get("ref_year"),
-                                "ref_doi": ref.get("ref_doi", "")
-                            }
-                            title_to_papers[title_norm] = set()
-                        if citing_paper and citing_paper in title_to_papers[title_norm]:
-                            continue
-                        title_counter[title_norm]["count"] += 1
-                        title_to_papers[title_norm].add(citing_paper)
-                        total_refs += 1
-
-            refs_list = []
-            for title_norm, info in title_counter.items():
-                refs_list.append({
-                    "title": info["raw_title"],
-                    "count": info["count"],
-                    "authors": info["ref_authors"],
-                    "year": info["ref_year"],
-                    "doi": info["ref_doi"]
-                })
-            refs_list.sort(key=lambda x: x["count"], reverse=True)
-
-            return {
-                "references": refs_list,
-                "total_refs": total_refs,
-                "total_chunks": len(all_chunks)
-            }
+            return compute_refstats()
         except Exception as e:
             logger.error(f"提取参考文献统计失败: {e}")
-            return {"references": [], "total_refs": 0, "total_chunks": 0, "error": str(e)}
+            return {"references": [], "total_refs": 0, "total_papers": 0, "error": str(e)}
 
     async def get_papers_with_zero_references(self) -> Dict[str, Any]:
         """
@@ -1008,83 +951,10 @@ class HybridIndexManager:
         Returns:
             {"papers": [...], "total_papers": int, "total_zero_ref": int}
         """
+        from rag.reference_processor import get_papers_with_zero_refs_from_json
+
         try:
-            import json
-            await self._ensure_collection()
-            collection = cast(Collection, self._collection)
-            loop = asyncio.get_event_loop()
-
-            papers = await self.list_unique_documents()
-            paper_names = [p.get("file_name", "") for p in papers if p.get("file_name")]
-
-            logger.info(f"🔍 开始检查 {len(paper_names)} 篇论文的参考文献数量...")
-
-            zero_ref_papers = []
-            checked_count = 0
-
-            for i, paper_name in enumerate(paper_names):
-                if i % 20 == 0:
-                    await self._ensure_collection()
-                    collection = cast(Collection, self._collection)
-
-                try:
-                    query_name = paper_name
-                    if self._file_name_has_pdf_suffix is not None:
-                        if self._file_name_has_pdf_suffix and not query_name.lower().endswith('.pdf'):
-                            query_name = query_name + ".pdf"
-                        elif not self._file_name_has_pdf_suffix and query_name.lower().endswith('.pdf'):
-                            query_name = query_name[:-4]
-
-                    all_results: Any = await loop.run_in_executor(
-                        None,
-                        lambda pn=query_name: collection.query(
-                            expr=f'metadata["file_name"] == "{pn}"',
-                            output_fields=["metadata"],
-                            limit=16384
-                        )
-                    )
-                    all_results = cast(List[Dict[str, Any]], all_results)
-
-                    if not all_results:
-                        zero_ref_papers.append({"file_name": paper_name, "chunk_count": 0})
-                        checked_count += 1
-                        continue
-
-                    has_any_ref = False
-                    chunks_with_refs = 0
-                    chunks_without_field = 0
-                    for row in all_results:
-                        meta = row.get("metadata", "{}")
-                        if isinstance(meta, str):
-                            try:
-                                meta = json.loads(meta)
-                            except json.JSONDecodeError:
-                                meta = {}
-                        if "cited_references" in meta:
-                            cited_refs = meta["cited_references"]
-                            if isinstance(cited_refs, list) and len(cited_refs) > 0:
-                                has_any_ref = True
-                                chunks_with_refs += 1
-                        else:
-                            chunks_without_field += 1
-
-                    if not has_any_ref:
-                        zero_ref_papers.append({
-                            "file_name": paper_name,
-                            "chunk_count": len(all_results)
-                        })
-                    checked_count += 1
-
-                except Exception as e:
-                    logger.warning(f"⚠️ 检查论文 {paper_name} 失败: {e}")
-                    continue
-
-            logger.info(f"📊 检查完成: {checked_count} 篇论文, {len(zero_ref_papers)} 篇无参考文献")
-            return {
-                "papers": zero_ref_papers,
-                "total_papers": checked_count,
-                "total_zero_ref": len(zero_ref_papers)
-            }
+            return get_papers_with_zero_refs_from_json()
         except Exception as e:
             logger.error(f"获取零引用论文失败: {e}")
             return {"papers": [], "total_papers": 0, "total_zero_ref": 0, "error": str(e)}

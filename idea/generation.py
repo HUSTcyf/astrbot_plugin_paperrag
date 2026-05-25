@@ -50,11 +50,18 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
         return fuse_knowledge_context(local_results, web_results)
 
     def _build_verified_reference_index(self, local_results: List[Dict]) -> str:
-        """从 chunk metadata 中提取已验证的参考文献，构建权威引用索引。
+        """从 paper_doc_stats.json 查找 chunk 引用的参考文献详情，构建权威引用索引。
 
-        chunk 的 cited_references 是 LLMReferenceParser + arXiv MCP 校验过的
-        结果，论文名称、作者、年份、DOI 均为正确值，天然免于 PDF OCR 噪声。
+        chunk 只存储 cited_ref_ids，完整引用信息（标题、作者、DOI 等）
+        在 data/paper_doc_stats.json 中，由 _save_paper_doc_stats 写入。
         """
+        from rag.reference_processor import _load_paper_doc_stats
+
+        all_stats = _load_paper_doc_stats()
+        if not all_stats:
+            logger.debug("_build_verified_reference_index: paper_doc_stats.json 为空")
+            return ""
+
         seen: set[str] = set()
         refs: List[Dict] = []
         for r in local_results:
@@ -64,11 +71,18 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
                     metadata = json.loads(metadata)
                 except (json.JSONDecodeError, TypeError):
                     continue
-            for ref in (metadata.get("cited_references") or []):
-                ref_id = ref.get("ref_id", "")
-                if ref_id and ref_id not in seen:
-                    seen.add(ref_id)
-                    refs.append(ref)
+            cited_ref_ids = metadata.get("cited_ref_ids") or []
+            if not cited_ref_ids:
+                continue
+            file_name = metadata.get("file_name", "")
+            paper_key = file_name
+            paper_info = all_stats.get(paper_key, {})
+            paper_refs = paper_info.get("references", {})
+            for ref_id in cited_ref_ids:
+                dedup_key = f"{paper_key}:{ref_id}"
+                if ref_id and dedup_key not in seen and ref_id in paper_refs:
+                    seen.add(dedup_key)
+                    refs.append(paper_refs[ref_id])
 
         if not refs:
             logger.debug(f"_build_verified_reference_index: 无已验证参考文献 (检查了 {len(local_results)} 条 local_results)")
@@ -83,11 +97,13 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
             year = ref.get("ref_year", "")
             venue = ref.get("ref_venue", "")
             doi = ref.get("ref_doi", "")
+            arxiv_url = ref.get("ref_arxiv_url", "")
+            github_url = ref.get("ref_github_url", "")
 
             first_author = (authors or "").split(",")[0].strip()
             label = f"{first_author} et al., {year}" if first_author and year else ""
 
-            url = f"https://doi.org/{doi}" if doi else ""
+            url = f"https://doi.org/{doi}" if doi else arxiv_url or github_url or ""
 
             parts = [f"- "]
             if label:
@@ -520,9 +536,8 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
                     for i, node in enumerate(nodes[:local_rag_top_k]):
                         src_metadata = node.metadata if hasattr(node, 'metadata') else {}
                         if isinstance(src_metadata, str):
-                            import json as _json
                             try:
-                                src_metadata = _json.loads(src_metadata)
+                                src_metadata = json.loads(src_metadata)
                             except Exception:
                                 src_metadata = {}
                         score = scores[i] if i < len(scores) else 0.0
@@ -538,7 +553,7 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
                                 "table_csv_path": src_metadata.get("table_csv_path"),
                                 "table_png_path": src_metadata.get("table_png_path"),
                                 "table_caption": src_metadata.get("table_caption"),
-                                "cited_references": src_metadata.get("cited_references", []),
+                                "cited_ref_ids": src_metadata.get("cited_ref_ids", []),
                             }
                         })
                 logger.info(f"[IdeaEngine] 本地RAG检索完成，找到 {len(local_results)} 条结果")

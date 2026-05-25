@@ -98,6 +98,9 @@
 | `rag/hybrid_index.py` | Milvus 索引管理 |
 | `rag/multimodal_extractor.py` | 多模态提取器 (docling) |
 | `rag/abstract_index.py` | 摘要索引 |
+| `rag/paper_link_resolver.py` | arXiv API 解析器（速率限制、健康检查、标题规范化） |
+| `rag/reference_processor.py` | 参考文献解析、富化与存储 |
+| `data/paper_doc_stats.json` | 论文级参考文献解析结果（单文件持久化） |
 | `rag/colbert_storage.py` | ColBERT 多向量存储 |
 | `agentic_rag/workflow.py` | 静态 DAG 工作流 |
 | `agentic_rag/react_workflow.py` | ReAct 工作流 |
@@ -121,4 +124,4 @@ python -m pytest test/ agentic_rag/test/ idea/test/ -v
 
 ---
 
-**最后更新**: 2026-05-23
+**最后更新**: 2026-05-25

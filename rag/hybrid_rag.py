@@ -2429,6 +2429,7 @@ class HybridRAGEngine:
             prefix = file_name or file_path
             if prefix:
                 colbert_storage.delete_by_file_prefix(prefix)
+                colbert_storage.save()
 
             # 刷新 BM25 索引
             bm25_retriever = getattr(self._retriever, '_bm25_retriever', None)

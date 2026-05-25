@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import threading
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -83,6 +84,12 @@ class PaperLinkResolver:
     OPENALEX_THRESHOLD = 75.0
     ARXIV_THRESHOLD = 70.0
 
+    _arxiv_health_checked: bool = False
+    _arxiv_available: bool = True
+    _arxiv_health_lock = threading.Lock()
+    _last_arxiv_request_time: float = 0.0
+    _MIN_ARXIV_INTERVAL: float = 2.0
+
     def __init__(
         self,
         core_api_key: str = "",
@@ -96,7 +103,47 @@ class PaperLinkResolver:
         self._enable_openalex = enable_openalex
         self._enable_arxiv_library = enable_arxiv_library
         self._log_prefix = log_prefix
-        self._last_request_time = 0.0
+
+        if self._enable_arxiv_library:
+            self._ensure_arxiv_health_check()
+            if not PaperLinkResolver._arxiv_available:
+                self._enable_arxiv_library = False
+
+    @classmethod
+    def _ensure_arxiv_health_check(cls) -> None:
+        """首次实例化时探测 arXiv API 可用性。若返回 429 则整个会话跳过 arXiv 搜索。"""
+        if cls._arxiv_health_checked:
+            return
+
+        with cls._arxiv_health_lock:
+            if cls._arxiv_health_checked:
+                return
+            cls._arxiv_health_checked = True
+
+        try:
+            import arxiv
+            import time as _time
+
+            client = arxiv.Client(num_retries=0)
+            search = arxiv.Search(query="test", max_results=1)
+            list(client.results(search))
+            cls._arxiv_available = True
+            cls._last_arxiv_request_time = _time.monotonic()
+        except Exception as e:
+            status = getattr(e, "status", None)
+            if status == 429:
+                cls._arxiv_available = False
+                logger.warning(
+                    "[PaperLinkResolver] arXiv API 返回 HTTP 429 (限流)，"
+                    "本次会话将跳过所有 arXiv 库搜索"
+                )
+            else:
+                cls._arxiv_available = False
+                logger.warning(
+                    "[PaperLinkResolver] arXiv 健康检查失败 (%s): %s，"
+                    "本次会话将跳过所有 arXiv 库搜索",
+                    type(e).__name__, e,
+                )
 
     @staticmethod
     def normalize_title(title: str) -> str:
@@ -863,7 +910,11 @@ class PaperLinkResolver:
             return []
 
     async def _search_arxiv_library_candidates(self, title: str, limit: int = 5, author_hint: str = "") -> List[Dict[str, Any]]:
-        """使用 arXiv library 搜索候选结果。"""
+        """使用 arXiv library 搜索候选结果。
+
+        arXiv API 使用 AND 语义，长查询容易因个别词不匹配而漏掉目标论文。
+        因此先用前 5 个关键词搜索，失败再用完整查询兜底。
+        """
         if not self._enable_arxiv_library:
             return []
 
@@ -871,14 +922,29 @@ class PaperLinkResolver:
             import arxiv
 
             loop = asyncio.get_event_loop()
-            elapsed = loop.time() - self._last_request_time
-            if elapsed < 0.6:
-                await asyncio.sleep(0.6 - elapsed)
+            elapsed = loop.time() - PaperLinkResolver._last_arxiv_request_time
+            if elapsed < PaperLinkResolver._MIN_ARXIV_INTERVAL:
+                await asyncio.sleep(PaperLinkResolver._MIN_ARXIV_INTERVAL - elapsed)
+
+            full_query = self.normalize_title(title)
+            words = full_query.split()
+            short_query = " ".join(words[:5]) if len(words) > 5 else full_query
+
+            queries_to_try = [short_query]
+            if short_query != full_query:
+                queries_to_try.append(full_query)
 
             client = arxiv.Client()
-            search = arxiv.Search(query=title, max_results=limit)
-            results = await loop.run_in_executor(None, lambda: list(client.results(search)))
-            self._last_request_time = loop.time()
+            results: list = []
+            for i, query in enumerate(queries_to_try):
+                search = arxiv.Search(query=query, max_results=limit)
+                results = await loop.run_in_executor(None, lambda: list(client.results(search)))
+                PaperLinkResolver._last_arxiv_request_time = loop.time()
+                if results:
+                    break
+                if i < len(queries_to_try) - 1:
+                    await asyncio.sleep(PaperLinkResolver._MIN_ARXIV_INTERVAL)
+
             normalized: List[Dict[str, Any]] = []
             for result in results:
                 entry_id = getattr(result, "entry_id", "") or ""

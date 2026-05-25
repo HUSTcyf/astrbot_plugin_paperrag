@@ -392,6 +392,8 @@ class HybridPDFParser:
 
         except Exception as e:
             logger.error(f"❌ PDF分块失败 {pdf_path}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return []
 
     def _build_lightweight_metadata(
@@ -1067,8 +1069,8 @@ class HybridPDFParser:
         # 全部保留，关联时选择文件存在且页码最匹配的。
         figure_refs: Dict[str, List[Tuple[str, str, int]]] = {}
         for key, path in image_paths.items():
-            # key 格式: "caption|page_num|idx"
-            parts = key.split("|")
+            # key 格式: "caption|page_num|idx". 用 rsplit 避免 caption 中 | 导致错位.
+            parts = key.rsplit("|", 2)
             caption_str = parts[0]
             page_num = int(parts[1]) if len(parts) > 1 else 0
             idx = int(parts[2]) if len(parts) > 2 else 0
@@ -1194,8 +1196,8 @@ class HybridPDFParser:
         # 同一 table 编号可能对应多张不同页面的表格，全部保留。
         table_refs: Dict[str, List[Tuple[str, str, str, str, int]]] = {}
         for key, paths in table_paths.items():
-            # key 格式: "caption|page_num|idx"
-            parts = key.split("|")
+            # key 格式: "caption|page_num|idx". 用 rsplit 避免 caption 中 | 导致错位.
+            parts = key.rsplit("|", 2)
             caption_str = parts[0]
             page_num = int(parts[1]) if len(parts) > 1 else 0
             idx = int(parts[2]) if len(parts) > 2 else 0

@@ -27,6 +27,7 @@ class Reference:
     ref_year: Optional[int]  # 年份
     ref_doi: Optional[str]  # DOI
     ref_venue: Optional[str]  # 期刊/会议
+    ref_arxiv_url: Optional[str] = None  # arXiv URL（PaperLinkResolver 解析）
     ref_cited_by: List[str] = field(default_factory=list)  # 正文中引用此文献的位置（chunk索引）
 
     def to_dict(self) -> Dict[str, Any]:
@@ -37,6 +38,7 @@ class Reference:
             "ref_authors": self.ref_authors,
             "ref_year": self.ref_year,
             "ref_doi": self.ref_doi,
+            "ref_arxiv_url": self.ref_arxiv_url,
             "ref_venue": self.ref_venue
         }
 
@@ -669,7 +671,7 @@ class CitationLinker:
             references: 提取的Reference列表
 
         Returns:
-            更新后的chunks列表，每个chunk添加了cited_references元数据
+            更新后的chunks列表，每个chunk添加了cited_ref_ids元数据
         """
         if not references:
             return chunks
@@ -704,21 +706,8 @@ class CitationLinker:
             if not hasattr(chunk, 'metadata'):
                 chunk.metadata = {}
 
-            if cited_refs:
-                # 存储完整的引用信息（标题、作者、年份等），而不仅仅是 ref_id
-                chunk.metadata['cited_references'] = [
-                    {
-                        "ref_id": rid,
-                        "ref_title": ref_map[rid].ref_title,
-                        "ref_authors": ref_map[rid].ref_authors,
-                        "ref_year": ref_map[rid].ref_year,
-                        "ref_doi": ref_map[rid].ref_doi,
-                        "ref_venue": ref_map[rid].ref_venue,
-                    }
-                    for rid in cited_refs
-                ]
-            else:
-                chunk.metadata['cited_references'] = []
+            # 只存储引用的 ref_id 列表，具体信息从 paper_doc_stats.json 查找
+            chunk.metadata['cited_ref_ids'] = sorted(cited_refs) if cited_refs else []
 
         return chunks
 
@@ -1295,8 +1284,9 @@ class LLMReferenceParser:
                     )
                     if resolution.has_any_url():
                         if resolution.doi_url and not ref.ref_doi:
-                            # 从 doi_url 提取纯 DOI（如 https://doi.org/10.xxx → 10.xxx）
                             ref.ref_doi = resolution.doi_url.replace("https://doi.org/", "")
+                        if resolution.arxiv_url and not ref.ref_arxiv_url:
+                            ref.ref_arxiv_url = resolution.arxiv_url
                         if resolution.matched_title and resolution.resolution_score >= 85:
                             # 高置信度匹配时，用解析器的标题和链接补全
                             ref.ref_title = resolution.matched_title
@@ -1362,90 +1352,216 @@ class LLMReferenceParser:
                 except Exception as e:
                     logger.warning(f"📝 [arXiv MCP] 查询异常，保留原始解析: {ref.ref_title[:60]} — {e}")
 
+        # 统计链接覆盖率
+        has_doi = 0
+        has_arxiv = 0
+        missing_all = []
+        for ref in references:
+            if not ref:
+                continue
+            doi_ok = bool(ref.ref_doi)
+            arxiv_ok = bool(ref.ref_arxiv_url)
+            if doi_ok:
+                has_doi += 1
+            if arxiv_ok:
+                has_arxiv += 1
+            if not doi_ok and not arxiv_ok:
+                title = (ref.ref_title or "")[:80]
+                if title:
+                    missing_all.append(title)
+
         logger.info(
             f"📝 参考文献富化完成: 多源解析 {enriched_by_link_resolver} 条, "
             f"arXiv MCP {enriched_by_arxiv_mcp} 条, "
             f"总计 {len(references)} 条"
         )
+        logger.info(
+            f"📝 链接覆盖: DOI {has_doi} | arXiv {has_arxiv} | "
+            f"无链接 {len(missing_all)}"
+        )
+        if missing_all:
+            logger.warning(
+                f"📝 无链接参考文献 ({len(missing_all)} 条):\n" +
+                "\n".join(f"  - {t}" for t in missing_all)
+            )
 
-    async def _enrich_from_arxiv(self, references: List[Reference]) -> None:
-        """
-        [已废弃] 仅通过 arXiv MCP 补充论文信息。
 
-        请使用 _enrich_references() 替代，它集成了多源链接解析 + arXiv MCP 兜底。
 
-        Args:
-            references: Reference 对象列表（会被直接修改）
-        """
-        if not self.arxiv_client:
-            return
+def _paper_doc_stats_path():
+    """返回 paper_doc_stats.json 的绝对路径。"""
+    from pathlib import Path
+    return Path(__file__).parent.parent / "data" / "paper_doc_stats.json"
 
-        enriched = 0
-        for ref in references:
-            if not ref:
+
+def _load_paper_doc_stats() -> dict:
+    """加载 paper_doc_stats.json，返回 {paper_key: stats_dict}。"""
+    import json
+    stats_path = _paper_doc_stats_path()
+    if not stats_path.exists():
+        return {}
+    try:
+        with open(stats_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def _save_paper_doc_stats(pdf_path: str, references: List[Reference]) -> None:
+    """保存论文级参考文献解析结果到 data/paper_doc_stats.json。
+
+    每篇论文一条记录，包含：
+    - 统计信息（链接覆盖率、缺失列表）
+    - references 字典（ref_id → 完整引用详情），供召回时查找
+    """
+    import json
+    from pathlib import Path
+    from datetime import datetime, timezone
+
+    has_doi = 0
+    has_arxiv = 0
+    missing_refs: List[Dict[str, Any]] = []
+    refs_detail: Dict[str, Dict[str, Any]] = {}
+
+    for ref in references:
+        if not ref:
+            continue
+        doi_ok = bool(ref.ref_doi)
+        arxiv_ok = bool(ref.ref_arxiv_url)
+        if doi_ok:
+            has_doi += 1
+        if arxiv_ok:
+            has_arxiv += 1
+        if not doi_ok and not arxiv_ok:
+            missing_refs.append({
+                "title": ref.ref_title or "",
+                "authors": ref.ref_authors or "",
+                "year": ref.ref_year,
+            })
+
+        refs_detail[ref.ref_id] = ref.to_dict()
+
+    stats: Dict[str, Any] = {
+        "file_name": Path(pdf_path).name,
+        "total_refs": len(references),
+        "has_doi": has_doi,
+        "has_arxiv": has_arxiv,
+        "missing_all": len(missing_refs),
+        "missing_refs": missing_refs,
+        "references": refs_detail,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    stats_path = _paper_doc_stats_path()
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+
+    all_stats = _load_paper_doc_stats()
+    paper_key = Path(pdf_path).name
+    existing = all_stats.get(paper_key, {})
+    existing.update(stats)
+    all_stats[paper_key] = existing
+
+    with open(stats_path, "w", encoding="utf-8") as f:
+        json.dump(all_stats, f, ensure_ascii=False, indent=2)
+
+    logger.info(
+        f"📝 论文参考文献统计已保存: {stats_path} "
+        f"(DOI {has_doi}, arXiv {has_arxiv}, 无链接 {len(missing_refs)})"
+    )
+
+
+def compute_refstats() -> Dict[str, Any]:
+    """直接从 paper_doc_stats.json 计算引用频次统计，无需查询 Milvus。
+
+    每篇论文每个引用只计一次（同一论文多次引用同一文献不重复计数）。
+    按标题归一化后跨论文聚合。
+
+    Returns:
+        {"references": [...], "total_refs": int, "total_papers": int}
+    """
+    all_stats = _load_paper_doc_stats()
+    if not all_stats:
+        return {"references": [], "total_refs": 0, "total_papers": 0}
+
+    # title_norm → {"count": int, "raw_title": str, ...}
+    title_counter: Dict[str, Dict[str, Any]] = {}
+    # title_norm → set of paper_keys (用于同一论文内去重)
+    paper_title_sets: Dict[str, set] = {}
+
+    for paper_key, paper_stats in all_stats.items():
+        if not isinstance(paper_stats, dict):
+            continue
+        refs = paper_stats.get("references", {})
+        if not isinstance(refs, dict):
+            continue
+
+        for ref_id, ref in refs.items():
+            if not isinstance(ref, dict):
+                continue
+            title = ref.get("ref_title", "").strip()
+            if not title or len(title) < 5:
                 continue
 
-            # 优先使用 DOI 搜索
-            search_query = None
-            if ref.ref_doi:
-                search_query = ref.ref_doi
-            elif ref.ref_title and len(ref.ref_title) > 5:
-                search_query = ref.ref_title
+            title_norm = " ".join(title.lower().split())
 
-            if not search_query:
-                logger.info(f"📝 [arXiv] 跳过无查询条件的参考文献: {ref.ref_title[:60] if ref.ref_title else '(无标题)'}")
-                continue
+            if title_norm not in title_counter:
+                title_counter[title_norm] = {
+                    "count": 0,
+                    "raw_title": title,
+                    "ref_authors": ref.get("ref_authors", ""),
+                    "ref_year": ref.get("ref_year"),
+                    "ref_doi": ref.get("ref_doi", ""),
+                }
+                paper_title_sets[title_norm] = set()
 
-            try:
-                result = await self.arxiv_client.call_tool_with_reconnect(
-                    tool_name="search_arxiv",
-                    arguments={"query": search_query, "max_results": 3}
-                )
+            if paper_key not in paper_title_sets[title_norm]:
+                title_counter[title_norm]["count"] += 1
+                paper_title_sets[title_norm].add(paper_key)
 
-                if result is None:
-                    logger.warning(f"📝 [arXiv] MCP 客户端返回 None，保留原始解析: {ref.ref_title[:60]}")
-                    continue
+    total_refs = sum(info["count"] for info in title_counter.values())
 
-                if not result.get("results"):
-                    logger.info(f"📝 [arXiv] 未搜到结果，保留原始解析: {ref.ref_title[:60]}")
-                    continue
+    refs_list = []
+    for title_norm, info in title_counter.items():
+        refs_list.append({
+            "title": info["raw_title"],
+            "count": info["count"],
+            "authors": info["ref_authors"],
+            "year": info["ref_year"],
+            "doi": info["ref_doi"],
+        })
+    refs_list.sort(key=lambda x: x["count"], reverse=True)
 
-                # 找到最匹配的论文
-                matched = False
-                for paper in result.get("results", []):
-                    paper_title = paper.get("title", "")
-                    ref_title = ref.ref_title if ref.ref_title else ""
+    return {
+        "references": refs_list,
+        "total_refs": total_refs,
+        "total_papers": len(all_stats),
+    }
 
-                    if not ref_title or not paper_title:
-                        continue
 
-                    # 标题必须完全相同（忽略大小写）
-                    if ref_title.lower() != paper_title.lower():
-                        continue
+def get_papers_with_zero_refs_from_json() -> Dict[str, Any]:
+    """直接从 paper_doc_stats.json 获取参考文献数为 0 的论文列表。
 
-                    # 完全匹配，更新 Reference 对象
-                    if paper.get("authors"):
-                        ref.ref_authors = ", ".join(paper["authors"])
-                    if paper.get("published_date"):
-                        year_match = re.search(r'(\d{4})', paper["published_date"])
-                        if year_match:
-                            ref.ref_year = int(year_match.group(1))
-                    if paper.get("doi"):
-                        ref.ref_doi = paper.get("doi")
+    若某论文无 references 字段或 references 为空，视为零引用。
 
-                    enriched += 1
-                    matched = True
-                    logger.debug(f"📝 [arXiv] 已校验: {ref.ref_title[:60]}")
-                    break
+    Returns:
+        {"papers": [...], "total_papers": int, "total_zero_ref": int}
+    """
+    all_stats = _load_paper_doc_stats()
+    if not all_stats:
+        return {"papers": [], "total_papers": 0, "total_zero_ref": 0}
 
-                if not matched:
-                    logger.info(f"📝 [arXiv] 标题未完全匹配，保留原始解析: {ref.ref_title[:60]}")
+    papers = []
+    for paper_key, paper_stats in all_stats.items():
+        if not isinstance(paper_stats, dict):
+            continue
+        refs = paper_stats.get("references", {})
+        if not isinstance(refs, dict) or not refs:
+            papers.append({"file_name": paper_stats.get("file_name", paper_key), "chunk_count": 0})
 
-            except Exception as e:
-                logger.warning(f"📝 [arXiv] 查询异常，保留原始解析: {ref.ref_title[:60] if ref.ref_title else '(无标题)'} — {e}")
-                continue
-
-        logger.info(f"📝 [arXiv] 共校验 {enriched}/{len(references)} 条参考文献")
+    return {
+        "papers": papers,
+        "total_papers": len(all_stats),
+        "total_zero_ref": len(papers),
+    }
 
 
 async def process_references_with_llm(
@@ -1519,6 +1635,9 @@ async def process_references_with_llm(
         return [], chunks
 
     logger.info(f"📚 LLM 解析成功: 共 {len(all_references)} 条参考文献")
+
+    # 2.5. 保存论文级参考文献统计到 paper_doc_stats.json
+    _save_paper_doc_stats(pdf_path, all_references)
 
     # 3. 建立引用关联
     linker = CitationLinker()

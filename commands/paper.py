@@ -760,7 +760,7 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             # 正常模式：显示高频引用论文统计
             yield event.plain_result("📊 正在统计参考文献...")
 
-            stats = await index_manager.get_all_references(allow_duplicates=(dedup == 0))
+            stats = await index_manager.get_all_references()
 
             if "error" in stats:
                 yield event.plain_result(f"❌ 获取统计失败: {stats['error']}")
@@ -768,19 +768,18 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
 
             references = stats.get("references", [])
             total_refs = stats.get("total_refs", 0)
-            total_chunks = stats.get("total_chunks", 0)
+            total_papers = stats.get("total_papers", 0)
 
             if not references:
                 yield event.plain_result("📭 数据库中暂无参考文献信息\n💡 请先使用 /paper add 添加论文")
                 return
 
             # 格式化输出
-            dedup_note = "（去重）" if dedup == 1 else ""
-            output = f"📚 **参考文献统计** {dedup_note}\n\n"
+            output = f"📚 **参考文献统计**（每篇论文同一引用只计一次）\n\n"
             output += f"📊 统计概览:\n"
-            output += f"   • 涉及论文种类: {len(references)}\n"
-            output += f"   • 引用总条次: {total_refs}\n"
-            output += f"   • 处理文档块: {total_chunks}\n\n"
+            output += f"   • 被引用文献种类: {len(references)}\n"
+            output += f"   • 跨论文引用总次数: {total_refs}\n"
+            output += f"   • 论文总数: {total_papers}\n\n"
 
             output += f"🔝 **Top {min(top_k, len(references))} 高频引用论文**\n\n"
 
@@ -789,25 +788,22 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
                 count = ref["count"]
                 authors = ref.get("authors", "")
                 year = ref.get("year", "N/A")
+                doi = ref.get("doi", "")
 
-                # 截断过长标题
-                if len(title) > 60:
-                    title_display = title[:57] + "..."
+                if doi:
+                    doi_url = f"https://doi.org/{doi}" if not doi.startswith("http") else doi
+                    title_line = f"{i:2d}. [{count:3d}次] [{title}]({doi_url})\n"
                 else:
-                    title_display = title
+                    title_line = f"{i:2d}. [{count:3d}次] **{title}**\n"
+                output += title_line
 
-                # 截断作者
-                if authors and len(authors) > 40:
-                    authors_display = authors[:37] + "..."
-                else:
-                    authors_display = authors
-
-                output += f"{i:2d}. [{count:3d}次] **{title_display}**\n"
-                if authors_display:
-                    output += f"    └─ {authors_display}"
-                    if year:
-                        output += f" ({year})"
-                    output += "\n"
+                meta_parts = []
+                if authors:
+                    meta_parts.append(authors)
+                if year:
+                    meta_parts.append(str(year))
+                if meta_parts:
+                    output += f"    └─ {' · '.join(meta_parts)}\n"
 
             yield event.plain_result(output.strip())
 
@@ -1220,6 +1216,15 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
                 yield event.plain_result("✅ Step 1/5b: Abstract index cleared")
             except Exception as e:
                 logger.warning(f"清除摘要索引失败: {e}")
+
+            # 清除 paper_doc_stats.json
+            doc_stats_path = _PLUGIN_DIR / "data" / "paper_doc_stats.json"
+            if doc_stats_path.exists():
+                try:
+                    doc_stats_path.unlink()
+                    yield event.plain_result("✅ Step 1/5c: Document stats cleared")
+                except Exception as e:
+                    logger.warning(f"清除 paper_doc_stats.json 失败: {e}")
 
         except Exception as e:
             logger.error(f"Failed to clear document library: {e}")
