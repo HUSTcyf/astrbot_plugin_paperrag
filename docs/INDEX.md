@@ -6,6 +6,7 @@
 |------|------|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 架构设计、组件说明、文件结构、配置参数 |
 | [AGENTIC_ARCHITECTURE.md](AGENTIC_ARCHITECTURE.md) | Agentic RAG + Agentic Ideas LangGraph 工作流详解 |
+| [FEISHU_CLAUDE_CODE_REMOTE.md](FEISHU_CLAUDE_CODE_REMOTE.md) | 飞书远程操控 Claude Code 方案（含 cc-connect 安装配置） |
 | [CHANGELOG.md](CHANGELOG.md) | 变更记录（版本索引见 [docs/changelog/](changelog/INDEX.md)） |
 | [cypher_queries.md](cypher_queries.md) | Neo4j Cypher 查询参考 |
 | [FEISHU_BLOCK_STYLING.md](FEISHU_BLOCK_STYLING.md) | 飞书文档导出技术方案（lark-cli 优先 + MCP 回退双路径） |
@@ -71,6 +72,17 @@
 | `/idea clean <confirm>` | 公开 | 清理孤立主题数据（扫描/执行） |
 | `/idea tofeishu <主题>` | 公开 | 创建飞书文档 |
 | `/idea regen <UUID>` | 公开 | 重新生成指定想法 |
+
+## LLM Tool 清单
+
+插件在 AstrBot Agent Pipeline 中注册以下 LLM Tool（Agent 可类似 Function Calling 调用）：
+
+| Tool 名称 | 类型 | 说明 |
+|-----------|------|------|
+| `paper_search` | 轻量混合 RAG | 直接搜索 + 文本清洗 + LLM 回答，适合简单查询 |
+| `paper_arag` | 静态 DAG Agentic RAG | 多跳推理、对比分析、引用溯源 |
+| `paper_react` | ReAct Agent | 自主选择检索工具（向量/知识图谱） |
+| `code_execute` | Claude Code 执行器 | `claude -p` 子进程执行编程任务 |
 
 ## 配置文件
 

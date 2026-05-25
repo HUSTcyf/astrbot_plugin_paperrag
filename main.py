@@ -37,7 +37,7 @@ from .commands.base import PluginCoreBase
     "paper_rag",
     "HUSTcyf",
     "本地文档库RAG检索插件 (支持PDF/Word/TXT/HTML, Gemini + Milvus Lite)",
-    "1.12.6",
+    "2.2.0",
     "https://github.com/HUSTcyf/astrbot_plugin_paperrag.git"
 )
 class PaperRAGPlugin(PaperCommandsMixin, ArxivCommandsMixin, GraphCommandsMixin, IdeaCommandsMixin, PluginCoreBase):
@@ -64,6 +64,26 @@ class PaperRAGPlugin(PaperCommandsMixin, ArxivCommandsMixin, GraphCommandsMixin,
             ],
             desc="用于论文问答的智能 Agent，可自主选择向量检索或知识图谱检索",
             func_obj=self._react_rag_tool,
+        )
+        # 注册基础 RAG 检索为 LLM Tool
+        context.register_llm_tool(
+            name="paper_search",
+            func_args=[
+                {"type": "string", "name": "query", "description": "论文检索查询，从本地论文库中搜索相关内容"},
+                {"type": "integer", "name": "top_k", "description": "召回数，默认5", "default": 5}
+            ],
+            desc="基础论文 RAG 检索：直接搜索本地论文库并生成回答。比 paper_arag/paper_react 更轻量快速，适合简单的论文内容查询",
+            func_obj=self._paper_search_tool,
+        )
+        # 注册 Claude Code 编程执行为 LLM Tool
+        context.register_llm_tool(
+            name="code_execute",
+            func_args=[
+                {"type": "string", "name": "task", "description": "完整的编程任务描述，需包含所有必要上下文和指令"},
+                {"type": "integer", "name": "timeout", "description": "最大执行秒数，默认300", "default": 300},
+            ],
+            desc="使用 Claude Code 执行编程任务：写/改代码、调试、运行实验、重构、git 操作等。agent 应先调用 paper_search/paper_arag/paper_react 检索相关知识，整合后形成完整任务再调用此工具",
+            func_obj=self._code_execute_tool,
         )
 
     # ==================== Paper 命令组 ====================

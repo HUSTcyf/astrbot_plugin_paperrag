@@ -1,10 +1,18 @@
-# 📚 Paper RAG Plugin v2.1.2 — 用户指南
+# 📚 Paper RAG Plugin v2.2.0 — 用户指南
 
-本地论文库 RAG 检索插件，为 AstrBot 提供智能论文检索、知识图谱增强问答和研究想法生成。支持多模态（图片/表格/公式）提取、Llama.cpp VLM 本地问答和 Agentic RAG（LangGraph 工作流）。
+本地论文库 RAG 检索插件，为 AstrBot 提供智能论文检索、知识图谱增强问答、研究想法生成和远程 Claude Code 编程执行。支持多模态（图片/表格/公式）提取、Llama.cpp VLM 本地问答和 Agentic RAG（LangGraph 工作流）。
 
-> **版本说明**：当前版本 v2.1.2，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
+> **版本说明**：当前版本 v2.2.0，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
 
-### 本版变化 (v2.1.2)
+### 本版变化 (v2.2.0)
+
+- **新 LLM Tool：`paper_search`** — 轻量混合 RAG 检索，比 paper_arag/paper_react 更快速，适合简单的论文内容查询。内部走 `engine.search → 文本清洗 → LLM 生成回答`。
+- **新 LLM Tool：`code_execute`** — Claude Code 远程编程执行器。AstrBot agent 可调用此工具在服务器上执行编程任务（写/改代码、调试、实验、git 操作等）。采用 `claude -p` 子进程模式，无需 cc-connect 即可使用。内置输入校验（危险命令拦截）和超时子进程清理。
+- **安全模型**：code_execute 使用 `--allowedTools` 白名单限制 Claude Code 工具范围，危险命令（rm -rf /、curl|sh、sudo 等）自动拦截，权限不足时返回清晰的授权指引。
+- **版本号修正**：`@register()` 装饰器版本号从遗留的 1.12.6 更新为 2.2.0，与 metadata.yaml 保持一致。
+- 完整变更详见 [docs/changelog/2.2.0.md](docs/changelog/2.2.0.md)
+
+### 上版变化 (v2.1.2)
 
 - **PaperBanana 本地服务集成**：插件可启动和管理本地 PaperBanana 服务，新增 `paperbanana_project_path` 配置项，自动使用项目 `.venv` 中的 Python 启动方法图生成服务。
 - **Feishu 导出修复**：修复 lark-cli vs MCP 网关选择、PaperBanana 临时文件过早清理、`__import__('re')` 惰性导入等多项问题；长引用上下文支持 token 预算分批处理。
@@ -56,6 +64,7 @@ PaperRAG 是一个多层学术论文问答系统，支持从简单向量检索�
 
 - 🔍 **混合检索**：稠密向量 + 稀疏权重（ABSPEC）+ BM25 精确匹配 三通道 RRF 融合，知识图谱独立召回（两阶段）
 - 🧠 **Agentic RAG**：LangGraph 静态 DAG + ReAct Tool-Using Agent（7 个自主工具），智能查询分类与多跳推理
+- 🔧 **远程 Claude Code**：Agent 可调用 `code_execute` 工具在服务器上执行编程任务，`paper_search` 提供轻量 RAG 检索
 - 🕸️ **知识图谱**：Neo4j 图数据库，9 类实体 + 14 类关系，LLM 自动三元组抽取，多模态图谱构建
 - 💡 **Idea 生成**：线性 + Agentic 迭代优化（自反思 critique→debate→refine 循环），飞书文档导出
 - 🖼️ **多模态处理**：PDF 图片/表格/公式提取，Llama.cpp VLM 本地图片问答（9B/4B 自动降级）
@@ -405,6 +414,123 @@ npx @larksuite/cli@latest install
 - **Agentic 模式**：复杂对比、多跳推理、引用溯源类问题开启 `enable_agentic_rag`，使用 `/paper arag` 或 `/paper react`
 
 ---
+## 🔧 Claude Code 远程编程执行
+
+AstrBot agent 可以通过 paperrag 插件的 `code_execute` LLM Tool 在服务器上远程执行 Claude Code。Agent 先用 `paper_search`/`paper_arag`/`paper_react` 检索知识，整合上下文后调用 `code_execute` 完成编程任务。
+
+**Agent 调用流程**：`paper_search/arag/react 检索知识 → 整合上下文 → code_execute 执行编程任务 → 返回结果`
+
+### 前置条件：安装 Claude Code
+
+```bash
+# 安装 Claude Code CLI
+npm install -g @anthropic-ai/claude-code
+
+# 验证安装
+claude --version
+claude -p "echo hello" --output-format text
+```
+
+### 配置 API 访问
+
+code_execute 工具使用 `claude -p` 子进程模式，依赖当前 shell 环境中的 API 凭证：
+
+```bash
+# 官方 Anthropic API
+export ANTHROPIC_AUTH_TOKEN="sk-ant-..."
+
+# 第三方 API Proxy（如 OpenRouter / one-api）
+export ANTHROPIC_BASE_URL="https://your-api-proxy.com"
+export ANTHROPIC_AUTH_TOKEN="sk-your-api-key"
+
+# 验证
+claude -p "hello" --output-format text
+```
+
+> ⚠️ **AstrBot 进程环境变量**：如果用 launchd/systemd 启动 AstrBot，需在 service 配置中设置环境变量。
+> launchd plist 示例：
+> ```xml
+> <key>EnvironmentVariables</key>
+> <dict>
+>     <key>ANTHROPIC_BASE_URL</key>
+>     <string>https://your-api-proxy.com</string>
+>     <key>ANTHROPIC_AUTH_TOKEN</key>
+>     <string>sk-your-api-key</string>
+> </dict>
+> ```
+
+### 安全模型
+
+code_execute 默认以受限模式运行，不跳过权限检查：
+
+| 机制 | 说明 |
+|------|------|
+| `--allowedTools` 白名单 | 限制为 Read、Write/Edit（插件目录）、Bash（git/python/pytest/pip）、Grep、Glob |
+| 危险命令拦截 | `rm -rf /`、`curl \| sh`、`sudo`、`chmod 777`、`git push --force` 等自动拒绝 |
+| 权限错误引导 | 当任务需要额外权限时，返回清晰的指引信息，引导用户在服务器上手动授权 |
+
+### Agent 如何使用 code_execute
+
+`code_execute` 作为 LLM Tool 注册在 AstrBot 中，Agent 可以像调用 `paper_search` 一样调用它：
+
+1. Agent 收到用户编程请求（如 "帮我写一个数据可视化脚本"）
+2. Agent 如需论文知识，先调用 `paper_search` 检索相关文献
+3. Agent 将检索结果 + 用户需求整合为完整任务描述
+4. Agent 调用 `code_execute(task=整合后的任务, timeout=300)`
+5. Claude Code 在服务器上执行并返回结果
+6. Agent 将结果回复给用户
+
+### 可选：cc-connect 会话持久化（高级）
+
+**默认不需要 cc-connect** —— 直接 `claude -p` 即可满足绝大多数场景。
+
+如果需要**跨调用保持 Claude Code 会话上下文**（例如多轮交互式编程），可以安装 cc-connect：
+
+```bash
+# 安装 cc-connect
+npm install -g @anthropic-ai/cc-connect
+
+# 创建项目
+cc-connect feishu setup --project paperrag
+
+# 启动 cc-connect 服务
+cc-connect start
+
+# 验证服务状态
+cc-connect status
+```
+
+cc-connect 配置文件 `~/.cc-connect/config.toml`：
+
+```toml
+[server]
+port = 9025
+host = "127.0.0.1"
+
+[projects.paperrag]
+path = "/Users/chenyifeng/AstrBot/data/plugins/astrbot_plugin_paperrag"
+
+[projects.paperrag.options.agent]
+model = "claude-sonnet-4-6"
+
+[projects.paperrag.options.env]
+ANTHROPIC_BASE_URL = "https://your-api-proxy.com"
+ANTHROPIC_AUTH_TOKEN = "sk-your-api-key"
+```
+
+启动后可通过 `claude --resume <session_id>` 复用会话上下文：
+
+```bash
+# 创建新会话
+claude --resume new --print "列出项目的主要模块" --output-format text
+
+# 后续调用复用同一会话
+claude --resume <session_id> --print "详细分析第一个模块" --output-format text
+```
+
+> 详情参考 [docs/FEISHU_CLAUDE_CODE_REMOTE.md](docs/FEISHU_CLAUDE_CODE_REMOTE.md)
+
+---
 
 ## ❓ 常见问题
 
@@ -447,6 +573,7 @@ CMAKE_ARGS="-DGGML_METAL=on -DLLAMA_MTMD=on" pip install llama-cpp-python
 |------|------|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构设计、组件说明、文件结构 |
 | [docs/AGENTIC_ARCHITECTURE.md](docs/AGENTIC_ARCHITECTURE.md) | Agentic RAG + Agentic Ideas 工作流详解 |
+| [docs/FEISHU_CLAUDE_CODE_REMOTE.md](docs/FEISHU_CLAUDE_CODE_REMOTE.md) | 飞书远程操控 Claude Code 方案（含 cc-connect 安装配置） |
 | [docs/CHANGELOG.md](docs/CHANGELOG.md) | 变更记录 |
 | [docs/changelog/INDEX.md](docs/changelog/INDEX.md) | 按版本拆分的变更索引 |
 | [docs/FEISHU_BLOCK_STYLING.md](docs/FEISHU_BLOCK_STYLING.md) | 飞书导出技术方案（lark-cli + MCP 双路径） |

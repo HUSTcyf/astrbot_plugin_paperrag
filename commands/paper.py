@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Optional
 
@@ -24,6 +25,23 @@ except ImportError:
     from plugin_common import SUPPORTED_DOC_EXTENSIONS
 
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
+
+# Claude Code 权限相关 stderr 关键字（需要用户手动授权时出现）
+_PERMISSION_KEYWORDS = re.compile(
+    r"permission|approval|authorization|not allowed|denied|requires? (human|user|manual)",
+    re.IGNORECASE,
+)
+
+# code_execute 危险命令模式（模块级常量，避免每次调用重新创建）
+_DANGEROUS_PATTERNS: list[tuple[str, str]] = [
+    (r"rm\s+-rf\s+/($|\*)", "rm -rf /"),
+    (r"curl\s+.*\|\s*(ba)?sh", "curl ... | sh"),
+    (r"wget\s+.*\|\s*(ba)?sh", "wget ... | sh"),
+    (r"git\s+push\s+(-f|--force)", "git push --force"),
+    (r"\bsudo\b", "sudo"),
+    (r"chmod\s+777", "chmod 777"),
+    (r">\s*/dev/(sd[a-z]|nvme\d+n\d+|xvd[a-z]|hd[a-z]|mmcblk\d+)", "> /dev/disk (磁盘覆写)"),
+]
 
 
 class PaperCommandsMixin(RetrievalHelpersMixin):
@@ -431,6 +449,133 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             if text.strip():
                 results.append(text.strip())
         return results[-1] if results else ""
+
+    async def _paper_search_tool(self, event: AstrMessageEvent, query: str, top_k: int = 5) -> str:
+        """LLM Tool wrapper: 基础 RAG 检索 + LLM 生成回答，返回纯文本。
+
+        比 paper_arag/paper_react 更轻量，适合简单的论文内容检索。
+        内部调用 engine.search → 文本清洗 → LLM 生成回答。
+
+        Args:
+            event: AstrMessageEvent (injected by framework)
+            query: query string
+            top_k: number of results to retrieve
+
+        Returns:
+            Generated answer text, or error message.
+        """
+        engine = self._get_engine()
+        if not engine:
+            return "RAG 引擎未就绪"
+
+        try:
+            response = await engine.search(query, top_k=top_k, mode="rag")
+        except Exception as e:
+            logger.error(f"[paper_search] 检索失败: {e}")
+            return f"检索失败: {e}"
+
+        sources = self._query_result_to_sources(response)
+        if not sources:
+            return "未找到相关论文片段"
+
+        try:
+            sources = await self._compact_chunk_texts_with_vlm(sources)
+            answer = await self._generate_rag_answer(query, sources)
+        except ValueError as e:
+            logger.error(f"[paper_search] 上下文窗口不足: {e}")
+            return f"检索到 {len(sources)} 条结果，但上下文窗口不足，无法生成回答。请尝试缩小查询范围。"
+        except Exception as e:
+            logger.error(f"[paper_search] 回答生成失败: {e}")
+            return f"回答生成失败: {e}"
+
+        return answer if answer else "未能生成回答"
+
+    @staticmethod
+    def _validate_code_execute_task(task: str) -> str | None:
+        """输入校验：危险模式检测。合法返回 None，非法返回错误信息。"""
+        for pattern, label in _DANGEROUS_PATTERNS:
+            if re.search(pattern, task, re.IGNORECASE):
+                logger.error(f"[code_execute] 危险模式拒绝: {label}")
+                return f"任务包含潜在危险操作 ({label})，已被拒绝。请移除危险命令后重试。"
+        return None
+
+    async def _code_execute_tool(self, event: AstrMessageEvent, task: str, timeout: int = 300) -> str:
+        """LLM Tool wrapper: 启动 claude -p 子进程执行编程任务，同步返回结果。
+
+        Agent 应先调用 paper_search/paper_arag/paper_react 检索相关知识，
+        整合上下文后形成完整任务再调用此工具。
+
+        Args:
+            event: AstrMessageEvent (injected by framework)
+            task: 完整的编程任务描述，需包含所有必要上下文和指令
+            timeout: 最大执行秒数，默认300
+
+        Returns:
+            Claude Code 的输出文本
+        """
+        error = self._validate_code_execute_task(task)
+        if error:
+            return error
+
+        logger.debug(f"[code_execute] 完整任务: {task}")
+
+        work_dir = str(_PLUGIN_DIR)
+        cmd = [
+            "claude", "-p", "--", task,
+            "--output-format", "text",
+            "--allowedTools",
+            "Read,Write(astrbot_plugin_paperrag/**),Edit(astrbot_plugin_paperrag/**),Bash(git:*,python:*,pytest:*,pip:*),Grep,Glob",
+        ]
+
+        logger.info(f"[code_execute] 执行: {task[:100]}...")
+        process = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=work_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except FileNotFoundError:
+            logger.error("[code_execute] claude 命令未找到（未安装或不在 PATH 中）")
+            return "Claude Code 未安装或不在 PATH 中，请联系管理员安装。"
+        except asyncio.TimeoutError:
+            logger.error(f"[code_execute] 超时 ({timeout}s): {task[:100]}...")
+            if process is not None:
+                try:
+                    process.kill()
+                    await process.wait()
+                except Exception:
+                    pass
+            return f"Claude Code 超时 ({timeout}s)，请缩小任务范围或增加超时。"
+
+        output = stdout.decode("utf-8", errors="replace").strip()
+        err_output = stderr.decode("utf-8", errors="replace").strip()
+
+        # 权限检测：无论 returncode 是否为 0，stderr 中出现权限关键字都应提示
+        perm_in_output = _PERMISSION_KEYWORDS.search(output)
+        perm_in_stderr = _PERMISSION_KEYWORDS.search(err_output)
+        if perm_in_output or perm_in_stderr:
+            logger.warning(f"[code_execute] 需要用户手动授权: {task[:100]}...")
+            return (
+                f"Claude Code 执行此任务需要额外权限（如 Bash 执行或网络访问）。\n\n"
+                f"请先在服务器上审查以下任务是否安全，确认无误后手动执行：\n\n"
+                f"```bash\ncd '{work_dir}'\n"
+                f"claude --dangerously-skip-permissions -p \"$(cat <<'EOF'\n{task}\nEOF\n)\"\n```\n\n"
+                f"注意：--dangerously-skip-permissions 将绕过所有权限检查，仅在审查确认安全后使用。"
+            )
+
+        if process.returncode != 0:
+            logger.error(f"[code_execute] 非零退出 (rc={process.returncode}): stderr={err_output[:200]}")
+            if not output:
+                return f"Claude Code 退出码 {process.returncode}: {err_output[:500]}"
+
+        if err_output:
+            logger.warning(f"[code_execute] stderr: {err_output[:200]}")
+
+        logger.info(f"[code_execute] 完成 ({len(output)} chars)")
+        return output if output else "(no output)"
 
 
     async def _paper_list(self, event: AstrMessageEvent):

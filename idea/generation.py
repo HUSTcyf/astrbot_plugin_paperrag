@@ -177,7 +177,7 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
 **用户研究主题：{topic}**
 
 收集的知识（请仔细阅读，这些是与主题相关的参考资料）：
-{knowledge_context[:8000]}
+{knowledge_context}
 
 {focus_instruction}
 
