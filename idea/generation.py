@@ -83,6 +83,13 @@ class IdeaEngineGeneration(IdeaEngineVM, IdeaEngineWebSearch):
                 if ref_id and dedup_key not in seen and ref_id in paper_refs:
                     seen.add(dedup_key)
                     refs.append(paper_refs[ref_id])
+                elif ref_id and dedup_key not in seen:
+                    logger.warning(
+                        f"_build_verified_reference_index: ref_id '{ref_id}' not found in "
+                        f"paper_doc_stats.json for paper '{paper_key}' — chunk cited_ref_ids "
+                        f"may be stale. Consider running /paper reparseref {paper_key}"
+                    )
+                    seen.add(dedup_key)
 
         if not refs:
             logger.debug(f"_build_verified_reference_index: 无已验证参考文献 (检查了 {len(local_results)} 条 local_results)")

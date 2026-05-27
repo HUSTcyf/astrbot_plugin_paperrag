@@ -24,6 +24,20 @@ try:
 except ImportError:
     from plugin_common import SUPPORTED_DOC_EXTENSIONS
 
+
+def _llm_display_name(llm_config: dict) -> str:
+    """Extract a human-readable LLM name from config (provider or freeapi)."""
+    provider = llm_config.get("provider")
+    if provider is not None:
+        model = getattr(provider, 'model', None) or getattr(provider, 'model_name', None)
+        if model:
+            return model
+        provider_id = getattr(provider, 'provider_id', None) or getattr(provider, 'provider_name', None)
+        if provider_id:
+            return provider_id
+        return "provider"
+    return llm_config.get("model", "unknown")
+
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 
 # Claude Code 权限相关 stderr 关键字（需要用户手动授权时出现）
@@ -58,12 +72,6 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
     def _build_file_path_map(self, papers_path: Path) -> dict[str, Path]:
         """Build a file_name -> full path mapping from papers directory."""
         file_path_map: dict[str, Path] = {}
-
-        for ext in SUPPORTED_DOC_EXTENSIONS:
-            for f in papers_path.glob(f"*{ext}"):
-                file_path_map[f.name] = f
-            for f in papers_path.glob(f"*{ext.upper()}"):
-                file_path_map[f.name] = f
 
         for ext in SUPPORTED_DOC_EXTENSIONS:
             for f in papers_path.rglob(f"*{ext}"):
@@ -861,43 +869,125 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             # 获取索引管理器
             index_manager = engine._ensure_index_manager_initialized()
 
-            # top_k = -1 表示列出参考文献数量为0的论文
+            # top_k = -1 表示列出每篇论文的参考文献解析成功/失败统计
             if top_k == -1:
-                yield event.plain_result("📊 正在查找无参考文献的论文...")
+                yield event.plain_result("📊 正在分析参考文献解析质量...")
 
-                result = await index_manager.get_papers_with_zero_references()
-
-                if "error" in result:
-                    yield event.plain_result(f"❌ 获取失败: {result['error']}")
+                doc_stats_path = _PLUGIN_DIR / "data" / "paper_doc_stats.json"
+                if not doc_stats_path.exists():
+                    yield event.plain_result("📭 paper_doc_stats.json 不存在，请先添加论文")
                     return
 
-                papers = result.get("papers", [])
-                total_papers = result.get("total_papers", 0)
-                total_zero_ref = result.get("total_zero_ref", 0)
-
-                # total_papers == 0 表示未能成功获取论文列表
-                if total_papers == 0:
-                    yield event.plain_result("⚠️ 未能获取到论文列表，请检查索引是否初始化")
+                try:
+                    with open(doc_stats_path, "r", encoding="utf-8") as f:
+                        all_stats = json.load(f)
+                except Exception as e:
+                    yield event.plain_result(f"❌ 读取 paper_doc_stats.json 失败: {e}")
                     return
 
-                if not papers:
-                    yield event.plain_result("✅ 所有论文都已提取到参考文献")
+                if not isinstance(all_stats, dict):
+                    yield event.plain_result("❌ paper_doc_stats.json 格式无效")
                     return
 
-                # 格式化输出
-                output = f"📚 **无参考文献的论文** ({total_zero_ref}/{total_papers})\n\n"
+                # Build per-paper stats:
+                #   linked: has DOI or arXiv URL (true success)
+                #   title_only: has title but no link (LLM OK, link resolution failed)
+                #   no_title: empty title (LLM extraction failed)
+                paper_rows: list[dict] = []
+                unparsed_papers: list[str] = []
+                total_refs_all = 0
+                total_linked_all = 0
+                total_title_only_all = 0
+                total_no_title_all = 0
 
-                for i, paper in enumerate(papers, 1):
-                    file_name = paper.get("file_name", "unknown")
-                    chunk_count = paper.get("chunk_count", 0)
+                for file_name, stats in all_stats.items():
+                    refs = stats.get("references", {})
+                    if not isinstance(refs, dict) or not refs:
+                        # Paper added to knowledge base but references never parsed
+                        unparsed_papers.append(file_name)
+                        continue
 
-                    if len(file_name) > 70:
-                        file_name_display = file_name[:67] + "..."
+                    total = len(refs)
+                    linked = 0
+                    title_only = 0
+                    no_title = 0
+                    for r in refs.values():
+                        if not isinstance(r, dict):
+                            continue
+                        has_link = bool(r.get("ref_doi") or r.get("ref_arxiv_url"))
+                        has_title = bool(r.get("ref_title", "").strip())
+                        if has_link:
+                            linked += 1
+                        elif has_title:
+                            title_only += 1
+                        else:
+                            no_title += 1
+
+                    total_refs_all += total
+                    total_linked_all += linked
+                    total_title_only_all += title_only
+                    total_no_title_all += no_title
+
+                    paper_rows.append({
+                        "file_name": file_name,
+                        "total": total,
+                        "linked": linked,
+                        "title_only": title_only,
+                        "no_title": no_title,
+                        "unresolved": title_only + no_title,
+                    })
+
+                if not paper_rows and not unparsed_papers:
+                    yield event.plain_result("📭 没有已解析参考文献的论文")
+                    return
+
+                # Sort: most unresolved first, then by file name
+                paper_rows.sort(key=lambda r: (-r["unresolved"], r["file_name"]))
+
+                total_papers = len(paper_rows) + len(unparsed_papers)
+                total_unresolved = total_title_only_all + total_no_title_all
+                output = "📚 **参考文献解析质量报告**\n\n"
+                output += f"📊 总计: {total_refs_all} 条参考文献\n"
+                output += f"   • 已链接 (DOI/arXiv): {total_linked_all}"
+                if total_refs_all > 0:
+                    output += f" ({total_linked_all/total_refs_all:.1%})"
+                output += f"\n   • 仅有标题无链接: {total_title_only_all}"
+                output += f"\n   • 标题为空 (LLM 失败): {total_no_title_all}"
+                output += f"\n📄 论文总数: {total_papers}"
+                output += f" (已解析: {len(paper_rows)}, 未解析: {len(unparsed_papers)})\n\n"
+
+                output += "📋 **逐篇统计** (未解决数降序):\n\n"
+
+                for i, row in enumerate(paper_rows, 1):
+                    file_name = row["file_name"]
+                    display_name = file_name if len(file_name) <= 60 else file_name[:57] + "..."
+
+                    if row["unresolved"] == 0:
+                        status_icon = "✅"
+                    elif row["linked"] > 0:
+                        status_icon = "⚠️"
                     else:
-                        file_name_display = file_name
+                        status_icon = "❌"
 
-                    output += f"{i:3d}. **{file_name_display}**\n"
-                    output += f"      └─ chunks: {chunk_count}\n"
+                    output += f"{i:3d}. {status_icon} **{display_name}**\n"
+                    parts = [f"{row['total']} 条"]
+                    if row["linked"]:
+                        parts.append(f"{row['linked']} 已链接")
+                    if row["title_only"]:
+                        parts.append(f"{row['title_only']} 仅标题")
+                    if row["no_title"]:
+                        parts.append(f"{row['no_title']} 空标题")
+                    output += f"      └─ {', '.join(parts)}"
+                    if row["total"] > 0:
+                        output += f" (链接率 {row['linked']/row['total']:.0%})"
+                    output += "\n"
+
+                if unparsed_papers:
+                    output += f"\n📭 **未解析参考文献的论文 ({len(unparsed_papers)} 篇):**\n\n"
+                    for i, name in enumerate(unparsed_papers, 1):
+                        display_name = name if len(name) <= 60 else name[:57] + "..."
+                        output += f"  {i}. {display_name}\n"
+                        output += f"     💡 使用 /paper reparseref {name} 重新解析\n"
 
                 yield event.plain_result(output.strip())
                 return
@@ -1023,7 +1113,10 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
 
 
     async def _paper_reparse_zero_ref(self, event: AstrMessageEvent, confirm: str = ''):
-        """Batch re-parse papers with zero references (Admin)
+        """Batch re-parse references for papers with zero/missing references (Admin)
+
+        Uses lightweight path: PyMuPDF text extraction + LLM reference parsing.
+        Does NOT delete or rebuild chunks/embeddings — references only.
 
         Args:
             confirm: Must be 'confirm' to proceed
@@ -1033,7 +1126,7 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             return
 
         if confirm != 'confirm':
-            yield event.plain_result("⚠️ This will re-parse all papers with zero references.\n"
+            yield event.plain_result("⚠️ This will re-parse references for all papers with zero refs.\n"
                                    "This operation may take a long time.\n"
                                    "Usage: /paper reparse_zero_ref confirm")
             return
@@ -1044,11 +1137,21 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             return
 
         try:
+            # Step 1: Resolve LLM config upfront
+            yield event.plain_result("🔍 Step 1/4: Resolving LLM config...")
+            llm_config = await engine._resolve_llm_config()
+            if not llm_config:
+                yield event.plain_result(
+                    "❌ LLM reference parsing is not configured. "
+                    "Enable enable_llm_reference_parsing or set freeapi_url/freeapi_key in plugin config."
+                )
+                return
+            yield event.plain_result(f"🤖 Using LLM: {_llm_display_name(llm_config)}")
+
+            # Step 2: Get papers with zero references
+            yield event.plain_result("🔍 Step 2/4: Finding papers with zero references...")
+
             index_manager = engine._ensure_index_manager_initialized()
-
-            # Step 1: Get papers with zero references
-            yield event.plain_result("🔍 Step 1/4: Finding papers with zero references...")
-
             result = await index_manager.get_papers_with_zero_references()
 
             if "error" in result:
@@ -1059,13 +1162,13 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             total_zero_ref = result.get("total_zero_ref", 0)
 
             if not papers:
-                yield event.plain_result("✅ All papers have extracted references")
+                yield event.plain_result("✅ All papers have references with valid titles")
                 return
 
-            yield event.plain_result(f"📊 Found {total_zero_ref} papers with zero references")
+            yield event.plain_result(f"📊 Found {total_zero_ref} papers with zero/invalid references")
 
-            # Step 2: Find file paths for each paper
-            yield event.plain_result("🔍 Step 2/4: Locating paper files...")
+            # Step 3: Locate paper files
+            yield event.plain_result("🔍 Step 3/4: Locating paper files...")
 
             papers_dir = self.config.get("papers_dir", "./papers")
             papers_path = Path(papers_dir)
@@ -1089,71 +1192,77 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
 
             yield event.plain_result(f"✅ Found {len(papers_to_reparse)} paper files")
 
-            # Step 3: Delete from database
-            yield event.plain_result("🔍 Step 3/4: Deleting from database and figures...")
+            # Step 4: Lightweight reference re-parsing
+            yield event.plain_result("🔍 Step 4/4: Re-parsing references (lightweight, no re-index)...")
 
-            deleted_count = 0
-            for paper in papers_to_reparse:
-                file_name = paper["file_name"]
-                file_path = paper.get("file_path")
-                try:
-                    result = await engine.delete_paper(file_name, file_path or "")
-                    if result.get("status") == "success":
-                        deleted_count += 1
-                    else:
-                        logger.warning(f"删除失败: {file_name} - {result.get('message')}")
-                except Exception as e:
-                    logger.error(f"Failed to delete {file_name}: {e}")
-
-                if deleted_count % 10 == 0:
-                    yield event.plain_result(f"   Deleted {deleted_count}/{len(papers_to_reparse)}...")
-
-            yield event.plain_result(f"✅ Deleted {deleted_count} papers from database")
-
-            # Step 4: Re-parse and re-vectorize
-            yield event.plain_result("🔍 Step 4/4: Re-parsing and vectorizing...")
+            from rag.reference_processor import process_references_with_llm
+            import fitz
 
             start_time = time.time()
             success_count = 0
             fail_count = 0
-            total_chunks = 0
+            synced_chunks = 0
+            sync_errors = 0
+            index_manager = engine._ensure_index_manager_initialized()
 
             for i, paper in enumerate(papers_to_reparse, 1):
-                try:
-                    result = await engine.add_paper(paper["file_path"])
+                file_path = paper["file_path"]
+                file_name = paper["file_name"]
 
-                    if result.get("status") == "success":
-                        chunks_added = result.get("chunks_added", 0)
-                        total_chunks += chunks_added
+                try:
+                    with fitz.open(file_path) as doc:
+                        raw_text = "".join(str(page.get_text()) for page in doc)
+
+                    if not raw_text.strip():
+                        fail_count += 1
+                        logger.warning(f"[reparse_zero_ref] No extractable text: {file_name}")
+                        continue
+
+                    refs, _ = await process_references_with_llm(
+                        file_path, [], raw_text, llm_config,
+                        enable_fallback_search=True,
+                    )
+                    if refs:
                         success_count += 1
+                        # Sync chunk-level cited_ref_ids in Milvus
+                        sync_result = await index_manager.sync_cited_ref_ids_for_paper(
+                            file_name, refs
+                        )
+                        if sync_result.get("error"):
+                            sync_errors += 1
+                            logger.warning(
+                                f"[reparse_zero_ref] cited_ref_ids sync failed for "
+                                f"{file_name}: {sync_result['error']}"
+                            )
+                        else:
+                            synced_chunks += sync_result.get("synced", 0)
                     else:
                         fail_count += 1
-                        logger.warning(f"Failed to re-parse {paper['file_name']}: {result.get('message')}")
+                        logger.warning(f"[reparse_zero_ref] No references found: {file_name}")
                 except Exception as e:
                     fail_count += 1
-                    logger.error(f"Failed to re-parse {paper['file_name']}: {e}")
+                    logger.error(f"[reparse_zero_ref] Failed {file_name}: {e}")
 
-                # Progress update every 5 papers
                 if i % 5 == 0 or i == len(papers_to_reparse):
-                    elapsed = time.time() - start_time
                     yield event.plain_result(
                         f"   Progress: {i}/{len(papers_to_reparse)} "
-                        f"(success: {success_count}, failed: {fail_count})"
+                        f"(success: {success_count}, failed: {fail_count}, "
+                        f"chunks synced: {synced_chunks})"
                     )
 
             elapsed_time = time.time() - start_time
 
-            output = f"""✅ **Reparse Complete**
+            output = f"""✅ **Reference Reparse Complete**
 
 📊 Statistics:
   • Total zero-ref papers: {total_zero_ref}
   • Files found: {len(papers_to_reparse)}
   • Successfully re-parsed: {success_count}
   • Failed: {fail_count}
-  • Chunks created: {total_chunks}
+  • Chunk cited_ref_ids synced: {synced_chunks}{' (⚠️ ' + str(sync_errors) + ' sync failures)' if sync_errors else ''}
   • Time: {elapsed_time:.1f}s
 
-💡 Tip: Use /paper refstats -1 to check again"""
+💡 Tip: Use /paper refstats -1 to verify results"""
 
             if not_found:
                 output += f"\n\n⚠️ {len(not_found)} papers not found in filesystem"
@@ -1162,6 +1271,243 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
 
         except Exception as e:
             logger.error(f"Failed to reparse zero-ref papers: {e}")
+            yield event.plain_result(f"❌ 操作失败: {e}")
+
+
+    async def _paper_repair_refs(self, event: AstrMessageEvent, confirm: str = ''):
+        """Auto-classify and repair papers with unlinked references (Admin)
+
+        Reads paper_doc_stats.json and splits papers into two strategies:
+
+        Strategy A — full_reparse: Papers with any no_title refs (LLM extraction failed)
+            or completely unparsed. Runs full pipeline: PyMuPDF text extraction + LLM
+            reference parsing + link resolution.
+
+        Strategy B — link_only: Papers where ALL unlinked refs have valid titles. Only
+            link resolution failed. Lightweight repair: reloads refs from JSON and
+            re-runs PaperLinkResolver enrichment (no LLM extraction, no PyMuPDF).
+
+        Args:
+            confirm: Must be 'confirm' to proceed
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if confirm != 'confirm':
+            yield event.plain_result(
+                "⚠️ This will repair all papers with unlinked references.\n"
+                "Papers with empty titles → full reparse (LLM)\n"
+                "Papers with only missing links → lightweight link repair\n"
+                "Usage: /paper repair_refs confirm"
+            )
+            return
+
+        engine = self._get_engine()
+        if not engine:
+            yield event.plain_result("❌ RAG engine is not ready")
+            return
+
+        try:
+            # Step 1: Resolve LLM config
+            yield event.plain_result("🔍 Step 1/3: Resolving LLM config...")
+            llm_config = await engine._resolve_llm_config()
+            if not llm_config:
+                yield event.plain_result(
+                    "❌ LLM reference parsing is not configured. "
+                    "Enable enable_llm_reference_parsing or set freeapi_url/freeapi_key in plugin config."
+                )
+                return
+            yield event.plain_result(f"🤖 Using LLM: {_llm_display_name(llm_config)}")
+
+            # Step 2: Auto-classify papers
+            yield event.plain_result("🔍 Step 2/3: Analyzing paper_doc_stats.json...")
+
+            index_manager = engine._ensure_index_manager_initialized()
+            classification = await index_manager.classify_papers_for_repair()
+
+            if classification.get("error"):
+                yield event.plain_result(f"❌ Analysis failed: {classification['error']}")
+                return
+
+            full_reparse = classification.get("full_reparse", [])
+            link_only = classification.get("link_only", [])
+            total_papers = classification.get("total_papers", 0)
+
+            if not full_reparse and not link_only:
+                yield event.plain_result("✅ All papers have fully-linked references. Nothing to repair.")
+                return
+
+            # Show classification summary
+            total_full_unlinked = sum(p["title_only"] + p["no_title"] for p in full_reparse)
+            total_link_unlinked = sum(p["title_only"] for p in link_only)
+            full_no_title = sum(p["no_title"] for p in full_reparse)
+
+            yield event.plain_result(
+                f"📊 **Auto-Classification** (out of {total_papers} papers):\n\n"
+                f"🔴 **Full Reparse** ({len(full_reparse)} papers):\n"
+                f"   • {total_full_unlinked} unlinked refs ({full_no_title} with empty titles)\n"
+                f"   • Needs: LLM extraction + link resolution\n\n"
+                f"🔗 **Link-Only Repair** ({len(link_only)} papers):\n"
+                f"   • {total_link_unlinked} unlinked refs (all have valid titles)\n"
+                f"   • Needs: link re-resolution only (no LLM extraction)\n"
+            )
+
+            papers_dir = self.config.get("papers_dir", "./papers")
+            papers_path = Path(papers_dir)
+            if not papers_path.exists():
+                yield event.plain_result(f"❌ Papers directory does not exist: {papers_dir}")
+                return
+
+            start_time = time.time()
+
+            # ---- Strategy B: Link-only repair (runs first — fast, no LLM) ----
+            link_success = 0
+            link_fail = 0
+            link_newly_linked = 0
+            link_synced_chunks = 0
+            link_sync_errors = 0
+
+            if link_only:
+                yield event.plain_result(
+                    f"\n🔗 **Phase 1: Link-Only Repair** ({len(link_only)} papers)..."
+                )
+
+                from rag.reference_processor import repair_links_for_paper
+
+                link_matched, link_not_found = self._match_papers_to_files(link_only, papers_dir)
+                if link_not_found:
+                    yield event.plain_result(
+                        f"   ⚠️ {len(link_not_found)} link-only papers not found in filesystem, skipped"
+                    )
+
+                for i, paper in enumerate(link_matched, 1):
+                    file_name = paper["file_name"]
+                    try:
+                        result = await repair_links_for_paper(
+                            file_name, llm_config, enable_fallback_search=True
+                        )
+                        if result.get("error"):
+                            link_fail += 1
+                            logger.warning(f"[repair_refs:link] {file_name}: {result['error']}")
+                        else:
+                            link_success += 1
+                            link_newly_linked += result.get("newly_linked", 0)
+                    except Exception as e:
+                        link_fail += 1
+                        logger.error(f"[repair_refs:link] Failed {file_name}: {e}")
+
+                    if i % 10 == 0 or i == len(link_matched):
+                        yield event.plain_result(
+                            f"   Link repair: {i}/{len(link_matched)} "
+                            f"(success: {link_success}, failed: {link_fail}, "
+                            f"newly linked: {link_newly_linked})"
+                        )
+
+            # ---- Strategy A: Full reparse (runs second — heavy, uses LLM) ----
+            full_success = 0
+            full_fail = 0
+            full_synced_chunks = 0
+            full_sync_errors = 0
+            all_not_found: list[str] = []
+
+            if full_reparse:
+                yield event.plain_result(
+                    f"\n🔴 **Phase 2: Full Reparse** ({len(full_reparse)} papers)..."
+                )
+
+                full_matched, full_not_found = self._match_papers_to_files(full_reparse, papers_dir)
+                all_not_found = full_not_found
+
+                if full_not_found:
+                    yield event.plain_result(
+                        f"   ⚠️ {len(full_not_found)} full-reparse papers not found:"
+                    )
+                    for fn in full_not_found[:5]:
+                        yield event.plain_result(f"      - {fn}")
+                    if len(full_not_found) > 5:
+                        yield event.plain_result(f"      ... and {len(full_not_found) - 5} more")
+
+                if not full_matched:
+                    yield event.plain_result("   ❌ No full-reparse paper files found")
+                else:
+                    from rag.reference_processor import process_references_with_llm
+                    import fitz
+
+                    for i, paper in enumerate(full_matched, 1):
+                        file_path = paper["file_path"]
+                        file_name = paper["file_name"]
+
+                        try:
+                            with fitz.open(file_path) as doc:
+                                raw_text = "".join(str(page.get_text()) for page in doc)
+
+                            if not raw_text.strip():
+                                full_fail += 1
+                                logger.warning(f"[repair_refs:full] No extractable text: {file_name}")
+                                continue
+
+                            refs, _ = await process_references_with_llm(
+                                file_path, [], raw_text, llm_config,
+                                enable_fallback_search=True,
+                            )
+                            if refs:
+                                full_success += 1
+                                sync_result = await index_manager.sync_cited_ref_ids_for_paper(
+                                    file_name, refs
+                                )
+                                if sync_result.get("error"):
+                                    full_sync_errors += 1
+                                    logger.warning(
+                                        f"[repair_refs:full] cited_ref_ids sync failed for "
+                                        f"{file_name}: {sync_result['error']}"
+                                    )
+                                else:
+                                    full_synced_chunks += sync_result.get("synced", 0)
+                            else:
+                                full_fail += 1
+                                logger.warning(f"[repair_refs:full] No references found: {file_name}")
+                        except Exception as e:
+                            full_fail += 1
+                            logger.error(f"[repair_refs:full] Failed {file_name}: {e}")
+
+                        if i % 5 == 0 or i == len(full_matched):
+                            yield event.plain_result(
+                                f"   Full reparse: {i}/{len(full_matched)} "
+                                f"(success: {full_success}, failed: {full_fail}, "
+                                f"chunks synced: {full_synced_chunks})"
+                            )
+
+            elapsed_time = time.time() - start_time
+
+            # ---- Final report ----
+            total_success = link_success + full_success
+            total_fail = link_fail + full_fail
+            total_synced = link_synced_chunks + full_synced_chunks
+            total_sync_errs = link_sync_errors + full_sync_errors
+
+            output = f"""✅ **Reference Repair Complete**
+
+📊 **Results** ({elapsed_time:.1f}s):
+
+🔗 Link-Only Repair:
+  • Papers: {link_success} success, {link_fail} failed
+  • Newly linked refs: {link_newly_linked}
+
+🔴 Full Reparse:
+  • Papers: {full_success} success, {full_fail} failed
+  • Chunk cited_ref_ids synced: {full_synced_chunks}{' (⚠️ ' + str(full_sync_errors) + ' sync failures)' if full_sync_errors else ''}
+
+📊 Total: {total_success} success, {total_fail} failed
+💡 Tip: Use /paper refstats -1 to verify results"""
+
+            if all_not_found:
+                output += f"\n\n⚠️ {len(all_not_found)} full-reparse papers not found in filesystem"
+
+            yield event.plain_result(output.strip())
+
+        except Exception as e:
+            logger.error(f"Failed to repair references: {e}")
             yield event.plain_result(f"❌ 操作失败: {e}")
 
 
@@ -1532,3 +1878,134 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             import traceback
             logger.error(traceback.format_exc())
             yield event.plain_result(f"❌ Failed to rebuild: {e}")
+
+    async def _paper_reparseref(self, event: AstrMessageEvent, file_name: str = ''):
+        """Re-parse references for a single paper without full index rebuild (Admin)
+
+        Extracts raw text from PDF via PyMuPDF (fast, no re-chunking/embedding),
+        then calls process_references_with_llm directly to re-parse references.
+        Results are saved to data/paper_doc_stats.json.
+        """
+        if not self.enabled:
+            yield event.plain_result("❌ Plugin is disabled")
+            return
+
+        if not file_name:
+            yield event.plain_result(
+                "❌ Usage: /paper reparseref <filename>\n"
+                "Example: /paper reparseref 2508.09977v2.pdf"
+            )
+            return
+
+        engine = self._get_engine()
+        if not engine:
+            yield event.plain_result("❌ RAG engine is not ready")
+            return
+
+        # Locate the PDF file (same logic as rebuildf)
+        papers_dir = self.config.get("papers_dir", "./papers")
+        papers_dir_resolved = Path(papers_dir).resolve()
+        paper_path = None
+
+        for ext in ['', '.pdf', '.PDF']:
+            candidate = os.path.join(papers_dir, file_name + ext) if ext else os.path.join(papers_dir, file_name)
+            candidate_resolved = Path(candidate).resolve()
+            if not str(candidate_resolved).startswith(str(papers_dir_resolved)):
+                continue
+            if os.path.exists(candidate) and os.path.isfile(candidate):
+                paper_path = candidate
+                break
+
+        if not paper_path:
+            for p in Path(papers_dir).glob("*"):
+                if file_name.lower() in p.name.lower():
+                    p_resolved = p.resolve()
+                    if not str(p_resolved).startswith(str(papers_dir_resolved)):
+                        continue
+                    if p.is_file():
+                        paper_path = str(p)
+                        break
+
+        if not paper_path:
+            yield event.plain_result(f"❌ File not found: {file_name}")
+            return
+
+        actual_file_name = os.path.basename(paper_path)
+        yield event.plain_result(f"📝 Re-parsing references for: {actual_file_name}")
+
+        # Extract raw text using PyMuPDF
+        try:
+            import fitz
+            with fitz.open(paper_path) as doc:
+                raw_text = "".join(str(page.get_text()) for page in doc)
+        except Exception as e:
+            logger.error(f"[reparseref] PDF text extraction failed: {e}")
+            yield event.plain_result(f"❌ Failed to extract text from PDF: {e}")
+            return
+
+        if not raw_text.strip():
+            yield event.plain_result(f"❌ No extractable text in {actual_file_name} (scanned PDF?)")
+            return
+
+        yield event.plain_result(f"📄 Extracted {len(raw_text)} chars of raw text")
+
+        # Resolve LLM config via engine's shared method (freeapi → provider)
+        llm_config = await engine._resolve_llm_config()
+        if not llm_config:
+            yield event.plain_result(
+                "❌ LLM reference parsing is not configured. "
+                "Enable enable_llm_reference_parsing or set freeapi_url/freeapi_key in plugin config."
+            )
+            return
+
+        yield event.plain_result(f"🤖 Using LLM: {_llm_display_name(llm_config)}")
+
+        # Run reference parsing followed by chunk-level cited_ref_ids sync
+        try:
+            from rag.reference_processor import process_references_with_llm
+            yield event.plain_result("⏳ Parsing references with LLM (may take a few minutes)...")
+            references, _chunks = await process_references_with_llm(
+                paper_path, [], raw_text, llm_config,
+                enable_fallback_search=True,
+            )
+        except Exception as e:
+            logger.error(f"[reparseref] Reference parsing failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            yield event.plain_result(f"❌ Reference parsing failed: {e}")
+            return
+
+        if references:
+            # Sync chunk-level cited_ref_ids in Milvus to match new references
+            index_manager = engine._ensure_index_manager_initialized()
+            sync_result = await index_manager.sync_cited_ref_ids_for_paper(
+                actual_file_name, references
+            )
+            sync_msg = ""
+            if sync_result.get("error"):
+                sync_msg = (
+                    f"\n   ⚠️ cited_ref_ids sync failed: {sync_result['error']}"
+                )
+            elif sync_result.get("synced", 0) > 0:
+                sync_msg = (
+                    f"\n   🔄 Synced cited_ref_ids: {sync_result['synced']} chunks updated"
+                    f" ({sync_result.get('unchanged', 0)} unchanged)"
+                )
+            elif sync_result.get("total_chunks", 0) > 0:
+                sync_msg = (
+                    f"\n   ✅ cited_ref_ids up-to-date"
+                    f" ({sync_result['total_chunks']} chunks)"
+                )
+            # else: no chunks in Milvus (paper not indexed yet), no message
+
+            yield event.plain_result(
+                f"✅ References re-parsed successfully!\n"
+                f"   📄 File: {actual_file_name}\n"
+                f"   📚 References found: {len(references)}"
+                f"{sync_msg}"
+            )
+        else:
+            yield event.plain_result(
+                f"⚠️ No references found. The LLM may have timed out "
+                f"or {actual_file_name} has no recognizable reference section."
+            )

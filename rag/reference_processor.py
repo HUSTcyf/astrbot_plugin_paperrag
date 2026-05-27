@@ -28,6 +28,7 @@ class Reference:
     ref_doi: Optional[str]  # DOI
     ref_venue: Optional[str]  # 期刊/会议
     ref_arxiv_url: Optional[str] = None  # arXiv URL（PaperLinkResolver 解析）
+    ref_source_arxiv_id: Optional[str] = None  # arXiv ID（LLM 从引用文本直接提取）
     ref_cited_by: List[str] = field(default_factory=list)  # 正文中引用此文献的位置（chunk索引）
 
     def to_dict(self) -> Dict[str, Any]:
@@ -39,6 +40,7 @@ class Reference:
             "ref_year": self.ref_year,
             "ref_doi": self.ref_doi,
             "ref_arxiv_url": self.ref_arxiv_url,
+            "ref_source_arxiv_id": self.ref_source_arxiv_id,
             "ref_venue": self.ref_venue
         }
 
@@ -758,6 +760,7 @@ class LLMReferenceParser:
 - year: 年份（4位数字）
 - venue: 期刊/会议名称（如果有）
 - doi: DOI（如果有）
+- raw_snippet: 该条参考文献的原始文本片段（用于搜索补全）
 
 请以JSON数组格式返回，不要包含任何其他内容：
 [
@@ -766,7 +769,8 @@ class LLMReferenceParser:
         "authors": "作者列表",
         "year": "年份",
         "venue": "期刊/会议",
-        "doi": "DOI"
+        "doi": "DOI",
+        "raw_snippet": "原始参考文献文本"
     }}
 ]
 
@@ -789,20 +793,24 @@ class LLMReferenceParser:
 - 如果某行以大写字母开头且上一行以年份结尾，这是新引用的开始
 
 请为每条识别出的参考文献提取以下字段：
-- title: 论文标题
+- title: 论文标题（**重要：必须逐字完整复制标题，不要截断、缩写或省略任何部分**）
 - authors: 作者（多个作者用逗号分隔，只填作者姓名，不填"et al"等）
 - year: 年份（4位数字）
 - venue: 期刊/会议名称（如果有）
 - doi: DOI（如果有，只填DOI号）
+- arxiv_id: arXiv ID（如果有，格式如 2412.01807，不含 arXiv: 前缀）
+- raw_snippet: 该条参考文献的原始文本（从参考文献部分逐字复制，用于搜索补全时的回退查询）
 
 请以JSON数组格式返回，只返回一个数组，不要有任何其他内容：
 [
     {{
-        "title": "论文标题",
+        "title": "论文完整标题",
         "authors": "作者1, 作者2, 作者3",
         "year": "2021",
         "venue": "期刊或会议名称",
-        "doi": "10.xxxx/xxxxx"
+        "doi": "10.xxxx/xxxxx",
+        "arxiv_id": "2412.01807",
+        "raw_snippet": "该条参考文献的原始文本片段"
     }}
 ]
 
@@ -811,6 +819,72 @@ class LLMReferenceParser:
 
 只返回JSON数组，不要有任何其他内容："""
 
+    REF_REEXTRACT_PROMPT = """从以下参考文献条目中提取结构化信息。只提取论文本身的元数据，不要包含引用编号。
+
+参考文献：
+{raw_text}
+
+请以JSON格式返回，只返回JSON对象，不要有任何其他内容：
+{{
+    "title": "论文标题（只提取标题本身，不要包含作者、期刊、年份）",
+    "authors": "作者（多个用逗号分隔，不要包含et al.）",
+    "year": "2024",
+    "arxiv_id": "2412.01807"
+}}
+
+只返回JSON对象："""
+
+    @staticmethod
+    def _looks_like_polluted_title(title: str, authors: str = "") -> bool:
+        """检测 title 是否被引用编号、作者名或 URL 污染。
+
+        高置信度信号：
+        1. 引用编号前缀 [N] / N. / N)
+        2. "et al." 出现在标题中 → 确定是作者名
+        3. title 完全等于 authors（LLM 将作者列表误认为标题）
+        4. title 是 URL（LLM 误将链接当作标题）
+        """
+        import re
+        t = (title or "").strip()
+        if not t:
+            return False
+        if re.match(r'^\[\d+\]', t) or re.match(r'^\d+[\.\)]\s', t):
+            return True
+        if re.search(r'\bet al\.?\b', t):
+            return True
+        if re.match(r'^https?://', t):
+            return True
+        if authors:
+            a = authors.strip().strip('.')
+            if len(a) >= 5 and t.lower().strip('.') == a.lower():
+                return True
+        return False
+
+    async def _re_extract_reference(self, raw_text: str) -> Optional[Dict[str, Any]]:
+        """将整条引用文本交 LLM 重新提取完整结构化信息。"""
+        raw = (raw_text or "").strip()
+        if not raw:
+            return None
+        prompt = self.REF_REEXTRACT_PROMPT.format(raw_text=raw)
+        try:
+            result = await self._call_llm(prompt)
+            if not result:
+                return None
+            json_str = self._extract_json(result)
+            if not json_str:
+                logger.warning(f"📝 [引用重提取] 无法从 LLM 响应提取 JSON: {result[:120]}")
+                return None
+            parsed = json.loads(json_str)
+            if not isinstance(parsed, dict):
+                return None
+            return parsed
+        except json.JSONDecodeError as e:
+            logger.warning(f"📝 [引用重提取] JSON 解析失败: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"📝 [引用重提取] LLM 调用异常: {e}")
+            return None
+
     def __init__(
         self,
         llm_config: Dict[str, Any],
@@ -818,15 +892,13 @@ class LLMReferenceParser:
         link_resolver: Any = None,
     ):
         """
-        初始化 LLM 参考文献解析器
+        Initialize LLM reference parser.
 
         Args:
-            llm_config: LLM 配置字典，包含：
-                - model: 模型名称（如 "gpt-4o"）
-                - api_base: API 基础 URL
-                - api_key: API Key
-            arxiv_client: arXiv MCP 客户端，用于查询论文详情（兜底方案）
-            link_resolver: PaperLinkResolver 实例，用于多源链接解析（首选方案）
+            llm_config: Either a provider dict {"provider": provider_obj} (uses provider.text_chat()),
+                        or a raw config dict {"model", "api_base", "api_key"} (uses direct HTTP for freeapi).
+            arxiv_client: arXiv MCP client for paper detail queries (fallback).
+            link_resolver: PaperLinkResolver instance for multi-source link resolution (preferred).
         """
         self.llm_config = llm_config
         self.arxiv_client = arxiv_client
@@ -834,11 +906,51 @@ class LLMReferenceParser:
         self._semaphore = None
 
     async def _call_llm(self, prompt: str, max_retries: int = 3) -> Optional[str]:
-        """调用 LLM 生成文本（使用官方 OpenAI API），支持重试"""
-        # 获取或创建信号量（限制并发）
+        """Call LLM — uses provider.text_chat() if available, otherwise raw HTTP (freeapi)."""
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(4)
 
+        provider = self.llm_config.get("provider")
+
+        if provider:
+            return await self._call_via_provider(prompt, provider, max_retries)
+
+        return await self._call_via_http(prompt, max_retries)
+
+    async def _call_via_provider(
+        self, prompt: str, provider, max_retries: int
+    ) -> Optional[str]:
+        """Call LLM through AstrBot provider (handles all API formats)."""
+        logger.info(f"📝 [LLM调用:provider] 开始请求，prompt长度: {len(prompt)} 字符")
+
+        for attempt in range(max_retries):
+            logger.info(f"📝 [LLM调用:provider] 尝试 {attempt + 1}/{max_retries}")
+            async with self._semaphore:
+                logger.info(f"📝 [LLM调用:provider] 获得信号量，开始请求...")
+                try:
+                    response = await provider.text_chat(prompt=prompt)
+                    content = response.completion_text
+                    if content:
+                        logger.info(
+                            f"📝 [LLM调用:provider] 提取到内容长度: {len(content)}"
+                        )
+                        return content
+                    else:
+                        logger.warning("⚠️ [LLM调用:provider] 返回空内容")
+                except Exception as e:
+                    logger.warning(
+                        f"⚠️ [LLM调用:provider] 请求异常: {type(e).__name__}: {e!r}"
+                    )
+                    await asyncio.sleep(3)
+                    continue
+
+        logger.warning(f"⚠️ [LLM调用:provider] 重试 {max_retries} 次后仍失败")
+        return None
+
+    async def _call_via_http(
+        self, prompt: str, max_retries: int
+    ) -> Optional[str]:
+        """Call LLM via raw HTTP (OpenAI-compatible API, used by freeapi)."""
         url = f"{self.llm_config['api_base']}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.llm_config.get('api_key', 'sk-placeholder')}",
@@ -847,8 +959,8 @@ class LLMReferenceParser:
         data = {
             "model": self.llm_config["model"],
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-            "max_tokens": 16384,  # 模型最大支持 16384 tokens
+            "temperature": 0.1,
+            "max_tokens": self.llm_config.get("max_tokens", 32768),
         }
 
         logger.info(f"📝 [LLM调用] 开始请求，prompt长度: {len(prompt)} 字符")
@@ -900,6 +1012,12 @@ class LLMReferenceParser:
                 if not choices:
                     logger.warning("⚠️ LLM 返回空 choices")
                     return None
+                finish_reason = choices[0].get("finish_reason", "")
+                if finish_reason == "length":
+                    logger.warning(
+                        "⚠️ LLM 输出被截断 (finish_reason=length)，"
+                        "参考文献解析可能不完整，建议检查结果"
+                    )
                 message = choices[0].get("message", {})
                 content = message.get("content", "")
                 logger.info(f"📝 [LLM调用] 提取到内容长度: {len(content) if content else 0}")
@@ -914,16 +1032,18 @@ class LLMReferenceParser:
     async def parse_reference_section(
         self,
         ref_section: str,
-        ref_id_prefix: str = "ref"
+        ref_id_prefix: str = "ref",
+        enable_fallback_search: bool = False,
     ) -> List[Reference]:
         """
         解析整段参考文献文本（让LLM自动分割+解析）
 
-        当文本超过32768字符时，自动分批处理，每批按序号分割避免截断参考文献。
+        当文本超过16384 tokens时，自动分批处理，每批按序号分割避免截断参考文献。
 
         Args:
             ref_section: 参考文献部分的完整文本（可能跨多行）
             ref_id_prefix: ref_id 前缀
+            enable_fallback_search: 启用回退搜索
 
         Returns:
             Reference 对象列表
@@ -931,36 +1051,37 @@ class LLMReferenceParser:
         if not ref_section or not ref_section.strip():
             return []
 
-        text_length = len(ref_section)
-        logger.info(f"📝 开始 LLM 参考文献解析（整段模式），文本长度: {text_length} 字符")
+        from rag.token_utils import count_tokens
 
-        # 文本超过32768字符时分批处理
-        if text_length > 32768:
-            logger.info(f"📝 文本超过32768字符，自动分批处理")
-            batches = self._split_reference_section_by_numbers(ref_section)
+        token_count = count_tokens(ref_section)
+        logger.info(f"📝 开始 LLM 参考文献解析，文本长度: {len(ref_section)} 字符, {token_count} tokens")
+
+        max_tokens = 16384
+
+        if token_count > max_tokens:
+            logger.info(f"📝 文本超过{max_tokens} tokens，自动分批处理")
+            batches = self._split_reference_section_by_numbers(ref_section, max_tokens=max_tokens)
             logger.info(f"📝 分成 {len(batches)} 批进行处理")
 
             all_results = []
             for i, batch_text in enumerate(batches):
-                logger.info(f"📝 处理第 {i+1}/{len(batches)} 批，字符数: {len(batch_text)}")
+                batch_tokens = count_tokens(batch_text)
+                logger.info(f"📝 处理第 {i+1}/{len(batches)} 批，tokens: {batch_tokens}")
                 batch_results = await self._parse_single_batch(batch_text, ref_id_prefix, i)
                 all_results.extend(batch_results)
 
-            # 重新编号
             for j, ref in enumerate(all_results):
                 ref.ref_id = f"{ref_id_prefix}_{j + 1}"
 
-            # arXiv 富化：用 arXiv 官方元数据校验并补全 GPT-4o 的解析结果
-            await self._enrich_references(all_results)
-
+            await self._enrich_references(all_results, enable_fallback_search=enable_fallback_search)
             logger.info(f"📚 LLM 解析参考文献: 成功 {len(all_results)} 条")
             return all_results
 
-        # 正常单次处理
         results = await self._parse_single_batch(ref_section, ref_id_prefix, 0)
         if results:
-            await self._enrich_references(results)
-        return results
+            await self._enrich_references(results, enable_fallback_search=enable_fallback_search)
+        logger.info(f"📚 LLM 解析参考文献: 成功 {len(results)} 条")
+        return results or []
 
     async def _parse_single_batch(
         self,
@@ -1003,14 +1124,16 @@ class LLMReferenceParser:
             results = []
             for j, parsed in enumerate(parsed_list):
                 try:
+                    raw_snippet = parsed.get("raw_snippet", "") or ""
                     ref = Reference(
-                        ref_id=f"{ref_id_prefix}_{j + 1}",  # 暂时编号，后面会重新编号
-                        raw_text="",  # 整段模式不保留raw_text
+                        ref_id=f"{ref_id_prefix}_{j + 1}",
+                        raw_text=raw_snippet,
                         ref_title=parsed.get("title", ""),
                         ref_authors=parsed.get("authors", ""),
                         ref_year=int(parsed["year"]) if str(parsed.get("year", "")).isdigit() else None,
                         ref_doi=parsed.get("doi") or None,
-                        ref_venue=parsed.get("venue") or None
+                        ref_venue=parsed.get("venue") or None,
+                        ref_source_arxiv_id=parsed.get("arxiv_id") or None,
                     )
                     results.append(ref)
                 except Exception as e:
@@ -1030,79 +1153,56 @@ class LLMReferenceParser:
     def _split_reference_section_by_numbers(
         self,
         ref_section: str,
-        max_chars: int = 32768
+        max_tokens: int = 16384
     ) -> List[str]:
         """
-        按参考文献序号分割文本，确保每批不超过 max_chars 字符
+        按参考文献序号分割文本，确保每批不超过 max_tokens tokens
 
         分割点: [1], [2], 1., 2., [12], [123] 等序号模式
         每批按序号分割，避免参考文献被从中间截断
 
         Args:
             ref_section: 参考文献文本
-            max_chars: 每批最大字符数
+            max_tokens: 每批最大 token 数
 
         Returns:
             分割后的文本列表
         """
+        from rag.token_utils import count_tokens
 
         lines = ref_section.split('\n')
         batches = []
         current_batch = []
-        current_char_count = 0
+        current_token_count = 0
 
         for line in lines:
-            line_char_count = len(line)
+            line_tokens = count_tokens(line)
 
-            # 检查是否在当前批次添加后超过限制
-            if current_char_count + line_char_count > max_chars and current_batch:
-                # 检查是否是新的参考文献开始（行首有序号）
+            if current_token_count + line_tokens > max_tokens and current_batch:
                 is_new_ref = bool(re.match(r'^\s*\[?\d+\]?\s*[\.\:]', line.strip()))
 
-                if not is_new_ref and current_char_count < max_chars * 0.9:
-                    # 不是新参考文献开始，且当前批次未达到90%容量，继续添加
+                if not is_new_ref and current_token_count < max_tokens * 0.9:
                     current_batch.append(line)
-                    current_char_count += line_char_count
+                    current_token_count += line_tokens
                     continue
 
-                # 保存当前批次
                 batches.append('\n'.join(current_batch))
                 current_batch = []
-                current_char_count = 0
+                current_token_count = 0
 
             current_batch.append(line)
-            current_char_count += line_char_count
+            current_token_count += line_tokens
 
-        # 添加最后一批
         if current_batch:
             batches.append('\n'.join(current_batch))
 
-        # 如果分割后仍有批次超过限制（单行就超过限制），强制按字符数截断
-        final_batches = []
-        for batch in batches:
-            if len(batch) > max_chars:
-                # 找到最后一个换行符位置，尽量在行边界分割
-                lines = batch.split('\n')
-                sub_batch = []
-                sub_char_count = 0
-                for line in lines:
-                    if sub_char_count + len(line) > max_chars and sub_batch:
-                        final_batches.append('\n'.join(sub_batch))
-                        sub_batch = []
-                        sub_char_count = 0
-                    sub_batch.append(line)
-                    sub_char_count += len(line)
-                if sub_batch:
-                    final_batches.append('\n'.join(sub_batch))
-            else:
-                final_batches.append(batch)
-
-        return final_batches
+        return batches
 
     async def parse_references(
         self,
         references: List[str],
-        ref_id_prefix: str = "ref"
+        ref_id_prefix: str = "ref",
+        enable_fallback_search: bool = False,
     ) -> List[Reference]:
         """
         解析参考文献列表
@@ -1110,6 +1210,7 @@ class LLMReferenceParser:
         Args:
             references: 参考文献原始文本列表
             ref_id_prefix: ref_id 前缀
+            enable_fallback_search: 启用回退搜索
 
         Returns:
             Reference 对象列表
@@ -1127,7 +1228,7 @@ class LLMReferenceParser:
         valid_results = [r for r in results if r is not None]
 
         # arXiv 富化：用 arXiv 官方元数据校验并补全
-        await self._enrich_references(valid_results)
+        await self._enrich_references(valid_results, enable_fallback_search=enable_fallback_search)
 
         logger.info(f"📚 LLM 解析参考文献: 成功 {len(valid_results)}/{total} 条")
         return valid_results
@@ -1193,6 +1294,29 @@ class LLMReferenceParser:
             logger.warning(f"⚠️ 批量解析失败: {e}")
             return [None] * len(references)
 
+    @staticmethod
+    def _find_last_complete_json(text: str) -> Optional[str]:
+        """从截断的 JSON 数组中提取最后一个完整的 JSON 对象，重新闭合数组。
+
+        例如 "[{...}, {"title": "inc" → "[{...}]"
+        """
+        import re
+        # 从末尾向前找最后一个完整的 }（JSON 对象结束）
+        # 策略：找到最后一个 }, 标记处，往前确认对应的 { 位置，然后闭合数组
+        rbrace_positions = [m.end() for m in re.finditer(r'\}', text)]
+        if not rbrace_positions:
+            return None
+
+        # 从后往前试：逐个尝试在 } 后面加 ] 看是否能解析
+        for pos in reversed(rbrace_positions):
+            candidate = text[:pos] + ']'
+            try:
+                json.loads(candidate)
+                return candidate
+            except json.JSONDecodeError:
+                continue
+        return None
+
     def _extract_json(self, text: str) -> Optional[str]:
         """从文本中提取 JSON 字符串"""
 
@@ -1247,34 +1371,115 @@ class LLMReferenceParser:
                 logger.info(f"[_extract_json] 匹配 {i+1} 解析成功")
                 return result
 
+        # 截断挽救：LLM 输出可能因 max_tokens 被截断，尝试从已有数据中挽救
+        truncated = text.strip()
+        # 去掉 markdown 代码块前缀
+        truncated = re.sub(r'^```(?:json)?\s*', '', truncated)
+        # 如果以 [ 开头但不以 ] 结尾，尝试修复
+        if truncated.startswith('[') and not truncated.rstrip().endswith(']'):
+            last_complete = self._find_last_complete_json(truncated)
+            if last_complete:
+                logger.info(f"[_extract_json] 截断挽救: 从 {len(truncated)} 字符中恢复 {last_complete.count(chr(10))+1} 条记录")
+                return last_complete
+
         return None
 
-    async def _enrich_references(self, references: List[Reference]) -> None:
+    async def _enrich_references(
+        self, references: List[Reference], enable_fallback_search: bool = False
+    ) -> None:
         """
         多源参考文献链接解析 + 元数据校验。
 
         策略（按优先级）：
         1. PaperLinkResolver（Crossref → OpenAlex → arXiv library）— 模糊匹配
         2. arXiv MCP（DOI 精确搜索）— 兜底
-        3. 都失败则保留 GPT-4o 原始解析结果，记录日志
+        3. 回退搜索（仅 enable_fallback_search=True 时）:
+           a. 原始参考文献文本搜索（raw_snippet）
+           b. 作者 + 年份 + 标题关键词组合搜索
+        4. 都失败则保留 LLM 原始解析结果，记录日志
 
         Args:
             references: Reference 对象列表（会被直接修改）
+            enable_fallback_search: 启用回退搜索（reparse 时推荐开启）
         """
         if not references:
             return
 
         enriched_by_link_resolver = 0
         enriched_by_arxiv_mcp = 0
+        enriched_by_fallback = 0
 
-        for ref in references:
-            if not ref:
-                continue
+        sem = asyncio.Semaphore(10)
 
-            if not ref.ref_title or len(ref.ref_title) <= 5:
-                continue
+        async def enrich_one(ref: Reference) -> Dict[str, int]:
+            """Enrich a single reference. Returns counts dict."""
+            local_counts = {"link_resolver": 0, "arxiv_mcp": 0}
+
+            if not ref or not ref.ref_title or len(ref.ref_title) <= 5:
+                return local_counts
+
+            # ---- 标题污染检测：若以编号或作者名开头，交 LLM 重提取 ----
+            if self._looks_like_polluted_title(ref.ref_title, ref.ref_authors):
+                raw_text = (ref.raw_text or "").strip()
+                # raw_text 不足时，用 ref_title 本身作为回退文本（LLM 仍可从中提取干净标题）
+                if not raw_text or len(raw_text) < 30:
+                    if ref.ref_title and len(ref.ref_title) >= 30:
+                        raw_text = ref.ref_title
+                    else:
+                        logger.debug(
+                            f"📝 [引用重提取] 检测到污染但可用文本不足 "
+                            f"({len(raw_text)} 字符)，跳过: {ref.ref_title[:80]}"
+                        )
+                        raw_text = None
+                if raw_text:
+                    logger.info(f"📝 [引用重提取] 检测到污染: {ref.ref_title[:80]}...")
+                    extracted = await self._re_extract_reference(raw_text)
+
+                    if extracted:
+                        new_title = (extracted.get("title") or "").strip()
+                        if new_title and len(new_title) >= 5:
+                            logger.info(f"📝 [引用重提取] title: {new_title[:80]}")
+                            ref.ref_title = new_title
+                        new_authors = (extracted.get("authors") or "").strip()
+                        if new_authors and not ref.ref_authors:
+                            ref.ref_authors = new_authors
+                        new_year = extracted.get("year")
+                        if ref.ref_year is None:
+                            try:
+                                ref.ref_year = int(float(str(new_year)))
+                            except (ValueError, TypeError):
+                                pass
+                        new_arxiv_id = (extracted.get("arxiv_id") or "").strip()
+                        if new_arxiv_id and not ref.ref_source_arxiv_id:
+                            ref.ref_source_arxiv_id = new_arxiv_id
+                    else:
+                        logger.warning(f"📝 [引用重提取] 重提取失败，继续使用原始字段")
 
             author_hint = ref.ref_authors or ""
+
+            # ---- 第零优先：DataCite 直查（LLM 已提取 arXiv ID）----
+            if ref.ref_source_arxiv_id and self._link_resolver is not None:
+                try:
+                    resolution = await self._link_resolver.resolve_by_arxiv_id(
+                        ref.ref_source_arxiv_id
+                    )
+                    if resolution.has_any_url():
+                        if resolution.doi_url and not ref.ref_doi:
+                            ref.ref_doi = resolution.doi_url.replace("https://doi.org/", "")
+                        if resolution.arxiv_url and not ref.ref_arxiv_url:
+                            ref.ref_arxiv_url = resolution.arxiv_url
+                        if resolution.matched_title:
+                            ref.ref_title = resolution.matched_title
+                        local_counts["link_resolver"] += 1
+                        logger.info(
+                            f"📝 [DataCite 直查] {ref.ref_source_arxiv_id} → "
+                            f"{ref.ref_title[:60]}"
+                        )
+                        return local_counts
+                except Exception as e:
+                    logger.warning(
+                        f"📝 [DataCite 直查] 异常: {ref.ref_source_arxiv_id} — {e}"
+                    )
 
             # ---- 第一优先：PaperLinkResolver 多源解析 ----
             if self._link_resolver is not None:
@@ -1288,15 +1493,14 @@ class LLMReferenceParser:
                         if resolution.arxiv_url and not ref.ref_arxiv_url:
                             ref.ref_arxiv_url = resolution.arxiv_url
                         if resolution.matched_title and resolution.resolution_score >= 85:
-                            # 高置信度匹配时，用解析器的标题和链接补全
                             ref.ref_title = resolution.matched_title
-                        enriched_by_link_resolver += 1
+                        local_counts["link_resolver"] += 1
                         logger.info(
                             f"📝 [多源解析] {resolution.backend} 匹配成功 "
                             f"(相似度 {resolution.resolution_score:.1f}%): "
                             f"{ref.ref_title[:60]}"
                         )
-                        continue  # 多源解析成功，跳过 arXiv MCP 兜底
+                        return local_counts
                     else:
                         logger.info(
                             f"📝 [多源解析] 未找到链接 "
@@ -1317,19 +1521,19 @@ class LLMReferenceParser:
 
                     if result is None:
                         logger.warning(f"📝 [arXiv MCP] 客户端返回 None，保留原始解析: {ref.ref_title[:60]}")
-                        continue
+                        return local_counts
 
                     if not result.get("results"):
                         logger.info(f"📝 [arXiv MCP] 未搜到结果，保留原始解析: {ref.ref_title[:60]}")
-                        continue
+                        return local_counts
 
                     matched = False
                     for paper in result.get("results", []):
                         paper_title = paper.get("title", "")
-                        ref_title = ref.ref_title if ref.ref_title else ""
-                        if not ref_title or not paper_title:
+                        _ref_title = ref.ref_title if ref.ref_title else ""
+                        if not _ref_title or not paper_title:
                             continue
-                        if ref_title.lower() != paper_title.lower():
+                        if _ref_title.lower() != paper_title.lower():
                             continue
 
                         if paper.get("authors"):
@@ -1341,7 +1545,7 @@ class LLMReferenceParser:
                         if paper.get("doi"):
                             ref.ref_doi = paper.get("doi")
 
-                        enriched_by_arxiv_mcp += 1
+                        local_counts["arxiv_mcp"] += 1
                         matched = True
                         logger.debug(f"📝 [arXiv MCP] 已校验: {ref.ref_title[:60]}")
                         break
@@ -1351,6 +1555,126 @@ class LLMReferenceParser:
 
                 except Exception as e:
                     logger.warning(f"📝 [arXiv MCP] 查询异常，保留原始解析: {ref.ref_title[:60]} — {e}")
+
+            return local_counts
+
+        async def enrich_with_semaphore(ref: Reference) -> Dict[str, int]:
+            async with sem:
+                return await enrich_one(ref)
+
+        tasks = [enrich_with_semaphore(ref) for ref in references if ref]
+        if tasks:
+            gathered = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in gathered:
+                if isinstance(r, dict):
+                    enriched_by_link_resolver += r.get("link_resolver", 0)
+                    enriched_by_arxiv_mcp += r.get("arxiv_mcp", 0)
+                elif isinstance(r, Exception):
+                    logger.warning(f"📝 [批量增强] 单条引用处理异常: {r}")
+
+        # ---- 第三优先：回退搜索（仅在 reparse 时启用） ----
+        if enable_fallback_search and self._link_resolver is not None:
+            for ref in references:
+                if not ref or not ref.ref_title or len(ref.ref_title) <= 5:
+                    continue
+                # 已有链接的跳过
+                if ref.ref_doi or ref.ref_arxiv_url:
+                    continue
+
+                author_hint = ref.ref_authors or ""
+                ref_resolved = False
+
+                # 回退 1: 用 raw_snippet（原始参考文献文本）搜索
+                raw_snippet = (ref.raw_text or "").strip()
+                if raw_snippet and len(raw_snippet) > 20:
+                    try:
+                        # 截取前 300 字符作为搜索查询（太长的原始文本可能引入噪声）
+                        raw_query = raw_snippet[:300]
+                        resolution = await self._link_resolver.resolve_by_title(
+                            raw_query, author_hint=author_hint
+                        )
+                        if resolution.has_any_url():
+                            if resolution.doi_url and not ref.ref_doi:
+                                ref.ref_doi = resolution.doi_url.replace("https://doi.org/", "")
+                            if resolution.arxiv_url and not ref.ref_arxiv_url:
+                                ref.ref_arxiv_url = resolution.arxiv_url
+                            if resolution.matched_title and resolution.resolution_score >= 85:
+                                ref.ref_title = resolution.matched_title
+                            enriched_by_fallback += 1
+                            ref_resolved = True
+                            logger.info(
+                                f"📝 [回退-raw] {resolution.backend} 匹配成功 "
+                                f"(相似度 {resolution.resolution_score:.1f}%): "
+                                f"{ref.ref_title[:60]}"
+                            )
+                    except Exception as e:
+                        logger.debug(f"📝 [回退-raw] 异常: {ref.ref_title[:60]} — {e}")
+
+                if ref_resolved:
+                    continue
+
+                # 回退 2: 作者 + 年份 + 标题关键词组合搜索
+                if author_hint or ref.ref_year:
+                    try:
+                        # 取第一作者姓氏 + 年份 + 标题前 5 个词
+                        first_author = author_hint.split(",")[0].strip() if author_hint else ""
+                        # 提取姓氏（最后一个词通常为姓氏）
+                        first_author_parts = first_author.split()
+                        last_name = first_author_parts[-1] if first_author_parts else first_author
+                        # 去掉标题中的特殊字符，取前几个词
+                        title_words = re.sub(r'[^\w\s]', ' ', ref.ref_title).split()
+                        title_keywords = " ".join(title_words[:5]) if len(title_words) > 5 else ref.ref_title
+
+                        parts = [p for p in [last_name, str(ref.ref_year or ""), title_keywords] if p]
+                        combined_query = " ".join(parts)
+
+                        if len(combined_query) > 15:
+                            resolution = await self._link_resolver.resolve_by_title(
+                                combined_query, author_hint=author_hint
+                            )
+                            if resolution.has_any_url():
+                                if resolution.doi_url and not ref.ref_doi:
+                                    ref.ref_doi = resolution.doi_url.replace("https://doi.org/", "")
+                                if resolution.arxiv_url and not ref.ref_arxiv_url:
+                                    ref.ref_arxiv_url = resolution.arxiv_url
+                                if resolution.matched_title and resolution.resolution_score >= 85:
+                                    ref.ref_title = resolution.matched_title
+                                enriched_by_fallback += 1
+                                ref_resolved = True
+                                logger.info(
+                                    f"📝 [回退-author+year] {resolution.backend} 匹配成功 "
+                                    f"(相似度 {resolution.resolution_score:.1f}%): "
+                                    f"{ref.ref_title[:60]}"
+                                )
+                    except Exception as e:
+                        logger.debug(f"📝 [回退-author+year] 异常: {ref.ref_title[:60]} — {e}")
+
+                if ref_resolved:
+                    continue
+
+                # 回退 3: 只用原始文本搜索（无 author_hint，避免误导）
+                if raw_snippet and len(raw_snippet) > 20 and not ref_resolved:
+                    try:
+                        raw_query = raw_snippet[:300]
+                        resolution = await self._link_resolver.resolve_by_title(raw_query)
+                        if resolution.has_any_url():
+                            if resolution.doi_url and not ref.ref_doi:
+                                ref.ref_doi = resolution.doi_url.replace("https://doi.org/", "")
+                            if resolution.arxiv_url and not ref.ref_arxiv_url:
+                                ref.ref_arxiv_url = resolution.arxiv_url
+                            if resolution.matched_title and resolution.resolution_score >= 85:
+                                ref.ref_title = resolution.matched_title
+                            enriched_by_fallback += 1
+                            logger.info(
+                                f"📝 [回退-raw-only] {resolution.backend} 匹配成功 "
+                                f"(相似度 {resolution.resolution_score:.1f}%): "
+                                f"{ref.ref_title[:60]}"
+                            )
+                    except Exception as e:
+                        logger.debug(f"📝 [回退-raw-only] 异常: {ref.ref_title[:60]} — {e}")
+
+            if enriched_by_fallback > 0:
+                logger.info(f"📝 回退搜索成功: {enriched_by_fallback} 条")
 
         # 统计链接覆盖率
         has_doi = 0
@@ -1370,9 +1694,14 @@ class LLMReferenceParser:
                 if title:
                     missing_all.append(title)
 
+        parts = [
+            f"多源解析 {enriched_by_link_resolver} 条",
+            f"arXiv MCP {enriched_by_arxiv_mcp} 条",
+        ]
+        if enriched_by_fallback > 0:
+            parts.append(f"回退搜索 {enriched_by_fallback} 条")
         logger.info(
-            f"📝 参考文献富化完成: 多源解析 {enriched_by_link_resolver} 条, "
-            f"arXiv MCP {enriched_by_arxiv_mcp} 条, "
+            f"📝 参考文献富化完成: {', '.join(parts)}, "
             f"总计 {len(references)} 条"
         )
         logger.info(
@@ -1540,7 +1869,9 @@ def compute_refstats() -> Dict[str, Any]:
 def get_papers_with_zero_refs_from_json() -> Dict[str, Any]:
     """直接从 paper_doc_stats.json 获取参考文献数为 0 的论文列表。
 
-    若某论文无 references 字段或 references 为空，视为零引用。
+    视为零引用的情况：
+    - 无 references 字段或 references 为空
+    - references 条目全部 title 为空（LLM 解析失败）
 
     Returns:
         {"papers": [...], "total_papers": int, "total_zero_ref": int}
@@ -1556,6 +1887,13 @@ def get_papers_with_zero_refs_from_json() -> Dict[str, Any]:
         refs = paper_stats.get("references", {})
         if not isinstance(refs, dict) or not refs:
             papers.append({"file_name": paper_stats.get("file_name", paper_key), "chunk_count": 0})
+            continue
+        # All refs have empty titles → effectively zero refs (LLM parse failure)
+        if all(
+            not (isinstance(r, dict) and r.get("ref_title", "").strip())
+            for r in refs.values()
+        ):
+            papers.append({"file_name": paper_stats.get("file_name", paper_key), "chunk_count": 0})
 
     return {
         "papers": papers,
@@ -1564,12 +1902,195 @@ def get_papers_with_zero_refs_from_json() -> Dict[str, Any]:
     }
 
 
+def classify_papers_for_repair() -> Dict[str, Any]:
+    """Auto-classify papers from paper_doc_stats.json into two repair strategies.
+
+    Strategy A — full_reparse: Papers with any no_title refs (LLM extraction failed),
+        polluted titles (author names / citation numbers in title field), or completely
+        unparsed. Needs full pipeline: PyMuPDF + LLM extraction + link resolution.
+
+    Strategy B — link_only: Papers where ALL unlinked refs have clean, valid titles.
+        Only link resolution failed. Lightweight repair: reload refs from JSON and
+        re-run PaperLinkResolver enrichment. No LLM extraction, no PyMuPDF.
+
+    Returns:
+        {"full_reparse": [...], "link_only": [...], "total_papers": int}
+        Each paper dict: {"file_name": str, "total": int, "linked": int,
+                          "title_only": int, "no_title": int}
+    """
+    all_stats = _load_paper_doc_stats()
+    if not all_stats:
+        return {"full_reparse": [], "link_only": [], "total_papers": 0}
+
+    full_reparse: list[dict] = []
+    link_only: list[dict] = []
+
+    for paper_key, paper_stats in all_stats.items():
+        if not isinstance(paper_stats, dict):
+            continue
+        refs = paper_stats.get("references", {})
+        file_name = paper_stats.get("file_name", paper_key)
+
+        if not isinstance(refs, dict) or not refs:
+            full_reparse.append({
+                "file_name": file_name,
+                "total": 0, "linked": 0, "title_only": 0, "no_title": 0,
+            })
+            continue
+
+        total = len(refs)
+        linked = 0
+        title_only = 0
+        no_title = 0
+        for r in refs.values():
+            if not isinstance(r, dict):
+                continue
+            has_link = bool(r.get("ref_doi") or r.get("ref_arxiv_url"))
+            title = (r.get("ref_title") or "").strip()
+            if has_link:
+                linked += 1
+            elif title:
+                # Check for polluted title (author names / citation numbers).
+                # Polluted titles can't match in Crossref → route to full reparse.
+                if LLMReferenceParser._looks_like_polluted_title(
+                    title, r.get("ref_authors", "")
+                ):
+                    no_title += 1
+                else:
+                    title_only += 1
+            else:
+                no_title += 1
+
+        unlinked = title_only + no_title
+        if unlinked == 0:
+            continue
+
+        entry = {
+            "file_name": file_name,
+            "total": total,
+            "linked": linked,
+            "title_only": title_only,
+            "no_title": no_title,
+        }
+
+        if no_title > 0:
+            full_reparse.append(entry)
+        else:
+            link_only.append(entry)
+
+    full_reparse.sort(key=lambda p: (-(p["title_only"] + p["no_title"]), p["file_name"]))
+    link_only.sort(key=lambda p: (-p["title_only"], p["file_name"]))
+
+    return {
+        "full_reparse": full_reparse,
+        "link_only": link_only,
+        "total_papers": len(all_stats),
+    }
+
+
+async def repair_links_for_paper(
+    file_name: str,
+    llm_config: Dict[str, Any],
+    enable_fallback_search: bool = True,
+) -> Dict[str, Any]:
+    """Lightweight link-only repair: re-run link enrichment on stored refs.
+
+    Loads existing references from paper_doc_stats.json, converts them back to
+    Reference objects, and re-runs PaperLinkResolver enrichment. No LLM extraction,
+    no PyMuPDF — only API calls to Crossref/OpenAlex/arXiv.
+
+    Args:
+        file_name: Paper file name (key in paper_doc_stats.json).
+        llm_config: LLM config dict for optional polluted-title re-extraction.
+        enable_fallback_search: Enable 3-tier fallback search for unresolved refs.
+
+    Returns:
+        {"file_name": str, "total": int, "linked_before": int, "linked_after": int,
+         "newly_linked": int, "error": str | None}
+    """
+    all_stats = _load_paper_doc_stats()
+    paper_stats = all_stats.get(file_name)
+    if not paper_stats:
+        return {"file_name": file_name, "error": f"Paper not found in stats: {file_name}"}
+
+    refs_dict = paper_stats.get("references", {})
+    if not isinstance(refs_dict, dict) or not refs_dict:
+        return {"file_name": file_name, "error": "No references to repair"}
+
+    # Count linked before
+    linked_before = 0
+    refs: list[Reference] = []
+    for ref_id, r in refs_dict.items():
+        if not isinstance(r, dict):
+            continue
+        if r.get("ref_doi") or r.get("ref_arxiv_url"):
+            linked_before += 1
+        refs.append(Reference(
+            ref_id=ref_id,
+            raw_text=r.get("raw_text", ""),
+            ref_title=r.get("ref_title", ""),
+            ref_authors=r.get("ref_authors", ""),
+            ref_year=r.get("ref_year"),
+            ref_doi=r.get("ref_doi"),
+            ref_venue=r.get("ref_venue"),
+            ref_arxiv_url=r.get("ref_arxiv_url"),
+            ref_source_arxiv_id=r.get("ref_source_arxiv_id"),
+        ))
+
+    total = len(refs)
+    if total == 0:
+        return {"file_name": file_name, "error": "No references to repair"}
+
+    # Only repair refs that currently have no link
+    refs_to_repair = [r for r in refs if not r.ref_doi and not r.ref_arxiv_url]
+    if not refs_to_repair:
+        return {
+            "file_name": file_name, "total": total,
+            "linked_before": linked_before, "linked_after": linked_before,
+            "newly_linked": 0, "error": None,
+        }
+
+    # Run enrichment
+    from .paper_link_resolver import PaperLinkResolver
+
+    link_resolver = PaperLinkResolver(
+        enable_crossref=True,
+        enable_openalex=True,
+        enable_arxiv_library=True,
+        log_prefix=f"[LinkRepair:{file_name}]",
+    )
+    parser = LLMReferenceParser(llm_config, link_resolver=link_resolver)
+    await parser._enrich_references(refs_to_repair, enable_fallback_search=enable_fallback_search)
+
+    # Count linked after
+    linked_after = sum(1 for r in refs if r.ref_doi or r.ref_arxiv_url)
+    newly_linked = linked_after - linked_before
+
+    # Save updated refs back to JSON
+    _save_paper_doc_stats(file_name, refs)
+
+    logger.info(
+        f"📝 [LinkRepair] {file_name}: {linked_before}→{linked_after} linked "
+        f"(+{newly_linked}), {total - linked_after} still unlinked"
+    )
+
+    return {
+        "file_name": file_name,
+        "total": total,
+        "linked_before": linked_before,
+        "linked_after": linked_after,
+        "newly_linked": newly_linked,
+        "error": None,
+    }
+
+
 async def process_references_with_llm(
     pdf_path: str,
     chunks: List[Any],
     text: str,
     llm_config: Dict[str, Any],
-    arxiv_client: Any = None
+    arxiv_client: Any = None,
+    enable_fallback_search: bool = False,
 ) -> Tuple[List[Reference], List[Any]]:
     """
     使用 LLM 解析参考文献并建立引用关联
@@ -1582,6 +2103,7 @@ async def process_references_with_llm(
         text: PDF 原始文本
         llm_config: LLM 配置字典，包含 model、api_base、api_key
         arxiv_client: arXiv MCP 客户端（可选）
+        enable_fallback_search: 启用回退搜索（raw_snippet / author+year+keywords）
 
     Returns:
         (references列表, 更新后的chunks列表)
@@ -1616,7 +2138,9 @@ async def process_references_with_llm(
         logger.info(f"📝 处理 {section_name} 参考文献，字符数: {len(ref_section)}")
 
         # 调用 LLM 解析
-        refs = await llm_parser.parse_reference_section(ref_section)
+        refs = await llm_parser.parse_reference_section(
+            ref_section, enable_fallback_search=enable_fallback_search
+        )
 
         if not refs:
             logger.warning(f"⚠️ {section_name} 参考文献 LLM 解析失败")

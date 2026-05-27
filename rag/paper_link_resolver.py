@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import threading
 from dataclasses import dataclass, field
@@ -20,6 +21,15 @@ from difflib import SequenceMatcher
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import httpx
+
+# 确保 arXiv API 不经过代理（requests 库遵从 no_proxy 环境变量）
+# 代理断连（RemoteDisconnected）会导致 arXiv 搜索失败，
+# 而 arXiv 直连通常可达，无需代理
+_existing = os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or ""
+if "export.arxiv.org" not in _existing:
+    _parts = [p.strip() for p in _existing.split(",") if p.strip()] if _existing.strip() else []
+    _parts.append("export.arxiv.org")
+    os.environ["no_proxy"] = ",".join(_parts)
 
 try:
     from astrbot.api import logger
@@ -103,6 +113,7 @@ class PaperLinkResolver:
         self._enable_openalex = enable_openalex
         self._enable_arxiv_library = enable_arxiv_library
         self._log_prefix = log_prefix
+        self._crossref_semaphore = asyncio.Semaphore(3)
 
         if self._enable_arxiv_library:
             self._ensure_arxiv_health_check()
@@ -811,13 +822,14 @@ class PaperLinkResolver:
             headers = {
                 "User-Agent": "astrbot-paperrag/1.0 (mailto:astrbot@local)",
             }
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get("https://api.crossref.org/works", params=params, headers=headers)
-                response.raise_for_status()
-                message = response.json().get("message", {}) or {}
-                items = message.get("items", []) or []
-                normalized = [self._work_from_crossref_item(item) for item in items if isinstance(item, dict)]
-                return self._dedupe_works(normalized)
+            async with self._crossref_semaphore:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    response = await client.get("https://api.crossref.org/works", params=params, headers=headers)
+                    response.raise_for_status()
+                    message = response.json().get("message", {}) or {}
+                    items = message.get("items", []) or []
+                    normalized = [self._work_from_crossref_item(item) for item in items if isinstance(item, dict)]
+                    return self._dedupe_works(normalized)
         except Exception as e:
             logger.warning(f"  → Crossref 标题搜索失败: {e}")
             return []
@@ -861,21 +873,30 @@ class PaperLinkResolver:
             return []
 
     async def _search_openalex_candidates(self, title: str, limit: int = 5, author_hint: str = "") -> List[Dict[str, Any]]:
-        """使用 OpenAlex 搜索候选结果。"""
+        """使用 OpenAlex REST API 搜索候选结果（httpx 异步，无 pyalex 依赖）。"""
         if not self._enable_openalex:
             return []
 
         try:
-            import pyalex
-            from pyalex import Works
-
-            pyalex.config.email = "astrbot@local"
-            query = self.normalize_title(title)
+            params = {
+                "search": title.strip(),
+                "per_page": str(limit),
+                "mailto": "astrbot@local",
+            }
             logger.info(f"🔎 {self._log_prefix} OpenAlex 标题搜索: {title[:80]}")
-            works = await asyncio.to_thread(lambda: Works().search(query).get(per_page=limit))
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(
+                    "https://api.openalex.org/works",
+                    params=params,
+                    headers={"User-Agent": "astrbot-paperrag/1.0 (mailto:astrbot@local)"},
+                )
+                response.raise_for_status()
+                data = response.json()
+
+            results = data.get("results", []) or []
             normalized: List[Dict[str, Any]] = []
-            for work in works:
-                if not hasattr(work, "get"):
+            for work in results:
+                if not isinstance(work, dict):
                     continue
 
                 authorships = work.get("authorships", []) or []
@@ -891,7 +912,7 @@ class PaperLinkResolver:
 
                 normalized.append({
                     "title": work.get("title", "") or work.get("display_name", "") or "",
-                    "arxiv_id": work.get("arxiv_id", "") or "",
+                    "arxiv_id": work.get("arxiv_id", "") or work.get("arxivId", "") or "",
                     "arxivId": work.get("arxivId", "") or "",
                     "doi": work.get("doi", "") or "",
                     "sourceFulltextUrls": work.get("sourceFulltextUrls", []) or [],
@@ -1068,6 +1089,45 @@ class PaperLinkResolver:
             return title_score
         return min(100.0, title_score * 0.85 + author_score * 0.15)
 
+    async def resolve_by_arxiv_id(self, arxiv_id: str) -> LinkResolution:
+        """Direct DataCite DOI lookup for a known arXiv ID.
+
+        Bypasses all multi-source title search. Guaranteed hit if the arXiv ID is valid.
+        """
+        arxiv_id = (arxiv_id or "").strip()
+        if not arxiv_id:
+            return LinkResolution()
+
+        doi = f"10.48550/arxiv.{arxiv_id}"
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.get(
+                    f"https://api.datacite.org/dois/{doi}",
+                    headers={"Accept": "application/vnd.api+json"},
+                )
+                if response.status_code != 200:
+                    logger.info(f"  → DataCite lookup failed: HTTP {response.status_code} for {doi}")
+                    return LinkResolution()
+                data = response.json().get("data", {}) or {}
+                attrs = data.get("attributes", {}) or {}
+                titles = attrs.get("titles", []) or []
+                title = titles[0].get("title", "") if titles else ""
+                url = attrs.get("url", "") or ""
+                if not title:
+                    return LinkResolution()
+                logger.info(f"  → DataCite 直查成功 ({arxiv_id}): {title[:80]}")
+                return LinkResolution(
+                    arxiv_url=url if "arxiv.org" in url else f"https://arxiv.org/abs/{arxiv_id}",
+                    doi_url=f"https://doi.org/{doi}",
+                    backend="DataCite",
+                    resolution_source="DataCite",
+                    resolution_score=100.0,
+                    matched_title=title,
+                )
+        except Exception as e:
+            logger.warning(f"  → DataCite lookup error for {arxiv_id}: {e}")
+            return LinkResolution()
+
     async def resolve_by_title(self, title: str, author_hint: str = "") -> LinkResolution:
         """按标题解析论文链接。"""
         search_title = (title or "").strip()
@@ -1123,6 +1183,8 @@ class PaperLinkResolver:
                     logger.info(f"  → CORE API 未找到足够相似的候选结果 (最佳 {best_score:.1f}%, query={used_query[:60]})")
                 elif source == "OpenAlex":
                     logger.info(f"  → OpenAlex 未找到足够相似的候选结果 (最佳 {best_score:.1f}%, query={used_query[:60]})")
+                elif source == "Crossref":
+                    logger.info(f"  → Crossref 未找到足够相似的候选结果 (最佳 {best_score:.1f}%, query={used_query[:60]})")
                 else:
                     logger.info(f"  → arXiv library 未找到足够相似的候选结果 (最佳 {best_score:.1f}%, query={used_query[:60]})")
                 continue

@@ -37,7 +37,7 @@ from .commands.base import PluginCoreBase
     "paper_rag",
     "HUSTcyf",
     "本地文档库RAG检索插件 (支持PDF/Word/TXT/HTML, Gemini + Milvus Lite)",
-    "2.2.0",
+    "2.2.1",
     "https://github.com/HUSTcyf/astrbot_plugin_paperrag.git"
 )
 class PaperRAGPlugin(PaperCommandsMixin, ArxivCommandsMixin, GraphCommandsMixin, IdeaCommandsMixin, PluginCoreBase):
@@ -110,6 +110,7 @@ class PaperRAGPlugin(PaperCommandsMixin, ArxivCommandsMixin, GraphCommandsMixin,
         graph_clear    - Clear knowledge graph (Admin)
         abstractstats  - Show abstract extraction statistics (-1 for papers without abstracts)
         reparse_zero_abstract - Batch re-extract abstracts for papers without abstracts (Admin)
+        reparseref     - Re-parse references for a single paper (Admin, no full rebuild)
         """
         pass
 
@@ -197,6 +198,30 @@ class PaperRAGPlugin(PaperCommandsMixin, ArxivCommandsMixin, GraphCommandsMixin,
     async def cmd_reparse_zero_abstract(self, event: AstrMessageEvent, confirm: str = ''):
         """Batch re-extract abstracts for papers without abstracts (Admin)"""
         async for result in self._paper_reparse_zero_abstract(event, confirm=confirm):
+            yield result
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @paper_commands.command("reparseref")
+    async def cmd_reparseref(self, event: AstrMessageEvent, file_name: str = ''):
+        """Re-parse references for a single paper without full index rebuild (Admin)
+
+        Extracts raw text from PDF via PyMuPDF and re-runs LLM reference parsing.
+        Results saved to data/paper_doc_stats.json. Use when LLM timeout causes
+        reference parsing to fail for a specific paper.
+        """
+        async for result in self._paper_reparseref(event, file_name=file_name):
+            yield result
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @paper_commands.command("repair_refs")
+    async def cmd_repair_refs(self, event: AstrMessageEvent, confirm: str = ''):
+        """Auto-classify and repair all papers with unlinked references (Admin)
+
+        Splits papers into two strategies automatically:
+        - Full reparse: papers with empty-title refs (LLM extraction failed)
+        - Link-only repair: papers where all unlinked refs have valid titles
+        """
+        async for result in self._paper_repair_refs(event, confirm=confirm):
             yield result
 
     @filter.permission_type(filter.PermissionType.ADMIN)

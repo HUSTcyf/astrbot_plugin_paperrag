@@ -322,14 +322,14 @@ def test_storage_path():
     # 测试相对路径计算
     storage = ColBERTStorage(str(PLUGIN_DIR / "data" / "test_colbert_storage"))
     print(f"  storage_dir: {storage.storage_dir}")
-    print(f"  doc_vectors: {storage.doc_vectors_path}")
+    print(f"  chunks_dir: {storage.chunks_dir}")
     print(f"  faiss_index: {storage.faiss_index_path}")
     print(f"  id_mapping: {storage.id_mapping_path}")
 
     # 验证路径前缀
     assert str(storage.storage_dir).startswith(str(PLUGIN_DIR / "data"))
     print(f"  路径前缀正确 ✓")
-    assert ".npy" in str(storage.doc_vectors_path)
+    assert storage.chunks_dir.name == "chunks"
     assert ".bin" in str(storage.faiss_index_path)
     assert ".json" in str(storage.id_mapping_path)
     print(f"  文件后缀正确 ✓")

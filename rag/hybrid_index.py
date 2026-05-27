@@ -959,6 +959,151 @@ class HybridIndexManager:
             logger.error(f"获取零引用论文失败: {e}")
             return {"papers": [], "total_papers": 0, "total_zero_ref": 0, "error": str(e)}
 
+    async def classify_papers_for_repair(self) -> Dict[str, Any]:
+        """Auto-classify papers into full_reparse vs link_only repair strategies.
+
+        Returns:
+            {"full_reparse": [...], "link_only": [...], "total_papers": int}
+        """
+        from rag.reference_processor import classify_papers_for_repair
+
+        try:
+            return classify_papers_for_repair()
+        except Exception as e:
+            logger.error(f"论文分类失败: {e}")
+            return {"full_reparse": [], "link_only": [], "total_papers": 0, "error": str(e)}
+
+    async def sync_cited_ref_ids_for_paper(
+        self, file_name: str, references: List[Any]
+    ) -> Dict[str, Any]:
+        """
+        Re-run CitationLinker on a paper's Milvus chunks and upsert updated cited_ref_ids.
+
+        After reparseref/reparse_zero_ref updates paper_doc_stats.json with new reference
+        data, the chunk-level cited_ref_ids in Milvus become stale (ref_id numbering may
+        have changed). This method re-runs citation linking against the new references
+        and uses partial_update to fix only the metadata field, leaving vectors/text intact.
+
+        Args:
+            file_name: Paper file name (e.g., "2508.09977v2.pdf")
+            references: List of Reference objects from the new parse
+
+        Returns:
+            {"synced": int, "unchanged": int, "total_chunks": int, "error": str|None}
+        """
+        from rag.hybrid_parser import Node
+        from rag.reference_processor import CitationLinker
+
+        if not references:
+            return {"synced": 0, "unchanged": 0, "total_chunks": 0, "error": None}
+
+        try:
+            await self._ensure_collection()
+            collection = cast(Collection, self._collection)
+
+            query_name = file_name
+            if self._file_name_has_pdf_suffix is not None:
+                if self._file_name_has_pdf_suffix and not query_name.lower().endswith('.pdf'):
+                    query_name = query_name + ".pdf"
+                elif not self._file_name_has_pdf_suffix and query_name.lower().endswith('.pdf'):
+                    query_name = query_name[:-4]
+
+            loop = asyncio.get_event_loop()
+            raw_results: Any = await loop.run_in_executor(
+                None,
+                lambda pn=query_name: collection.query(
+                    expr=f'metadata["file_name"] == "{pn}"',
+                    output_fields=["id", "text", "metadata", "vector"],
+                )
+            )
+            raw_results = cast(List[Dict[str, Any]], raw_results)
+
+            if not raw_results:
+                logger.warning(
+                    f"[sync_cited_ref_ids] No Milvus chunks found for {file_name} — "
+                    f"skipping sync (paper may not be indexed yet)"
+                )
+                return {"synced": 0, "unchanged": 0, "total_chunks": 0, "error": None}
+
+            # Build Node objects and capture old cited_ref_ids + full row data.
+            # Nodes and raw_results share the same index for matching back to chunk IDs.
+            old_ref_ids: Dict[int, List[str]] = {}
+            chunk_id_by_index: Dict[int, int] = {}
+            # Store full row data (text, vector) so we can do a full upsert.
+            # milvus_lite 2.5.x does not support partial_update.
+            row_data: Dict[int, Dict[str, Any]] = {}
+            nodes: List[Any] = []
+            for i, row in enumerate(raw_results):
+                chunk_id = row.get("id")
+                text = row.get("text", "")
+                vector = row.get("vector")
+                meta = row.get("metadata", {})
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except Exception:
+                        meta = {}
+                old_ref_ids[chunk_id] = meta.get("cited_ref_ids", []) or []
+                chunk_id_by_index[i] = chunk_id
+                row_data[chunk_id] = {"text": text, "vector": vector}
+                nodes.append(Node(text=text, metadata=dict(meta)))
+
+            # Re-run citation linking with new references
+            linker = CitationLinker()
+            linker.link_citations_to_references(nodes, references)
+
+            # Diff and collect changed chunks (match by index, not text)
+            changed_data: List[Dict[str, Any]] = []
+            synced = 0
+            for i, node in enumerate(nodes):
+                chunk_id = chunk_id_by_index.get(i)
+                if chunk_id is None:
+                    continue
+
+                new_ids = sorted(node.metadata.get("cited_ref_ids", [])) if node.metadata.get("cited_ref_ids") else []
+                old_ids = old_ref_ids.get(chunk_id, [])
+
+                if new_ids != old_ids:
+                    full_meta = dict(node.metadata)
+                    orig = row_data.get(chunk_id, {})
+                    row = {
+                        "id": chunk_id,
+                        "text": orig.get("text", ""),
+                        "vector": orig.get("vector"),
+                        "metadata": json.dumps(full_meta, ensure_ascii=False),
+                    }
+                    changed_data.append(row)
+                    synced += 1
+
+            unchanged = len(nodes) - synced
+
+            if changed_data:
+                await loop.run_in_executor(
+                    None,
+                    lambda: collection.upsert(changed_data)
+                )
+                await loop.run_in_executor(None, lambda: collection.flush())
+                logger.info(
+                    f"[sync_cited_ref_ids] {file_name}: synced {synced} chunks, "
+                    f"{unchanged} unchanged (total {len(nodes)})"
+                )
+            else:
+                logger.info(
+                    f"[sync_cited_ref_ids] {file_name}: all {len(nodes)} chunks "
+                    f"already up-to-date, no upsert needed"
+                )
+
+            return {
+                "synced": synced,
+                "unchanged": unchanged,
+                "total_chunks": len(nodes),
+                "error": None,
+            }
+
+        except Exception as e:
+            logger.error(f"[sync_cited_ref_ids] Failed for {file_name}: {e}")
+            return {"synced": 0, "unchanged": 0, "total_chunks": 0, "error": str(e)}
+
     def __del__(self):
         """析构函数，确保断开连接"""
         self.disconnect()

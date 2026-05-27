@@ -14,6 +14,7 @@ Verifies the full knowledge graph construction pipeline:
 
 import json
 import sys
+import tempfile
 import types
 from dataclasses import dataclass
 from pathlib import Path
@@ -144,6 +145,9 @@ def _make_builder(config=None):
     builder._llm_config = types.SimpleNamespace(n_ctx=8192, max_tokens=1024)
     builder._triplet_grammar = None
     builder._multimodal_grammar = None
+    builder._canonical_registry = {}
+    builder._entity_registry_by_type = {}
+    builder._entity_registry_by_paper = {}
     return builder
 
 
@@ -1252,12 +1256,7 @@ class TestBuildFromNodesEndToEnd:
         ]})
 
         config = FakeGraphRAGConfig(max_triplets_per_chunk=10)
-        builder = MultimodalGraphBuilder.__new__(MultimodalGraphBuilder)
-        builder.config = config
-        builder.context = None
-        builder._llm_config = types.SimpleNamespace(n_ctx=8192, max_tokens=1024)
-        builder._triplet_grammar = None
-        builder._multimodal_grammar = None
+        builder = _make_builder(config)
 
         mock_llm = AsyncMock()
         mock_llm.text_chat = AsyncMock(return_value=_make_llm_response(triplets_json))
@@ -1304,12 +1303,7 @@ class TestBuildFromNodesEndToEnd:
         ]})
 
         config = FakeGraphRAGConfig(max_triplets_per_chunk=5)
-        builder = MultimodalGraphBuilder.__new__(MultimodalGraphBuilder)
-        builder.config = config
-        builder.context = None
-        builder._llm_config = types.SimpleNamespace(n_ctx=8192, max_tokens=1024)
-        builder._triplet_grammar = None
-        builder._multimodal_grammar = None
+        builder = _make_builder(config)
 
         mock_llm = AsyncMock()
         mock_llm.text_chat = AsyncMock(return_value=_make_llm_response(triplets_json))
@@ -1379,19 +1373,25 @@ class TestDeterministicMediaLink:
 
         adapter, driver = _make_graph_store_adapter()
 
-        node = _make_node(
-            "BERT extends the Transformer architecture for language understanding tasks.",
-            chunk_id="chunk_bert",
-            has_image=True,
-            image_path="/data/figures/bert_arch.png",
-        )
-        result = await builder._process_batch([node], adapter)
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            image_path = f.name
 
-        assert result["text_triplets_added"] == 0
-        media_cyphers = [q for q in driver.queries if "HAS_MEDIA" in q]
-        assert len(media_cyphers) == 1, "Should have HAS_MEDIA edge even with no triplets"
-        assert "chunk_bert" in media_cyphers[0]
-        assert "/data/figures/bert_arch.png" in media_cyphers[0]
+        try:
+            node = _make_node(
+                "BERT extends the Transformer architecture for language understanding tasks.",
+                chunk_id="chunk_bert",
+                has_image=True,
+                image_path=image_path,
+            )
+            result = await builder._process_batch([node], adapter)
+
+            assert result["text_triplets_added"] == 0
+            media_cyphers = [q for q in driver.queries if "HAS_MEDIA" in q]
+            assert len(media_cyphers) == 1, "Should have HAS_MEDIA edge even with no triplets"
+            assert "chunk_bert" in media_cyphers[0]
+            assert image_path in media_cyphers[0]
+        finally:
+            Path(image_path).unlink(missing_ok=True)
 
     @pytest.mark.asyncio
     async def test_process_batch_no_media_link_without_image_metadata(self):
@@ -1727,12 +1727,8 @@ class TestContextOverflowHandling:
         """When chunks are split, evidence [Chunk X] indices should be corrected."""
 
         # Use a very small context to force splitting
-        builder = MultimodalGraphBuilder.__new__(MultimodalGraphBuilder)
-        builder.config = FakeGraphRAGConfig(max_triplets_per_chunk=3)
-        builder.context = None
+        builder = _make_builder(FakeGraphRAGConfig(max_triplets_per_chunk=3))
         builder._llm_config = types.SimpleNamespace(n_ctx=200, max_tokens=100)
-        builder._triplet_grammar = None
-        builder._multimodal_grammar = None
 
         # Create triplets with [Chunk 1], [Chunk 2] evidence
         triplets_response = json.dumps({"triplets": [

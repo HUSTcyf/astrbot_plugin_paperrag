@@ -1,10 +1,26 @@
-# 📚 Paper RAG Plugin v2.2.0 — 用户指南
+# 📚 Paper RAG Plugin v2.2.1 — 用户指南
 
 本地论文库 RAG 检索插件，为 AstrBot 提供智能论文检索、知识图谱增强问答、研究想法生成和远程 Claude Code 编程执行。支持多模态（图片/表格/公式）提取、Llama.cpp VLM 本地问答和 Agentic RAG（LangGraph 工作流）。
 
-> **版本说明**：当前版本 v2.2.0，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
+> **版本说明**：当前版本 v2.2.1，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
 
-### 本版变化 (v2.2.0)
+### 本版变化 (v2.2.1)
+
+- **LLM Provider 集成**：`_call_llm()` 重构为 `provider.text_chat()` 主路径 + HTTP 回退，解决 Gemini 等非 OpenAI 兼容模型的不可达问题。Provider 代理/超时/密钥轮换全面生效。
+- **Token 精确分片**：tiktoken `cl100k_base` 替代字符估算，统一 16384 token 阈值（云端和本地 LLM 一致）。
+- **并行富化加速**：`asyncio.gather` + `Semaphore(10)`，参考文献富化 5.4x 加速（100 refs: ~7min → ~1.3min）。
+- **OpenAlex 异步化**：`pyalex` → `httpx` 原生异步 REST API，消除线程池开销。
+- **3 层回退搜索**：参考文献链接解析失败时，自动退至 raw_snippet → author+year+keywords → raw_snippet only 三层搜索。
+- **智能引用修复**：`classify_papers_for_repair()` 自动分类论文为 full_reparse / link_only 两种策略，`/paper repair_refs confirm` 一键修复所有未链接引用。
+- **新命令**：`/paper reparseref <file>`（单篇重解析）、`/paper repair_refs confirm`（智能批量修复）。
+- **命令重写**：`/paper reparse_zero_ref confirm`（轻量方案）、`/paper refstats -1`（质量报告）。
+- **cited_ref_ids 同步**：`sync_cited_ref_ids_for_paper()` 在 reparse 后自动更新 Milvus chunk 的引用映射，防止静默数据错误。
+- **Polluted Title 检测增强**：新增 URL 检测（`^https?://`），识别 4 类噪声标题（编号/作者名/URL/标题等于作者）。
+- **独立诊断脚本**：`verify_unlinked_refs.py` 支持 `--execute`/`--link-only`/`--full-only` 模式。
+- **Bug 修复**：Gemini 超时（120s→600s）、Debate 测试 mock 路径、closed_set_schema builder 初始化。
+- 完整变更详见 [docs/changelog/2.2.1.md](docs/changelog/2.2.1.md)
+
+### 上版变化 (v2.2.0)
 
 - **新 LLM Tool：`paper_search`** — 轻量混合 RAG 检索，比 paper_arag/paper_react 更快速，适合简单的论文内容查询。内部走 `engine.search → 文本清洗 → LLM 生成回答`。
 - **新 LLM Tool：`code_execute`** — Claude Code 远程编程执行器。AstrBot agent 可调用此工具在服务器上执行编程任务（写/改代码、调试、实验、git 操作等）。采用 `claude -p` 子进程模式，无需 cc-connect 即可使用。内置输入校验（危险命令拦截）和超时子进程清理。
@@ -147,13 +163,15 @@ npx @larksuite/cli@latest install
 
 # 检查参考文献解析状态
 /paper refstats        # 引用频次统计
-/paper refstats -1     # 列出零引用论文
+/paper refstats -1     # 引用解析质量报告（成功率/失败率）
 /paper abstractstats    # 摘要提取统计
 /paper abstractstats -1 # 列出未提取摘要的论文
 
 # 修复解析问题
-/paper reparse_zero_ref confirm       # 重解析零引用论文
-/paper reparse_zero_abstract confirm  # 重提取缺失摘要
+/paper reparseref <文件名>              # 单篇引用轻量重解析
+/paper repair_refs confirm              # 智能修复所有未链接引用
+/paper reparse_zero_ref confirm         # 重解析零引用/空标题论文
+/paper reparse_zero_abstract confirm    # 重提取缺失摘要
 ```
 
 ---
@@ -281,7 +299,7 @@ npx @larksuite/cli@latest install
 | `/paper react <query>` | 公开 | ReAct Tool-Using Agent 自主查询 |
 | `/paper list` | 公开 | 列出所有已索引文档 |
 | `/paper refstats [top_k]` | 公开 | 参考文献引用频次统计 |
-| `/paper refstats -1` | 公开 | 列出无参考文献的论文 |
+| `/paper refstats -1` | 公开 | 引用解析质量报告（成功率/失败率，列出失败论文） |
 | `/paper abstractstats [top_k]` | 公开 | 摘要提取统计 |
 | `/paper abstractstats -1` | 公开 | 列出未提取摘要的论文 |
 
@@ -295,7 +313,9 @@ npx @larksuite/cli@latest install
 | `/paper clear confirm` | 清空知识库 |
 | `/paper rebuild [目录] confirm` | 清空并重建 |
 | `/paper rebuildf <文件> confirm` | 重建单个论文 |
-| `/paper reparse_zero_ref confirm` | 批量重解析零引用论文 |
+| `/paper reparseref <文件>` | 单篇论文引用重解析（轻量） |
+| `/paper repair_refs confirm` | 智能修复所有未链接引用 |
+| `/paper reparse_zero_ref confirm` | 批量重解析零引用/空标题论文（轻量） |
 | `/paper reparse_zero_abstract confirm` | 批量重提取缺失摘要 |
 
 ### /paper arxiv — arXiv 集成

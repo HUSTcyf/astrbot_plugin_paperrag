@@ -23,6 +23,7 @@
 | `/paper react <query>` | 公开 | ReAct Tool-Using Agent 查询 |
 | `/paper list` | 公开 | 列出所有已索引文档 |
 | `/paper refstats` | 公开 | 参考文献标题频次统计 |
+| `/paper refstats -1` | 公开 | 引用解析质量报告（成功率/失败率，列出失败论文） |
 | `/paper abstractstats` | 公开 | 摘要提取统计 |
 | `/paper add <目录>` | 管理员 | 批量添加论文 |
 | `/paper addf <文件>` | 管理员 | 添加单个论文 |
@@ -30,6 +31,10 @@
 | `/paper clear confirm` | 管理员 | 清空知识库 |
 | `/paper rebuild <目录> confirm` | 管理员 | 清空并重建知识库 |
 | `/paper rebuildf <文件> confirm` | 管理员 | 重建单个论文 |
+| `/paper reparseref <文件>` | 管理员 | 单篇论文引用轻量重解析 |
+| `/paper reparse_zero_ref confirm` | 管理员 | 批量重解析零引用/空标题论文 |
+| `/paper repair_refs confirm` | 管理员 | 智能修复所有未链接引用（自动分类：轻量链接修复 / 完整重解析） |
+| `/paper reparse_zero_abstract confirm` | 管理员 | 批量重提取缺失摘要 |
 
 ### /paper arxiv — arXiv 论文管理
 
@@ -90,7 +95,8 @@
 
 核心配置项分类：
 
-- **LLM Provider**：`text_provider_id`, `multimodal_provider_id`, `text_llm_temperature`, `text_llm_max_tokens`
+- **LLM Provider**：`text_provider_id`（用于引用解析，通过 `provider.text_chat()` 调用，自动使用 provider 的 proxy/timeout/key-rotation 配置）, `multimodal_provider_id`, `text_llm_temperature`, `text_llm_max_tokens`
+- **LLM 回退**：`freeapi_url`, `freeapi_key`（仅当 `text_provider_id` 未设置或初始化失败时作为 fallback，例如本地 VLM 模式）
 - **Llama.cpp VLM**：`llama_vlm_model_path`, `llama_vlm_mmproj_path`, `llama_vlm_temperature`, `llama_vlm_n_ctx`, `llama_vlm_max_tokens`
 - **Milvus**：`milvus_lite_path`, `address`, `db_name`, `collection_name`
 - **Embedding**：`embedding_mode` (unsloth/api), `embed_dim`, `unsloth.*`
@@ -107,12 +113,14 @@
 | `provider/llm_utils.py` | 统一 LLM 调用 (get_llm_provider / call_llm / call_llm_json) |
 | `rag/hybrid_rag.py` | HybridRAGEngine：4 通道混合检索 |
 | `rag/hybrid_parser.py` | PDF 解析 + 语义分块 |
-| `rag/hybrid_index.py` | Milvus 索引管理 |
+| `rag/hybrid_index.py` | Milvus 索引管理（含 `sync_cited_ref_ids_for_paper()` — reparse 后同步 chunk 引用于 Milvus） |
 | `rag/multimodal_extractor.py` | 多模态提取器 (docling) |
 | `rag/abstract_index.py` | 摘要索引 |
 | `rag/paper_link_resolver.py` | arXiv API 解析器（速率限制、健康检查、标题规范化） |
 | `rag/reference_processor.py` | 参考文献解析、富化与存储 |
 | `data/paper_doc_stats.json` | 论文级参考文献解析结果（单文件持久化） |
+| `test/test_sync_cited_ref_ids.py` | cited_ref_ids 同步测试（10 个用例） |
+| `test/test_fallback_search.py` | 参考文献回退搜索测试（11 个用例） |
 | `rag/colbert_storage.py` | ColBERT 多向量存储 |
 | `agentic_rag/workflow.py` | 静态 DAG 工作流 |
 | `agentic_rag/react_workflow.py` | ReAct 工作流 |
@@ -130,10 +138,10 @@
 python -m pytest test/ agentic_rag/test/ idea/test/ -v
 ```
 
-- `test/` — 核心 RAG 测试（17 个文件）
+- `test/` — 核心 RAG 测试（18 个文件）
 - `agentic_rag/test/` — Agentic RAG 节点测试（9 个文件）
 - `idea/test/` — Idea 生成测试（3 个文件）
 
 ---
 
-**最后更新**: 2026-05-25
+**最后更新**: 2026-05-27

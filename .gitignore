@@ -222,6 +222,7 @@ evaluation/freeapi.json
 .planning/
 
 # Safe Refactor drafts
+.cc-connect/
 .vscode/
 .claude/
 .refactor/

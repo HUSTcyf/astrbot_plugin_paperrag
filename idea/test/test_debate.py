@@ -152,7 +152,7 @@ class TestDebateNode:
             "_context": MagicMock(),
         }
 
-        with patch("provider.llm_utils.call_llm_json", new_callable=AsyncMock, return_value=llm_result):
+        with patch("idea.nodes.debate.call_llm_json", new_callable=AsyncMock, return_value=llm_result):
             result = await debate_node(state)
 
         assert result["phase"] == "critique"
@@ -177,7 +177,7 @@ class TestDebateNode:
             "_context": MagicMock(),
         }
 
-        with patch("provider.llm_utils.call_llm_json", new_callable=AsyncMock, return_value=None):
+        with patch("idea.nodes.debate.call_llm_json", new_callable=AsyncMock, return_value=None):
             result = await debate_node(state)
 
         assert result["phase"] == "refine"
@@ -205,7 +205,7 @@ class TestDebateNode:
             "_context": MagicMock(),
         }
 
-        with patch("provider.llm_utils.call_llm_json", new_callable=AsyncMock, return_value=llm_result):
+        with patch("idea.nodes.debate.call_llm_json", new_callable=AsyncMock, return_value=llm_result):
             result = await debate_node(state)
 
         assert result["debate_round"] == 2

@@ -2182,6 +2182,39 @@ class HybridRAGEngine:
 
         return result
 
+    async def _resolve_llm_config(self) -> dict:
+        """Resolve LLM config for reference parsing.
+
+        Priority: provider (when text_provider_id is set) → freeapi (local VLM fallback).
+
+        Returns empty dict if neither source is available.
+        """
+        if not getattr(self.config, 'enable_llm_reference_parsing', True):
+            return {}
+
+        text_provider_id = getattr(self.config, 'text_provider_id', '') or ''
+
+        # Priority 1: configured provider (cloud LLM) — uses provider.text_chat()
+        if text_provider_id:
+            try:
+                provider = await self._ensure_llm_initialized()
+                if provider:
+                    model = getattr(provider, 'model', None) or getattr(provider, 'model_name', None) or 'unknown'
+                    logger.debug(f"📝 使用 Provider 进行 LLM 参考文献解析 ({model})")
+                    return {"provider": provider}
+                logger.warning("⚠️ Provider 初始化失败，尝试 fallback...")
+            except Exception as e:
+                logger.warning(f"⚠️ 无法获取 Provider: {e}，尝试 fallback...")
+
+        # Priority 2: freeapi config (fallback when no provider, e.g. local VLM mode)
+        api_url = getattr(self.config, 'freeapi_url', '') or ''
+        api_key = getattr(self.config, 'freeapi_key', '') or ''
+        if api_url and api_key:
+            logger.debug("📝 使用 freeapi 配置进行 LLM 参考文献解析")
+            return {"model": "gpt-4o-mini", "api_base": f"{api_url}/v1", "api_key": api_key}
+
+        return {}
+
     async def add_papers(
         self,
         file_paths: List[str],
@@ -2208,39 +2241,8 @@ class HybridRAGEngine:
             else:
                 logger.warning("[PaperRAG] HybridRetriever 无 _reranker，ColBERT storage 未绑定")
 
-        # 如果启用了 LLM 参考文献解析且没有显式提供 LLM config，
-        # 则自动获取配置的 text_provider_id 并构建 config
-        effective_llm_config = llm_config
-        if not effective_llm_config and self.config.enable_llm_reference_parsing:
-            try:
-                # 优先使用 freeapi 配置（从插件配置读取）
-                api_url = getattr(self.config, 'freeapi_url', '') or ''
-                api_key = getattr(self.config, 'freeapi_key', '') or ''
-                if api_url and api_key:
-                    effective_llm_config = {
-                        "model": "gpt-4o-mini",
-                        "api_base": f"{api_url}/v1",
-                        "api_key": api_key
-                    }
-                    logger.debug("📝 使用 freeapi 配置进行 LLM 参考文献解析")
-                else:
-                    # 回退到从 provider 提取配置信息
-                    provider = await self._ensure_llm_initialized()
-                    if provider:
-                        model = getattr(provider, 'model', None) or getattr(provider, 'model_name', None)
-                        api_base = getattr(provider, 'api_base', None) or getattr(provider, 'base_url', None)
-                        api_key = getattr(provider, 'api_key', None) or getattr(provider, 'key', None)
-                        if model and api_base:
-                            effective_llm_config = {
-                                "model": model,
-                                "api_base": api_base,
-                                "api_key": api_key or "sk-placeholder"
-                            }
-                            logger.debug("📝 使用 Provider 配置进行 LLM 参考文献解析")
-                        else:
-                            logger.warning(f"⚠️ 无法从 Provider 提取完整配置，LLM 参考文献解析被禁用")
-            except Exception as e:
-                logger.warning(f"⚠️ 无法获取 LLM 配置，LLM 参考文献解析被禁用: {e}")
+        # LLM 参考文献解析配置：显式传入优先，否则自动解析
+        effective_llm_config = llm_config if llm_config else await self._resolve_llm_config()
 
         results = {
             "total": len(file_paths),
