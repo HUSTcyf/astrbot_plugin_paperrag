@@ -914,7 +914,7 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
                     for r in refs.values():
                         if not isinstance(r, dict):
                             continue
-                        has_link = bool(r.get("ref_doi") or r.get("ref_arxiv_url"))
+                        has_link = bool(r.get("ref_doi") or r.get("ref_arxiv_url") or r.get("ref_url"))
                         has_title = bool(r.get("ref_title", "").strip())
                         if has_link:
                             linked += 1

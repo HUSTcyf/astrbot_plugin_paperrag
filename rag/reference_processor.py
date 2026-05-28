@@ -28,6 +28,7 @@ class Reference:
     ref_doi: Optional[str]  # DOI
     ref_venue: Optional[str]  # 期刊/会议
     ref_arxiv_url: Optional[str] = None  # arXiv URL（PaperLinkResolver 解析）
+    ref_url: Optional[str] = None  # Generic web link fallback (Semantic Scholar, PDF, etc.)
     ref_source_arxiv_id: Optional[str] = None  # arXiv ID（LLM 从引用文本直接提取）
     ref_cited_by: List[str] = field(default_factory=list)  # 正文中引用此文献的位置（chunk索引）
 
@@ -40,6 +41,7 @@ class Reference:
             "ref_year": self.ref_year,
             "ref_doi": self.ref_doi,
             "ref_arxiv_url": self.ref_arxiv_url,
+            "ref_url": self.ref_url,
             "ref_source_arxiv_id": self.ref_source_arxiv_id,
             "ref_venue": self.ref_venue
         }
@@ -1718,7 +1720,7 @@ class LLMReferenceParser:
             def _unresolved():
                 return [r for r in references if r and r.ref_title
                         and len(r.ref_title) > 5
-                        and not r.ref_doi and not r.ref_arxiv_url]
+                        and not r.ref_doi and not r.ref_arxiv_url and not r.ref_url]
 
             # Helper: apply resolution result to a ref
             def _apply(ref, resolution):
@@ -1726,6 +1728,8 @@ class LLMReferenceParser:
                     ref.ref_doi = resolution.doi_url.replace("https://doi.org/", "")
                 if resolution.arxiv_url and not ref.ref_arxiv_url:
                     ref.ref_arxiv_url = resolution.arxiv_url
+                if resolution.url and not ref.ref_url:
+                    ref.ref_url = resolution.url
                 if resolution.matched_title and resolution.resolution_score >= 85:
                     ref.ref_title = resolution.matched_title
 
@@ -2036,7 +2040,7 @@ def classify_papers_for_repair() -> Dict[str, Any]:
         for r in refs.values():
             if not isinstance(r, dict):
                 continue
-            has_link = bool(r.get("ref_doi") or r.get("ref_arxiv_url"))
+            has_link = bool(r.get("ref_doi") or r.get("ref_arxiv_url") or r.get("ref_url"))
             title = (r.get("ref_title") or "").strip()
             if has_link:
                 linked += 1
@@ -2114,7 +2118,7 @@ async def repair_links_for_paper(
     for ref_id, r in refs_dict.items():
         if not isinstance(r, dict):
             continue
-        if r.get("ref_doi") or r.get("ref_arxiv_url"):
+        if r.get("ref_doi") or r.get("ref_arxiv_url") or r.get("ref_url"):
             linked_before += 1
         refs.append(Reference(
             ref_id=ref_id,
@@ -2125,6 +2129,7 @@ async def repair_links_for_paper(
             ref_doi=r.get("ref_doi"),
             ref_venue=r.get("ref_venue"),
             ref_arxiv_url=r.get("ref_arxiv_url"),
+            ref_url=r.get("ref_url"),
             ref_source_arxiv_id=r.get("ref_source_arxiv_id"),
         ))
 
@@ -2133,7 +2138,7 @@ async def repair_links_for_paper(
         return {"file_name": file_name, "error": "No references to repair"}
 
     # Only repair refs that currently have no link
-    refs_to_repair = [r for r in refs if not r.ref_doi and not r.ref_arxiv_url]
+    refs_to_repair = [r for r in refs if not r.ref_doi and not r.ref_arxiv_url and not r.ref_url]
     if not refs_to_repair:
         return {
             "file_name": file_name, "total": total,
@@ -2154,7 +2159,7 @@ async def repair_links_for_paper(
     await parser._enrich_references(refs_to_repair, enable_fallback_search=enable_fallback_search)
 
     # Count linked after
-    linked_after = sum(1 for r in refs if r.ref_doi or r.ref_arxiv_url)
+    linked_after = sum(1 for r in refs if r.ref_doi or r.ref_arxiv_url or r.ref_url)
     newly_linked = linked_after - linked_before
 
     # Save updated refs back to JSON

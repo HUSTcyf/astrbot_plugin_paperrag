@@ -1,128 +1,14 @@
 import asyncio
 import importlib
 import sys
-import tempfile
-import types
 from pathlib import Path
 
-
-def _install_astrbot_stubs():
-
-    class DummyLogger:
-        def debug(self, *args, **kwargs):
-            pass
-
-        info = warning = error = debug
-
-    class DummyCommandGroup:
-        def __init__(self, func):
-            self.func = func
-
-        def __get__(self, instance, owner):
-            if instance is None:
-                return self
-            return self.func.__get__(instance, owner)
-
-        def command(self, _name):
-            def decorator(func):
-                return func
-
-            return decorator
-
-    def command_group(_name):
-        def decorator(func):
-            return DummyCommandGroup(func)
-
-        return decorator
-
-    def permission_type(_permission):
-        def decorator(func):
-            return func
-
-        return decorator
-
-    class DummyPermissionType:
-        ADMIN = "admin"
-
-    def register(*_args, **_kwargs):
-        def decorator(cls):
-            return cls
-
-        return decorator
-
-    class Context:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def register_llm_tool(self, *args, **kwargs):
-            pass
-
-        def unregister_llm_tool(self, *args, **kwargs):
-            pass
-
-    class Star:
-        def __init__(self, context, *args, config=None, **kwargs):
-            self.context = context
-
-        async def terminate(self):
-            pass
-
-    class AstrMessageEvent:
-        pass
-
-    class MessageChain:
-        def message(self, text):
-            pass
-
-        def file_image(self, path):
-            pass
-
-    sys.modules["astrbot"] = types.ModuleType("astrbot")
-    api_mod = types.ModuleType("astrbot.api")
-    api_mod.logger = DummyLogger()
-    sys.modules["astrbot.api"] = api_mod
-
-    event_mod = types.ModuleType("astrbot.api.event")
-    event_mod.AstrMessageEvent = AstrMessageEvent
-    event_mod.filter = types.SimpleNamespace(
-        command_group=command_group,
-        permission_type=permission_type,
-        PermissionType=DummyPermissionType,
-    )
-    sys.modules["astrbot.api.event"] = event_mod
-
-    star_mod = types.ModuleType("astrbot.api.star")
-    star_mod.Context = Context
-    star_mod.Star = Star
-    star_mod.register = register
-    sys.modules["astrbot.api.star"] = star_mod
-
-    message_mod = types.ModuleType("astrbot.core.message.message_event_result")
-    message_mod.MessageChain = MessageChain
-    sys.modules["astrbot.core.message.message_event_result"] = message_mod
-
-
-class DummyEvent:
-    def __init__(self):
-        self.messages = []
-
-    def plain_result(self, text):
-        self.messages.append(text)
-        return text
-
-    async def send(self, _chain):
-        return None
-
-
-async def _collect(async_gen):
-    results = []
-    async for item in async_gen:
-        results.append(item)
-    return results
+from ._test_utils import install_astrbot_stubs, DummyEvent, collect_async
+import tempfile
 
 
 def test_zero_abstract_detection_and_reparse_command():
-    _install_astrbot_stubs()
+    install_astrbot_stubs()
 
     plugin_parent = Path(__file__).resolve().parents[2]
     if str(plugin_parent) not in sys.path:
@@ -205,7 +91,7 @@ def test_zero_abstract_detection_and_reparse_command():
         assert result["papers"][0]["file_name"] == "missing_abstract.pdf"
 
         stats_event = DummyEvent()
-        stats_output = asyncio.run(_collect(plugin.cmd_abstractstats(stats_event, -1)))
+        stats_output = asyncio.run(collect_async(plugin.cmd_abstractstats(stats_event, -1)))
         assert any("无摘要的论文" in msg for msg in stats_output)
         assert any("missing_abstract.pdf" in msg for msg in stats_output)
 
@@ -222,7 +108,7 @@ def test_zero_abstract_detection_and_reparse_command():
         abstract_stats_before = (data_dir / "milvus_abstracts_doc_stats.json").read_text(encoding="utf-8")
 
         reparse_event = DummyEvent()
-        reparse_output = asyncio.run(_collect(plugin.cmd_reparse_zero_abstract(reparse_event, "confirm")))
+        reparse_output = asyncio.run(collect_async(plugin.cmd_reparse_zero_abstract(reparse_event, "confirm")))
         assert abstract_manager.deleted == []
         assert abstract_manager.vectors_deleted == ["missing_abstract"]
         assert len(abstract_manager.indexed) == 1
@@ -248,7 +134,7 @@ def test_zero_abstract_detection_and_reparse_command():
 
         plugin._extract_missing_abstract_text = fake_extract_failure
         failure_event = DummyEvent()
-        asyncio.run(_collect(plugin.cmd_reparse_zero_abstract(failure_event, "confirm")))
+        asyncio.run(collect_async(plugin.cmd_reparse_zero_abstract(failure_event, "confirm")))
 
         assert failing_manager.deleted == []
         assert failing_manager.vectors_deleted == []
@@ -265,7 +151,7 @@ def test_zero_abstract_detection_and_reparse_command():
 
         plugin._extract_missing_abstract_text = fake_extract_success_missing_vector
         missing_vector_event = DummyEvent()
-        asyncio.run(_collect(plugin.cmd_reparse_zero_abstract(missing_vector_event, "confirm")))
+        asyncio.run(collect_async(plugin.cmd_reparse_zero_abstract(missing_vector_event, "confirm")))
 
         assert missing_vector_manager.deleted == []
         assert missing_vector_manager.vectors_deleted == ["missing_abstract"]

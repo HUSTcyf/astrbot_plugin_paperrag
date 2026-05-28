@@ -4,6 +4,7 @@
 
 ## 最新版本
 
+- [2.2.2](changelog/2.2.2.md)
 - [2.2.1](changelog/2.2.1.md)
 - [2.2.0](changelog/2.2.0.md)
 - [2.1.2](changelog/2.1.2.md)

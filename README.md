@@ -1,10 +1,17 @@
-# 📚 Paper RAG Plugin v2.2.1 — 用户指南
+# 📚 Paper RAG Plugin v2.2.2 — 用户指南
 
 本地论文库 RAG 检索插件，为 AstrBot 提供智能论文检索、知识图谱增强问答、研究想法生成和远程 Claude Code 编程执行。支持多模态（图片/表格/公式）提取、Llama.cpp VLM 本地问答和 Agentic RAG（LangGraph 工作流）。
 
-> **版本说明**：当前版本 v2.2.1，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
+> **版本说明**：当前版本 v2.2.2，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
 
-### 本版变化 (v2.2.1)
+### 本版变化 (v2.2.2)
+
+- **知识图谱云端 LLM 支持**：`/paper graph_build` / `graph_rebuild` 现在优先使用 `multimodal_provider_id` 配置的云端 LLM（Gemini/GPT 等）进行三元组提取，未配置时回退本地 GGUF 模型。云端 Provider 连续失败 3 次后自动降级到本地模型。
+- **Pydantic 结构化验证**：云端 LLM 输出通过 Pydantic 模型校验，`head_type`/`tail_type` 限定了 9 种封闭实体类型 Literal，`confidence` 限制 [0.0, 1.0] 范围，`head`/`tail` 最大 60 字符。解析失败自动走 JSON 截断恢复链。
+- **后台构建进度推送**：图谱构建进度实时推送到用户聊天窗口（每篇论文完成时显示实体计数和三元组计数），推送失败不影响构建流程。
+- **Grammar 警告守卫**：云端 Provider 路径不再误报 "Grammar 未加载" 错误。
+
+### 上版变化 (v2.2.1)
 
 - **⚠️ LLM Provider 思考模式处理**：参考文献解析需要 LLM 返回**纯 JSON**。推理模型的思考/推理 tokens 会破坏 JSON 解析。目前**自动关闭**的模型：Gemini（`thinking_budget=0`）、DeepSeek（`"thinking": {"type": "disabled"}`）、GLM（同上）。其他 provider 使用默认配置（大部分模型默认不开启思考模式，但若使用 o-series/reasoner 模型需手动在 AstrBot 配置中关闭）。详见下方 [⚠️ LLM 思考模式说明](#-llm-思考模式说明)。
 - **LLM Provider 多路径**：provider 三重路径（Gemini → stream → sync），HTTP 作为最终回退。
@@ -193,6 +200,14 @@ npx @larksuite/cli@latest install
 2. **实体规范化**：自动将 "our method"/"the proposed approach" 替换为论文专属标识符，避免不同论文的通用自指代词被错误合并
 3. **别名去重**：4 层去重体系（`Full Name (ACRONYM)` 解析 → 同论文共现 → 跨论文首字母匹配 → `:ALIAS_OF` 关系链接）
 4. **Neo4j 写入**：实体节点 + 关系边，支持 Cypher 查询
+
+**Neo4j Browser 可视化**（`http://localhost:7474`）：
+
+```cypher
+-- 查看知识图谱全貌（所有节点和关系）
+MATCH (n)-[r]->(m)
+RETURN n, r, m
+```
 
 ```bash
 # 图谱维护

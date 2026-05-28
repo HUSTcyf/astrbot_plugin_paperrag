@@ -193,28 +193,39 @@ class GraphCommandsMixin(PluginCoreBase):
 
         plugin_dir = _PLUGIN_DIR
 
-        def send_msg(text: str):
-            """发送消息到用户（仅通过日志）"""
+        # 捕获 session 信息用于后台推送消息
+        session_str = getattr(event, 'session', None) or getattr(event, 'unified_msg_origin', None)
+
+        async def send_msg(text: str):
+            """发送进度消息到用户聊天窗口 + 日志"""
             logger.info(f"[GraphBuild] {text}")
+            if session_str and self.context:
+                try:
+                    from astrbot.core.message.message_event_result import MessageChain
+                    chain = MessageChain()
+                    chain.message(text)
+                    await self.context.send_message(session_str, chain)
+                except Exception as e:
+                    logger.debug(f"[GraphBuild] 推送消息失败（非致命）: {e}")
 
         try:
             # 获取索引管理器
             index_manager = engine._ensure_index_manager_initialized()
 
-            send_msg("📖 正在从向量数据库读取论文列表...")
+            await send_msg("📖 正在从向量数据库读取论文列表...")
 
             try:
                 papers = await index_manager.list_unique_documents()
             except Exception as e:
-                send_msg(f"❌ 无法获取论文列表: {e}\n请确保已使用 /paper add 添加文档")
+                await send_msg(f"❌ 无法获取论文列表: {e}\n请确保已使用 /paper add 添加文档")
                 return
 
             if not papers:
-                send_msg("📭 向量数据库中未找到已索引的文档\n请先使用 /paper add 添加文档")
+                await send_msg("📭 向量数据库中未找到已索引的文档\n请先使用 /paper add 添加文档")
                 return
 
             paper_names = [p.get("file_name", "") for p in papers if p.get("file_name")]
-            send_msg(f"📚 找到 {len(paper_names)} 篇论文，开始逐篇构建...")
+            await send_msg(f"📚 找到 {len(paper_names)} 篇论文，开始逐篇构建...")
 
             # 导入必要的模块
             try:
@@ -229,7 +240,7 @@ class GraphCommandsMixin(PluginCoreBase):
 
             import json as _json_json
 
-            send_msg(f"📑 开始逐篇构建知识图谱 ({len(paper_names)} 篇论文)...")
+            await send_msg(f"📑 开始逐篇构建知识图谱 ({len(paper_names)} 篇论文)...")
 
             # 创建 GraphRAGConfig（只创建一次）
             graph_config = self._create_graph_rag_config()
@@ -251,7 +262,7 @@ class GraphCommandsMixin(PluginCoreBase):
             graph_store = SimplePropertyGraphStoreAdapter(raw_store)
             logger.info(f"[GraphRAG] 使用 Neo4j 存储: {graph_config.neo4j_uri}")
 
-            builder = MultimodalGraphBuilder(config=graph_config, context=self.context)
+            builder = MultimodalGraphBuilder(config=graph_config, context=self.context, plugin_config=self.config)
 
             # 初始化 LLM（只初始化一次）
             await builder._ensure_llm_initialized()
@@ -281,11 +292,11 @@ class GraphCommandsMixin(PluginCoreBase):
                         ckpt = _json.load(f)
                         skip_count = ckpt.get("skip_count", 0)
                         if skip_count > 0:
-                            send_msg(f"🔄 检测到检查点，将跳过前 {skip_count} 篇已处理的论文")
+                            await send_msg(f"🔄 检测到检查点，将跳过前 {skip_count} 篇已处理的论文")
                 except Exception:
                     pass
             elif skip_count > 0:
-                send_msg(f"⏭️ 使用 skip 参数，跳过前 {skip_count} 篇论文")
+                await send_msg(f"⏭️ 使用 skip 参数，跳过前 {skip_count} 篇论文")
 
             for i, paper_name in enumerate(paper_names):
                 # 跳过已处理的论文
@@ -310,7 +321,7 @@ class GraphCommandsMixin(PluginCoreBase):
                     if not raw_results:
                         continue
 
-                    send_msg(f"📄 [{i+1}/{len(paper_names)}] {paper_name} ({len(raw_results)} chunks)")
+                    await send_msg(f"📄 [{i+1}/{len(paper_names)}] {paper_name} ({len(raw_results)} chunks)")
 
                     # 解析该论文的 chunks
                     paper_chunks = []
@@ -361,7 +372,9 @@ class GraphCommandsMixin(PluginCoreBase):
                         logger.warning(f"⚠️ 保存检查点失败: {e}")
 
                     # 每篇论文都更新进度
-                    send_msg(f"📥 进度: {i + 1}/{len(paper_names)} 篇论文...")
+                    entities = total_stats["entities_added"]
+                    triplets = total_stats["text_triplets_added"] + total_stats["cross_modal_triplets_added"]
+                    await send_msg(f"📥 进度: {i + 1}/{len(paper_names)} 篇论文 — 实体={entities}, 三元组={triplets}")
 
                 except Exception as e:
                     logger.warning(f"处理论文 {paper_name} 失败: {e}")
@@ -376,7 +389,7 @@ class GraphCommandsMixin(PluginCoreBase):
                                 "last_paper": paper_name
                             }, f, ensure_ascii=False)
                         temp_file.replace(checkpoint_file)
-                        send_msg(f"⚠️ 处理论文 {paper_name} 失败，已保存检查点")
+                        await send_msg(f"⚠️ 处理论文 {paper_name} 失败，已保存检查点")
                     except Exception:
                         pass
 
@@ -411,13 +424,13 @@ class GraphCommandsMixin(PluginCoreBase):
    • 失败块数：{total_stats.get('chunks_failed', 0)}
 
 💡 使用 /paper graph_stats 查看图谱详情"""
-            send_msg(output)
+            await send_msg(output)
 
         except Exception as e:
             logger.error(f"构建知识图谱失败: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            send_msg(f"❌ 构建失败: {e}")
+            await send_msg(f"❌ 构建失败: {e}")
 
 
     async def _paper_graph_stats(self, event: AstrMessageEvent):

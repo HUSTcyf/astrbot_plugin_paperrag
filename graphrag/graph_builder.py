@@ -29,6 +29,8 @@ from dataclasses import dataclass
 
 from astrbot.api import logger
 from llama_cpp import LlamaGrammar
+import pydantic
+from pydantic import BaseModel, Field
 from rag.token_utils import count_tokens
 
 
@@ -159,6 +161,63 @@ _EXT_TO_FIGURE_TYPE: Dict[str, str] = {
     ".svg": "diagram", ".pdf": "document", ".gif": "image",
     ".tiff": "image", ".bmp": "image", ".webp": "image",
 }
+
+
+# ============================================================================
+# Pydantic models for structured output validation (cloud LLM)
+# ============================================================================
+
+from typing import Literal
+
+EntityType = Literal[
+    "Method", "Model", "Task", "Dataset", "Metric",
+    "Component", "Limitation", "Application", "Baseline",
+]
+
+RelationType = Literal[
+    "ADDRESSES", "PROPOSES", "USES_COMPONENT", "EVALUATED_ON",
+    "ACHIEVES", "COMPARES_WITH", "LIMITED_BY", "APPLIES_TO", "EXTENDS",
+    "TRAINS_ON", "IMPLEMENTS", "OUTPERFORMS", "REQUIRES", "ABLATES_ON",
+]
+
+
+class Triplet(BaseModel):
+    head: str = Field(max_length=60)
+    head_type: EntityType
+    relation: str
+    relation_type: RelationType
+    tail: str = Field(max_length=60)
+    tail_type: EntityType
+    confidence: float = Field(ge=0.0, le=1.0)
+    evidence: str = Field(default="")
+
+
+class TripletExtraction(BaseModel):
+    triplets: list[Triplet]
+
+
+class FigureInfo(BaseModel):
+    figure_id: str = Field(default="")
+    description: str = Field(default="")
+    figure_type: str = Field(default="unknown")
+    key_entities: list[str] = Field(default_factory=list)
+    relations_shown: list[str] = Field(default_factory=list)
+
+
+class CrossModalTriplet(BaseModel):
+    head: str
+    relation: str
+    relation_type: str
+    tail: str
+    tail_type: EntityType = Field(default="Application")
+    confidence: float = Field(default=0.9, ge=0.0, le=1.0)
+    evidence: str = Field(default="")
+
+
+class MultimodalExtraction(BaseModel):
+    text_triplets: list[Triplet] = Field(default_factory=list)
+    image_info: FigureInfo = Field(default_factory=FigureInfo)
+    cross_modal_triplets: list[CrossModalTriplet] = Field(default_factory=list)
 
 
 # ============================================================================
@@ -530,7 +589,7 @@ Output:
       "relation": "visualizes",
       "relation_type": "visualizes",
       "tail": "BERT vs GPT comparison",
-      "tail_type": "Comparison",
+      "tail_type": "Metric",
       "confidence": 0.95,
       "evidence": "Figure 2 shows performance comparison"
     }}
@@ -541,6 +600,73 @@ Output:
 
 
 # ============================================================================
+# JSON parsing helpers (module-level, shared by text and multimodal paths)
+# ============================================================================
+
+def _strip_code_block(response: str) -> str:
+    """Strip markdown code block wrapper and BOM."""
+    s = response.strip().lstrip('﻿')
+    if s.startswith("```"):
+        lines = s.split("\n")
+        s = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+    return s
+
+
+def _try_parse_json(json_str: str) -> Any | None:
+    """Try to parse JSON string, return parsed data or None."""
+    try:
+        return json.loads(json_str)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _try_truncate_recover(json_str: str) -> dict | None:
+    """Try to recover a truncated JSON by finding the last complete object."""
+    if not json_str:
+        return None
+
+    # Strategy 1: find last }, and close JSON
+    pos = len(json_str)
+    while True:
+        pos = json_str.rfind('},', 0, pos)
+        if pos == -1:
+            break
+        candidate = json_str[:pos + 1] + ']}'
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict) and 'triplets' in data:
+                return data
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 2: single triplet — find last } and close
+    last_brace = json_str.rfind('}')
+    if last_brace > 0:
+        candidate = json_str[:last_brace + 1] + ']}'
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict) and 'triplets' in data:
+                return data
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 3: search for closing ]
+    last_bracket = json_str.rfind(']')
+    if last_bracket > 0:
+        for i in range(last_bracket, 0, -1):
+            try:
+                candidate = json_str[:i + 1]
+                if candidate.rstrip().endswith(']'):
+                    data = json.loads(candidate)
+                    if isinstance(data, dict) and 'triplets' in data:
+                        return data
+            except json.JSONDecodeError:
+                continue
+
+    return None
+
+
+# ============================================================================
 # 多模态知识图谱构建器
 # ============================================================================
 
@@ -548,11 +674,12 @@ class MultimodalGraphBuilder:
     """
     多模态知识图谱构建器
 
-    使用本地 Qwen3.5 GGUF 模型从文本和图片中抽取三元组，构建知识图谱。
+    优先使用插件配置的 multimodal_provider_id（多模态 LLM Provider）从文本和图片中抽取三元组；
+    如果未配置，则回退到本地 GGUF 模型。
 
     支持：
     1. 纯文本三元组抽取
-    2. 多模态联合抽取（图+文）
+    2. 多模态联合抽取（图+文，需要本地 VLM）
     3. 图片实体提取
     4. 跨模态关系建立
     """
@@ -560,7 +687,8 @@ class MultimodalGraphBuilder:
     def __init__(
         self,
         config: "GraphRAGConfig",
-        context: Any = None
+        context: Any = None,
+        plugin_config: dict | None = None,
     ):
         """
         初始化构建器
@@ -568,13 +696,17 @@ class MultimodalGraphBuilder:
         Args:
             config: GraphRAGConfig 配置
             context: AstrBot 上下文
+            plugin_config: 插件配置字典（含 multimodal_provider_id 等）
         """
         self.config = config
         self.context = context
-        self._llm: Optional[Any] = None  # LlamaCppVLMProvider
+        self._plugin_config = plugin_config or {}
+        self._llm: Optional[Any] = None  # LlamaCppVLMProvider (本地)
+        self._cloud_llm: Optional[Any] = None  # 云端 LLM Provider（非本地 VLM）
         self._llm_config = self._get_llm_config()
         self._triplet_grammar: Optional[Any] = None
         self._multimodal_grammar: Optional[Any] = None
+        self._cloud_consecutive_failures: int = 0  # 云端连续失败计数，超过阈值才降级
         # Entity dedup: maps lower(acronym) → canonical full name
         self._canonical_registry: dict[str, str] = {}
         # Entity dedup: tracks all entity names by type for cross-paper initials matching
@@ -620,27 +752,60 @@ class MultimodalGraphBuilder:
         )
 
     async def _ensure_llm_initialized(self):
-        """确保 LLM 已初始化 - 使用 LlamaCppVLMProvider"""
-        if self._llm is None:
-            from provider.llama_cpp_vlm import (
-                get_cached_llama_cpp_provider,
-                init_llama_cpp_vlm_provider,
-            )
-            # 优先复用已初始化的单例
-            cached = get_cached_llama_cpp_provider()
-            if cached is not None:
-                self._llm = cached
-            else:
-                self._llm = init_llama_cpp_vlm_provider(
-                    model_path=self._llm_config.model_path,
-                    mmproj_path=self._llm_config.mmproj_path,
-                    n_ctx=self._llm_config.n_ctx,
-                    n_gpu_layers=self._llm_config.n_gpu_layers,
-                    max_tokens=self._llm_config.max_tokens,
-                    temperature=self._llm_config.temperature
+        """确保 LLM 已初始化。
+
+        优先级：
+        1. 插件配置的 multimodal_provider_id（多模态问答的 LLM Provider，通常支持图片）
+        2. 本地 LlamaCppVLMProvider（GGUF 模型）
+
+        配置的云端 Provider 同时用于文本三元组提取和多模态（图片）三元组提取。
+        云端 Provider 不支持 GBNF grammar，依赖 prompt 约束 + JSON 解析。
+        """
+        # 步骤1: 尝试获取配置的 multimodal_provider_id
+        if self._cloud_llm is None and self.context is not None:
+            try:
+                multimodal_provider_id = self._plugin_config.get("multimodal_provider_id", "")
+                if multimodal_provider_id:
+                    pm = getattr(self.context, 'provider_manager', None)
+                    if pm:
+                        inst_map = getattr(pm, 'inst_map', None)
+                        if isinstance(inst_map, dict):
+                            provider = inst_map.get(multimodal_provider_id)
+                            if provider is not None:
+                                self._cloud_llm = provider
+                                provider_name = getattr(provider, 'provider_model', '') or \
+                                    getattr(provider, 'model_name', '') or \
+                                    type(provider).__name__
+                                logger.info(
+                                    f"[Graph-LLM] 使用 multimodal_provider_id 配置的 LLM: "
+                                    f"{multimodal_provider_id} ({provider_name})"
+                                )
+                if self._cloud_llm is None:
+                    logger.info("[Graph-LLM] 未配置 multimodal_provider_id，将使用本地 GGUF 模型")
+            except Exception as e:
+                logger.debug(f"[Graph-LLM] multimodal_provider_id 解析失败: {e}")
+
+        # 步骤2: 初始化本地 VLM（当没有配置云端 Provider 时需要）
+        if self._cloud_llm is None:
+            if self._llm is None:
+                from provider.llama_cpp_vlm import (
+                    get_cached_llama_cpp_provider,
+                    init_llama_cpp_vlm_provider,
                 )
-        await self._llm.initialize()
-        self._load_grammars()
+                cached = get_cached_llama_cpp_provider()
+                if cached is not None:
+                    self._llm = cached
+                else:
+                    self._llm = init_llama_cpp_vlm_provider(
+                        model_path=self._llm_config.model_path,
+                        mmproj_path=self._llm_config.mmproj_path,
+                        n_ctx=self._llm_config.n_ctx,
+                        n_gpu_layers=self._llm_config.n_gpu_layers,
+                        max_tokens=self._llm_config.max_tokens,
+                        temperature=self._llm_config.temperature
+                    )
+            await self._llm.initialize()
+            self._load_grammars()
 
     def _load_grammars(self):
         """从 JSON schema 文件生成 grammar，约束 LLM 输出为合法 JSON"""
@@ -832,7 +997,7 @@ class MultimodalGraphBuilder:
                 )
                 user_prompt = f"Extract triplets from the following text chunks:\n\n{combined_text}\n\nExtract all entity-relationship triplets:"
 
-                # 检查是否超出上下文长度（精确计算）
+                # 检查是否超出上下文长度（仅本地模型需要拆分，云端模型上下文窗口远大于本地）
                 system_tokens = count_tokens(system_prompt)
                 user_prefix_tokens = count_tokens("Extract triplets from the following text chunks:\n\n")
                 user_suffix_tokens = count_tokens("\n\nExtract all entity-relationship triplets:")
@@ -842,7 +1007,7 @@ class MultimodalGraphBuilder:
                 max_output = self._llm_config.max_tokens if hasattr(self, '_llm_config') else 4096
                 total_tokens = system_tokens + user_prefix_tokens + content_tokens + user_suffix_tokens + max_output
 
-                if total_tokens > max_context:
+                if total_tokens > max_context and self._cloud_llm is None:
                     logger.warning(
                         f"[Graph-LLM] ⚠️ 批次 {batch_idx + 1}/{total_batches} 超出上下文长度: "
                         f"{total_tokens} tokens (含输出预算 {max_output}) > {max_context} tokens，自动拆分"
@@ -896,22 +1061,22 @@ class MultimodalGraphBuilder:
                             )
                     triplets = all_triplets
                 else:
-                    # 调用 LLM（使用 GBNF grammar 约束输出）
-                    assert self._llm is not None
+                    # 调用 LLM（云端 Provider 或本地 VLM）
+                    assert self._llm is not None or self._cloud_llm is not None
 
-                    if self._triplet_grammar is None:
+                    if self._triplet_grammar is None and self._cloud_llm is None:
                         logger.error(
                             "[Graph-LLM] Grammar 未加载，grammar 约束已禁用。"
                             "输出可能不符合预期格式。请检查 triplet_schema.json。"
                         )
 
-                    response = await self._llm.text_chat(
-                        prompt=user_prompt,
+                    response = await self._call_text_llm(
                         system_prompt=system_prompt,
+                        user_prompt=user_prompt,
                         max_tokens=self._llm_config.max_tokens,
                         grammar=self._triplet_grammar,
                     )
-                    response_text = response.content if hasattr(response, 'content') else str(response)
+                    response_text = response
 
                     # 调试：记录完整响应
                     logger.info(f"[Graph-LLM] 批次 {batch_idx + 1} LLM响应长度: {len(response_text)}")
@@ -1094,6 +1259,81 @@ class MultimodalGraphBuilder:
             logger.error(f"[Graph-LLM] 节点 {chunk_id} 处理失败: {e}")
             return e
 
+    async def _call_text_llm(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int,
+        grammar: Any = None,
+    ) -> str:
+        """调用 LLM 进行文本三元组提取。
+
+        优先使用配置的 multimodal_provider_id（云端 VLM），否则使用本地 GGUF 模型。
+        云端连续失败 3 次后降级到本地模型。
+        """
+        from provider.llm_utils import extract_text_from_response
+
+        if self._cloud_llm is not None:
+            try:
+                response = await self._cloud_llm.text_chat(
+                    prompt=user_prompt,
+                    contexts=[],
+                    system_prompt=system_prompt,
+                    temperature=0.1,
+                    max_tokens=max_tokens,
+                )
+                response_text = extract_text_from_response(response)
+                logger.info(f"[Graph-LLM] 云端 Provider 响应长度: {len(response_text)}")
+                if not response_text:
+                    logger.warning("[Graph-LLM] 云端 Provider 返回空响应")
+                self._cloud_consecutive_failures = 0
+                return response_text
+            except Exception as e:
+                self._cloud_consecutive_failures += 1
+                if self._cloud_consecutive_failures >= 3:
+                    logger.warning(
+                        f"[Graph-LLM] 云端 Provider 连续失败 {self._cloud_consecutive_failures} 次，永久降级到本地模型: {e}"
+                    )
+                    self._cloud_llm = None
+                else:
+                    logger.warning(
+                        f"[Graph-LLM] 云端 Provider 调用失败 ({self._cloud_consecutive_failures}/3)，本次回退本地模型: {e}"
+                    )
+
+        # 本地 VLM 路径（带 grammar 约束）
+        await self._ensure_local_llm_available()
+        response = await self._llm.text_chat(
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+            max_tokens=max_tokens,
+            grammar=grammar,
+        )
+        return extract_text_from_response(response)
+
+    async def _ensure_local_llm_available(self):
+        """确保本地 VLM 可用（云端降级时懒初始化）。"""
+        if self._llm is not None:
+            return
+        logger.info("[Graph-LLM] 云端已降级，正在初始化本地 VLM...")
+        from provider.llama_cpp_vlm import (
+            get_cached_llama_cpp_provider,
+            init_llama_cpp_vlm_provider,
+        )
+        cached = get_cached_llama_cpp_provider()
+        if cached is not None:
+            self._llm = cached
+        else:
+            self._llm = init_llama_cpp_vlm_provider(
+                model_path=self._llm_config.model_path,
+                mmproj_path=self._llm_config.mmproj_path,
+                n_ctx=self._llm_config.n_ctx,
+                n_gpu_layers=self._llm_config.n_gpu_layers,
+                max_tokens=self._llm_config.max_tokens,
+                temperature=self._llm_config.temperature
+            )
+        await self._llm.initialize()
+        self._load_grammars()
+
     async def _call_llm_for_chunks(
         self,
         chunks_text: List[str],
@@ -1106,24 +1346,24 @@ class MultimodalGraphBuilder:
         system_prompt = BATCH_TRIPLET_EXTRACTION_PROMPT.format(max_triplets=max_triplets)
         user_prompt = f"Extract triplets from the following text chunks:\n\n{combined_text}\n\nExtract all entity-relationship triplets:"
 
-        # 预检查：确保输入 + 输出不超 n_ctx
-        input_tokens = count_tokens(system_prompt) + count_tokens(user_prompt)
-        max_context = self._llm_config.n_ctx if hasattr(self, '_llm_config') else 4096
-        max_output = self._llm_config.max_tokens if hasattr(self, '_llm_config') else 4096
-        if input_tokens + max_output > max_context:
-            logger.warning(
-                f"[Graph-LLM] 分组 {batch_idx + 1}.{part_suffix} token 预算紧张: "
-                f"input={input_tokens} + output={max_output} = {input_tokens + max_output} > n_ctx={max_context}"
-            )
+        # 预检查：确保输入 + 输出不超 n_ctx（仅本地模型需要）
+        if self._cloud_llm is None:
+            input_tokens = count_tokens(system_prompt) + count_tokens(user_prompt)
+            max_context = self._llm_config.n_ctx if hasattr(self, '_llm_config') else 4096
+            max_output = self._llm_config.max_tokens if hasattr(self, '_llm_config') else 4096
+            if input_tokens + max_output > max_context:
+                logger.warning(
+                    f"[Graph-LLM] 分组 {batch_idx + 1}.{part_suffix} token 预算紧张: "
+                    f"input={input_tokens} + output={max_output} = {input_tokens + max_output} > n_ctx={max_context}"
+                )
 
-        assert self._llm is not None
-        response = await self._llm.text_chat(
-            prompt=user_prompt,
+        assert self._llm is not None or self._cloud_llm is not None
+        response_text = await self._call_text_llm(
             system_prompt=system_prompt,
+            user_prompt=user_prompt,
             max_tokens=self._llm_config.max_tokens,
             grammar=self._triplet_grammar,
         )
-        response_text = response.content if hasattr(response, 'content') else str(response)
         logger.info(f"[Graph-LLM] 批次 {batch_idx + 1}.{part_suffix} LLM响应长度: {len(response_text)}")
         return response_text
 
@@ -1145,14 +1385,13 @@ class MultimodalGraphBuilder:
             system_prompt = TRIPLET_EXTRACTION_PROMPT.format(max_triplets=self.config.max_triplets_per_chunk)
             user_prompt = f"## Input Text\n\n{text}\n\nExtract all entity-relationship triplets:"
 
-            assert self._llm is not None
-            response = await self._llm.text_chat(
-                prompt=user_prompt,
+            assert self._llm is not None or self._cloud_llm is not None
+            response_text = await self._call_text_llm(
                 system_prompt=system_prompt,
+                user_prompt=user_prompt,
                 max_tokens=self._llm_config.max_tokens,
                 grammar=self._triplet_grammar,
             )
-            response_text = response.content if hasattr(response, 'content') else str(response)
             triplets = self._parse_json_response(response_text)
 
             # Track entities counted in this extraction to avoid double-counting
@@ -1365,7 +1604,9 @@ class MultimodalGraphBuilder:
         image_caption: str,
         figure_id: str,
     ) -> Dict[str, Any]:
-        """调用 VLM 获取多模态三元组"""
+        """调用 VLM 获取多模态三元组（优先云端 Provider，否则本地 VLM）"""
+        from provider.llm_utils import extract_text_from_response
+
         system_prompt = MULTIMODAL_TRIPLET_EXTRACTION_PROMPT.format(
             text=text,
             image_caption=image_caption or "No caption",
@@ -1376,7 +1617,34 @@ Image Caption: {image_caption or 'No caption'}
 
 Extract triplets:"""
 
-        assert self._llm is not None
+        if self._cloud_llm is not None:
+            try:
+                response = await self._cloud_llm.text_chat(
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    image_urls=[image_path] if self.config.multimodal_enabled else None,
+                    temperature=0.1,
+                    max_tokens=self._llm_config.max_tokens,
+                )
+                response_text = extract_text_from_response(response)
+                if not response_text:
+                    logger.warning("[Graph-LLM] 云端 VLM 返回空响应")
+                logger.info(f"[Graph-LLM] 云端 VLM 多模态响应长度: {len(response_text)}")
+                self._cloud_consecutive_failures = 0
+                return self._parse_multimodal_response(response_text)
+            except Exception as e:
+                self._cloud_consecutive_failures += 1
+                if self._cloud_consecutive_failures >= 3:
+                    logger.warning(
+                        f"[Graph-LLM] 云端 VLM 连续失败 {self._cloud_consecutive_failures} 次，永久降级到本地模型: {e}"
+                    )
+                    self._cloud_llm = None
+                else:
+                    logger.warning(
+                        f"[Graph-LLM] 云端 VLM 调用失败 ({self._cloud_consecutive_failures}/3)，本次回退本地模型: {e}"
+                    )
+
+        await self._ensure_local_llm_available()
         response = await self._llm.text_chat(
             prompt=user_prompt,
             system_prompt=system_prompt,
@@ -1384,7 +1652,7 @@ Extract triplets:"""
             max_tokens=self._llm_config.max_tokens,
             grammar=self._multimodal_grammar,
         )
-        response_text = response.content if hasattr(response, 'content') else str(response)
+        response_text = extract_text_from_response(response)
         logger.info(f"[Graph-LLM] VLM响应长度: {len(response_text)}, 响应: {repr(response_text)}")
         return self._parse_multimodal_response(response_text)
 
@@ -1718,88 +1986,67 @@ Extract triplets:"""
         return aliases_created
 
     def _parse_json_response(self, response: str) -> List[Dict[str, Any]]:
-        """解析 JSON 响应。Grammar 已约束输出，理论上应该合法。"""
+        """解析 JSON 响应，使用 Pydantic 验证字段类型和值范围。"""
         if not response:
             logger.warning("[Graph-LLM] JSON 解析失败: 响应为空")
             return []
 
-        json_str = response.strip().lstrip('﻿')
-        if json_str.startswith("```"):
-            lines = json_str.split("\n")
-            json_str = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+        json_str = _strip_code_block(response)
 
+        # 路径1: Pydantic 严格验证
+        data = _try_parse_json(json_str)
+        if data is not None:
+            validated = self._validate_triplet_response(data)
+            if validated is not None:
+                return validated
+
+        # 路径2: 截断恢复 + Pydantic 验证
+        truncated = _try_truncate_recover(json_str)
+        if truncated is not None:
+            validated = self._validate_triplet_response(truncated)
+            if validated is not None:
+                logger.warning(f"[Graph-LLM] JSON 截断恢复成功，提取 {len(validated)} 个三元组")
+                return validated
+
+        # 全部失败
+        logger.error(
+            f"[Graph-LLM] JSON 解析/验证全部失败，响应长度: {len(json_str)}，"
+            f"末尾内容: {repr(json_str[-200:] if len(json_str) > 200 else json_str)}"
+        )
+        self._save_failed_response(response, 0)
+        return []
+
+    def _validate_triplet_response(self, data: Any) -> List[Dict[str, Any]] | None:
+        """用 Pydantic 验证三元组数据，返回标准化列表或 None。"""
         try:
-            data = json.loads(json_str)
-            return self._extract_triplets(data)
-        except json.JSONDecodeError as e:
-            err_pos = e.pos if hasattr(e, 'pos') else 0
+            # 宽松模式：跳过无效的三元组而不是整体失败
+            if isinstance(data, dict):
+                raw_triplets = data.get("triplets", [])
+            elif isinstance(data, list):
+                raw_triplets = data
+            else:
+                return None
 
-            # 尝试截断恢复：从后向前找最后一个完整的 JSON 块
-            truncated_data = self._try_truncate_recover(json_str)
-            if truncated_data is not None:
-                logger.warning(f"[Graph-LLM] JSON 截断恢复成功，提取 {len(truncated_data.get('triplets', []))} 个三元组")
-                return self._extract_triplets(truncated_data)
+            if not isinstance(raw_triplets, list):
+                return None
 
-            # 恢复失败，记录完整响应用于调试
-            logger.error(
-                f"[Graph-LLM] JSON 解析失败: {e}，"
-                f"错误位置: {err_pos}，响应长度: {len(json_str)}，"
-                f"末尾内容: {repr(json_str[-200:] if len(json_str) > 200 else json_str)}"
-            )
-            # 记录原始响应到文件（用于调试）
-            self._save_failed_response(response, err_pos)
-            return []
-
-    def _try_truncate_recover(self, json_str: str) -> Optional[Dict]:
-        """尝试恢复被截断的 JSON。
-
-        策略：找到最后一个完整的三元组对象（以 }, 结尾），
-        然后关闭 JSON 数组和对象，重新解析。
-        """
-        if not json_str:
-            return None
-
-        # 策略1：找到最后一个 }, 并关闭 JSON
-        # 从后向前搜索 },（完整三元组对象的结束标志）
-        pos = len(json_str)
-        while True:
-            pos = json_str.rfind('},', 0, pos)
-            if pos == -1:
-                break
-            # 尝试在这里关闭 JSON：}, → }]}
-            candidate = json_str[:pos + 1] + ']}'
-            try:
-                data = json.loads(candidate)
-                if isinstance(data, dict) and 'triplets' in data:
-                    return data
-            except json.JSONDecodeError:
-                pass
-
-        # 策略2：单三元组场景 — 找到 "evidence" 字段结束的 } 并关闭
-        last_brace = json_str.rfind('}')
-        if last_brace > 0:
-            candidate = json_str[:last_brace + 1] + ']}'
-            try:
-                data = json.loads(candidate)
-                if isinstance(data, dict) and 'triplets' in data:
-                    return data
-            except json.JSONDecodeError:
-                pass
-
-        # 策略3：原有的 ] 搜索（处理已有关闭括号但嵌套错误的情况）
-        last_bracket = json_str.rfind(']')
-        if last_bracket > 0:
-            for i in range(last_bracket, 0, -1):
+            result: List[Dict[str, Any]] = []
+            for item in raw_triplets:
+                if not isinstance(item, dict):
+                    continue
                 try:
-                    candidate = json_str[:i + 1]
-                    if candidate.rstrip().endswith(']'):
-                        data = json.loads(candidate)
-                        if isinstance(data, dict) and 'triplets' in data:
-                            return data
-                except json.JSONDecodeError:
+                    t = Triplet.model_validate(item)
+                    result.append(t.model_dump())
+                except pydantic.ValidationError:
+                    # 单条无效不影响其余
                     continue
 
-        return None
+            result.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+            return result
+        except Exception as e:
+            logger.debug(f"[Graph-LLM] Pydantic 验证异常: {e}")
+            return None
+
 
     def _save_failed_response(self, response: str, err_pos: int):
         """保存解析失败的响应到文件用于调试"""
@@ -1822,65 +2069,67 @@ Extract triplets:"""
         except Exception as ex:
             logger.warning(f"[Graph-LLM] 保存失败响应失败: {ex}")
 
-    def _extract_triplets(self, data) -> List[Dict[str, Any]]:
-        """从解析后的数据中提取三元组"""
-        if isinstance(data, dict):
-            triplets = data.get("triplets", [])
-        elif isinstance(data, list):
-            triplets = data
-        else:
-            return []
-
-        if not isinstance(triplets, list):
-            return []
-
-        result = []
-        for item in triplets:
-            if not isinstance(item, dict):
-                continue
-            head = item.get("head")
-            relation = item.get("relation")
-            tail = item.get("tail")
-            if head and relation and tail:
-                result.append({
-                    "head": str(head),
-                    "head_type": item.get("head_type", ""),
-                    "relation": str(relation),
-                    "relation_type": item.get("relation_type", ""),
-                    "tail": str(tail),
-                    "tail_type": item.get("tail_type", ""),
-                    "confidence": float(item.get("confidence", 0.5)),
-                    "evidence": item.get("evidence", "")
-                })
-
-        result.sort(key=lambda x: x.get("confidence", 0), reverse=True)
-        return result
 
     def _parse_multimodal_response(self, response: str) -> Dict[str, Any]:
-        """解析多模态响应"""
+        """解析多模态响应，使用 Pydantic 验证。"""
         if not response or not isinstance(response, str):
             return {"text_triplets": [], "image_info": {}, "cross_modal_triplets": []}
 
-        json_str = response.strip().lstrip('\ufeff')
+        json_str = _strip_code_block(response)
 
-        if json_str.startswith("```"):
-            lines = json_str.split("\n")
-            json_str = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+        data = _try_parse_json(json_str)
+        if data is not None:
+            validated = self._validate_multimodal_response(data)
+            if validated is not None:
+                return validated
 
+        # 截断恢复
+        truncated = _try_truncate_recover(json_str)
+        if truncated is not None:
+            validated = self._validate_multimodal_response(truncated)
+            if validated is not None:
+                logger.info("[Graph-LLM] 多模态截断恢复成功")
+                return validated
+
+        return {"text_triplets": [], "image_info": {}, "cross_modal_triplets": []}
+
+    def _validate_multimodal_response(self, data: Any) -> Dict[str, Any] | None:
+        """用 Pydantic 验证多模态响应。"""
         try:
-            return json.loads(json_str)
-        except json.JSONDecodeError as e:
-            logger.warning(f"[Graph-LLM] 多模态 JSON 解析失败: {e}")
-            # 截断恢复：从后向前找到最后一个完整的 }
-            last_brace = json_str.rfind('}')
-            if last_brace > 0:
+            m = MultimodalExtraction.model_validate(data)
+            return m.model_dump()
+        except pydantic.ValidationError:
+            pass
+        # 宽松模式：部分解析
+        try:
+            if not isinstance(data, dict):
+                return None
+            text_triplets = []
+            for item in data.get("text_triplets", []):
                 try:
-                    truncated = json.loads(json_str[:last_brace + 1])
-                    logger.info(f"[Graph-LLM] 多模态截断恢复成功")
-                    return truncated
-                except json.JSONDecodeError:
-                    pass
-            return {"text_triplets": [], "image_info": {}, "cross_modal_triplets": []}
+                    text_triplets.append(Triplet.model_validate(item).model_dump())
+                except pydantic.ValidationError:
+                    continue
+            image_info = {}
+            try:
+                image_info = FigureInfo.model_validate(data.get("image_info", {})).model_dump()
+            except pydantic.ValidationError:
+                image_info = data.get("image_info", {})
+            cross_triplets = []
+            for item in data.get("cross_modal_triplets", []):
+                try:
+                    cross_triplets.append(CrossModalTriplet.model_validate(item).model_dump())
+                except pydantic.ValidationError:
+                    continue
+            if text_triplets or cross_triplets:
+                return {
+                    "text_triplets": text_triplets,
+                    "image_info": image_info,
+                    "cross_modal_triplets": cross_triplets,
+                }
+        except Exception:
+            pass
+        return None
 
 
 # ============================================================================

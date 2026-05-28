@@ -2,120 +2,9 @@ import asyncio
 import ast
 import importlib
 import sys
-import tempfile
-import types
 from pathlib import Path
 
-
-def _install_astrbot_stubs():
-
-    class DummyLogger:
-        def debug(self, *args, **kwargs):
-            pass
-
-        info = warning = error = debug
-
-    class DummyCommandGroup:
-        def __init__(self, func):
-            self.func = func
-
-        def __get__(self, instance, owner):
-            if instance is None:
-                return self
-            return self.func.__get__(instance, owner)
-
-        def command(self, _name):
-            def decorator(func):
-                return func
-
-            return decorator
-
-    def command_group(_name):
-        def decorator(func):
-            return DummyCommandGroup(func)
-
-        return decorator
-
-    def permission_type(_permission):
-        def decorator(func):
-            return func
-
-        return decorator
-
-    class DummyPermissionType:
-        ADMIN = "admin"
-
-    def register(*_args, **_kwargs):
-        def decorator(cls):
-            return cls
-
-        return decorator
-
-    class Context:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def register_llm_tool(self, *args, **kwargs):
-            pass
-
-        def unregister_llm_tool(self, *args, **kwargs):
-            pass
-
-    class Star:
-        def __init__(self, context, *args, config=None, **kwargs):
-            self.context = context
-
-        async def terminate(self):
-            pass
-
-    class AstrMessageEvent:
-        pass
-
-    class MessageChain:
-        def __init__(self):
-            self.parts = []
-
-        def message(self, text):
-            self.parts.append(text)
-
-        def file_image(self, path):
-            self.parts.append(path)
-
-    astrbot_mod = types.ModuleType("astrbot")
-    api_mod = types.ModuleType("astrbot.api")
-    event_mod = types.ModuleType("astrbot.api.event")
-    star_mod = types.ModuleType("astrbot.api.star")
-    message_mod = types.ModuleType("astrbot.core.message.message_event_result")
-
-    api_mod.logger = DummyLogger()
-    event_mod.AstrMessageEvent = AstrMessageEvent
-    event_mod.filter = types.SimpleNamespace(
-        command_group=command_group,
-        permission_type=permission_type,
-        PermissionType=DummyPermissionType,
-    )
-    star_mod.Context = Context
-    star_mod.Star = Star
-    star_mod.register = register
-    message_mod.MessageChain = MessageChain
-
-    sys.modules["astrbot"] = astrbot_mod
-    sys.modules["astrbot.api"] = api_mod
-    sys.modules["astrbot.api.event"] = event_mod
-    sys.modules["astrbot.api.star"] = star_mod
-    sys.modules["astrbot.core.message.message_event_result"] = message_mod
-
-
-class DummyEvent:
-    def __init__(self):
-        self.messages = []
-
-    def plain_result(self, text):
-        self.messages.append(text)
-        return text
-
-    async def send(self, _chain):
-        return None
+from ._test_utils import install_astrbot_stubs, DummyEvent, collect_async
 
 
 class FakeEngine:
@@ -132,15 +21,8 @@ class FakeEngine:
         return {"status": "success", "message": "cleared"}
 
 
-async def _collect(async_gen):
-    results = []
-    async for item in async_gen:
-        results.append(item)
-    return results
-
-
 def test_split_main_keeps_command_shell_and_paper_commands_callable():
-    _install_astrbot_stubs()
+    install_astrbot_stubs()
 
     plugin_parent = Path(__file__).resolve().parents[2]
     if str(plugin_parent) not in sys.path:
@@ -225,10 +107,10 @@ def test_split_main_keeps_command_shell_and_paper_commands_callable():
     plugin._idea_list = fake_idea_list
 
     event = DummyEvent()
-    assert asyncio.run(_collect(plugin.cmd_search(event, "query", 7))) == ["search-ok"]
-    assert asyncio.run(_collect(plugin.cmd_graph_restore(event, "demo.json.gz"))) == ["restore-ok"]
-    assert asyncio.run(_collect(plugin.cmd_graph_link(event, "status"))) == ["link-ok"]
-    assert asyncio.run(_collect(plugin.cmd_idea_list(event))) == ["idea-list-ok"]
+    assert asyncio.run(collect_async(plugin.cmd_search(event, "query", 7))) == ["search-ok"]
+    assert asyncio.run(collect_async(plugin.cmd_graph_restore(event, "demo.json.gz"))) == ["restore-ok"]
+    assert asyncio.run(collect_async(plugin.cmd_graph_link(event, "status"))) == ["link-ok"]
+    assert asyncio.run(collect_async(plugin.cmd_idea_list(event))) == ["idea-list-ok"]
     assert calls == [
         ("search", "query", 7),
         ("graph_restore", "demo.json.gz"),

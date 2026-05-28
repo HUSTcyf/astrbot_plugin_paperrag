@@ -6,8 +6,6 @@ from neo4j import GraphDatabase
 from pathlib import Path
 import json
 
-import os
-
 def _load_neo4j_password() -> str:
     """从插件配置文件读取 Neo4j 密码"""
     config_paths = [
@@ -35,17 +33,19 @@ LIMIT_EDGES = 10000   # 边数量限制
 
 OUTPUT_FILE = Path(__file__).parent / "graph_visualization.html"
 
-# 节点颜色配置（与 graph_style.grass 一致）
+# 节点颜色配置（与 closed-set 实体类型一致）
 NODE_COLORS = {
-    "Paper": "#3498DB",
-    "Author": "#E74C3C",
-    "Reference": "#F39C12",
-    "Concept": "#9B59B6",
-    "Institution": "#1ABC9C",
-    "Figure": "#2ECC71",
-    "Table": "#E67E22",
-    "Section": "#34495E",
-    "Chunk": "#95A5A6",
+    "Method": "#3498DB",
+    "Model": "#2ECC71",
+    "Task": "#E74C3C",
+    "Dataset": "#F39C12",
+    "Metric": "#9B59B6",
+    "Component": "#1ABC9C",
+    "Limitation": "#E67E22",
+    "Application": "#2C3E50",
+    "Baseline": "#95A5A6",
+    "Figure": "#FF6B6B",
+    "Table": "#FFD93D",
 }
 
 
@@ -71,15 +71,17 @@ def visualize_html():
 
     # 节点尺寸配置
     NODE_SIZES = {
-        "Paper": 30,
-        "Author": 20,
-        "Reference": 20,
-        "Concept": 15,
-        "Institution": 18,
-        "Figure": 15,
-        "Table": 15,
-        "Section": 12,
-        "Chunk": 8,
+        "Method": 25,
+        "Model": 30,
+        "Task": 22,
+        "Dataset": 20,
+        "Metric": 15,
+        "Component": 18,
+        "Limitation": 15,
+        "Application": 20,
+        "Baseline": 18,
+        "Figure": 12,
+        "Table": 12,
     }
 
     with driver.session() as session:

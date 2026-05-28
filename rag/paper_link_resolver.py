@@ -47,6 +47,7 @@ class LinkResolution:
     arxiv_url: str = ""
     github_url: str = ""
     doi_url: str = ""
+    url: str = ""  # generic link fallback (Semantic Scholar, PDF, etc.)
     backend: str = ""
     resolution_source: str = ""
     resolution_score: float = 0.0
@@ -65,7 +66,7 @@ class LinkResolution:
             self.score = self.resolution_score
 
     def has_any_url(self) -> bool:
-        return bool(self.arxiv_url or self.github_url or self.doi_url)
+        return bool(self.arxiv_url or self.github_url or self.doi_url or self.url)
 
 
 @dataclass
@@ -1268,7 +1269,8 @@ class PaperLinkResolver:
             return LinkResolution()
 
         norm_title = self.normalize_title(title)
-        best = None  # (score, doi_url, arxiv_url, matched_title)
+        best_ids = None  # (score, doi_url, arxiv_url, matched, paper_id)
+        best_no_ids = None  # (score, paper_id, matched) — matched but no DOI/arXiv
 
         for paper in papers[:5]:
             matched = paper.get("title", "")
@@ -1276,6 +1278,7 @@ class PaperLinkResolver:
             if score < 60:
                 continue
 
+            paper_id = paper.get("paperId", "")
             ext_ids = paper.get("externalIds", {}) or {}
             doi = (ext_ids.get("DOI") or "").strip()
             arxiv_id = (ext_ids.get("ArXiv") or "").strip()
@@ -1283,40 +1286,32 @@ class PaperLinkResolver:
             doi_url = f"https://doi.org/{doi}" if doi else ""
             arxiv_url = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else ""
 
-            if not doi_url and not arxiv_url:
-                continue
+            if doi_url or arxiv_url:
+                if best_ids is None or score > best_ids[0]:
+                    best_ids = (score, doi_url, arxiv_url, matched, paper_id)
+            elif paper_id and (best_no_ids is None or score > best_no_ids[0]):
+                best_no_ids = (score, paper_id, matched)
 
-            if best is None or score > best[0]:
-                best = (score, doi_url, arxiv_url, matched)
+        if best_ids is not None:
+            score, doi_url, arxiv_url, matched, _ = best_ids
+            if doi_url:
+                logger.info(f"  → SemanticScholar DOI ({score:.0f}%): {title[:60]}")
+                return LinkResolution(
+                    doi_url=doi_url, backend="SemanticScholar",
+                    resolution_score=score, matched_title=matched)
+            if arxiv_url:
+                logger.info(f"  → SemanticScholar arXiv ({score:.0f}%): {title[:60]}")
+                return LinkResolution(
+                    arxiv_url=arxiv_url, backend="SemanticScholar",
+                    resolution_score=score, matched_title=matched)
 
-        if best is None:
-            return LinkResolution()
-
-        score, doi_url, arxiv_url, matched = best
-
-        if doi_url:
-            logger.info(
-                f"  → SemanticScholar (相似度 {score:.1f}%): "
-                f"{title[:60]}"
-            )
+        if best_no_ids is not None:
+            score, paper_id, matched = best_no_ids
+            ss_url = f"https://www.semanticscholar.org/paper/{paper_id}"
+            logger.info(f"  → SemanticScholar link ({score:.0f}%): {title[:60]}")
             return LinkResolution(
-                doi_url=doi_url,
-                backend="SemanticScholar",
-                resolution_score=score,
-                matched_title=matched,
-            )
-
-        if arxiv_url:
-            logger.info(
-                f"  → SemanticScholar arXiv (相似度 {score:.1f}%): "
-                f"{arxiv_url} — {title[:60]}"
-            )
-            return LinkResolution(
-                arxiv_url=arxiv_url,
-                backend="SemanticScholar",
-                resolution_score=score,
-                matched_title=matched,
-            )
+                url=ss_url, backend="SemanticScholar",
+                resolution_score=score, matched_title=matched)
 
         return LinkResolution()
 
@@ -1346,9 +1341,10 @@ class PaperLinkResolver:
         if not results:
             return LinkResolution()
 
-        # Extract DOIs and arXiv IDs from all results
-        best_doi = None   # (doi_url,)
-        best_arxiv = None # (arxiv_url,)
+        # Extract best DOI, arXiv, or fallback link from results
+        best_doi = None
+        best_arxiv = None
+        best_link = None  # (url,) — fallback when no DOI/arXiv found
         for r in results:
             href = r.get("href", "") or ""
             body = r.get("body", "") or ""
@@ -1357,32 +1353,33 @@ class PaperLinkResolver:
             if best_doi is None:
                 dois = re.findall(r"10\.\d{4,}/[^\s\"'<>\])]+", combined)
                 if dois:
-                    best_doi = (f"https://doi.org/{dois[0]}",)
+                    best_doi = f"https://doi.org/{dois[0]}"
 
             if best_arxiv is None:
                 arxiv_ids = re.findall(r"arxiv\.org/abs/(\d{4}\.\d{4,})", combined)
                 if arxiv_ids:
-                    best_arxiv = (f"https://arxiv.org/abs/{arxiv_ids[0]}",)
+                    best_arxiv = f"https://arxiv.org/abs/{arxiv_ids[0]}"
+
+            if best_link is None and href and not href.startswith("https://doi.org") and "arxiv.org/abs" not in href:
+                best_link = href
 
             if best_doi and best_arxiv:
                 break
 
         if best_doi:
-            logger.info(f"  → WebSearch DOI: {best_doi[0]} — {title[:60]}")
+            logger.info(f"  → WebSearch DOI: {best_doi} — {title[:60]}")
             return LinkResolution(
-                doi_url=best_doi[0],
-                backend="WebSearch",
-                resolution_score=70.0,
-                matched_title=title,
-            )
-
+                doi_url=best_doi, backend="WebSearch",
+                resolution_score=70.0, matched_title=title)
         if best_arxiv:
-            logger.info(f"  → WebSearch arXiv: {best_arxiv[0]} — {title[:60]}")
+            logger.info(f"  → WebSearch arXiv: {best_arxiv} — {title[:60]}")
             return LinkResolution(
-                arxiv_url=best_arxiv[0],
-                backend="WebSearch",
-                resolution_score=70.0,
-                matched_title=title,
-            )
+                arxiv_url=best_arxiv, backend="WebSearch",
+                resolution_score=70.0, matched_title=title)
+        if best_link:
+            logger.info(f"  → WebSearch link: {title[:60]}")
+            return LinkResolution(
+                url=best_link, backend="WebSearch",
+                resolution_score=60.0, matched_title=title)
 
         return LinkResolution()
