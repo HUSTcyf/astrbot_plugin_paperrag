@@ -188,7 +188,7 @@ npx @larksuite/cli@latest install
 
 ```bash
 # 构建知识图谱（9 类实体 + 14 类关系）
-/paper graph_build
+/paper graph_build confirm          # 构建（支持 skip：graph_build confirm 30）
 
 # 查看图谱统计
 /paper graph_stats
@@ -213,12 +213,12 @@ RETURN n, r, m
 # 图谱维护
 /paper graph_rebuild confirm   # 重建图谱（清空后重新构建）
 /paper graph_clear confirm     # 清空图谱
-/paper graph_backup offline    # 备份图谱到本地文件
+/paper graph_backup              # 在线备份图谱（Cypher JSON 导出）
 /paper graph_restore <文件>    # 从备份恢复
 /paper graph_backup_list       # 列出可用备份
 ```
 
-> **使用云端大模型构建图谱**：在 AstrBot WebUI 中将当前会话 Provider 设为云端模型（如 DeepSeek、Qwen），`graph_build` 会自动使用该 Provider，且不设 `max_tokens` 限制。
+> **使用云端大模型构建图谱**：在插件配置中设置 `multimodal_provider_id`（如 `google_gemini/gemini-3.5-flash`、DeepSeek、Qwen 等），`graph_build` / `graph_rebuild` 会自动使用该 Provider 进行三元组提取。未配置时回退本地 GGUF 模型。
 
 ---
 
@@ -289,7 +289,7 @@ npx @larksuite/cli@latest install
 /paper add ./papers
 
 # 2) 构建知识图谱
-/paper graph_build
+/paper graph_build confirm
 
 # 3) 查询
 /paper search 扩散模型的加速采样方法有哪些？
@@ -346,9 +346,9 @@ npx @larksuite/cli@latest install
 
 | 命令 | 权限 | 说明 |
 |------|------|------|
-| `/paper graph_build` | 公开 | 构建知识图谱 |
+| `/paper graph_build confirm [skip]` | 公开 | 构建知识图谱（后台，检查点断点续传） |
 | `/paper graph_stats` | 公开 | 图谱统计信息 |
-| `/paper graph_link <实体>` | 公开 | 查询实体关系 |
+| `/paper graph_link [status\|create\|remove]` | 公开 | Neo4j 数据符号链接管理 |
 | `/paper graph_rebuild confirm` | 管理员 | 重建图谱 |
 | `/paper graph_clear confirm` | 管理员 | 清空图谱 |
 | `/paper graph_backup [online\|offline]` | 管理员 | 备份图谱 |
@@ -370,6 +370,7 @@ npx @larksuite/cli@latest install
 | `/idea del <UUID>` | 公开 | 删除指定想法 |
 | `/idea delete <主题>` | 公开 | 删除主题 + 文件夹 |
 | `/idea clear <主题>` | 公开 | 清空主题（保留文件夹） |
+| `/idea clean <主题>` | 公开 | 清理主题（删除文件夹） |
 | `/idea tofeishu <主题> [folder_token]` | 公开 | 导出飞书文档（lark-cli 优先，支持可点击链接） |
 | `/idea regen <UUID>` | 公开 | 重新生成指定想法 |
 
