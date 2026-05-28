@@ -604,11 +604,29 @@ Output:
 # ============================================================================
 
 def _strip_code_block(response: str) -> str:
-    """Strip markdown code block wrapper and BOM."""
+    """Extract JSON from response, handling markdown code blocks and pre-amble text.
+
+    Handles these LLM response patterns:
+      - `` ```json\\n{...}\\n``` ``
+      - `` preamble text\\n```json\\n{...}\\n``` ``
+      - `` {\\"triplets\\": [...]} `` (bare JSON)
+    """
     s = response.strip().lstrip('﻿')
-    if s.startswith("```"):
-        lines = s.split("\n")
-        s = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+    # Pattern 1 & 2: find code block markers
+    start = s.find("```")
+    if start != -1:
+        inner = s[start + 3:]  # after opening ```
+        if inner.startswith("json"):
+            inner = inner[4:]
+        inner = inner.lstrip("\n\r")
+        # Find closing ```
+        end = inner.rfind("```")
+        if end != -1:
+            return inner[:end].strip()
+        return inner.strip()
+
+    # Pattern 3: bare JSON
     return s
 
 
@@ -2036,10 +2054,13 @@ Extract triplets:"""
                     continue
                 try:
                     t = Triplet.model_validate(item)
-                    result.append(t.model_dump())
                 except pydantic.ValidationError:
-                    # 单条无效不影响其余
                     continue
+                d = t.model_dump()
+                # Skip self-referencing triplets (head == tail is semantically invalid)
+                if d["head"].strip().lower() == d["tail"].strip().lower():
+                    continue
+                result.append(d)
 
             result.sort(key=lambda x: x.get("confidence", 0), reverse=True)
             return result
