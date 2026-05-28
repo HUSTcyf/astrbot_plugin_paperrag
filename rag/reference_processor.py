@@ -903,54 +903,168 @@ class LLMReferenceParser:
         self.llm_config = llm_config
         self.arxiv_client = arxiv_client
         self._link_resolver = link_resolver
-        self._semaphore = None
 
     async def _call_llm(self, prompt: str, max_retries: int = 3) -> Optional[str]:
-        """Call LLM — uses provider.text_chat() if available, otherwise raw HTTP (freeapi)."""
-        if self._semaphore is None:
-            self._semaphore = asyncio.Semaphore(4)
+        """Call LLM for reference parsing.
+
+        Uses provider.text_chat() for all provider types (handles proxy,
+        timeout, key rotation, format conversion). Falls back to raw HTTP
+        (freeapi) when provider fails all retries.
+        """
+        if not self.llm_config:
+            logger.error("📝 LLM 配置为空，无法调用 LLM")
+            return None
 
         provider = self.llm_config.get("provider")
 
         if provider:
-            return await self._call_via_provider(prompt, provider, max_retries)
+            result = await self._call_via_provider(prompt, provider, max_retries)
+            if result is not None:
+                return result
+            # Provider 失败，回退到 freeapi（如果配置了）
+            api_url = self.llm_config.get("api_base", "")
+            if api_url:
+                logger.warning("📝 Provider 全部重试失败，回退到 freeapi HTTP 调用")
+                return await self._call_via_http(prompt, max_retries)
+            return None
 
         return await self._call_via_http(prompt, max_retries)
 
     async def _call_via_provider(
         self, prompt: str, provider, max_retries: int
     ) -> Optional[str]:
-        """Call LLM through AstrBot provider (handles all API formats)."""
-        logger.info(f"📝 [LLM调用:provider] 开始请求，prompt长度: {len(prompt)} 字符")
+        """Call LLM through AstrBot provider (handles all API formats).
+
+        For Google Gemini providers, calls the client directly with thinking
+        disabled and streaming enabled to avoid server-side timeout on
+        long-thinking requests. For other providers, falls back to the
+        standard stream or sync path.
+        """
+        is_gemini = type(provider).__name__ == 'ProviderGoogleGenAI'
+
+        logger.info(
+            f"📝 [LLM调用:provider] 开始请求，prompt长度: {len(prompt)} 字符"
+            f"，provider: {type(provider).__name__}"
+        )
 
         for attempt in range(max_retries):
             logger.info(f"📝 [LLM调用:provider] 尝试 {attempt + 1}/{max_retries}")
-            async with self._semaphore:
-                logger.info(f"📝 [LLM调用:provider] 获得信号量，开始请求...")
-                try:
-                    response = await provider.text_chat(prompt=prompt)
-                    content = response.completion_text
-                    if content:
-                        logger.info(
-                            f"📝 [LLM调用:provider] 提取到内容长度: {len(content)}"
-                        )
-                        return content
-                    else:
-                        logger.warning("⚠️ [LLM调用:provider] 返回空内容")
-                except Exception as e:
-                    logger.warning(
-                        f"⚠️ [LLM调用:provider] 请求异常: {type(e).__name__}: {e!r}"
+            try:
+                if is_gemini:
+                    content = await self._call_gemini_no_thinking(prompt, provider)
+                elif callable(getattr(provider, 'text_chat_stream', None)):
+                    content = await self._call_via_provider_stream(prompt, provider)
+                else:
+                    content = await self._call_via_provider_sync(prompt, provider)
+
+                if content and len(content) >= 50:
+                    logger.info(
+                        f"📝 [LLM调用:provider] 提取到内容长度: {len(content)}"
                     )
-                    await asyncio.sleep(3)
+                    return content
+
+                if content:
+                    logger.warning(
+                        f"⚠️ [LLM调用:provider] 响应内容过短 ({len(content)} 字符)，"
+                        f"可能被限流，5秒后重试..."
+                    )
+                    await asyncio.sleep(5)
                     continue
+                else:
+                    logger.warning("⚠️ [LLM调用:provider] 返回空内容")
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ [LLM调用:provider] 请求超时 (910s)")
+                await asyncio.sleep(3)
+                continue
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ [LLM调用:provider] 请求异常: {type(e).__name__}: {e!r}"
+                )
+                await asyncio.sleep(3)
+                continue
 
         logger.warning(f"⚠️ [LLM调用:provider] 重试 {max_retries} 次后仍失败")
         return None
 
+    async def _call_gemini_no_thinking(
+        self, prompt: str, provider
+    ) -> Optional[str]:
+        """Call Google Gemini directly with thinking disabled and streaming.
+
+        Bypasses provider.text_chat_stream to set thinking_budget=0, which
+        eliminates hidden reasoning tokens and dramatically speeds up
+        structured output generation for reference parsing.
+        """
+        from google.genai import types
+
+        model = provider.get_model()
+        config = types.GenerateContentConfig(
+            temperature=0.1,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        )
+        contents = [types.UserContent(parts=[types.Part.from_text(text=prompt)])]
+
+        accumulated = []
+        result = await provider.client.models.generate_content_stream(
+            model=model,
+            contents=contents,
+            config=config,
+        )
+        async for chunk in result:
+            if chunk.text:
+                accumulated.append(chunk.text)
+
+        return "".join(accumulated) if accumulated else None
+
+    async def _call_via_provider_stream(
+        self, prompt: str, provider
+    ) -> Optional[str]:
+        """Stream-based call that keeps connection alive for long requests.
+
+        Providers emit incremental chunks (is_chunk=True) then a final
+        response (is_chunk=False) with the full accumulated text.
+        """
+        final_text: Optional[str] = None
+        async for resp in provider.text_chat_stream(prompt=prompt):
+            if not resp.is_chunk and resp.completion_text:
+                final_text = resp.completion_text
+        return final_text
+
+    async def _call_via_provider_sync(
+        self, prompt: str, provider
+    ) -> Optional[str]:
+        """Non-stream call for providers without stream timeout issues."""
+        original_timeout = getattr(provider, 'timeout', 120)
+        client = getattr(provider, 'client', None)
+        original_client_timeout = getattr(client, 'timeout', None)
+        if client is not None:
+            try:
+                client.timeout = 900.0
+            except (AttributeError, TypeError):
+                pass
+        provider.timeout = 900
+
+        try:
+            response = await asyncio.wait_for(
+                provider.text_chat(prompt=prompt),
+                timeout=910,
+            )
+            return response.completion_text
+        finally:
+            try:
+                provider.timeout = original_timeout
+            except (AttributeError, TypeError):
+                pass
+            if client is not None and original_client_timeout is not None:
+                try:
+                    client.timeout = original_client_timeout
+                except (AttributeError, TypeError):
+                    pass
+
     async def _call_via_http(
         self, prompt: str, max_retries: int
     ) -> Optional[str]:
-        """Call LLM via raw HTTP (OpenAI-compatible API, used by freeapi)."""
+        """Call LLM via raw HTTP (OpenAI-compatible API). Used for freeapi fallback."""
         url = f"{self.llm_config['api_base']}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.llm_config.get('api_key', 'sk-placeholder')}",
@@ -959,53 +1073,57 @@ class LLMReferenceParser:
         data = {
             "model": self.llm_config["model"],
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.1,
             "max_tokens": self.llm_config.get("max_tokens", 32768),
         }
+        temperature = self.llm_config.get("temperature")
+        if temperature is not None:
+            data["temperature"] = temperature
+
+        # Disable thinking mode for models that output reasoning by default
+        # which breaks structured JSON response parsing
+        model_lower = self.llm_config["model"].lower()
+        if "glm" in model_lower or "deepseek" in model_lower:
+            data["thinking"] = {"type": "disabled"}
 
         logger.info(f"📝 [LLM调用] 开始请求，prompt长度: {len(prompt)} 字符")
 
         for attempt in range(max_retries):
             logger.info(f"📝 [LLM调用] 尝试 {attempt + 1}/{max_retries}")
-            async with self._semaphore:
-                logger.info(f"📝 [LLM调用] 获得信号量，开始请求...")
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(url, headers=headers, json=data, timeout=aiohttp.ClientTimeout(total=600)) as resp:
-                            logger.info(f"📝 [LLM调用] 收到响应状态码: {resp.status}")
-                            if resp.status == 429:
-                                # 速率限制，等待后重试
-                                retry_after = int(resp.headers.get("Retry-After", 5))
-                                logger.warning(f"⚠️ LLM API 速率限制 (429)，{retry_after}秒后重试... (尝试 {attempt + 1}/{max_retries})")
-                                await asyncio.sleep(retry_after)
-                                continue
-                            if resp.status == 500:
-                                # 服务器错误，等待后重试
-                                logger.warning(f"⚠️ LLM API 服务器错误 (500)，5秒后重试... (尝试 {attempt + 1}/{max_retries})")
-                                await asyncio.sleep(5)
-                                continue
-                            if resp.status != 200:
-                                text = await resp.text()
-                                logger.warning(f"⚠️ LLM API 请求失败: HTTP {resp.status}, 响应前200字符: {text[:200]}")
-                                return None
-                            # 检查 Content-Type，200 但非 JSON 时打印响应体
-                            content_type = resp.headers.get("Content-Type", "")
-                            if "application/json" not in content_type:
-                                body = await resp.text()
-                                logger.warning(f"⚠️ LLM API 返回非JSON (Content-Type={content_type})，响应体前200字符: {body[:200]}")
-                                return None
-                            result = await resp.json()
-                            logger.info(f"📝 [LLM调用] 响应解析成功")
-                except asyncio.TimeoutError:
-                    logger.warning("⚠️ LLM API 请求超时")
-                    await asyncio.sleep(3)
-                    continue
-                except Exception as e:
-                    logger.warning(f"⚠️ LLM API 请求异常: {e}")
-                    await asyncio.sleep(3)
-                    continue
+            try:
+                async with aiohttp.ClientSession(trust_env=False) as session:
+                    async with session.post(url, headers=headers, json=data, timeout=aiohttp.ClientTimeout(total=900)) as resp:
+                        logger.info(f"📝 [LLM调用] 收到响应状态码: {resp.status}")
+                        if resp.status == 429:
+                            retry_after = int(resp.headers.get("Retry-After", 5))
+                            logger.warning(f"⚠️ LLM API 速率限制 (429)，{retry_after}秒后重试... (尝试 {attempt + 1}/{max_retries})")
+                            await asyncio.sleep(retry_after)
+                            continue
+                        if resp.status == 500:
+                            logger.warning(f"⚠️ LLM API 服务器错误 (500)，5秒后重试... (尝试 {attempt + 1}/{max_retries})")
+                            await asyncio.sleep(5)
+                            continue
+                        if resp.status != 200:
+                            text = await resp.text()
+                            redacted = re.sub(r'(key|token|secret|Authorization)[=:]\s*\S+', r'\1=***', text, flags=re.IGNORECASE)
+                            logger.warning(f"⚠️ LLM API 请求失败: HTTP {resp.status}, {redacted[:300]}")
+                            return None
+                        body = await resp.text()
+                        try:
+                            result = json.loads(body)
+                        except json.JSONDecodeError:
+                            logger.warning(f"⚠️ LLM API 返回非JSON，响应前200字符: {body[:200]}")
+                            return None
+                        logger.info(f"📝 [LLM调用] 响应解析成功")
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ LLM API 请求超时")
+                await asyncio.sleep(3)
+                continue
+            except Exception as e:
+                logger.warning(f"⚠️ LLM API 请求异常: {e}")
+                await asyncio.sleep(3)
+                continue
 
-            # 提取响应内容（在信号量外部执行）
+            # 提取响应内容
             logger.info(f"📝 [LLM调用] 解析响应内容...")
             try:
                 choices = result.get("choices", [])
@@ -1021,6 +1139,16 @@ class LLMReferenceParser:
                 message = choices[0].get("message", {})
                 content = message.get("content", "")
                 logger.info(f"📝 [LLM调用] 提取到内容长度: {len(content) if content else 0}")
+                if not content:
+                    logger.warning("⚠️ [LLM调用] 返回空内容")
+                    await asyncio.sleep(3)
+                    continue
+                if len(content) < 50:
+                    logger.warning(
+                        f"⚠️ [LLM调用] 响应内容过短 ({len(content)} 字符)，可能被限流，5秒后重试..."
+                    )
+                    await asyncio.sleep(5)
+                    continue
                 return content
             except Exception as e:
                 logger.warning(f"⚠️ 解析 LLM 响应失败: {e}")
@@ -1038,7 +1166,7 @@ class LLMReferenceParser:
         """
         解析整段参考文献文本（让LLM自动分割+解析）
 
-        当文本超过16384 tokens时，自动分批处理，每批按序号分割避免截断参考文献。
+        超过 15000 字符时按序号边界分批，避免单次请求过大导致超时。
 
         Args:
             ref_section: 参考文献部分的完整文本（可能跨多行）
@@ -1051,37 +1179,99 @@ class LLMReferenceParser:
         if not ref_section or not ref_section.strip():
             return []
 
-        from rag.token_utils import count_tokens
+        text_length = len(ref_section)
+        logger.info(f"📝 开始 LLM 参考文献解析，文本长度: {text_length} 字符")
 
-        token_count = count_tokens(ref_section)
-        logger.info(f"📝 开始 LLM 参考文献解析，文本长度: {len(ref_section)} 字符, {token_count} tokens")
-
-        max_tokens = 16384
-
-        if token_count > max_tokens:
-            logger.info(f"📝 文本超过{max_tokens} tokens，自动分批处理")
-            batches = self._split_reference_section_by_numbers(ref_section, max_tokens=max_tokens)
-            logger.info(f"📝 分成 {len(batches)} 批进行处理")
+        # 超过 15000 字符时分批处理（约 4000 tokens，安全上限）
+        if text_length > 15000:
+            batches = self._split_reference_section_by_numbers(ref_section, max_chars=15000)
+            logger.info(f"📝 分为 {len(batches)} 批进行处理（串行）")
 
             all_results = []
             for i, batch_text in enumerate(batches):
-                batch_tokens = count_tokens(batch_text)
-                logger.info(f"📝 处理第 {i+1}/{len(batches)} 批，tokens: {batch_tokens}")
-                batch_results = await self._parse_single_batch(batch_text, ref_id_prefix, i)
-                all_results.extend(batch_results)
+                if i > 0:
+                    await asyncio.sleep(5)
+                batch_prefix = f"{ref_id_prefix}_{i}"
+                try:
+                    results = await self._parse_single_batch(batch_text, batch_prefix, i)
+                    all_results.extend(results)
+                except Exception as e:
+                    logger.warning(f"📝 批次 {batch_prefix} 处理异常: {e}")
+                    continue
 
+            # 重新编号
             for j, ref in enumerate(all_results):
                 ref.ref_id = f"{ref_id_prefix}_{j + 1}"
 
+            # 统一 arXiv 富化
             await self._enrich_references(all_results, enable_fallback_search=enable_fallback_search)
-            logger.info(f"📚 LLM 解析参考文献: 成功 {len(all_results)} 条")
+
+            logger.info(f"📚 LLM 解析参考文献: 成功 {len(all_results)} 条 ({len(batches)} 批次)")
             return all_results
 
+        # 正常单次处理
         results = await self._parse_single_batch(ref_section, ref_id_prefix, 0)
         if results:
             await self._enrich_references(results, enable_fallback_search=enable_fallback_search)
-        logger.info(f"📚 LLM 解析参考文献: 成功 {len(results)} 条")
-        return results or []
+        return results
+
+    def _split_reference_section_by_numbers(
+        self,
+        ref_section: str,
+        max_chars: int = 15000
+    ) -> List[str]:
+        """
+        按参考文献序号分割文本，确保每批不超过 max_chars 字符
+
+        分割点: [1], [2], 1., 2., [12], [123] 等序号模式
+        每批按序号分割，避免参考文献被从中间截断
+        """
+        lines = ref_section.split('\n')
+        batches = []
+        current_batch = []
+        current_char_count = 0
+
+        for line in lines:
+            line_char_count = len(line)
+
+            if current_char_count + line_char_count > max_chars and current_batch:
+                is_new_ref = bool(re.match(r'^\s*\[?\d+\]?\s*[\.\:]', line.strip()))
+
+                if not is_new_ref and current_char_count < max_chars * 0.9:
+                    current_batch.append(line)
+                    current_char_count += line_char_count
+                    continue
+
+                batches.append('\n'.join(current_batch))
+                current_batch = []
+                current_char_count = 0
+
+            current_batch.append(line)
+            current_char_count += line_char_count
+
+        if current_batch:
+            batches.append('\n'.join(current_batch))
+
+        # 二次分割：强制截断仍超限的批次
+        final_batches = []
+        for batch in batches:
+            if len(batch) > max_chars:
+                sub_lines = batch.split('\n')
+                sub_batch = []
+                sub_char_count = 0
+                for line in sub_lines:
+                    if sub_char_count + len(line) > max_chars and sub_batch:
+                        final_batches.append('\n'.join(sub_batch))
+                        sub_batch = []
+                        sub_char_count = 0
+                    sub_batch.append(line)
+                    sub_char_count += len(line)
+                if sub_batch:
+                    final_batches.append('\n'.join(sub_batch))
+            else:
+                final_batches.append(batch)
+
+        return final_batches
 
     async def _parse_single_batch(
         self,
@@ -1149,54 +1339,6 @@ class LLMReferenceParser:
         except Exception as e:
             logger.warning(f"⚠️ 批次 {batch_index+1}: 参考文献解析失败: {e}")
             return []
-
-    def _split_reference_section_by_numbers(
-        self,
-        ref_section: str,
-        max_tokens: int = 16384
-    ) -> List[str]:
-        """
-        按参考文献序号分割文本，确保每批不超过 max_tokens tokens
-
-        分割点: [1], [2], 1., 2., [12], [123] 等序号模式
-        每批按序号分割，避免参考文献被从中间截断
-
-        Args:
-            ref_section: 参考文献文本
-            max_tokens: 每批最大 token 数
-
-        Returns:
-            分割后的文本列表
-        """
-        from rag.token_utils import count_tokens
-
-        lines = ref_section.split('\n')
-        batches = []
-        current_batch = []
-        current_token_count = 0
-
-        for line in lines:
-            line_tokens = count_tokens(line)
-
-            if current_token_count + line_tokens > max_tokens and current_batch:
-                is_new_ref = bool(re.match(r'^\s*\[?\d+\]?\s*[\.\:]', line.strip()))
-
-                if not is_new_ref and current_token_count < max_tokens * 0.9:
-                    current_batch.append(line)
-                    current_token_count += line_tokens
-                    continue
-
-                batches.append('\n'.join(current_batch))
-                current_batch = []
-                current_token_count = 0
-
-            current_batch.append(line)
-            current_token_count += line_tokens
-
-        if current_batch:
-            batches.append('\n'.join(current_batch))
-
-        return batches
 
     async def parse_references(
         self,
@@ -1393,9 +1535,7 @@ class LLMReferenceParser:
         策略（按优先级）：
         1. PaperLinkResolver（Crossref → OpenAlex → arXiv library）— 模糊匹配
         2. arXiv MCP（DOI 精确搜索）— 兜底
-        3. 回退搜索（仅 enable_fallback_search=True 时）:
-           a. 原始参考文献文本搜索（raw_snippet）
-           b. 作者 + 年份 + 标题关键词组合搜索
+        3. Semantic Scholar 标题匹配 — 最终回退（仅 enable_fallback_search=True 时）
         4. 都失败则保留 LLM 原始解析结果，记录日志
 
         Args:
@@ -1407,7 +1547,7 @@ class LLMReferenceParser:
 
         enriched_by_link_resolver = 0
         enriched_by_arxiv_mcp = 0
-        enriched_by_fallback = 0
+        enriched_by_web_search = 0
 
         sem = asyncio.Semaphore(10)
 
@@ -1572,109 +1712,60 @@ class LLMReferenceParser:
                 elif isinstance(r, Exception):
                     logger.warning(f"📝 [批量增强] 单条引用处理异常: {r}")
 
-        # ---- 第三优先：回退搜索（仅在 reparse 时启用） ----
+        # ---- Fallback tiers: Semantic Scholar → DDG web search ----
         if enable_fallback_search and self._link_resolver is not None:
-            for ref in references:
-                if not ref or not ref.ref_title or len(ref.ref_title) <= 5:
-                    continue
-                # 已有链接的跳过
-                if ref.ref_doi or ref.ref_arxiv_url:
-                    continue
+            # Helper: collect refs still missing links
+            def _unresolved():
+                return [r for r in references if r and r.ref_title
+                        and len(r.ref_title) > 5
+                        and not r.ref_doi and not r.ref_arxiv_url]
 
-                author_hint = ref.ref_authors or ""
-                ref_resolved = False
+            # Helper: apply resolution result to a ref
+            def _apply(ref, resolution):
+                if resolution.doi_url and not ref.ref_doi:
+                    ref.ref_doi = resolution.doi_url.replace("https://doi.org/", "")
+                if resolution.arxiv_url and not ref.ref_arxiv_url:
+                    ref.ref_arxiv_url = resolution.arxiv_url
+                if resolution.matched_title and resolution.resolution_score >= 85:
+                    ref.ref_title = resolution.matched_title
 
-                # 回退 1: 用 raw_snippet（原始参考文献文本）搜索
-                raw_snippet = (ref.raw_text or "").strip()
-                if raw_snippet and len(raw_snippet) > 20:
+            # Tier 3: Semantic Scholar title match
+            missing = _unresolved()
+            if missing:
+                logger.info(f"📝 [SemanticScholar] {len(missing)} refs to try...")
+                ss_matched = 0
+                for ref in missing[:10]:  # cap at 10
                     try:
-                        # 截取前 300 字符作为搜索查询（太长的原始文本可能引入噪声）
-                        raw_query = raw_snippet[:300]
-                        resolution = await self._link_resolver.resolve_by_title(
-                            raw_query, author_hint=author_hint
-                        )
-                        if resolution.has_any_url():
-                            if resolution.doi_url and not ref.ref_doi:
-                                ref.ref_doi = resolution.doi_url.replace("https://doi.org/", "")
-                            if resolution.arxiv_url and not ref.ref_arxiv_url:
-                                ref.ref_arxiv_url = resolution.arxiv_url
-                            if resolution.matched_title and resolution.resolution_score >= 85:
-                                ref.ref_title = resolution.matched_title
-                            enriched_by_fallback += 1
-                            ref_resolved = True
-                            logger.info(
-                                f"📝 [回退-raw] {resolution.backend} 匹配成功 "
-                                f"(相似度 {resolution.resolution_score:.1f}%): "
-                                f"{ref.ref_title[:60]}"
-                            )
+                        r = await self._link_resolver._resolve_via_semantic_scholar(ref.ref_title)
+                        if r.has_any_url():
+                            _apply(ref, r)
+                            enriched_by_web_search += 1
+                            ss_matched += 1
+                            logger.info(f"📝 [SemanticScholar] {r.backend} ({r.resolution_score:.0f}%): {ref.ref_title[:60]}")
                     except Exception as e:
-                        logger.debug(f"📝 [回退-raw] 异常: {ref.ref_title[:60]} — {e}")
+                        logger.debug(f"📝 [SS] {ref.ref_title[:40]} — {type(e).__name__}")
 
-                if ref_resolved:
-                    continue
+                if ss_matched == 0:
+                    logger.info(f"📝 [SemanticScholar] no matches (papers likely not in academic index)")
 
-                # 回退 2: 作者 + 年份 + 标题关键词组合搜索
-                if author_hint or ref.ref_year:
+            # Tier 4: DDG web search for remaining refs
+            missing = _unresolved()
+            if missing:
+                logger.info(f"📝 [WebSearch] {len(missing)} refs remain, searching web...")
+                web_matched = 0
+                for ref in missing[:10]:
                     try:
-                        # 取第一作者姓氏 + 年份 + 标题前 5 个词
-                        first_author = author_hint.split(",")[0].strip() if author_hint else ""
-                        # 提取姓氏（最后一个词通常为姓氏）
-                        first_author_parts = first_author.split()
-                        last_name = first_author_parts[-1] if first_author_parts else first_author
-                        # 去掉标题中的特殊字符，取前几个词
-                        title_words = re.sub(r'[^\w\s]', ' ', ref.ref_title).split()
-                        title_keywords = " ".join(title_words[:5]) if len(title_words) > 5 else ref.ref_title
-
-                        parts = [p for p in [last_name, str(ref.ref_year or ""), title_keywords] if p]
-                        combined_query = " ".join(parts)
-
-                        if len(combined_query) > 15:
-                            resolution = await self._link_resolver.resolve_by_title(
-                                combined_query, author_hint=author_hint
-                            )
-                            if resolution.has_any_url():
-                                if resolution.doi_url and not ref.ref_doi:
-                                    ref.ref_doi = resolution.doi_url.replace("https://doi.org/", "")
-                                if resolution.arxiv_url and not ref.ref_arxiv_url:
-                                    ref.ref_arxiv_url = resolution.arxiv_url
-                                if resolution.matched_title and resolution.resolution_score >= 85:
-                                    ref.ref_title = resolution.matched_title
-                                enriched_by_fallback += 1
-                                ref_resolved = True
-                                logger.info(
-                                    f"📝 [回退-author+year] {resolution.backend} 匹配成功 "
-                                    f"(相似度 {resolution.resolution_score:.1f}%): "
-                                    f"{ref.ref_title[:60]}"
-                                )
+                        r = await self._link_resolver._resolve_via_web_search(ref.ref_title)
+                        if r.has_any_url():
+                            _apply(ref, r)
+                            enriched_by_web_search += 1
+                            web_matched += 1
+                            logger.info(f"📝 [WebSearch] {r.backend}: {ref.ref_title[:60]}")
                     except Exception as e:
-                        logger.debug(f"📝 [回退-author+year] 异常: {ref.ref_title[:60]} — {e}")
+                        logger.debug(f"📝 [WS] {ref.ref_title[:40]} — {type(e).__name__}")
 
-                if ref_resolved:
-                    continue
-
-                # 回退 3: 只用原始文本搜索（无 author_hint，避免误导）
-                if raw_snippet and len(raw_snippet) > 20 and not ref_resolved:
-                    try:
-                        raw_query = raw_snippet[:300]
-                        resolution = await self._link_resolver.resolve_by_title(raw_query)
-                        if resolution.has_any_url():
-                            if resolution.doi_url and not ref.ref_doi:
-                                ref.ref_doi = resolution.doi_url.replace("https://doi.org/", "")
-                            if resolution.arxiv_url and not ref.ref_arxiv_url:
-                                ref.ref_arxiv_url = resolution.arxiv_url
-                            if resolution.matched_title and resolution.resolution_score >= 85:
-                                ref.ref_title = resolution.matched_title
-                            enriched_by_fallback += 1
-                            logger.info(
-                                f"📝 [回退-raw-only] {resolution.backend} 匹配成功 "
-                                f"(相似度 {resolution.resolution_score:.1f}%): "
-                                f"{ref.ref_title[:60]}"
-                            )
-                    except Exception as e:
-                        logger.debug(f"📝 [回退-raw-only] 异常: {ref.ref_title[:60]} — {e}")
-
-            if enriched_by_fallback > 0:
-                logger.info(f"📝 回退搜索成功: {enriched_by_fallback} 条")
+                if web_matched > 0:
+                    logger.info(f"📝 [WebSearch] found {web_matched}")
 
         # 统计链接覆盖率
         has_doi = 0
@@ -1698,8 +1789,8 @@ class LLMReferenceParser:
             f"多源解析 {enriched_by_link_resolver} 条",
             f"arXiv MCP {enriched_by_arxiv_mcp} 条",
         ]
-        if enriched_by_fallback > 0:
-            parts.append(f"回退搜索 {enriched_by_fallback} 条")
+        if enriched_by_web_search > 0:
+            parts.append(f"回退搜索 {enriched_by_web_search} 条")
         logger.info(
             f"📝 参考文献富化完成: {', '.join(parts)}, "
             f"总计 {len(references)} 条"
@@ -2002,7 +2093,7 @@ async def repair_links_for_paper(
     Args:
         file_name: Paper file name (key in paper_doc_stats.json).
         llm_config: LLM config dict for optional polluted-title re-extraction.
-        enable_fallback_search: Enable 3-tier fallback search for unresolved refs.
+        enable_fallback_search: Enable Semantic Scholar fallback for unresolved refs.
 
     Returns:
         {"file_name": str, "total": int, "linked_before": int, "linked_after": int,
@@ -2090,7 +2181,7 @@ async def process_references_with_llm(
     text: str,
     llm_config: Dict[str, Any],
     arxiv_client: Any = None,
-    enable_fallback_search: bool = False,
+    enable_fallback_search: bool = True,
 ) -> Tuple[List[Reference], List[Any]]:
     """
     使用 LLM 解析参考文献并建立引用关联
@@ -2103,7 +2194,7 @@ async def process_references_with_llm(
         text: PDF 原始文本
         llm_config: LLM 配置字典，包含 model、api_base、api_key
         arxiv_client: arXiv MCP 客户端（可选）
-        enable_fallback_search: 启用回退搜索（raw_snippet / author+year+keywords）
+        enable_fallback_search: 启用网络搜索回退（仅 reparse/repair 命令时启用）
 
     Returns:
         (references列表, 更新后的chunks列表)

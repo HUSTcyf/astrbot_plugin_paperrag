@@ -6,18 +6,17 @@
 
 ### 本版变化 (v2.2.1)
 
-- **LLM Provider 集成**：`_call_llm()` 重构为 `provider.text_chat()` 主路径 + HTTP 回退，解决 Gemini 等非 OpenAI 兼容模型的不可达问题。Provider 代理/超时/密钥轮换全面生效。
-- **Token 精确分片**：tiktoken `cl100k_base` 替代字符估算，统一 16384 token 阈值（云端和本地 LLM 一致）。
-- **并行富化加速**：`asyncio.gather` + `Semaphore(10)`，参考文献富化 5.4x 加速（100 refs: ~7min → ~1.3min）。
-- **OpenAlex 异步化**：`pyalex` → `httpx` 原生异步 REST API，消除线程池开销。
-- **3 层回退搜索**：参考文献链接解析失败时，自动退至 raw_snippet → author+year+keywords → raw_snippet only 三层搜索。
+- **⚠️ LLM Provider 思考模式处理**：参考文献解析需要 LLM 返回**纯 JSON**。推理模型的思考/推理 tokens 会破坏 JSON 解析。目前**自动关闭**的模型：Gemini（`thinking_budget=0`）、DeepSeek（`"thinking": {"type": "disabled"}`）、GLM（同上）。其他 provider 使用默认配置（大部分模型默认不开启思考模式，但若使用 o-series/reasoner 模型需手动在 AstrBot 配置中关闭）。详见下方 [⚠️ LLM 思考模式说明](#-llm-思考模式说明)。
+- **LLM Provider 多路径**：provider 三重路径（Gemini → stream → sync），HTTP 作为最终回退。
+- **参考文献 4 层解析链路**：Crossref → OpenAlex → arXiv Library → Semantic Scholar → DDG 网络搜索。每层失败后自动退至下一层。
+- **arXiv 限流保护**：`_arxiv_lock` 全局串行化 + `_MIN_ARXIV_INTERVAL=2s` 最小间隔，初始化健康检查用真实查询替代 `"test"` 缓存命中，`num_retries=0` 避免 429 时浪费重试时间。
+- **字符分片回退**：移除 tiktoken 依赖，回归 `15000` 字符阈值（≈4000 tokens），按参考文献序号边界分割 + 二次强制拆分兜底。
+- **并行富化加速**：`asyncio.gather` + `Semaphore(10)`，参考文献富化 5.4x 加速。
+- **OpenAlex 异步化**：`pyalex` → `httpx` 原生异步 REST API。
 - **智能引用修复**：`classify_papers_for_repair()` 自动分类论文为 full_reparse / link_only 两种策略，`/paper repair_refs confirm` 一键修复所有未链接引用。
 - **新命令**：`/paper reparseref <file>`（单篇重解析）、`/paper repair_refs confirm`（智能批量修复）。
-- **命令重写**：`/paper reparse_zero_ref confirm`（轻量方案）、`/paper refstats -1`（质量报告）。
-- **cited_ref_ids 同步**：`sync_cited_ref_ids_for_paper()` 在 reparse 后自动更新 Milvus chunk 的引用映射，防止静默数据错误。
-- **Polluted Title 检测增强**：新增 URL 检测（`^https?://`），识别 4 类噪声标题（编号/作者名/URL/标题等于作者）。
-- **独立诊断脚本**：`verify_unlinked_refs.py` 支持 `--execute`/`--link-only`/`--full-only` 模式。
-- **Bug 修复**：Gemini 超时（120s→600s）、Debate 测试 mock 路径、closed_set_schema builder 初始化。
+- **enable_fallback_search 默认开启**：正常 ingestion 流程也启用 Semantic Scholar + DDG fallback。
+- **test/ 清理**：移除 8 个 mock-heavy 测试文件（4368 行），保留 10 个有真实代码路径覆盖的测试。
 - 完整变更详见 [docs/changelog/2.2.1.md](docs/changelog/2.2.1.md)
 
 ### 上版变化 (v2.2.0)
@@ -373,6 +372,35 @@ npx @larksuite/cli@latest install
 | `multimodal_provider_id` | 多模态问答 LLM | 空（使用本地 VLM） |
 | `text_llm_temperature` | 文本 LLM 温度 | `0.7` |
 | `text_llm_max_tokens` | 文本 LLM 最大 token 数 | `2048` |
+
+### ⚠️ LLM 思考模式说明
+
+参考文献解析依赖 LLM 输出**纯 JSON**。如果 LLM 开启了思考/推理模式，响应中会包含 `<think>` 标签或 `reasoning_content` 字段，导致 JSON 解析失败，参考文献解析**静默返回空结果**。
+
+**插件已自动关闭思考模式的 Provider：**
+
+| Provider | 路径 | 方式 |
+|----------|------|------|
+| Google Gemini | `_call_via_provider` → `_call_gemini_no_thinking` | `ThinkingConfig(thinking_budget=0)` |
+| DeepSeek | `_call_via_http`（HTTP 回退） | `"thinking": {"type": "disabled"}` |
+| GLM（智谱） | `_call_via_http`（HTTP 回退） | `"thinking": {"type": "disabled"}` |
+
+**以下情况不会自动关闭思考模式，需要用户手动处理：**
+
+| 场景 | 原因 | 解决方案 |
+|------|------|---------|
+| DeepSeek/GLM 走 Provider 路径（非 HTTP 回退） | `_call_via_provider_stream/sync` 不修改请求参数 | 在 AstrBot Provider 配置中将模型设为**非 reasoning 版本**（如 `deepseek-chat` 替代 `deepseek-reasoner`） |
+| OpenAI o-series（o3, o4-mini 等） | 插件不支持 `reasoning_effort` 参数 | 在 Provider 配置中使用非 reasoning 模型（如 `gpt-4o`） |
+| Qwen/其他支持思考的模型 | 插件未针对这些模型做特殊处理 | 在 AstrBot Provider 配置中关闭思考模式，或使用非 reasoning 版本 |
+| Anthropic Claude（Opus 4.6+ adaptive thinking） | Claude 默认不开启 extended thinking | 一般不需要处理；若 Provider 配置了 `thinking` 参数，去掉即可 |
+
+**如何判断是否受此问题影响？**
+
+1. 使用 `/paper reparseref <文件名>` 命令测试
+2. 观察 AstrBot 日志，如果看到 `JSON 解析失败` 或 `无法从 LLM 响应中提取 JSON` 且 LLM 原始输出中有 `<think>` 标签或大量推理文本，说明思考模式未关闭
+3. 同等条件下参考文献解析返回 0 条结果
+
+**不想手动处理的临时方案**：配置 `freeapi_url` + `freeapi_key` 作为备用 LLM。当 Provider 路径失败时，插件会自动回退到 HTTP 路径（该路径对 DeepSeek/GLM 自动关闭思考模式）。
 
 ### Llama.cpp 本地 VLM
 

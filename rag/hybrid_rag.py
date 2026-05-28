@@ -2185,33 +2185,54 @@ class HybridRAGEngine:
     async def _resolve_llm_config(self) -> dict:
         """Resolve LLM config for reference parsing.
 
-        Priority: provider (when text_provider_id is set) → freeapi (local VLM fallback).
+        For OpenAI-compatible providers (ModelScope, etc.), extracts the
+        provider's own API config so _call_via_http can call it directly,
+        bypassing AstrBot's provider wrapper (which may have parsing issues).
 
-        Returns empty dict if neither source is available.
+        Falls back to freeapi if no provider is available.
         """
         if not getattr(self.config, 'enable_llm_reference_parsing', True):
             return {}
 
-        text_provider_id = getattr(self.config, 'text_provider_id', '') or ''
+        config = {}
 
-        # Priority 1: configured provider (cloud LLM) — uses provider.text_chat()
+        # Priority 1: configured provider (AstrBot plugin LLM)
+        text_provider_id = getattr(self.config, 'text_provider_id', '') or ''
         if text_provider_id:
             try:
                 provider = await self._ensure_llm_initialized()
                 if provider:
                     model = getattr(provider, 'model', None) or getattr(provider, 'model_name', None) or 'unknown'
-                    logger.debug(f"📝 使用 Provider 进行 LLM 参考文献解析 ({model})")
-                    return {"provider": provider}
-                logger.warning("⚠️ Provider 初始化失败，尝试 fallback...")
-            except Exception as e:
-                logger.warning(f"⚠️ 无法获取 Provider: {e}，尝试 fallback...")
+                    config["provider"] = provider
 
-        # Priority 2: freeapi config (fallback when no provider, e.g. local VLM mode)
+                    # For OpenAI-compatible providers, extract API config
+                    # so _call_via_http can call the provider directly as fallback
+                    pc = getattr(provider, 'provider_config', {})
+                    ptype = pc.get("type", "")
+                    if "openai" in ptype:
+                        api_base = pc.get("api_base", "")
+                        keys = pc.get("key", [])
+                        if api_base and keys:
+                            config["model"] = model
+                            config["api_base"] = api_base
+                            config["api_key"] = keys[0] if isinstance(keys, list) else keys
+                            logger.debug(f"📝 Provider raw HTTP fallback: {model} @ {api_base}")
+
+                    logger.debug(f"📝 使用 Provider 进行 LLM 参考文献解析 ({model})")
+                    return config
+                logger.warning("⚠️ Provider 初始化失败")
+            except Exception as e:
+                logger.warning(f"⚠️ 无法获取 Provider: {e}")
+
+        # Priority 2: freeapi fallback
         api_url = getattr(self.config, 'freeapi_url', '') or ''
         api_key = getattr(self.config, 'freeapi_key', '') or ''
         if api_url and api_key:
-            logger.debug("📝 使用 freeapi 配置进行 LLM 参考文献解析")
-            return {"model": "gpt-4o-mini", "api_base": f"{api_url}/v1", "api_key": api_key}
+            config["model"] = "gpt-4o-mini"
+            config["api_base"] = f"{api_url}/v1"
+            config["api_key"] = api_key
+            logger.debug("📝 使用 freeapi (gpt-4o-mini) 进行 LLM 参考文献解析")
+            return config
 
         return {}
 

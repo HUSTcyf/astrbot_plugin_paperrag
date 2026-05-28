@@ -59,6 +59,7 @@ openai>=1.0.0  # OpenAI SDK（用于智谱GLM，避免pyjwt版本冲突）
 pyalex # OpenAlex API 客户端（抗干扰标题匹配）
 rapidfuzz  # 模糊匹配（token_set_ratio）
 arxiv  # arXiv 论文查询（备用，新论文）
+ddgs  # DuckDuckGo 搜索（WebSearch fallback）
 
 # 数据集处理
 datasets>=2.14.0  # HuggingFace 数据集加载

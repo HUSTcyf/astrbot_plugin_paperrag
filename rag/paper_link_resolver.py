@@ -16,9 +16,10 @@ import asyncio
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import httpx
 
@@ -97,6 +98,7 @@ class PaperLinkResolver:
     _arxiv_health_checked: bool = False
     _arxiv_available: bool = True
     _arxiv_health_lock = threading.Lock()
+    _arxiv_lock = asyncio.Lock()
     _last_arxiv_request_time: float = 0.0
     _MIN_ARXIV_INTERVAL: float = 2.0
 
@@ -136,7 +138,7 @@ class PaperLinkResolver:
             import time as _time
 
             client = arxiv.Client(num_retries=0)
-            search = arxiv.Search(query="test", max_results=1)
+            search = arxiv.Search(query="deep learning", max_results=1)
             list(client.results(search))
             cls._arxiv_available = True
             cls._last_arxiv_request_time = _time.monotonic()
@@ -505,7 +507,7 @@ class PaperLinkResolver:
                 page_text = ""
                 if len(doc) > 0:
                     page = doc[0]
-                    page_text = page.get_text() or ""
+                    page_text = str(page.get_text() or "")
                     probe.first_page_text = page_text[:max_chars]
                     probe.title_candidates = self._extract_title_candidates_from_text(probe.first_page_text)
                     layout_title = self._extract_title_from_layout(page)
@@ -942,11 +944,6 @@ class PaperLinkResolver:
         try:
             import arxiv
 
-            loop = asyncio.get_event_loop()
-            elapsed = loop.time() - PaperLinkResolver._last_arxiv_request_time
-            if elapsed < PaperLinkResolver._MIN_ARXIV_INTERVAL:
-                await asyncio.sleep(PaperLinkResolver._MIN_ARXIV_INTERVAL - elapsed)
-
             full_query = self.normalize_title(title)
             words = full_query.split()
             short_query = " ".join(words[:5]) if len(words) > 5 else full_query
@@ -955,16 +952,21 @@ class PaperLinkResolver:
             if short_query != full_query:
                 queries_to_try.append(full_query)
 
-            client = arxiv.Client()
             results: list = []
-            for i, query in enumerate(queries_to_try):
-                search = arxiv.Search(query=query, max_results=limit)
-                results = await loop.run_in_executor(None, lambda: list(client.results(search)))
-                PaperLinkResolver._last_arxiv_request_time = loop.time()
-                if results:
-                    break
-                if i < len(queries_to_try) - 1:
-                    await asyncio.sleep(PaperLinkResolver._MIN_ARXIV_INTERVAL)
+            async with PaperLinkResolver._arxiv_lock:
+                for query in queries_to_try:
+                    now = time.monotonic()
+                    elapsed = now - PaperLinkResolver._last_arxiv_request_time
+                    if elapsed < PaperLinkResolver._MIN_ARXIV_INTERVAL:
+                        await asyncio.sleep(PaperLinkResolver._MIN_ARXIV_INTERVAL - elapsed)
+
+                    client = arxiv.Client(num_retries=0)
+                    search = arxiv.Search(query=query, max_results=limit)
+                    results = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: list(client.results(search)))
+                    PaperLinkResolver._last_arxiv_request_time = time.monotonic()
+                    if results:
+                        break
 
             normalized: List[Dict[str, Any]] = []
             for result in results:
@@ -1221,5 +1223,166 @@ class PaperLinkResolver:
                 )
 
             logger.info(f"  → {source} 命中但未提取到可用链接 (相似度 {best_score:.1f}%)")
+
+        return LinkResolution()
+
+    # Rate limiter for Semantic Scholar API (free tier: ~1 req/sec)
+    _ss_last_request: float = 0.0
+
+    async def _resolve_via_semantic_scholar(self, title: str) -> LinkResolution:
+        """Semantic Scholar title match — uses free Title Match API.
+        404 = no match, 429 = rate limited.
+        """
+        from urllib.parse import quote_plus
+
+        # Enforce ~1 req/sec to avoid 429
+        now = time.monotonic()
+        elapsed = now - self._ss_last_request
+        if elapsed < 1.0:
+            await asyncio.sleep(1.0 - elapsed)
+        self._ss_last_request = time.monotonic()
+
+        try:
+            url = (
+                "https://api.semanticscholar.org/graph/v1/paper/search/match"
+                f"?query={quote_plus(title)}"
+                "&fields=title,externalIds,year"
+            )
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(url)
+                if resp.status_code == 404:
+                    return LinkResolution()
+                if resp.status_code == 429:
+                    logger.warning(f"  → Semantic Scholar rate limited, skipping batch")
+                    return LinkResolution()
+                if resp.status_code != 200:
+                    logger.info(f"  → Semantic Scholar error {resp.status_code}")
+                    return LinkResolution()
+                data = resp.json()
+        except Exception as e:
+            logger.warning(f"  → Semantic Scholar error: {type(e).__name__}: {e!r}")
+            return LinkResolution()
+
+        papers = data.get("data", []) or []
+        if not papers:
+            return LinkResolution()
+
+        norm_title = self.normalize_title(title)
+        best = None  # (score, doi_url, arxiv_url, matched_title)
+
+        for paper in papers[:5]:
+            matched = paper.get("title", "")
+            score = self._title_similarity(norm_title, self.normalize_title(matched))
+            if score < 60:
+                continue
+
+            ext_ids = paper.get("externalIds", {}) or {}
+            doi = (ext_ids.get("DOI") or "").strip()
+            arxiv_id = (ext_ids.get("ArXiv") or "").strip()
+
+            doi_url = f"https://doi.org/{doi}" if doi else ""
+            arxiv_url = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else ""
+
+            if not doi_url and not arxiv_url:
+                continue
+
+            if best is None or score > best[0]:
+                best = (score, doi_url, arxiv_url, matched)
+
+        if best is None:
+            return LinkResolution()
+
+        score, doi_url, arxiv_url, matched = best
+
+        if doi_url:
+            logger.info(
+                f"  → SemanticScholar (相似度 {score:.1f}%): "
+                f"{title[:60]}"
+            )
+            return LinkResolution(
+                doi_url=doi_url,
+                backend="SemanticScholar",
+                resolution_score=score,
+                matched_title=matched,
+            )
+
+        if arxiv_url:
+            logger.info(
+                f"  → SemanticScholar arXiv (相似度 {score:.1f}%): "
+                f"{arxiv_url} — {title[:60]}"
+            )
+            return LinkResolution(
+                arxiv_url=arxiv_url,
+                backend="SemanticScholar",
+                resolution_score=score,
+                matched_title=matched,
+            )
+
+        return LinkResolution()
+
+    async def _resolve_via_web_search(self, title: str) -> LinkResolution:
+        """DuckDuckGo web search — final fallback for papers not found by any
+        academic API. Extracts DOI/arXiv from search result URLs and snippets.
+
+        Uses the ddgs library (ddgs.DDGS). Rate-limited by DuckDuckGo.
+        """
+        try:
+            from ddgs import DDGS
+
+            loop = asyncio.get_event_loop()
+            results = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, lambda: list(DDGS().text(f'{title} paper', max_results=5))
+                ),
+                timeout=60.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"  → WebSearch timeout (60s): {title[:60]}")
+            return LinkResolution()
+        except Exception as e:
+            logger.warning(f"  → WebSearch error: {type(e).__name__}: {e!r}")
+            return LinkResolution()
+
+        if not results:
+            return LinkResolution()
+
+        # Extract DOIs and arXiv IDs from all results
+        best_doi = None   # (doi_url,)
+        best_arxiv = None # (arxiv_url,)
+        for r in results:
+            href = r.get("href", "") or ""
+            body = r.get("body", "") or ""
+            combined = f"{href} {body}"
+
+            if best_doi is None:
+                dois = re.findall(r"10\.\d{4,}/[^\s\"'<>\])]+", combined)
+                if dois:
+                    best_doi = (f"https://doi.org/{dois[0]}",)
+
+            if best_arxiv is None:
+                arxiv_ids = re.findall(r"arxiv\.org/abs/(\d{4}\.\d{4,})", combined)
+                if arxiv_ids:
+                    best_arxiv = (f"https://arxiv.org/abs/{arxiv_ids[0]}",)
+
+            if best_doi and best_arxiv:
+                break
+
+        if best_doi:
+            logger.info(f"  → WebSearch DOI: {best_doi[0]} — {title[:60]}")
+            return LinkResolution(
+                doi_url=best_doi[0],
+                backend="WebSearch",
+                resolution_score=70.0,
+                matched_title=title,
+            )
+
+        if best_arxiv:
+            logger.info(f"  → WebSearch arXiv: {best_arxiv[0]} — {title[:60]}")
+            return LinkResolution(
+                arxiv_url=best_arxiv[0],
+                backend="WebSearch",
+                resolution_score=70.0,
+                matched_title=title,
+            )
 
         return LinkResolution()

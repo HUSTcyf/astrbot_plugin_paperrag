@@ -8,8 +8,6 @@ from pathlib import Path
 
 
 def _install_astrbot_stubs():
-    if "astrbot.api" in sys.modules:
-        return
 
     class DummyLogger:
         def debug(self, *args, **kwargs):
@@ -54,6 +52,9 @@ def _install_astrbot_stubs():
         return decorator
 
     class Context:
+        def __init__(self, *args, **kwargs):
+            pass
+
         def register_llm_tool(self, *args, **kwargs):
             pass
 
@@ -61,7 +62,7 @@ def _install_astrbot_stubs():
             pass
 
     class Star:
-        def __init__(self, context):
+        def __init__(self, context, *args, config=None, **kwargs):
             self.context = context
 
         async def terminate(self):
