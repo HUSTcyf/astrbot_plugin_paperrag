@@ -8,6 +8,7 @@ from typing import Literal
 
 from langgraph.types import Send
 from langgraph.graph import StateGraph, END
+from langgraph.graph.state import CompiledStateGraph
 
 from .state import AgenticRAGState
 from .nodes.router import router_node
@@ -45,7 +46,7 @@ def route_after_quality_check(state: AgenticRAGState) -> Literal["synthesize", "
     return "final_output"
 
 
-def compile_workflow() -> StateGraph:
+def compile_workflow() -> CompiledStateGraph:
     """编译 LangGraph StateGraph。"""
     graph = StateGraph(AgenticRAGState)
 

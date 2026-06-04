@@ -773,55 +773,48 @@ class MultimodalGraphBuilder:
         """确保 LLM 已初始化。
 
         优先级：
-        1. 插件配置的 multimodal_provider_id（多模态问答的 LLM Provider，通常支持图片）
-        2. 本地 LlamaCppVLMProvider（GGUF 模型）
-
-        配置的云端 Provider 同时用于文本三元组提取和多模态（图片）三元组提取。
-        云端 Provider 不支持 GBNF grammar，依赖 prompt 约束 + JSON 解析。
+        1. 云端 Provider（从 context.provider_manager 取任意可用 provider）
+        2. 本地 VLM（GGUF 模型，最终回退）
         """
-        # 步骤1: 尝试获取配置的 multimodal_provider_id
+        # 步骤1: 从 context.provider_manager 取任意可用 provider
         if self._cloud_llm is None and self.context is not None:
             try:
-                multimodal_provider_id = self._plugin_config.get("multimodal_provider_id", "")
-                if multimodal_provider_id:
-                    pm = getattr(self.context, 'provider_manager', None)
-                    if pm:
-                        inst_map = getattr(pm, 'inst_map', None)
-                        if isinstance(inst_map, dict):
-                            provider = inst_map.get(multimodal_provider_id)
-                            if provider is not None:
-                                self._cloud_llm = provider
-                                provider_name = getattr(provider, 'provider_model', '') or \
-                                    getattr(provider, 'model_name', '') or \
-                                    type(provider).__name__
-                                logger.info(
-                                    f"[Graph-LLM] 使用 multimodal_provider_id 配置的 LLM: "
-                                    f"{multimodal_provider_id} ({provider_name})"
-                                )
-                if self._cloud_llm is None:
-                    logger.info("[Graph-LLM] 未配置 multimodal_provider_id，将使用本地 GGUF 模型")
+                pm = getattr(self.context, 'provider_manager', None)
+                inst_map = getattr(pm, 'inst_map', None) if pm else None
+                if isinstance(inst_map, dict) and len(inst_map) > 0:
+                    # 优先取指定的 provider_id，否则取第一个
+                    for pid_key in ("multimodal_provider_id", "text_provider_id"):
+                        pid = self._plugin_config.get(pid_key, "")
+                        if pid and pid in inst_map:
+                            self._cloud_llm = inst_map[pid]
+                            logger.info(f"[Graph-LLM] 使用云端: {pid_key}={pid}")
+                            break
+                    if self._cloud_llm is None:
+                        # 取任意一个
+                        self._cloud_llm = next(iter(inst_map.values()))
+                        logger.info(f"[Graph-LLM] 使用云端 Provider（默认）")
             except Exception as e:
-                logger.debug(f"[Graph-LLM] multimodal_provider_id 解析失败: {e}")
+                logger.debug(f"[Graph-LLM] 云端 Provider 解析失败: {e}")
 
-        # 步骤2: 初始化本地 VLM（当没有配置云端 Provider 时需要）
-        if self._cloud_llm is None:
-            if self._llm is None:
-                from provider.llama_cpp_vlm import (
-                    get_cached_llama_cpp_provider,
-                    init_llama_cpp_vlm_provider,
+        # 步骤2: 本地 VLM（无云端 Provider 时回退）
+        if self._cloud_llm is None and self._llm is None:
+            logger.warning("[Graph-LLM] ⬇️ 无云端 Provider，回退本地 VLM")
+            from provider.llama_cpp_vlm import (
+                get_cached_llama_cpp_provider,
+                init_llama_cpp_vlm_provider,
+            )
+            cached = get_cached_llama_cpp_provider()
+            if cached is not None:
+                self._llm = cached
+            else:
+                self._llm = init_llama_cpp_vlm_provider(
+                    model_path=self._llm_config.model_path,
+                    mmproj_path=self._llm_config.mmproj_path,
+                    n_ctx=self._llm_config.n_ctx,
+                    n_gpu_layers=self._llm_config.n_gpu_layers,
+                    max_tokens=self._llm_config.max_tokens,
+                    temperature=self._llm_config.temperature
                 )
-                cached = get_cached_llama_cpp_provider()
-                if cached is not None:
-                    self._llm = cached
-                else:
-                    self._llm = init_llama_cpp_vlm_provider(
-                        model_path=self._llm_config.model_path,
-                        mmproj_path=self._llm_config.mmproj_path,
-                        n_ctx=self._llm_config.n_ctx,
-                        n_gpu_layers=self._llm_config.n_gpu_layers,
-                        max_tokens=self._llm_config.max_tokens,
-                        temperature=self._llm_config.temperature
-                    )
             await self._llm.initialize()
             self._load_grammars()
 
@@ -1197,7 +1190,7 @@ class MultimodalGraphBuilder:
 
         except Exception as e:
             logger.error(f"[Graph-LLM] 批次 {batch_idx + 1}/{total_batches} 处理失败: {e}")
-            return e
+            return {}
 
     async def _process_node(
         self,
@@ -1275,7 +1268,7 @@ class MultimodalGraphBuilder:
 
         except Exception as e:
             logger.error(f"[Graph-LLM] 节点 {chunk_id} 处理失败: {e}")
-            return e
+            return None
 
     async def _call_text_llm(
         self,
@@ -1320,6 +1313,7 @@ class MultimodalGraphBuilder:
 
         # 本地 VLM 路径（带 grammar 约束）
         await self._ensure_local_llm_available()
+        assert self._llm is not None, "本地 VLM 不可用"
         response = await self._llm.text_chat(
             prompt=user_prompt,
             system_prompt=system_prompt,
@@ -1663,6 +1657,7 @@ Extract triplets:"""
                     )
 
         await self._ensure_local_llm_available()
+        assert self._llm is not None, "本地 VLM 不可用"
         response = await self._llm.text_chat(
             prompt=user_prompt,
             system_prompt=system_prompt,

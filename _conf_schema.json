@@ -589,5 +589,78 @@
         "hint": "本地 PaperBanana 项目的绝对路径。插件启动时将使用该路径下的 .venv 中的 Python 来启动本地生成服务。默认使用 AstrBot/data/PaperBanana",
         "obvious_hint": true,
         "default": ""
+    },
+    "remote_exec": {
+        "description": "远程SSH Claude Code执行配置",
+        "type": "object",
+        "hint": "配置远程服务器用于通过SSH执行Claude Code编程任务。启用后，code_execute将在远程服务器上运行，而非本地。",
+        "obvious_hint": true,
+        "items": {
+            "enabled": {
+                "description": "启用远程Claude Code执行",
+                "type": "bool",
+                "default": false,
+                "hint": "启用后，code_execute任务在远程服务器上运行；关闭则回退到本地执行。"
+            },
+            "host": {
+                "description": "SSH服务器主机名或IP",
+                "type": "string",
+                "default": "",
+                "hint": "远程服务器的IP地址或主机名"
+            },
+            "port": {
+                "description": "SSH服务器端口",
+                "type": "int",
+                "default": 22,
+                "minimum": 1,
+                "maximum": 65535
+            },
+            "username": {
+                "description": "SSH用户名",
+                "type": "string",
+                "default": "root",
+                "hint": "远程服务器的登录用户名"
+            },
+            "password": {
+                "description": "SSH密码",
+                "type": "string",
+                "default": "",
+                "hint": "SSH认证密码"
+            },
+            "work_dir": {
+                "description": "远程工作目录",
+                "type": "string",
+                "default": "/root/paperrag_workspace",
+                "hint": "远程服务器上Claude Code执行任务的工作目录"
+            },
+            "connect_timeout": {
+                "description": "SSH连接超时（秒）",
+                "type": "int",
+                "default": 15,
+                "minimum": 2,
+                "maximum": 120
+            },
+            "exec_timeout": {
+                "description": "远程执行最大超时（秒）",
+                "type": "int",
+                "default": 600,
+                "minimum": 30,
+                "maximum": 3600,
+                "hint": "长时间运行的任务可能需要更长的超时时间"
+            },
+            "auto_install": {
+                "description": "自动安装Claude Code和CC-Connect（如未安装）",
+                "type": "bool",
+                "default": true,
+                "hint": "启用后，插件将自动尝试在远程服务器上安装Node.js和Claude Code"
+            },
+            "max_output_chars": {
+                "description": "捕获远程执行输出的最大字符数",
+                "type": "int",
+                "default": 50000,
+                "minimum": 1000,
+                "maximum": 200000
+            }
+        }
     }
 }

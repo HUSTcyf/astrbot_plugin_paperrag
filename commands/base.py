@@ -155,7 +155,7 @@ class PluginCoreBase(Star):
         )
 
     async def _check_academic_intent(self, query: str) -> tuple[bool, str]:
-        """用本地VLM判断用户问题是否与学术论文相关"""
+        """用 LLM 判断用户问题是否与学术论文相关"""
         prompt = f"""你是一个严格的学术问题分类器。只判断用户问题是否明确涉及学术论文的阅读、检索、分析。
 
 以下情况回答"否"：
@@ -174,40 +174,16 @@ class PluginCoreBase(Star):
 
 只需回答"是"或"否"，不要解释。"""
         try:
-            from provider.llama_cpp_vlm import get_cached_llama_cpp_provider
-
-            vlm_provider = get_cached_llama_cpp_provider()
-            if vlm_provider and vlm_provider._initialized and vlm_provider._llama:
-                response = await vlm_provider.text_chat(prompt=prompt, image_urls=[], temperature=0.0)
-                text = response.content.strip().lower() if hasattr(response, "content") else str(response).lower()
-                logger.info(f"[_check_academic_intent] VLM原始回答: '{text}'")
-                if text.startswith("否"):
-                    return False, "非学术问题"
-                return True, "学术问题"
-
-            logger.info("[_check_academic_intent] VLM未就绪，触发初始化...")
-            from provider.llama_cpp_vlm import init_llama_cpp_vlm_provider
-
-            model_dir = _PLUGIN_DIR / "models" / "Qwen3.5-9B-GGUF"
-            model_path = model_dir / "Qwen3.5-9B-UD-Q4_K_XL.gguf"
-            mmproj_path = model_dir / "mmproj-BF16.gguf"
-            vlm_provider = init_llama_cpp_vlm_provider(
-                model_path=str(model_path),
-                mmproj_path=str(mmproj_path),
-                n_ctx=self.config.get("llama_vlm_n_ctx", 16384),
-                n_gpu_layers=99,
-                max_tokens=25600,
-                temperature=0.0,
+            from provider.llm_utils import call_llm
+            text = await call_llm(
+                prompt, self.context, self.config,
+                temperature=0.0, max_tokens=5,
             )
-            await vlm_provider.initialize()
-            if vlm_provider and vlm_provider._initialized:
-                response = await vlm_provider.text_chat(prompt=prompt, image_urls=[], temperature=0.0)
-                text = response.content.strip().lower() if hasattr(response, "content") else str(response).lower()
-                logger.info(f"[_check_academic_intent] VLM原始回答: '{text}'")
-                if text.startswith("否"):
-                    return False, "非学术问题"
-                return True, "学术问题"
-            return True, "VLM不可用，默认进行检索"
+            text = text.strip().lower()
+            logger.info(f"[_check_academic_intent] LLM 回答: '{text}'")
+            if text.startswith("否"):
+                return False, "非学术问题"
+            return True, "学术问题"
         except Exception as e:
             logger.warning(f"[_check_academic_intent] 意图判断失败: {e}")
             return True, f"意图判断失败，默认检索: {e}"
@@ -215,36 +191,11 @@ class PluginCoreBase(Star):
     async def _llm_direct_answer(self, query: str) -> str:
         """由LLM直接回答问题（不经过RAG）"""
         try:
-            text_provider_id = self.config.get("text_provider_id", "")
-
-            if text_provider_id:
-                provider_manager = getattr(self.context, "provider_manager", None)
-                if not provider_manager:
-                    logger.error("[_llm_direct_answer] provider_manager 不可用，无法获取云端 LLM")
-                else:
-                    llm_provider = provider_manager.get_provider(text_provider_id)
-                    if not llm_provider:
-                        llm_provider = provider_manager.get_provider(None)
-                    if not llm_provider:
-                        logger.error(f"[_llm_direct_answer] 无法获取 LLM Provider (id={text_provider_id})")
-                    else:
-                        response = await llm_provider.generate(query)
-                        return response.text.strip() if hasattr(response, "text") else str(response)
-            else:
-                from provider.llama_cpp_vlm import get_cached_llama_cpp_provider
-                vlm_provider = get_cached_llama_cpp_provider()
-                if not vlm_provider:
-                    logger.error("[_llm_direct_answer] 本地 VLM Provider 不可用")
-                else:
-                    response = await vlm_provider.text_chat(
-                        prompt=query,
-                        temperature=self.config.get("llama_vlm_temperature", 0.7),
-                    )
-                    if hasattr(response, 'content'):
-                        return response.content.strip()
-                    else:
-                        logger.warning(f"[_llm_direct_answer] VLM 响应格式无法识别: {type(response)}")
-
+            from provider.llm_utils import call_llm
+            return await call_llm(
+                query, self.context, self.config,
+                temperature=0.7,
+            )
         except Exception as e:
             logger.warning(f"[_llm_direct_answer] 回答失败: {e}")
         return ""

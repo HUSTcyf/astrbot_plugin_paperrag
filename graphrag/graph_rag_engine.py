@@ -44,7 +44,18 @@ if LLMSynonymRetriever is not None:
         def _parse_llm_output(self, output: str) -> list:
             if self._output_parsing_fn:
                 return self._output_parsing_fn(output)
+            import re
+            # 协议格式：^ 分隔
             raw = [x.strip() for x in output.strip().split("^") if x.strip()]
+            # 如果 ^ 分隔只得到 1-2 个结果，尝试用空格切分（LLM 可能未遵循 ^ 格式）
+            if len(raw) <= 2:
+                # 移除常见前缀（"query:"、编号、markdown 等）
+                cleaned = re.sub(r'(?i)^(query|keywords?|synonyms?)[\s:：]+', '', output.strip())
+                cleaned = re.sub(r'^[-\d.)、，]+\s*', '', cleaned, flags=re.MULTILINE)
+                # 按空格、逗号等分拆，每个词作为独立关键词
+                words = [w.strip().rstrip(',.;:，。；：') for w in cleaned.split() if len(w.strip()) >= 2]
+                if words:
+                    raw = words
             expanded = set()
             for m in raw:
                 expanded.add(m)
@@ -653,7 +664,7 @@ class GraphRAGEngine:
         """从 AstrBot Provider 创建 LlamaIndex 兼容的 LLM。
 
         Args:
-            prefer_cloud: 为 True 时跳过本地 VLM，直接使用云端 Provider（适合 Cypher 生成）。
+            prefer_cloud: 为 True 时跳过本地 VLM，仅使用云端 Provider（适合 Cypher 生成）。
         """
         try:
             from provider.llm_utils import get_llama_index_llm

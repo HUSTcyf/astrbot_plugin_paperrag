@@ -19,19 +19,20 @@ from astrbot.api import logger
 
 def extract_text_from_response(response) -> str:
     """从 LLM 响应中提取文本（兼容 VLM、AstrBot cloud provider、dict）。"""
-    if hasattr(response, 'content'):
-        return response.content
-
-    # AstrBot cloud provider 返回 result_chain 格式
+    # AstrBot cloud provider: result_chain 格式（优先，避免 .content 误判）
     rc = getattr(response, 'result_chain', None)
-    if rc is not None:
-        chain = getattr(rc, 'chain', None)
+    if rc is not None and hasattr(rc, 'chain'):
+        chain = rc.chain
         if chain and len(chain) > 0:
             first = chain[0]
-            if hasattr(first, 'get_text'):
-                return first.get_text()
-            if hasattr(first, 'text'):
-                return first.text
+            text = getattr(first, 'text', '') or getattr(first, 'get_text', lambda: '')()
+            if text:
+                return text
+
+    # VLM / cloud raw response with .content
+    content = getattr(response, 'content', None)
+    if content is not None and isinstance(content, str) and content.strip():
+        return content
 
     if isinstance(response, dict):
         return response.get("content", "") or response.get("text", "")
@@ -73,13 +74,9 @@ def get_llm_provider(context, config=None):
     统一的 LLM Provider 解析链（4 步优先级）。
 
     1. config["text_provider_id"] → inst_map[id]
-    2. 本地 VLM (llama_cpp)
-    3. context.get_using_provider()
-    4. inst_map 中第一个有 text_chat 的
-
-    Args:
-        context: AstrBot Context 对象
-        config: 可选，插件配置字典
+    2. context.get_using_provider()（当前会话云端）
+    3. inst_map 中第一个有 text_chat 的
+    4. 本地 VLM (llama_cpp) — 最后兜底
     """
     if config is None:
         config = getattr(context, 'config', {}) if context else {}
@@ -95,26 +92,16 @@ def get_llm_provider(context, config=None):
             if isinstance(inst_map, dict):
                 provider = inst_map.get(text_provider_id)
 
-    # Step 2: 本地 VLM (llama.cpp)
-    if not provider:
-        try:
-            from provider.llama_cpp_vlm import get_llama_cpp_vlm_provider
-            vlm = get_llama_cpp_vlm_provider()
-            if vlm and getattr(vlm, "_initialized", False):
-                provider = vlm
-        except Exception as e:
-            logger.debug(f"[Provider] Step 2 (local VLM) failed: {e}")
-
-    # Step 3: 当前会话的云端 provider
+    # Step 2: 当前会话的云端 provider（优先于本地 VLM）
     if not provider and context is not None:
         try:
             fn = getattr(context, 'get_using_provider', None)
             if fn:
                 provider = fn()
         except Exception as e:
-            logger.debug(f"[Provider] Step 3 (get_using_provider) failed: {e}")
+            logger.debug(f"[Provider] Step 2 (get_using_provider) failed: {e}")
 
-    # Step 4: inst_map 中第一个有 text_chat 的 provider
+    # Step 3: inst_map 中第一个有 text_chat 的 provider
     if not provider:
         pm = getattr(context, 'provider_manager', None)
         if pm:
@@ -124,6 +111,17 @@ def get_llm_provider(context, config=None):
                     if callable(getattr(p, 'text_chat', None)):
                         provider = p
                         break
+
+    # Step 4: 本地 VLM (llama.cpp) — 最后的兜底
+    if not provider:
+        try:
+            from provider.llama_cpp_vlm import get_llama_cpp_vlm_provider
+            logger.warning("[Provider] ⬇️ 无可用的云端 Provider，回退到本地 VLM")
+            vlm = get_llama_cpp_vlm_provider()
+            if vlm and getattr(vlm, "_initialized", False):
+                provider = vlm
+        except Exception as e:
+            logger.debug(f"[Provider] Step 4 (local VLM) failed: {e}")
 
     # 验证返回的 provider 有 text_chat 方法
     if provider and not callable(getattr(provider, 'text_chat', None)):
@@ -208,13 +206,13 @@ async def call_llm_json(
 # LlamaIndex LLM Bridge
 # ============================================================================
 
-def _create_vlm_custom_llm(vlm_provider):
-    """Create a LlamaIndex CustomLLM that wraps LlamaCppVLMProvider.
+def _create_custom_llm(provider, model_name: str, ctx_window: int):
+    """创建统一的 LlamaIndex CustomLLM 包装器，委托 text_chat 给任意 provider。
 
-    Uses llama_index.core.llms.CustomLLM base class so that Pydantic
-    validation in LlamaIndex components (SimpleLLMPathExtractor, etc.)
-    accepts the instance.  Avoids llama_index.llms.openai.OpenAI which
-    validates model names against OpenAI's known list and rejects 'local-vlm'.
+    Args:
+        provider: 任何有 text_chat(prompt, contexts, temperature, max_tokens) 的 provider
+        model_name: 模型名（用于 metadata）
+        ctx_window: 上下文窗口大小
     """
     from llama_index.core.base.llms.generic_utils import (
         completion_response_to_chat_response,
@@ -224,20 +222,24 @@ def _create_vlm_custom_llm(vlm_provider):
     from typing import Sequence
     import asyncio
 
-    class _Impl(CustomLLM):
-        model_name: str = "local-vlm"
-        _ctx_window: int = getattr(vlm_provider, 'n_ctx', 16384)
+    _name = model_name
+    _ctx = ctx_window
 
+    class _Impl(CustomLLM):
         class Config:
             arbitrary_types_allowed = True
 
         @property
         def metadata(self) -> LLMMetadata:
             return LLMMetadata(
-                model_name=self.model_name,
-                context_window=self._ctx_window,
+                model_name=_name,
+                context_window=_ctx,
                 is_chat_model=True,
             )
+
+        @property
+        def model_name(self) -> str:  # type: ignore[override]
+            return _name
 
         def stream_complete(self, prompt: str, formatted: bool = False, **kwargs):
             raise NotImplementedError
@@ -252,14 +254,14 @@ def _create_vlm_custom_llm(vlm_provider):
             )
 
         async def acomplete(self, prompt: str, formatted: bool = False, **kwargs):
-            resp = await vlm_provider.text_chat(
+            resp = await provider.text_chat(
                 prompt=prompt,
                 contexts=[],
                 temperature=kwargs.get("temperature", 0.1),
                 max_tokens=kwargs.get("max_tokens", 256),
             )
             return CompletionResponse(
-                text=resp.content if hasattr(resp, "content") else str(resp)
+                text=extract_text_from_response(resp)
             )
 
         async def achat(
@@ -280,72 +282,57 @@ async def get_llama_index_llm(context: Any = None, prefer_cloud: bool = False):
     Create a LlamaIndex-compatible LLM from the provider resolution chain.
 
     Priority:
-    1. Local VLM via _VLMCustomLLM (bypasses OpenAI SDK model validation)
-    2. Cloud provider via llama_index.llms.openai.OpenAI
+    1. Cloud provider via _create_custom_llm (always tried first)
+    2. Local VLM via _create_custom_llm (fallback when prefer_cloud=False)
 
     Returns:
         LlamaIndex LLM object, or None if no provider available.
     """
-    # Step 1: Local VLM (CustomLLM — no model name validation)
+    from astrbot.api import logger
+
+    # Step 1: Cloud provider (always preferred)
+    if context is not None:
+        provider = None
+        pm = getattr(context, 'provider_manager', None)
+        inst_map = getattr(pm, 'inst_map', None) if pm else None
+
+        if not provider:
+            try:
+                provider = context.get_using_provider()
+            except Exception as e:
+                logger.debug(f"[Provider] LlamaIndex get_using_provider failed: {e}")
+
+        if not provider and isinstance(inst_map, dict):
+            for p in inst_map.values():
+                if callable(getattr(p, 'text_chat', None)):
+                    provider = p
+                    break
+
+        if provider:
+            model = getattr(provider, 'model_name', '') or getattr(provider, 'provider_config', {}).get('model', '')
+            ctx_window = getattr(provider, 'provider_config', {}).get('max_context_tokens', 204800)
+            if model:
+                logger.info(f"[Provider] ✅ LlamaIndex LLM → 云端: model={model}")
+                return _create_custom_llm(provider, model, int(ctx_window))
+            else:
+                logger.warning(
+                    f"[Provider] ⚠️ 云端 Provider 缺少 model 名，回退 VLM"
+                )
+        elif context is not None:
+            logger.warning("[Provider] ⚠️ 未找到云端 Provider，回退 VLM")
+
+    # Step 2: Local VLM (only when prefer_cloud=False)
     if not prefer_cloud:
         try:
             from provider.llama_cpp_vlm import get_llama_cpp_vlm_provider
+            logger.warning("[Provider] ⬇️ 回退到本地 VLM")
             vlm = get_llama_cpp_vlm_provider()
             if vlm and not getattr(vlm, '_initialized', False):
                 await vlm.initialize()
             if vlm and getattr(vlm, '_initialized', False):
-                return _create_vlm_custom_llm(vlm)
+                ctx_window = getattr(vlm, 'n_ctx', 16384)
+                return _create_custom_llm(vlm, "local-vlm", ctx_window)
         except Exception as e:
-            logger.debug(f"[Provider] LlamaIndex Step 1 (local VLM) failed: {e}")
+            logger.debug(f"[Provider] LlamaIndex VLM fallback failed: {e}")
 
-    # Step 2: Cloud provider
-    from astrbot.api import logger
-    try:
-        from llama_index.llms.openai import OpenAI
-    except ImportError:
-        logger.warning("[Provider] llama_index.llms.openai 不可用")
-        return None
-
-    if context is None:
-        return None
-
-    provider = None
-    pm = getattr(context, 'provider_manager', None)
-    inst_map = getattr(pm, 'inst_map', None) if pm else None
-
-    # Try context.get_using_provider()
-    if not provider:
-        try:
-            provider = context.get_using_provider()
-        except Exception as e:
-            logger.debug(f"[Provider] LlamaIndex get_using_provider failed: {e}")
-
-    # Fallback: first provider with text_chat from inst_map
-    if not provider and isinstance(inst_map, dict):
-        for p in inst_map.values():
-            if callable(getattr(p, 'text_chat', None)):
-                provider = p
-                break
-
-    if not provider:
-        return None
-
-    model = getattr(provider, 'model_name', '') or getattr(provider, 'provider_config', {}).get('model', '')
-    if not model:
-        return None
-
-    api_key = getattr(provider, 'chosen_api_key', None)
-    if not api_key:
-        try:
-            api_key = provider.get_current_key()
-        except Exception as e:
-            logger.debug(f"[Provider] get_current_key failed: {e}")
-    if not api_key:
-        return None
-
-    api_base = getattr(provider, 'provider_config', {}).get('api_base', '')
-    kwargs = {"model": model, "api_key": api_key}
-    if api_base:
-        kwargs["api_base"] = api_base
-    logger.info(f"[Provider] 创建 LlamaIndex LLM: model={model}")
-    return OpenAI(**kwargs)
+    return None

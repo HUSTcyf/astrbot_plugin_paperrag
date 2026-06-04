@@ -8,6 +8,18 @@ import os
 import re
 from typing import Any, Dict, List
 
+
+def _extract_text(obj, default: str = "") -> str:
+    """从 AstrBot ProviderRequest 或普通字符串中提取文本。"""
+    try:
+        from astrbot.core.provider.entities import ProviderRequest
+        if isinstance(obj, ProviderRequest):
+            prompt = getattr(obj, "prompt", None)
+            return prompt if prompt is not None else default
+    except ImportError:
+        pass
+    return obj if isinstance(obj, str) else default
+
 from astrbot.api import logger
 
 from .base import PluginCoreBase, _PLUGIN_DIR
@@ -99,9 +111,11 @@ class RetrievalHelpersMixin(PluginCoreBase):
             return
 
         async def search_tool(event, query: str | None, top_k: int = 5):
+            query = _extract_text(query)
             return await self._search_papers_tool_impl(query, top_k)
 
         async def retrieve_tool(event, query: str | None, top_k: int = 5):
+            query = _extract_text(query)
             return await self._retrieve_papers_tool_impl(query, top_k)
 
         try:

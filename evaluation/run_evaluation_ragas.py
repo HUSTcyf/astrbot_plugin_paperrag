@@ -36,13 +36,13 @@ import hashlib
 import json
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 # 确保 evaluation 模块可导入
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from astrbot.api import logger
 from rag.hybrid_index import HybridIndexManager
 import csv
 import io
@@ -52,8 +52,7 @@ from .ragas_generator import RagasTestsetGenerator
 import tempfile
 import uuid
 import re
-from .ragas_generator import EvalSample
-from .ragas_evaluator import RagasEvaluator
+from .ragas_evaluator import RagasEvaluator, load_raw_answers
 from .report_generator import ReportGenerator
 from rag.rag_engine import create_rag_engine, RAGConfig
 from .ragas_generator import OpenAICompatibleLLM
@@ -62,12 +61,222 @@ from .ragas_generator import OpenAICompatibleLLM
 # 多模态文档生成时，发送给 LLM 的文档数量倍数（test_size * MULTIMODAL_DOC_MULTIPLIER）
 MULTIMODAL_DOC_MULTIPLIER = 2
 
+# 默认 LLM URL（CLI 参数和配置解析共用）
+_DEFAULT_LLM_URL = "https://open.bigmodel.cn/api/paas/v4"
+
+
+def _atomic_write_json(path: str | Path, data: Any) -> None:
+    """原子写入 JSON（写 .tmp 再 os.replace），防止中途崩溃导致文件损坏。"""
+    path = str(path)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+@dataclass
+class _EvalLLMConfig:
+    """评估脚本的 LLM 配置容器，消除参数爆炸。"""
+    # 测试集生成用
+    llm_model: str = "gpt-4o-mini"
+    llm_base_url: str = ""
+    llm_api_key: str = ""
+    # 评估指标计算用
+    eval_llm_model: str = "gpt-5.4-nano"
+    eval_llm_base_url: str = ""
+    eval_llm_max_tokens: int = 16384
+    # Embedding 用
+    embedding_model: str = "text-embedding-v4"
+    embed_base_url: str = ""
+    embed_api_key: str = ""
+    embedding_mode: str = "api"
+    eval_embedding_mode: str = "api"
+    max_rpm: int = 96
+
+
+def _resolve_eval_config(args) -> tuple[_EvalLLMConfig, dict]:
+    """从 CLI 参数、环境变量、插件配置、free.json 解析 LLM 配置。
+
+    优先级：CLI 显式参数 > 环境变量 > 插件配置 freeapi > free.json vapi
+    """
+    llm = _EvalLLMConfig()
+
+    # Step 1: 从 CLI 参数读取
+    llm.llm_model = args.llm_model
+    llm.llm_api_key = args.llm_api_key or args.eval_llm_api_key or os.getenv("EVAL_LLM_API_KEY", "")
+    llm.embed_api_key = args.embed_api_key or os.getenv("EVAL_EMBED_API_KEY", "")
+    llm.eval_llm_model = args.eval_llm_model
+    llm.eval_llm_max_tokens = args.eval_llm_max_tokens
+    llm.embedding_model = args.embedding_model
+    llm.embedding_mode = args.embedding_mode
+    llm.eval_embedding_mode = args.eval_embedding_mode
+    llm.max_rpm = args.max_rpm
+
+    # Step 2: 从插件配置读取 freeapi
+    plugin_config_path = Path(__file__).parent.parent.parent.parent / "config" / "astrbot_plugin_paperrag_config.json"
+    plugin_config = {}
+    if plugin_config_path.exists():
+        with open(plugin_config_path, "r", encoding="utf-8-sig") as f:
+            plugin_config = json.load(f)
+        config_freeapi_key = plugin_config.get("freeapi_key", "")
+        config_freeapi_url = plugin_config.get("freeapi_url", "")
+        if config_freeapi_key and not llm.llm_api_key:
+            llm.llm_api_key = config_freeapi_key
+        if config_freeapi_key and not llm.embed_api_key:
+            llm.embed_api_key = config_freeapi_key
+        if config_freeapi_url:
+            llm.llm_base_url = config_freeapi_url + "/v1/"
+            llm.embed_base_url = config_freeapi_url + "/v1/"
+    else:
+        llm.llm_base_url = args.llm_base_url
+        llm.embed_base_url = args.embed_base_url
+
+    # Step 2.5: CLI 显式 URL 覆盖插件配置
+    if args.llm_base_url and args.llm_base_url != _DEFAULT_LLM_URL:
+        llm.llm_base_url = args.llm_base_url
+    if args.embed_base_url:
+        llm.embed_base_url = args.embed_base_url
+
+    # Step 3: 从 free.json 读取 vapi（用于评估指标计算）
+    free_json_path = Path(__file__).parent.parent.parent.parent / "free.json"
+    if free_json_path.exists():
+        try:
+            with open(free_json_path, "r", encoding="utf-8-sig") as f:
+                free_cfg = json.load(f)
+            vapi_cfg = free_cfg.get("vapi", {})
+            if isinstance(vapi_cfg, dict):
+                vapi_url = vapi_cfg.get("url", "")
+                vapi_key = vapi_cfg.get("key", "")
+                if vapi_url:
+                    print(f"✅ 已从 free.json 加载 vapi: {vapi_url}")
+                llm.eval_llm_base_url = args.eval_llm_base_url or (vapi_url + "/v1/" if vapi_url else "") or llm.llm_base_url
+                if vapi_key and not llm.llm_api_key:
+                    llm.llm_api_key = vapi_key
+                    print("✅ 使用 vapi key 作为 API Key")
+        except Exception as e:
+            print(f"⚠️ 读取 free.json 失败: {e}")
+            llm.eval_llm_base_url = args.eval_llm_base_url or llm.llm_base_url
+    else:
+        llm.eval_llm_base_url = args.eval_llm_base_url or llm.llm_base_url
+
+    # Step 4: 打印配置信息
+    print(f"\n📊 配置信息:")
+    print(f"   步骤: {args.step}")
+    print(f"   LLM 模型: {llm.llm_model}")
+    print(f"   LLM API URL: {llm.llm_base_url}")
+    print(f"   评估 LLM 模型: {llm.eval_llm_model}")
+    print(f"   评估 LLM URL: {llm.eval_llm_base_url}")
+    print(f"   Embedding 模型: {llm.embedding_model}")
+    print(f"   Embedding API URL: {llm.embed_base_url}")
+    print(f"   Embedding 模式: {llm.embedding_mode}")
+    if llm.embedding_mode == "unsloth":
+        print(f"   Embedding 模式: Unsloth (本地 BGE-M3)")
+
+    if not llm.llm_api_key:
+        print("⚠️ 警告: 未提供 API Key（设置 EVAL_LLM_API_KEY 环境变量或使用 --llm-api-key）")
+
+    return llm, plugin_config
+
+
+# provider type → 模块路径映射（触发 @register_provider_adapter）
+_PROVIDER_MODULES = {
+    "openai_chat_completion": "astrbot.core.provider.sources.openai_source",
+    "zhipu_chat_completion": "astrbot.core.provider.sources.zhipu_source",
+    "openrouter_chat_completion": "astrbot.core.provider.sources.openrouter_source",
+    "googlegenai_chat_completion": "astrbot.core.provider.sources.gemini_source",
+}
+
+
+def _init_system_llm_provider(plugin_config: dict):
+    """从主 AstrBot 配置初始化系统 LLM provider，返回带 inst_map 的轻量 provider manager。"""
+    import importlib
+    text_provider_id = plugin_config.get("text_provider_id", "")
+    if not text_provider_id:
+        print("⚠️ 插件配置中未设置 text_provider_id，无法使用系统 LLM 生成答案")
+        return None
+
+    main_config_path = Path(__file__).parent.parent.parent.parent / "cmd_config.json"
+    if not main_config_path.exists():
+        print(f"⚠️ 主配置文件不存在: {main_config_path}")
+        return None
+
+    with open(main_config_path, "r", encoding="utf-8-sig") as f:
+        main_cfg = json.load(f)
+
+    # 查找匹配的 provider 条目
+    provider_config = None
+    for p in main_cfg.get("provider", []):
+        if p.get("id") == text_provider_id:
+            if not p.get("enable", True):
+                print(f"⚠️ Provider {text_provider_id} 未启用")
+                return None
+            provider_config = dict(p)
+            break
+
+    if not provider_config:
+        print(f"⚠️ 未在主配置中找到 provider: {text_provider_id}")
+        return None
+
+    # 合并 provider_source 配置
+    src_id = provider_config.get("provider_source_id", "")
+    if src_id:
+        for ps in main_cfg.get("provider_sources", []):
+            if ps.get("id") == src_id:
+                merged = {**ps, **provider_config}
+                merged["id"] = provider_config["id"]
+                provider_config = merged
+                break
+
+    provider_type = provider_config.get("type", "")
+    if not provider_type:
+        print(f"⚠️ Provider {text_provider_id} 缺少 type 字段")
+        return None
+
+    # 确保 provider type 对应的 source 模块已加载（触发 @register_provider_adapter）
+    # 与 AstrBot ProviderManager.dynamic_import_provider() 逻辑一致
+    try:
+        from astrbot.core.provider.register import provider_cls_map
+    except ImportError as e:
+        print(f"⚠️ 无法导入 provider_cls_map: {e}")
+        return None
+
+    if provider_type not in provider_cls_map:
+        module_path = _PROVIDER_MODULES.get(provider_type)
+        if not module_path:
+            print(f"⚠️ 不支持的 provider 类型: {provider_type}")
+            return None
+        importlib.import_module(module_path)
+
+    meta = provider_cls_map.get(provider_type)
+    if meta is None:
+        print(f"⚠️ 未注册的 provider 类型: {provider_type}")
+        return None
+
+    provider_settings = main_cfg.get("provider_settings", {})
+    try:
+        provider_inst = meta.cls_type(provider_config, provider_settings)
+    except Exception as e:
+        print(f"⚠️ 实例化 provider {text_provider_id} 失败: {e}")
+        return None
+
+    model = provider_config.get("model", "?")
+    api_base = provider_config.get("api_base", "?")
+    print(f"✅ 系统 LLM provider 初始化成功: {text_provider_id} ({model}) @ {api_base}")
+
+    # 返回带 inst_map 的轻量 provider manager
+    class _LightweightProviderManager:
+        def __init__(self, inst_map):
+            self.inst_map = inst_map
+
+    return _LightweightProviderManager({text_provider_id: provider_inst})
+
 
 class _EvalFakeContext:
-    """用于评估脚本的模拟上下文，可选地注入 LLM provider 用于图谱检索。"""
+    """用于评估脚本的模拟上下文，支持注入 LLM provider 和 provider_manager。"""
 
-    def __init__(self, llm_provider=None):
-        self.provider_manager = None
+    def __init__(self, llm_provider=None, provider_manager=None):
+        self.provider_manager = provider_manager
         self._llm_provider = llm_provider
 
     def get_using_provider(self):
@@ -118,11 +327,7 @@ async def extract_chunks_from_milvus(
     chunks = await index_manager.get_all_chunks()
 
     # 保存到文件（原子写入）
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    temp_path = output_path + ".tmp"
-    with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(chunks, f, ensure_ascii=False, indent=2)
-    os.replace(temp_path, output_path)
+    _atomic_write_json(output_path, chunks)
 
     print(f"✅ 提取完成: {len(chunks)} chunks -> {output_path}")
 
@@ -190,13 +395,12 @@ def _read_table_csv_as_text(csv_path: str, max_rows: int = 50) -> str:
         return f"[Table: {csv_path} (read error)]"
 
 
-def _get_multimodal_context(node_metadata: Dict[str, Any], figures_dir: Path) -> str:
+def _get_multimodal_context(node_metadata: Dict[str, Any]) -> str:
     """
     从 chunk metadata 中提取图片/表格上下文信息，转换为文本描述
 
     Args:
         node_metadata: chunk 的 metadata
-        figures_dir: figures 目录路径
 
     Returns:
         包含图片/表格描述的文本
@@ -293,7 +497,7 @@ def chunks_to_documents(
             if include_multimodal:
                 metadata = c.get("metadata", {})
                 if isinstance(metadata, dict):
-                    multimodal_ctx = _get_multimodal_context(metadata, Path(figures_dir))
+                    multimodal_ctx = _get_multimodal_context(metadata)
                     if multimodal_ctx:
                         has_multimodal = True
                         multimodal_count += 1
@@ -425,33 +629,15 @@ def extract_multimodal_chunks_with_context(
         if paper_id:
             chunks_by_paper[paper_id].append((i, chunk))
 
-    # 找出多模态 chunks 和普通 chunks
-    multimodal_indices = set()
-    for chunk in chunks:
-        metadata = chunk.get("metadata", {})
-        if not isinstance(metadata, dict):
-            continue
-
-        has_image = bool(metadata.get("image_path") or metadata.get("all_images"))
-        has_table = bool(metadata.get("table_path"))
-        mm_data = metadata.get("multimodal_data", {})
-        if isinstance(mm_data, dict):
-            if mm_data.get("images") or mm_data.get("tables"):
-                has_image = True
-
-        if has_image or has_table:
-            # 找到这个 chunk 在原始列表中的索引
-            for i, c in enumerate(chunks):
-                if c.get("id") == chunk.get("id"):
-                    multimodal_indices.add(i)
-                    break
+    # 复用 extract_multimodal_chunks 做多模态检测，获取带 _multimodal_type 标记的 chunks
+    multimodal_with_tags = extract_multimodal_chunks(chunks)
+    multimodal_ids = {c.get("id") for c in multimodal_with_tags}
+    multimodal_indices = {i for i, c in enumerate(chunks) if c.get("id") in multimodal_ids}
 
     # 收集上下文 chunks
-    context_chunks = []
     context_indices = set()
 
     for paper_id, paper_chunks in chunks_by_paper.items():
-        paper_chunk_indices = [idx for idx, _ in paper_chunks]
         multimodal_in_paper = [idx for idx, _ in paper_chunks if idx in multimodal_indices]
 
         # 对于每个多模态 chunk，添加相邻的普通 chunks
@@ -624,14 +810,7 @@ async def generate_multimodal_testset(
     chunks: List[Dict[str, Any]],
     test_size: int = 20,
     output_path: str = "results/testset.json",
-    llm_model: str = "gpt-4o-mini",
-    llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
-    llm_api_key: str = "",
-    embedding_model: str = "text-embedding-v4",
-    embed_base_url: str = "",
-    embed_api_key: str = "",
-    embedding_mode: str = "api",
-    max_rpm: int = 96,
+    llm: _EvalLLMConfig = _EvalLLMConfig(),
     context_before: int = 1,
     context_after: int = 1,
 ) -> List[Any]:
@@ -644,10 +823,7 @@ async def generate_multimodal_testset(
         chunks: 所有 chunks 列表
         test_size: 生成问题数量
         output_path: 输出路径（会将结果 append 到已有文件）
-        llm_model: LLM 模型名称
-        llm_base_url: API 基础 URL
-        llm_api_key: API Key
-        max_rpm: RPM 限制
+        llm: LLM 配置容器
         context_before: 每个多模态 chunk 前面取几个普通 chunks 作为上下文
         context_after: 每个多模态 chunk 后面取几个普通 chunks 作为上下文
 
@@ -659,7 +835,7 @@ async def generate_multimodal_testset(
     print("=" * 60)
 
     # 提取多模态 chunks 和上下文 chunks
-    multimodal_chunks, context_chunks = extract_multimodal_chunks_with_context(
+    multimodal_chunks, _ = extract_multimodal_chunks_with_context(
         chunks,
         context_before=context_before,
         context_after=context_after,
@@ -676,42 +852,12 @@ async def generate_multimodal_testset(
         print("⚠️ 没有成功构建多模态文档")
         return []
 
-    # 构建上下文 documents（普通文本）
-    context_docs = []
-    for chunk in context_chunks:
-        text = chunk.get("text", "")
-        if text:
-            doc = LIDocument(
-                text=text,
-                metadata={
-                    "paper_id": chunk.get("paper_id", "") or chunk.get("metadata", {}).get("paper_id", ""),
-                    "chunk_id": chunk.get("id", ""),
-                    "source": "context",
-                }
-            )
-            context_docs.append(doc)
-
-    # 合并多模态文档和上下文文档
-    all_docs = multimodal_docs + context_docs
-
     # 使用 Ragas 生成测试集
+    generator = _create_testset_generator(llm)
 
-    generator = RagasTestsetGenerator(
-        llm_model=llm_model,
-        llm_base_url=llm_base_url,
-        llm_api_key=llm_api_key,
-        embedding_model=embedding_model,
-        embed_base_url=embed_base_url,
-        embed_api_key=embed_api_key,
-        embedding_mode=embedding_mode,
-        max_rpm=max_rpm,
-    )
-
-    # 只使用有多模态内容的文档
-    multimodal_docs = [doc for doc in all_docs if doc.metadata.get("has_multimodal", False)]
     print(f"📊 多模态文档数量: {len(multimodal_docs)}")
 
-    # 使用足够的文档（多模态 + 上下文）
+    # 使用足够的文档
     trimmed_docs = multimodal_docs[:min(test_size * MULTIMODAL_DOC_MULTIPLIER, len(multimodal_docs))]
 
     # 使用临时文件避免覆盖主文件（generate_testset 会直接写入文件）
@@ -752,14 +898,13 @@ async def generate_multimodal_testset(
         chunk_id = match.group(1) if match else ""
         metadata = chunk_id_to_metadata.get(chunk_id, {})
 
-        is_multimodal = True  # 所有样本都是多模态的
         if chunk_id and metadata:
             matched_count += 1
         else:
             unmatched_count += 1
 
         sample.metadata = {
-            "is_multimodal": is_multimodal,
+            "is_multimodal": True,
             "multimodal_types": ["image", "table"],
             "image_path": metadata.get("image_path", ""),
             "table_path": metadata.get("table_path", ""),
@@ -827,12 +972,8 @@ async def generate_multimodal_testset(
         print(f"⚠️ 路径验证失败: {e}")
         raise
 
-    # 原子写入：先写临时文件，再 rename
-    output_path_obj.parent.mkdir(parents=True, exist_ok=True)
-    temp_final = str(output_path_obj) + ".tmp"
-    with open(temp_final, "w", encoding="utf-8") as f:
-        json.dump(all_samples, f, ensure_ascii=False, indent=2)
-    os.replace(temp_final, output_path_obj)
+    # 原子写入
+    _atomic_write_json(output_path_obj, all_samples)
 
     print(f"✅ 多模态测试集已生成并追加到: {output_path}")
     print(f"   新增 {len(multimodal_samples)} 个多模态样本")
@@ -847,6 +988,20 @@ async def generate_multimodal_testset(
     return multimodal_samples
 
 
+def _create_testset_generator(llm: _EvalLLMConfig) -> RagasTestsetGenerator:
+    """从 LLM 配置创建 RagasTestsetGenerator — generate_testset_from_documents 和 generate_multimodal_testset 共用。"""
+    return RagasTestsetGenerator(
+        llm_model=llm.llm_model,
+        llm_base_url=llm.llm_base_url,
+        llm_api_key=llm.llm_api_key,
+        embedding_model=llm.embedding_model,
+        embed_base_url=llm.embed_base_url,
+        embed_api_key=llm.embed_api_key,
+        embedding_mode=llm.embedding_mode,
+        max_rpm=llm.max_rpm,
+    )
+
+
 # ============================================================================
 # 步骤 3: 生成测试集
 # ============================================================================
@@ -855,31 +1010,14 @@ async def generate_testset_from_documents(
     documents: List[Any],
     test_size: int = 50,
     output_path: str = "results/testset.json",
-    llm_model: str = "gpt-4o-mini",
-    llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
-    llm_api_key: str = "",
-    embedding_model: str = "text-embedding-v4",
-    embed_base_url: str = "",  # 强制留空，使用 freeapi_url
-    embed_api_key: str = "",
-    embedding_mode: str = "api",
-    max_rpm: int = 96,
+    llm: _EvalLLMConfig = _EvalLLMConfig(),
 ) -> List[Any]:
     """使用 Ragas 生成测试集"""
     print(f"\n{'='*60}")
     print(f"📝 步骤 2/4: 生成 {test_size} 个评测问题")
     print("=" * 60)
 
-
-    generator = RagasTestsetGenerator(
-        llm_model=llm_model,
-        llm_base_url=llm_base_url,
-        llm_api_key=llm_api_key,
-        embedding_model=embedding_model,
-        embed_base_url=embed_base_url,
-        embed_api_key=embed_api_key,
-        embedding_mode=embedding_mode,
-        max_rpm=max_rpm,
-    )
+    generator = _create_testset_generator(llm)
 
     samples = await generator.generate_testset(
         documents=documents,
@@ -891,6 +1029,21 @@ async def generate_testset_from_documents(
     return samples
 
 
+def _create_ragas_evaluator(llm: _EvalLLMConfig, answer_top_k: int = 5) -> RagasEvaluator:
+    """从 LLM 配置创建 RagasEvaluator — run_evaluation 和 run_evaluation_from_raw_answers 共用。"""
+    return RagasEvaluator(
+        llm_model=llm.eval_llm_model,
+        llm_base_url=llm.eval_llm_base_url,
+        llm_api_key=llm.llm_api_key,
+        embedding_model=llm.embedding_model,
+        embed_base_url=llm.embed_base_url,
+        embed_api_key=llm.embed_api_key,
+        embedding_mode=llm.eval_embedding_mode,
+        answer_top_k=answer_top_k,
+        llm_max_tokens=llm.eval_llm_max_tokens,
+    )
+
+
 # ============================================================================
 # 步骤 4: 执行评估
 # ============================================================================
@@ -900,36 +1053,20 @@ async def run_evaluation(
     testset_path: str,
     output_path: str = "results/evaluation_results.csv",
     max_concurrent: int = 5,
-    llm_model: str = "gpt-4o-mini",
-    llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
-    llm_api_key: str = "",
-    embedding_model: str = "text-embedding-v4",
-    embed_base_url: str = "",  # 强制留空，使用 freeapi_url
-    embed_api_key: str = "",
-    embedding_mode: str = "api",
-    eval_embedding_mode: str = "api",
+    llm: _EvalLLMConfig = _EvalLLMConfig(),
     answer_top_k: int = 5,
     context=None,
     config: Optional[dict] = None,
-    eval_llm_max_tokens: int = 16384,
+    mode: str = "rag",
 ) -> Any:
     """执行 Ragas 评估"""
+    mode_label = "Agentic RAG" if mode == "agentic" else "RAG"
     print(f"\n{'='*60}")
-    print("📊 步骤 3/4: 执行 Ragas 评估")
+    print(f"📊 步骤 3/4: 执行 Ragas 评估 [{mode_label}]")
     print("=" * 60)
-    print(f"📊 指标评估: {llm_model} @ {llm_base_url}")
+    print(f"📊 指标评估: {llm.eval_llm_model} @ {llm.eval_llm_base_url}")
 
-    evaluator = RagasEvaluator(
-        llm_model=llm_model,
-        llm_base_url=llm_base_url,
-        llm_api_key=llm_api_key,
-        embedding_model=embedding_model,
-        embed_base_url=embed_base_url,
-        embed_api_key=embed_api_key,
-        embedding_mode=eval_embedding_mode,
-        answer_top_k=answer_top_k,
-        llm_max_tokens=eval_llm_max_tokens,
-    )
+    evaluator = _create_ragas_evaluator(llm, answer_top_k)
 
     results = await evaluator.evaluate(
         query_engine=query_engine,
@@ -938,6 +1075,7 @@ async def run_evaluation(
         max_concurrent=max_concurrent,
         context=context,
         config=config,
+        mode=mode,
     )
 
     print(f"✅ 评估完成 -> {output_path}")
@@ -948,33 +1086,15 @@ async def run_evaluation_from_raw_answers(
     raw_answers_path: str,
     output_path: str = "results/evaluation_results.csv",
     max_concurrent: int = 5,
-    llm_model: str = "gpt-4o-mini",
-    llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
-    llm_api_key: str = "",
-    embedding_model: str = "text-embedding-v4",
-    embed_base_url: str = "",  # 强制留空，使用 freeapi_url
-    embed_api_key: str = "",
-    embedding_mode: str = "api",
+    llm: _EvalLLMConfig = _EvalLLMConfig(),
     answer_top_k: int = 5,
-    eval_llm_max_tokens: int = 16384,
 ) -> Any:
     """从已有 raw_answers.json 执行 Ragas 评估（跳过 RAG 推理）"""
     print(f"\n{'='*60}")
     print("📊 步骤 3/4: 执行 Ragas 评估（跳过 RAG 推理）")
     print("=" * 60)
 
-
-    evaluator = RagasEvaluator(
-        llm_model=llm_model,
-        llm_base_url=llm_base_url,
-        llm_api_key=llm_api_key,
-        embedding_model=embedding_model,
-        embed_base_url=embed_base_url,
-        embed_api_key=embed_api_key,
-        embedding_mode=embedding_mode,
-        answer_top_k=answer_top_k,
-        llm_max_tokens=eval_llm_max_tokens,
-    )
+    evaluator = _create_ragas_evaluator(llm, answer_top_k)
 
     results = await evaluator.evaluate_from_raw_answers(
         raw_answers_path=raw_answers_path,
@@ -1021,15 +1141,21 @@ def generate_reports(
     return {"html": html_path, "markdown": md_path}
 
 
-def _build_rag_config(plugin_dir: Path, top_k: int | None = None) -> tuple:
-    """从插件配置文件构建 RAGConfig 和 raw config dict（两处调用共享）"""
-    config_path = plugin_dir.parent.parent / "config" / "astrbot_plugin_paperrag_config.json"
+def _build_rag_config(plugin_dir: Path, top_k: int | None = None,
+                      plugin_config: dict | None = None) -> tuple:
+    """从插件配置文件构建 RAGConfig 和 raw config dict（两处调用共享）。
 
-    if config_path.exists():
-        with open(config_path, "r", encoding="utf-8-sig") as f:
-            rag_cfg = json.load(f)
+    如已通过 _resolve_eval_config() 加载 plugin_config，可传入避免重复读文件。
+    """
+    if plugin_config is not None:
+        rag_cfg = plugin_config
     else:
-        rag_cfg = {}
+        config_path = plugin_dir.parent.parent / "config" / "astrbot_plugin_paperrag_config.json"
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8-sig") as f:
+                rag_cfg = json.load(f)
+        else:
+            rag_cfg = {}
 
     config = RAGConfig(
         embedding_mode=rag_cfg.get("embedding_mode", "unsloth"),
@@ -1072,30 +1198,54 @@ def _build_rag_config(plugin_dir: Path, top_k: int | None = None) -> tuple:
 # 完整流程
 # ============================================================================
 
+async def _run_rag_eval(
+    testset_path: str,
+    results_path: str,
+    llm: _EvalLLMConfig,
+    sys_provider_mgr,
+    top_k: int | None,
+    max_concurrent: int,
+    answer_top_k: int,
+    mode: str = "rag",
+    plugin_config: dict | None = None,
+) -> Any:
+    """创建 HybridRAG 引擎并执行评估 — run_full_pipeline 和 --step evaluate 共用。"""
+    plugin_dir = Path(__file__).parent.parent
+    config, rag_cfg = _build_rag_config(plugin_dir, top_k, plugin_config)
+    fake_context = _EvalFakeContext(provider_manager=sys_provider_mgr)
+    mode_label = "Agentic RAG" if mode == "agentic" else "RAG"
+    print(f"🔧 初始化 HybridRAG 引擎 [{mode_label}]...")
+    engine = create_rag_engine(config, fake_context)
+    print("✅ HybridRAG 引擎创建成功")
+    return await run_evaluation(
+        query_engine=engine,
+        testset_path=testset_path,
+        output_path=results_path,
+        max_concurrent=max_concurrent,
+        llm=llm,
+        answer_top_k=answer_top_k,
+        context=fake_context,
+        config=rag_cfg,
+        mode=mode,
+    )
+
+
 async def run_full_pipeline(
     output_dir: str = "results",
     test_size: int = 50,
     multimodal_test_size: int = 0,
     max_concurrent: int = 5,
-    llm_model: str = "gpt-4o-mini",
-    llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
-    llm_api_key: str = "",
-    embedding_model: str = "text-embedding-v4",
-    embed_base_url: str = "",  # 强制留空，使用 freeapi_url
-    embed_api_key: str = "",
-    embedding_mode: str = "api",
-    max_rpm: int = 96,
+    llm: _EvalLLMConfig = _EvalLLMConfig(),
     plugin_version: str = "1.0.0",
-    eval_llm_model: str = "gpt-4o-mini",
-    eval_llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
     use_existing_chunks: bool = False,
     existing_chunks_path: str = "results/milvus_chunks.json",
-    eval_embedding_mode: str = "api",
     top_k: int | None = None,
     multimodal_context_before: int = 1,
     multimodal_context_after: int = 1,
     answer_top_k: int = 5,
-    eval_llm_max_tokens: int = 16384,
+    provider_manager=None,
+    mode: str = "rag",
+    plugin_config: dict | None = None,
 ) -> dict:
     """
     完整评测流程
@@ -1131,18 +1281,11 @@ async def run_full_pipeline(
         return {"success": False, "error": "No valid documents created"}
 
     testset_path = str(output_path / "testset.json")
-    samples = await generate_testset_from_documents(
+    await generate_testset_from_documents(
         documents=documents,
         test_size=test_size,
         output_path=testset_path,
-        llm_model=llm_model,
-        llm_base_url=llm_base_url,
-        llm_api_key=llm_api_key,
-        embedding_model=embedding_model,
-        embed_base_url=embed_base_url,
-        embed_api_key=embed_api_key,
-        embedding_mode=embedding_mode,
-        max_rpm=max_rpm,
+        llm=llm,
     )
 
     # ========== 步骤 2.5: 生成多模态测试集（追加到同一文件） ==========
@@ -1151,50 +1294,23 @@ async def run_full_pipeline(
             chunks=chunks,
             test_size=multimodal_test_size,
             output_path=testset_path,
-            llm_model=llm_model,
-            llm_base_url=llm_base_url,
-            llm_api_key=llm_api_key,
-            embedding_model=embedding_model,
-            embed_base_url=embed_base_url,
-            embed_api_key=embed_api_key,
-            embedding_mode=embedding_mode,
-            max_rpm=max_rpm,
+            llm=llm,
             context_before=multimodal_context_before,
             context_after=multimodal_context_after,
         )
 
-    # ========== 步骤 3: 创建 RAG 查询引擎 ==========
-    print(f"\n{'='*60}")
-    print("🔧 步骤 3/4: 初始化 HybridRAG 引擎")
-    print("=" * 60)
-
-    # 使用插件现有配置创建引擎
-
-    plugin_dir = Path(__file__).parent.parent
-    config, rag_cfg = _build_rag_config(plugin_dir, top_k)
-
-    fake_context = _EvalFakeContext()
-    engine = create_rag_engine(config, fake_context)
-    print("✅ HybridRAG 引擎创建成功")
-
-    # ========== 步骤 4: 执行评估 ==========
+    # ========== 步骤 3+4: 创建引擎 + 执行评估 ==========
     results_path = str(output_path / "evaluation_results.csv")
-    await run_evaluation(
-        query_engine=engine,
+    await _run_rag_eval(
         testset_path=testset_path,
-        output_path=results_path,
+        results_path=results_path,
+        llm=llm,
+        sys_provider_mgr=provider_manager,
+        top_k=top_k,
         max_concurrent=max_concurrent,
-        llm_model=eval_llm_model,
-        llm_base_url=eval_llm_base_url,
-        llm_api_key=llm_api_key,
-        embedding_model=embedding_model,
-        embed_base_url=embed_base_url,
-        embed_api_key=embed_api_key,
-        embedding_mode=eval_embedding_mode,
         answer_top_k=answer_top_k,
-        context=fake_context,
-        config=rag_cfg,
-        eval_llm_max_tokens=eval_llm_max_tokens,
+        mode=mode,
+        plugin_config=plugin_config,
     )
 
     # ========== 步骤 5: 生成报告 ==========
@@ -1276,12 +1392,12 @@ def main():
 
     # LLM 配置（用于生成测试集）
     parser.add_argument("--llm-model", default="gpt-4o-mini", help="LLM 模型名称")
-    parser.add_argument("--llm-base-url", default="https://open.bigmodel.cn/api/paas/v4", help="LLM API 基础 URL")
+    parser.add_argument("--llm-base-url", default=_DEFAULT_LLM_URL, help="LLM API 基础 URL")
     parser.add_argument("--llm-api-key", default="", help="LLM API Key（可使用环境变量）")
 
     # Eval LLM 配置（用于评估指标计算）
-    parser.add_argument("--eval-llm-model", default="gpt-4o-mini", help="评估用 LLM 模型名称")
-    parser.add_argument("--eval-llm-base-url", default="https://open.bigmodel.cn/api/paas/v4", help="评估用 LLM API 基础 URL")
+    parser.add_argument("--eval-llm-model", default="gpt-5.4-nano", help="评估用 LLM 模型名称")
+    parser.add_argument("--eval-llm-base-url", default="", help="评估用 LLM API 基础 URL（留空则使用 free.json 中的 vapi 配置）")
     parser.add_argument("--eval-llm-api-key", default="", help="评估用 LLM API Key")
     parser.add_argument("--eval-llm-max-tokens", type=int, default=16384,
                         help="评估用 LLM max_tokens（默认 16384，推理模型需更高值容纳 reasoning tokens）")
@@ -1292,20 +1408,22 @@ def main():
     parser.add_argument("--embed-api-key", default="", help="Embedding API Key")
     parser.add_argument(
         "--embedding-mode",
-        choices=["api"],
+        choices=["api", "unsloth"],
         default="api",
-        help="Embedding 模式: api=使用远程API (默认: api)"
+        help="Embedding 模式: api=使用远程API, unsloth=本地 BGE-M3 (默认: api)"
     )
 
     # 评估用 Embedding 配置
     parser.add_argument(
         "--eval-embedding-mode",
-        choices=["api"],
+        choices=["api", "unsloth"],
         default="api",
-        help="评估指标用 Embedding 模式: api=使用远程API (默认)"
+        help="评估指标用 Embedding 模式: api=使用远程API, unsloth=本地 BGE-M3 (默认)"
     )
 
     # 评测参数
+    parser.add_argument("--mode", choices=["rag", "agentic"], default="rag",
+                        help="评估模式: rag=普通RAG检索+LLM生成, agentic=Agentic RAG (LangGraph workflow)")
     parser.add_argument("--max-concurrent", type=int, default=5, help="最大并发数")
     parser.add_argument("--answer-top-k", type=int, default=5, help="用 top-K 个检索 chunk 生成答案（默认5）")
     parser.add_argument("--max-rpm", type=int, default=96, help="RPM 限制（默认96）")
@@ -1323,86 +1441,33 @@ def main():
 
     args = parser.parse_args()
 
-    # 优先级: 显式参数 > 环境变量 > 插件配置
-    llm_api_key = args.llm_api_key or args.eval_llm_api_key or os.getenv("EVAL_LLM_API_KEY", "")
-    embed_api_key = args.embed_api_key or os.getenv("EVAL_EMBED_API_KEY", "")
+    # 解析 LLM 配置（CLI > env > plugin config > free.json）
+    llm, plugin_config = _resolve_eval_config(args)
 
-    # 尝试从插件配置读取 freeapi 设置（当 API Key 未显式提供时）
-    plugin_config_path = Path(__file__).parent.parent.parent.parent / "config" / "astrbot_plugin_paperrag_config.json"
-    embed_base_url = args.embed_base_url  # 默认使用命令行参数
-    if plugin_config_path.exists():
-        with open(plugin_config_path, "r", encoding="utf-8-sig") as f:
-            plugin_config = json.load(f)
-        config_freeapi_key = plugin_config.get("freeapi_key", "")
-        config_freeapi_url = plugin_config.get("freeapi_url", "")
-        if config_freeapi_key and not llm_api_key:
-            llm_api_key = config_freeapi_key
-            print(f"✅ 已从插件配置加载 freeapi key")
-        if config_freeapi_key and not embed_api_key:
-            embed_api_key = config_freeapi_key
-        if config_freeapi_url:
-            # 命令行 --eval-llm-base-url / --llm-base-url 优先于插件配置
-            _default_url = "https://open.bigmodel.cn/api/paas/v4"
-            user_url = args.eval_llm_base_url if args.eval_llm_base_url != _default_url else ""
-            user_url = user_url or (args.llm_base_url if args.llm_base_url != _default_url else "")
-            if user_url:
-                llm_base_url = user_url
-                embed_base_url = user_url
-                print(f"✅ 使用命令行指定的 LLM URL: {llm_base_url}")
-            else:
-                llm_base_url = config_freeapi_url + "/v1/"
-                embed_base_url = config_freeapi_url + "/v1/"
-                print(f"✅ 已从插件配置加载 freeapi: {llm_base_url}")
-        else:
-            llm_base_url = args.eval_llm_base_url or args.llm_base_url or "https://open.bigmodel.cn/api/paas/v4"
-            embed_base_url = llm_base_url
-    else:
-        llm_base_url = args.eval_llm_base_url or args.llm_base_url
-        embed_base_url = llm_base_url
-
-    print(f"\n📊 配置信息:")
-    print(f"   步骤: {args.step}")
-    print(f"   LLM 模型: {args.llm_model}")
-    print(f"   LLM API URL: {llm_base_url}")
-    print(f"   Embedding 模型: {args.embedding_model}")
-    print(f"   Embedding API URL: {embed_base_url}")
-    print(f"   Embedding 模式: {args.embedding_mode}")
-    if args.embedding_mode == "unsloth":
-        print(f"   Embedding 模式: Unsloth (本地 BGE-M3)")
-
-    if not llm_api_key:
-        print("⚠️ 警告: 未提供 API Key（设置 EVAL_LLM_API_KEY 环境变量或使用 --llm-api-key）")
-
-    # ========== 根据步骤执行 ==========
+    # 初始化系统 LLM provider（用于答案生成）
+    sys_provider_mgr = _init_system_llm_provider(plugin_config)
 
     # 设置 RPM 限制
-    OpenAICompatibleLLM.set_max_rpm(args.max_rpm)
-    print(f"   RPM 限制: {args.max_rpm}")
+    OpenAICompatibleLLM.set_max_rpm(llm.max_rpm)
+
+    # ========== 根据步骤执行 ==========
     if args.step == "all":
         asyncio.run(run_full_pipeline(
             output_dir=args.output_dir,
             test_size=args.test_size,
             multimodal_test_size=args.multimodal_test_size,
             max_concurrent=args.max_concurrent,
-            llm_model=args.llm_model,
-            llm_base_url=llm_base_url,
-            llm_api_key=llm_api_key,
-            embedding_model=args.embedding_model,
-            embed_base_url=embed_base_url,
-            embed_api_key=embed_api_key,
-            embedding_mode=args.embedding_mode,
-            max_rpm=args.max_rpm,
+            llm=llm,
             plugin_version=args.plugin_version,
-            eval_llm_model=args.eval_llm_model,
-            eval_llm_base_url=args.eval_llm_base_url,
             use_existing_chunks=args.use_existing_chunks,
             existing_chunks_path=args.existing_chunks_path,
-            eval_embedding_mode=args.eval_embedding_mode,
             top_k=args.top_k,
             multimodal_context_before=args.multimodal_context_before,
             multimodal_context_after=args.multimodal_context_after,
             answer_top_k=args.answer_top_k,
-            eval_llm_max_tokens=args.eval_llm_max_tokens,
+            provider_manager=sys_provider_mgr,
+            mode=args.mode,
+            plugin_config=plugin_config,
         ))
 
     elif args.step == "extract":
@@ -1430,28 +1495,14 @@ def main():
                 documents=documents,
                 test_size=args.test_size,
                 output_path=testset_path,
-                llm_model=args.llm_model,
-                llm_base_url=llm_base_url,
-                llm_api_key=llm_api_key,
-                embedding_model=args.embedding_model,
-                embed_base_url=embed_base_url,
-                embed_api_key=embed_api_key,
-                embedding_mode=args.embedding_mode,
-                max_rpm=args.max_rpm,
+                llm=llm,
             )
             if args.multimodal_test_size > 0:
                 await generate_multimodal_testset(
                     chunks=chunks,
                     test_size=args.multimodal_test_size,
                     output_path=testset_path,
-                    llm_model=args.llm_model,
-                    llm_base_url=llm_base_url,
-                    llm_api_key=llm_api_key,
-                    embedding_model=args.embedding_model,
-                    embed_base_url=embed_base_url,
-                    embed_api_key=embed_api_key,
-                    embedding_mode=args.embedding_mode,
-                    max_rpm=args.max_rpm,
+                    llm=llm,
                     context_before=args.multimodal_context_before,
                     context_after=args.multimodal_context_after,
                 )
@@ -1469,15 +1520,11 @@ def main():
                 print(f"❌ raw_answers.json 不存在: {raw_answers_path}")
                 print("请先运行带 RAG 推理的评估命令，生成该文件")
                 return
-            # 读取实际问题数量（兼容新旧格式）
-            with open(raw_answers_path, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, list):
-                raw_data = loaded
-            elif isinstance(loaded, dict) and "results" in loaded:
-                raw_data = loaded["results"]
-            else:
-                print(f"❌ 无法识别的 raw_answers.json 格式: {type(loaded).__name__}")
+            # 读取 raw_answers（兼容新旧格式）
+            try:
+                raw_data, _ = load_raw_answers(raw_answers_path)
+            except ValueError as e:
+                print(f"❌ 无法识别的 raw_answers.json 格式: {e}")
                 print("   文件必须是旧格式（JSON 数组）或新格式（含 _metadata 和 results 的 JSON 对象）")
                 return
             actual_count = len(raw_data)
@@ -1488,15 +1535,8 @@ def main():
                 raw_answers_path=raw_answers_path,
                 output_path=results_path,
                 max_concurrent=args.max_concurrent,
-                llm_model=args.eval_llm_model,
-                llm_base_url=args.eval_llm_base_url or llm_base_url,
-                llm_api_key=llm_api_key,
-                embedding_model=args.embedding_model,
-                embed_base_url=embed_base_url,
-                embed_api_key=embed_api_key,
-                embedding_mode=args.embedding_mode,
+                llm=llm,
                 answer_top_k=args.answer_top_k,
-                eval_llm_max_tokens=args.eval_llm_max_tokens,
             ))
         else:
             # 正常流程：RAG 推理 + 评估
@@ -1509,31 +1549,16 @@ def main():
 
             print(f"✅ 使用已有测试集: {testset_path}")
 
-            plugin_dir = Path(__file__).parent.parent
-            config, rag_cfg = _build_rag_config(plugin_dir, args.top_k)
-
-            fake_context = _EvalFakeContext()
-            print("🔧 初始化 HybridRAG 引擎...")
-            engine = create_rag_engine(config, fake_context)
-            print("✅ 引擎创建成功")
-
-            # 执行评估
-            asyncio.run(run_evaluation(
-                query_engine=engine,
+            asyncio.run(_run_rag_eval(
                 testset_path=testset_path,
-                output_path=results_path,
+                results_path=results_path,
+                llm=llm,
+                sys_provider_mgr=sys_provider_mgr,
+                top_k=args.top_k,
                 max_concurrent=args.max_concurrent,
-                llm_model=args.eval_llm_model,
-                llm_base_url=args.eval_llm_base_url or llm_base_url,
-                llm_api_key=llm_api_key,
-                embedding_model=args.embedding_model,
-                embed_base_url=embed_base_url,
-                embed_api_key=embed_api_key,
-                eval_embedding_mode=args.eval_embedding_mode,
                 answer_top_k=args.answer_top_k,
-                context=fake_context,
-                config=rag_cfg,
-                eval_llm_max_tokens=args.eval_llm_max_tokens,
+                mode=args.mode,
+                plugin_config=plugin_config,
             ))
 
         # 生成报告
@@ -1567,14 +1592,7 @@ def main():
             chunks=chunks,
             test_size=args.multimodal_test_size,
             output_path=str(Path(args.output_dir) / "testset.json"),
-            llm_model=args.llm_model,
-            llm_base_url=llm_base_url,
-            llm_api_key=llm_api_key,
-            embedding_model=args.embedding_model,
-            embed_base_url=embed_base_url,
-            embed_api_key=embed_api_key,
-            embedding_mode=args.embedding_mode,
-            max_rpm=args.max_rpm,
+            llm=llm,
             context_before=args.multimodal_context_before,
             context_after=args.multimodal_context_after,
         ))

@@ -192,6 +192,22 @@ class OpenAICompatibleLLM(BaseRagasLLM):
             pass
         return False
 
+    @staticmethod
+    def _repair_json_string(text: str) -> str:
+        """修复 LLM 输出中的常见 JSON 问题。
+
+        已知问题:
+        - 无效转义序列: \` → `  \\(非 JSON 转义字符) → 去掉反斜杠
+        - 单引号 JSON: {'key': 'val'} → {"key": "val"}
+        - 尾部逗号: [1, 2, ,] → [1, 2]
+        """
+        # 修复无效转义序列: \X → X (X 不是合法 JSON 转义字符)
+        # 合法转义: \" \\ \/ \b \f \n \r \t \uXXXX
+        repaired = re.sub(r'\\(?!["\\/bfnrtu])', '', text)
+        # 修复尾部逗号 (,] 或 ,})
+        repaired = re.sub(r',\s*([}\]])', r'\1', repaired)
+        return repaired
+
     def _call_api(self, prompt_text: str, temperature: float, max_tokens: int, stop: Optional[list], max_retries: int = 3):
         """同步调用 API（受全局 Semaphore 限制并发），超时/网络错误自动重试"""
 
@@ -237,12 +253,13 @@ class OpenAICompatibleLLM(BaseRagasLLM):
                 if not stripped:
                     final_text = '{"text": "模型未返回有效响应"}'
                 else:
+                    repaired = self._repair_json_string(stripped)
                     try:
-                        parsed = json.loads(stripped)
+                        parsed = json.loads(repaired)
                         if parsed == {}:
                             final_text = '{"text": "模型未返回有效响应"}'
                         else:
-                            final_text = stripped
+                            final_text = repaired
                     except json.JSONDecodeError:
                         final_text = json.dumps({"text": stripped})
 
@@ -356,11 +373,12 @@ class OpenAICompatibleLLM(BaseRagasLLM):
                 if not stripped:
                     raise RuntimeError("LLM 返回空内容，可能是模型服务暂时不可用或被限流")
 
+                repaired = self._repair_json_string(stripped)
                 try:
-                    parsed = json.loads(stripped)
+                    parsed = json.loads(repaired)
                     if parsed == {}:
                         raise RuntimeError("LLM 返回空 JSON 对象，可能是模型服务暂时不可用")
-                    final_text = stripped
+                    final_text = repaired
                 except json.JSONDecodeError:
                     final_text = json.dumps({"text": stripped})
 
@@ -421,7 +439,16 @@ class OpenAICompatibleLLM(BaseRagasLLM):
         except json.JSONDecodeError:
             pass
 
-        # 步骤 3：解析失败，记录日志并抛出
+        # 步骤 3：修复常见 JSON 问题后重试
+        repaired = self._repair_json_string(stripped)
+        try:
+            json.loads(repaired)
+            logger.warning(f"LLM JSON 经修复后解析成功: {repaired[:80]}...")
+            return repaired
+        except json.JSONDecodeError:
+            pass
+
+        # 步骤 4：解析失败，记录日志并抛出
         preview = text.strip()[:200]
         logger.error(f"LLM 返回内容无法解析为 JSON: {preview}...")
         raise InvalidLLMResponseError(
@@ -1146,8 +1173,32 @@ class RagasTestsetGenerator:
         # 生成测试集
         print("正在调用 LLM 生成问答对（可能需要几分钟）...")
 
-        # 容错：HeadlinesExtractor 失败时 headlines 属性为 None，
-        # 原版 HeadlineSplitter 会抛 ValueError，此处 patch 为安全返回
+        # 容错：LLM 返回无效/结构不匹配 JSON 时，RAGAS extractor 会抛 OutputParserException
+        # 导致整个 generate_with_llamaindex_docs 挂掉。此处 patch extractor，失败时返回空值。
+        from ragas.testset.transforms.extractors.llm_based import (
+            HeadlinesExtractor, ThemesExtractor,
+        )
+
+        _orig_headlines_extract = HeadlinesExtractor.extract
+        async def _safe_headlines_extract(self, node):
+            try:
+                return await _orig_headlines_extract(self, node)
+            except Exception as e:
+                logger.warning(f"[PaperRAG] HeadlinesExtractor 失败: {e}")
+                return self.property_name, []
+
+        _orig_themes_extract = ThemesExtractor.extract
+        async def _safe_themes_extract(self, node):
+            try:
+                return await _orig_themes_extract(self, node)
+            except Exception as e:
+                logger.warning(f"[PaperRAG] ThemesExtractor 失败: {e}")
+                return self.property_name, []
+
+        HeadlinesExtractor.extract = _safe_headlines_extract
+        ThemesExtractor.extract = _safe_themes_extract
+
+        # 容错：HeadlineSplitter 遇到 None headlines 时抛 ValueError
         _orig_split = HeadlineSplitter.split
         async def _safe_split(self, node):
             if node.get_property("headlines") is None:
@@ -1169,6 +1220,8 @@ class RagasTestsetGenerator:
             print("   尝试继续处理已生成的样本...")
             testset = None
         finally:
+            HeadlinesExtractor.extract = _orig_headlines_extract
+            ThemesExtractor.extract = _orig_themes_extract
             HeadlineSplitter.split = _orig_split
 
         # 转换为标准格式

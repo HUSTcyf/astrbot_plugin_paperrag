@@ -29,7 +29,7 @@ import logging
 for _ln in ("neo4j",):
     logging.getLogger(_ln).setLevel(logging.WARNING)
 
-from .commands import ArxivCommandsMixin, GraphCommandsMixin, IdeaCommandsMixin, PaperCommandsMixin
+from .commands import ArxivCommandsMixin, GraphCommandsMixin, IdeaCommandsMixin, PaperCommandsMixin, RemoteCodeMixin
 from .commands.base import PluginCoreBase
 
 
@@ -37,10 +37,10 @@ from .commands.base import PluginCoreBase
     "paper_rag",
     "HUSTcyf",
     "本地文档库RAG检索插件 (支持PDF/Word/TXT/HTML, Gemini + Milvus Lite)",
-    "2.2.2",
+    "2.2.3",
     "https://github.com/HUSTcyf/astrbot_plugin_paperrag.git"
 )
-class PaperRAGPlugin(PaperCommandsMixin, ArxivCommandsMixin, GraphCommandsMixin, IdeaCommandsMixin, PluginCoreBase):
+class PaperRAGPlugin(PaperCommandsMixin, ArxivCommandsMixin, GraphCommandsMixin, IdeaCommandsMixin, RemoteCodeMixin, PluginCoreBase):
     """论文RAG检索插件"""
 
     def __init__(self, context, config: dict = {}):
@@ -433,4 +433,51 @@ class PaperRAGPlugin(PaperCommandsMixin, ArxivCommandsMixin, GraphCommandsMixin,
     async def cmd_idea_regen(self, event: AstrMessageEvent, folder_hash: str = "", refresh: str = "auto", num: int = 3, focus: str = "all"):
         """Regenerate specific idea block"""
         async for result in self._idea_regen(event, folder_hash=folder_hash, refresh=refresh, num=num, focus=focus):
+            yield result
+
+    # ==================== Remote CC 命令组 ====================
+    @filter.command_group("cc")
+    def cc_commands(self):
+        """远程 Claude Code 管理命令
+        status         - 显示远程连接状态和 Claude Code 版本
+        connect        - 测试到远程服务器的 SSH 连接
+        install        - 安装/更新远程 Claude Code + CC-Connect
+        exec           - 在远程服务器上执行编程任务
+        config         - 查看当前远程执行配置
+        """
+        pass
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @cc_commands.command("status")
+    async def cmd_cc_status(self, event: AstrMessageEvent):
+        """Show remote connection status and Claude Code version"""
+        async for result in self._cc_status(event):
+            yield result
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @cc_commands.command("connect")
+    async def cmd_cc_connect(self, event: AstrMessageEvent):
+        """Test SSH connection to remote server"""
+        async for result in self._cc_connect(event):
+            yield result
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @cc_commands.command("install")
+    async def cmd_cc_install(self, event: AstrMessageEvent):
+        """Install/update Claude Code + CC-Connect on remote"""
+        async for result in self._cc_install(event):
+            yield result
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @cc_commands.command("exec")
+    async def cmd_cc_exec(self, event: AstrMessageEvent, task: str = "", timeout: int = 0):
+        """Execute a programming task on the remote server"""
+        async for result in self._cc_exec(event, task=task, timeout=timeout):
+            yield result
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @cc_commands.command("config")
+    async def cmd_cc_config(self, event: AstrMessageEvent):
+        """Show current remote execution configuration"""
+        async for result in self._cc_config(event):
             yield result

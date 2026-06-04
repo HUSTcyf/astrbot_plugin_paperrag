@@ -38,6 +38,22 @@ def _llm_display_name(llm_config: dict) -> str:
         return "provider"
     return llm_config.get("model", "unknown")
 
+
+def _extract_text(obj, default: str = "") -> str:
+    """从 AstrBot ProviderRequest 或普通字符串中提取文本。
+
+    AstrBot 框架在某些版本中会将 LLM Tool 的参数封装为 ProviderRequest 对象。
+    此函数兼容两种类型，确保 Tool 函数始终接收到纯字符串。
+    """
+    try:
+        from astrbot.core.provider.entities import ProviderRequest
+        if isinstance(obj, ProviderRequest):
+            prompt = getattr(obj, "prompt", None)
+            return prompt if prompt is not None else default
+    except ImportError:
+        pass
+    return obj if isinstance(obj, str) else default
+
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 
 # Claude Code 权限相关 stderr 关键字（需要用户手动授权时出现）
@@ -375,22 +391,10 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             yield event.plain_result(f"❌ Agentic RAG 执行失败: {e}")
 
     async def _agentic_rag_tool(self, event: AstrMessageEvent, query: str, top_k: int = 5) -> str:
-        """LLM Tool wrapper: consumes the async generator and returns the final answer text.
-
-        AstrBot's call_local_llm_tool passes the real event as first positional arg.
-        We pass it directly to _agentic_rag. Because this is a coroutine (not an
-        async generator), the yields from _agentic_rag are consumed internally and
-        never reach the framework for user delivery.  Only the last meaningful yield
-        (final answer or error) is returned to the LLM.
-
-        Args:
-            event: AstrMessageEvent (injected by framework)
-            query: query string
-            top_k: number of results to retrieve
-
-        Returns:
-            Final answer text (or error message) as a plain string for the LLM.
-        """
+        """LLM Tool wrapper: consumes the async generator and returns the final answer text."""
+        query = _extract_text(query, default="")
+        if not query:
+            return "查询字符串为空"
         results: list[str] = []
         async for result in self._agentic_rag(event, query=query, top_k=top_k):
             text = result.get_plain_text() if hasattr(result, "get_plain_text") else str(result)
@@ -441,16 +445,10 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             yield event.plain_result(f"❌ ReAct Agent 执行失败: {e}")
 
     async def _react_rag_tool(self, event: AstrMessageEvent, query: str, top_k: int = 5) -> str:
-        """LLM Tool wrapper: consumes the React Agent async generator, returns final text.
-
-        Args:
-            event: AstrMessageEvent (injected by framework)
-            query: query string
-            top_k: number of results to retrieve
-
-        Returns:
-            Final answer text (or error message) as a plain string for the LLM.
-        """
+        """LLM Tool wrapper: consumes the React Agent async generator, returns final text."""
+        query = _extract_text(query, default="")
+        if not query:
+            return "查询字符串为空"
         results: list[str] = []
         async for result in self._react_rag(event, query=query, top_k=top_k):
             text = result.get_plain_text() if hasattr(result, "get_plain_text") else str(result)
@@ -461,9 +459,6 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
     async def _paper_search_tool(self, event: AstrMessageEvent, query: str, top_k: int = 5) -> str:
         """LLM Tool wrapper: 基础 RAG 检索 + LLM 生成回答，返回纯文本。
 
-        比 paper_arag/paper_react 更轻量，适合简单的论文内容检索。
-        内部调用 engine.search → 文本清洗 → LLM 生成回答。
-
         Args:
             event: AstrMessageEvent (injected by framework)
             query: query string
@@ -472,6 +467,9 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
         Returns:
             Generated answer text, or error message.
         """
+        query = _extract_text(query, default="")
+        if not query:
+            return "查询字符串为空"
         engine = self._get_engine()
         if not engine:
             return "RAG 引擎未就绪"
@@ -507,11 +505,48 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
                 return f"任务包含潜在危险操作 ({label})，已被拒绝。请移除危险命令后重试。"
         return None
 
-    async def _code_execute_tool(self, event: AstrMessageEvent, task: str, timeout: int = 300) -> str:
-        """LLM Tool wrapper: 启动 claude -p 子进程执行编程任务，同步返回结果。
+    async def _is_code_task_llm(self, task: str) -> bool:
+        """用 LLM 严格判断是否真的是编程任务。不是则拒绝。"""
+        prompt = f"""你是一个严格的任务分类器。只判断以下用户请求是否是一个需要编写/修改代码、调试、重构、运行程序、操作文件系统、配置环境或执行其他编程相关操作的编程任务。
 
-        Agent 应先调用 paper_search/paper_arag/paper_react 检索相关知识，
-        整合上下文后形成完整任务再调用此工具。
+【严格规则】
+回答"否"的情况：
+- 询问知识、解释概念、介绍某个技术、了解某个话题
+- 纯对话、闲聊、问候、询问信息
+- 要求搜索、查找、检索论文或文档
+- 要求分析/解释但不涉及具体代码操作
+- 任何不是编程操作的自然语言请求
+
+回答"是"的情况（必须同时满足以下两点）：
+- 需要实际执行代码操作（写/改/运行/调试/测试/部署）
+- 任务目标是一个具体的编程产出物（代码、配置、测试、部署等）
+
+任务内容：
+{task[:800]}
+
+只回答"是"或"否"。"""
+        try:
+            from provider.llm_utils import call_llm
+            answer = await call_llm(
+                prompt=prompt,
+                context=self.context,
+                config=self.config,
+                temperature=0.0,
+            )
+            if answer and answer.strip():
+                result = answer.strip()
+                is_code = result.startswith("是")
+                logger.info(f"[code_execute] LLM 分类: {'是' if is_code else '否'} ({result[:20]})")
+                return is_code
+        except Exception as e:
+            logger.error(f"[code_execute] LLM 任务分类失败，默认拒绝: {e}")
+        return False
+
+    async def _code_execute_tool(self, event: AstrMessageEvent, task: str, timeout: int = 300) -> str:
+        """LLM Tool wrapper: execute programming task via Claude Code.
+
+        Dispatches to remote SSH backend when remote_exec.enabled is True,
+        otherwise falls back to local subprocess execution.
 
         Args:
             event: AstrMessageEvent (injected by framework)
@@ -521,21 +556,52 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
         Returns:
             Claude Code 的输出文本
         """
+        task = _extract_text(task, default="")
+        if not task:
+            return "任务为空，请提供有效的编程任务描述"
+
+        # LLM 严格把关：只放行真正的编程任务
+        if not await self._is_code_task_llm(task):
+            logger.warning(f"[code_execute] LLM 判断为非编程任务，拒绝执行: {task[:100]}")
+            return (
+                "`code_execute` 仅用于执行编程操作（写代码、改代码、调试、重构、运行实验等）。"
+                "此任务被判断为一般性查询，请改用 `paper_search` 等检索工具。"
+            )
+
         error = self._validate_code_execute_task(task)
         if error:
             return error
 
-        logger.debug(f"[code_execute] 完整任务: {task}")
+        # Dispatch: remote SSH vs local subprocess
+        remote_cfg = self.config.get("remote_exec", {}) if isinstance(self.config, dict) else {}
+        if remote_cfg.get("enabled", False):
+            logger.info(f"[code_execute] → Remote SSH backend: {task[:100]}...")
+            return await self._remote_code_execute(task, timeout=timeout)
+
+        logger.info(f"[code_execute] → Local subprocess: {task[:100]}...")
+        return await self._code_execute_local(task, timeout=timeout)
+
+    async def _code_execute_local(self, task: str, timeout: int = 300) -> str:
+        """Execute programming task locally via claude -p subprocess.
+
+        Args:
+            task: The complete programming task description (already validated).
+            timeout: Maximum execution time in seconds.
+
+        Returns:
+            Claude Code output text.
+        """
+        logger.debug(f"[code_execute_local] 完整任务: {task}")
 
         work_dir = str(_PLUGIN_DIR)
         cmd = [
-            "claude", "-p", "--", task,
+            "claude", "-p",
             "--output-format", "text",
             "--allowedTools",
             "Read,Write(astrbot_plugin_paperrag/**),Edit(astrbot_plugin_paperrag/**),Bash(git:*,python:*,pytest:*,pip:*),Grep,Glob",
+            "--", task,
         ]
 
-        logger.info(f"[code_execute] 执行: {task[:100]}...")
         process = None
         try:
             process = await asyncio.create_subprocess_exec(
@@ -546,10 +612,10 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             )
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
         except FileNotFoundError:
-            logger.error("[code_execute] claude 命令未找到（未安装或不在 PATH 中）")
+            logger.error("[code_execute_local] claude 命令未找到（未安装或不在 PATH 中）")
             return "Claude Code 未安装或不在 PATH 中，请联系管理员安装。"
         except asyncio.TimeoutError:
-            logger.error(f"[code_execute] 超时 ({timeout}s): {task[:100]}...")
+            logger.error(f"[code_execute_local] 超时 ({timeout}s): {task[:100]}...")
             if process is not None:
                 try:
                     process.kill()
@@ -565,7 +631,7 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
         perm_in_output = _PERMISSION_KEYWORDS.search(output)
         perm_in_stderr = _PERMISSION_KEYWORDS.search(err_output)
         if perm_in_output or perm_in_stderr:
-            logger.warning(f"[code_execute] 需要用户手动授权: {task[:100]}...")
+            logger.warning(f"[code_execute_local] 需要用户手动授权: {task[:100]}...")
             return (
                 f"Claude Code 执行此任务需要额外权限（如 Bash 执行或网络访问）。\n\n"
                 f"请先在服务器上审查以下任务是否安全，确认无误后手动执行：\n\n"
@@ -575,14 +641,14 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
             )
 
         if process.returncode != 0:
-            logger.error(f"[code_execute] 非零退出 (rc={process.returncode}): stderr={err_output[:200]}")
+            logger.error(f"[code_execute_local] 非零退出 (rc={process.returncode}): stderr={err_output[:200]}")
             if not output:
                 return f"Claude Code 退出码 {process.returncode}: {err_output[:500]}"
 
         if err_output:
-            logger.warning(f"[code_execute] stderr: {err_output[:200]}")
+            logger.warning(f"[code_execute_local] stderr: {err_output[:200]}")
 
-        logger.info(f"[code_execute] 完成 ({len(output)} chars)")
+        logger.info(f"[code_execute_local] 完成 ({len(output)} chars)")
         return output if output else "(no output)"
 
 

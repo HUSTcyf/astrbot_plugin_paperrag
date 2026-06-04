@@ -6,7 +6,7 @@ import re
 from typing import Tuple, List, Any
 
 from astrbot.api import logger
-from provider.llama_cpp_vlm import get_llama_cpp_vlm_provider
+from provider.llm_utils import get_llm_provider
 from rag.reference_processor import _find_all_reference_sections
 from rag.llm_preprocessor import remove_reference_sections
 
@@ -33,21 +33,15 @@ class LLMCompactionMixin:
         用 LLM 从论文首页文本中提取 title/abstract/authors。
         """
 
-        vlm_provider = get_llama_cpp_vlm_provider()
-        if vlm_provider is None:
-            logger.warning("⚠️ VLM Provider 不可用，跳过 title/abstract/authors 提取")
-            return "", "", []
-
-        try:
-            await vlm_provider.initialize()
-        except Exception as e:
-            logger.warning(f"⚠️ VLM Provider 初始化失败: {e}")
+        provider = get_llm_provider(getattr(self, 'context', None), getattr(self, 'config', None))
+        if provider is None:
+            logger.warning("⚠️ LLM Provider 不可用，跳过 title/abstract/authors 提取")
             return "", "", []
 
         prompt = self.LLM_EXTRACT_PROMPT_TEMPLATE.format(text=text)
 
         try:
-            response = await vlm_provider.text_chat(
+            response = await provider.text_chat(
                 prompt=prompt,
                 temperature=0.0,
             )

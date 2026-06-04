@@ -15,6 +15,7 @@
 
 import asyncio
 import os
+import ast
 import re
 import sys
 import shutil
@@ -996,13 +997,8 @@ class CragEvaluator:
                 temperature=0.1,
             )
 
-            response_text = ""
-            if hasattr(response, 'content'):
-                response_text = response.content
-            elif isinstance(response, dict):
-                response_text = response.get("content", "") or response.get("text", "")
-            else:
-                logger.warning(f"[CRAG] 评分响应格式无法识别: {type(response)}")
+            from provider.llm_utils import extract_text_from_response
+            response_text = extract_text_from_response(response)
 
             import json, re
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
@@ -1136,13 +1132,8 @@ class CragCorrector:
                 temperature=0.3,
             )
 
-            rewritten = ""
-            if hasattr(response, 'content'):
-                rewritten = response.content.strip()
-            elif isinstance(response, dict):
-                rewritten = response.get("content", "") or response.get("text", "")
-            else:
-                logger.warning(f"[CRAG] 查询重写响应格式无法识别: {type(response)}")
+            from provider.llm_utils import extract_text_from_response
+            rewritten = extract_text_from_response(response).strip()
 
             if rewritten:
                 query_embedding = await self._embed_provider.get_text_embedding(rewritten)
@@ -1277,14 +1268,12 @@ class HybridRAGEngine:
             raise
 
     async def _ensure_llm_provider_initialized(self) -> Any:
-        """确保 LLM Provider 已初始化（用于噪声过滤）"""
+        """确保 LLM Provider 已初始化（用于噪声过滤），复用 _ensure_llm_initialized 的统一解析。"""
         if getattr(self, '_llm_provider', None) is not None:
             return self._llm_provider
 
         try:
-            from provider.llama_cpp_vlm import get_llama_cpp_vlm_provider
-            self._llm_provider = get_llama_cpp_vlm_provider()
-            await self._llm_provider.initialize()
+            self._llm_provider = await self._ensure_llm_initialized()
             logger.info("✅ LLM Provider 初始化完成（噪声过滤）")
             return self._llm_provider
         except Exception as e:
@@ -1407,13 +1396,8 @@ class HybridRAGEngine:
                     contexts=[],
                     temperature=0.1,
                 )
-                content = ""
-                if hasattr(response, "content"):
-                    content = response.content
-                elif isinstance(response, dict):
-                    content = response.get("content", "") or response.get("text", "")
-                else:
-                    content = str(response)
+                from provider.llm_utils import extract_text_from_response
+                content = extract_text_from_response(response)
                 json_match = re.search(r"\{.*\}", content, re.DOTALL)
                 if json_match:
                     result = json.loads(json_match.group(0))
@@ -1824,38 +1808,80 @@ class HybridRAGEngine:
     async def _graph_recall_papers(self, query: str) -> List[str]:
         """Recall paper IDs from knowledge graph to supplement abstract search."""
         if not getattr(self.config, 'enable_graph_rag', False):
+            logger.debug("[HybridRAGEngine] graph召回: enable_graph_rag=False，跳过")
             return []
 
         try:
             retriever = await self._ensure_retriever_initialized()
             graph_retriever = getattr(retriever, '_graph_retriever', None)
             if not graph_retriever:
+                logger.warning("[HybridRAGEngine] graph召回: _graph_retriever 不可用")
                 return []
 
             graph_result = await graph_retriever.aretrieve(query)
             if not graph_result:
+                logger.info("[HybridRAGEngine] graph召回: retriever 返回 0 条结果")
                 return []
 
-            entity_names: set = set()
+            # 精度优先：按 retriever score 排序，只取 Top-5 实体
+            entity_scores: dict[str, float] = {}
             for nws in graph_result:
-                text = getattr(nws.node, 'text', '') or ''
-                if not text:
+                score = getattr(nws, 'score', None)
+                if score is not None and score <= 0:
                     continue
-                parts = [p.strip() for p in text.split(' -> ')]
-                if len(parts) == 3:
-                    for idx in (0, 2):
-                        p = parts[idx]
-                        if p and len(p) > 1:
-                            entity_names.add(p)
-                else:
-                    for p in parts:
-                        if p and len(p) >= 2:
-                            entity_names.add(p)
+                node = nws.node
+                text = getattr(node, 'text', '') or ''
 
-            if not entity_names:
+                # 格式1: TextToCypher → "Cypher Response:\n[{...}]"
+                cr_match = re.search(r'Cypher Response:\s*(\[.+?\](?:\s*$))', text, re.DOTALL)
+                if cr_match:
+                    try:
+                        rows = ast.literal_eval(cr_match.group(1))
+                        if isinstance(rows, list):
+                            for row in rows:
+                                for f in ('head', 'tail'):
+                                    v = row.get(f, '')
+                                    if v and isinstance(v, str) and len(v) >= 2:
+                                        name = v.strip()
+                                        entity_scores[name] = max(entity_scores.get(name, 0), score or 1.0)
+                    except (ValueError, SyntaxError):
+                        pass
+                    continue
+
+                # 格式2: LLMSynonymRetriever "EntityA -> REL -> EntityB"
+                if ' -> ' in text:
+                    for p in text.split(' -> '):
+                        p = p.strip()
+                        if len(p) >= 2:
+                            entity_scores[p] = max(entity_scores.get(p, 0), score or 1.0)
+                elif text:
+                    stripped = text.strip()
+                    if len(stripped) >= 2 and len(stripped) < 200:
+                        entity_scores[stripped] = max(entity_scores.get(stripped, 0), score or 1.0)
+
+            if not entity_scores:
+                logger.warning("[HybridRAGEngine] graph召回: 0 entities，无实体名可查")
                 return []
 
-            graph_paper_ids: set = set()
+            _STOP_WORDS = {'lpips', 'psnr', 'ssim', 'fid', 'iou', 'map', 'auc',
+                           'training', 'testing', 'evaluation', 'performance',
+                           'accuracy', 'quality', 'efficiency', 'robustness'}
+            scored = [
+                (name, s) for name, s in entity_scores.items()
+                if len(name) >= 5 and name.lower() not in _STOP_WORDS
+            ]
+            scored.sort(key=lambda x: -x[1])
+            limited_names = [name for name, _ in scored[:5]]
+            if not limited_names:
+                return []
+
+            logger.info(
+                f"[HybridRAGEngine] graph召回: Top-5 entities → "
+                f"{limited_names}"
+            )
+
+            # 精度优先：每个实体取 2 篇，按实体 score 加权累加
+            paper_entity_count: dict[str, float] = {}
             graph_store = None
             try:
                 if hasattr(graph_retriever, 'sub_retrievers') and graph_retriever.sub_retrievers:
@@ -1864,31 +1890,40 @@ class HybridRAGEngine:
                 logger.debug(f"[HybridRAGEngine] 无法从 PGRetriever 提取 graph_store: {e}")
 
             if graph_store is None:
-                logger.warning(
-                    "[HybridRAGEngine] graph论文召回: 无法获取 Neo4j graph_store，跳过论文查询"
-                )
+                logger.warning("[HybridRAGEngine] graph论文召回: 无法获取 Neo4j graph_store")
             else:
                 driver = getattr(graph_store, '_driver', None) or getattr(graph_store, 'client', None)
                 if driver is not None:
                     with driver.session(database="neo4j") as session:
-                        cypher_result = session.run(
-                            "MATCH (n) WHERE n.name IN $names "
-                            "AND n.chunk_id IS NOT NULL "
-                            "RETURN DISTINCT n.chunk_id AS cid",
-                            names=list(entity_names)[:50],
-                        )
-                        for record in cypher_result:
-                            cid = record["cid"]
-                            if cid:
-                                if not cid.lower().endswith(".pdf"):
-                                    cid = cid + ".pdf"
-                                graph_paper_ids.add(cid)
+                        # 每个实体取最多 2 篇，按实体 score 加权累加
+                        for name in limited_names:
+                            safe_name = name.replace("\\", "\\\\").replace("'", "\\'")
+                            weight = entity_scores.get(name, 1.0)
+                            r = session.run(
+                                f"MATCH (n) WHERE toLower(n.name) CONTAINS toLower('{safe_name}') "
+                                "AND n.chunk_id IS NOT NULL "
+                                "RETURN DISTINCT n.chunk_id AS cid LIMIT 2 "
+                                "UNION "
+                                f"MATCH (n)-[r]->() WHERE toLower(n.name) CONTAINS toLower('{safe_name}') "
+                                "AND r.chunk_id IS NOT NULL "
+                                "RETURN DISTINCT r.chunk_id AS cid LIMIT 2"
+                            )
+                            for rec in r:
+                                cid = rec["cid"]
+                                if cid:
+                                    if not cid.lower().endswith(".pdf"):
+                                        cid = cid + ".pdf"
+                                    paper_entity_count[cid] = paper_entity_count.get(cid, 0) + weight
+
+            # 按加权关联分排序（实体 score 加权），取 Top-3
+            ranked = sorted(paper_entity_count.items(), key=lambda x: -x[1])
+            graph_paper_ids = [cid for cid, _ in ranked[:3]]
 
             logger.info(
                 f"[HybridRAGEngine] graph论文召回: {len(graph_paper_ids)} papers "
-                f"from {len(entity_names)} entities"
+                f"from {len(limited_names)} entities (weighted={dict(list(ranked[:5]))})"
             )
-            return list(graph_paper_ids)
+            return graph_paper_ids
 
         except Exception as e:
             logger.warning(f"[HybridRAGEngine] graph论文召回失败: {e}")
@@ -1992,7 +2027,7 @@ class HybridRAGEngine:
 
                 # 阶段1.5: Rerank 摘要（使用 ColBERT MaxSim）
                 ABSTRACT_RERANK_QUOTA = 6
-                GRAPH_RECALL_QUOTA = 2
+                GRAPH_RECALL_QUOTA = 3
                 two_stage_rerank_k = ABSTRACT_RERANK_QUOTA
                 abstract_colbert = self._ensure_abstract_colbert_storage_initialized()
                 reranked_paper_ids = paper_ids[:two_stage_rerank_k]

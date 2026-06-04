@@ -73,3 +73,6 @@ docling==2.84.0  # PDF 多模态提取（图片、表格）
 
 # PaperBanana
 gradio>=6.0.0  # PaperBanana 本地服务调用（Client 在 gradio_client 包中）
+
+# Remote SSH Claude Code Execution
+paramiko>=3.4.0  # SSH client for remote Claude Code execution

@@ -5,14 +5,13 @@ Ragas 自动化评估模块
 """
 
 from .ragas_generator import RagasTestsetGenerator, EvalSample
-from .ragas_evaluator import RagasEvaluator, EvaluationResult
+from .ragas_evaluator import RagasEvaluator
 from .report_generator import ReportGenerator
 
 __all__ = [
     "RagasTestsetGenerator",
     "EvalSample",
     "RagasEvaluator",
-    "EvaluationResult",
     "ReportGenerator",
 ]
 

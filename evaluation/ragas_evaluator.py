@@ -4,21 +4,19 @@
 """
 
 import asyncio
-import copy
 import json
 import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Dict, Optional, Any, Union, cast
+from typing import Dict, Optional, Any, cast
 
 import pandas as pd
 from datasets import Dataset
 from ragas import evaluate, RunConfig, EvaluationDataset
-from ragas.llms.base import BaseRagasLLM, llm_factory
+from ragas.llms.base import BaseRagasLLM
 from ragas.embeddings.base import BaseRagasEmbedding, embedding_factory
 from ragas.metrics._faithfulness import Faithfulness
 from ragas.metrics._answer_relevance import AnswerRelevancy
@@ -26,12 +24,56 @@ from ragas.metrics._context_precision import ContextPrecision
 from ragas.metrics._context_recall import ContextRecall
 from ragas.metrics._nv_metrics import ContextRelevance
 from ragas.metrics._answer_correctness import AnswerCorrectness
-from langchain_core.prompt_values import StringPromptValue
-
 # 禁用 Ragas 遥测追踪（避免 SSL 证书过期错误）
 os.environ["RAGAS_DO_NOT_TRACK"] = "True"
 
 from astrbot.api import logger
+
+
+class _LLMWithN:
+    """自定义 LLM wrapper，替代 InstructorLLM 以支持 n>1。
+
+    问题：llm_factory() 创建的 InstructorLLM 在 RAGAS 的 generate_multiple() 中
+    走专门的分支（line 253-273），该分支忽略 n 参数，始终只返回 1 个 generation。
+
+    方案：不使用 InstructorLLM，直接用 OpenAI client + response_format=json_object 生成
+    JSON 输出。因为此类不是 InstructorBaseRagasLLM，RAGAS 的 generate_multiple() 会走
+    BaseRagasLLM 分支（line 274-283），该分支原生支持 n 参数。
+
+    每次 generate() 调用发送 n 次独立的 API 请求（确保任何 API 提供商都兼容），
+    返回 LLMResult 供 RAGAS 的 RagasOutputParser 解析为 Pydantic model。
+    """
+
+    def __init__(self, client, model: str, temperature: float = 0, max_tokens: int = 16384):
+        self._client = client
+        self._model = model
+        self._temperature = temperature
+        self._max_tokens = max_tokens
+        self.agenerate_text: Any = None  # 由 _make_agenerate_text 在 _get_llm() 中设置
+
+    async def generate(self, prompt_value, n=1, temperature=None, stop=None, callbacks=None):
+        """被 RAGAS generate_multiple() 的 BaseRagasLLM 分支调用。"""
+        from langchain_core.outputs import Generation, LLMResult
+
+        kwargs = dict(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt_value.text}],
+            max_tokens=self._max_tokens,
+            temperature=temperature if temperature is not None else self._temperature,
+            n=n,
+            response_format={"type": "json_object"},
+        )
+        if stop:
+            kwargs["stop"] = stop
+
+        r = self._client.chat.completions.create(**kwargs)
+        gens = [Generation(text=choice.message.content or "") for choice in r.choices]
+        # 兜底：部分 API 代理不支持 n 参数，仅返回 1 个 choice
+        while len(gens) < n:
+            fallback_kwargs = {k: v for k, v in kwargs.items() if k != "n"}
+            r = self._client.chat.completions.create(**fallback_kwargs)
+            gens.append(Generation(text=r.choices[0].message.content or ""))
+        return LLMResult(generations=[gens])
 
 
 def _get_git_info() -> dict:
@@ -66,47 +108,29 @@ def _get_git_info() -> dict:
     return {"commit": "unknown", "commit_date": "unknown", "dirty": False}
 
 
+def load_raw_answers(path: str) -> tuple[list[dict], dict]:
+    """加载 raw_answers.json（兼容新旧格式）。
+
+    Returns:
+        (results_list, metadata_dict) — 旧格式时 metadata 为空 dict
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        loaded = json.load(f)
+    if isinstance(loaded, list):
+        return loaded, {}
+    if isinstance(loaded, dict) and "results" in loaded:
+        return loaded["results"], loaded.get("_metadata", {})
+    raise ValueError(f"无法识别的 raw_answers.json 格式: {type(loaded).__name__}")
+
+
 sys.path.insert(0, str(Path(__file__).parent))
-from ragas_generator import EvalSample, OpenAICompatibleLLM, RagasTestsetGenerator
+from ragas_generator import EvalSample
 
 # call_llm import（确保 plugin root 在 sys.path 中）
 _plugin_root = str(Path(__file__).parent.parent)
 if _plugin_root not in sys.path:
     sys.path.insert(0, _plugin_root)
 from provider.llm_utils import call_llm  # noqa: E402
-
-
-# ============================================================================
-# 数据结构
-# ============================================================================
-
-@dataclass
-class EvaluationResult:
-    """评估结果"""
-    question: str
-    answer: str
-    contexts: List[str]
-    ground_truth: str
-
-    # Ragas 指标
-    faithfulness: float
-    answer_relevancy: float
-    context_precision: float
-    context_recall: float
-    context_relevancy: float
-    answer_correctness: float
-
-    # 元数据
-    latency_ms: float
-    question_type: str
-
-    def to_dict(self) -> dict:
-        d = asdict(self)
-        return d
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "EvaluationResult":
-        return cls(**data)
 
 
 # ============================================================================
@@ -119,53 +143,65 @@ class RAGQueryWrapper:
     def __init__(
         self,
         query_engine: Any,
-        llm_model: str = "",
-        llm_base_url: str = "",
-        llm_api_key: str = "",
         answer_top_k: int = 5,
         context=None,
         config: Optional[dict] = None,
+        mode: str = "rag",
     ):
         """
         Args:
             query_engine: HybridRAGEngine 实例
-            llm_model: LLM 模型名称（fallback 云端 LLM 的 answer 生成）
-            llm_base_url: LLM API 基础 URL
-            llm_api_key: LLM API Key
             answer_top_k: 用 top-K 个检索 chunk 生成答案（默认5）
             context: AstrBot Context（用于 call_llm() 调用系统 LLM）
             config: 插件配置字典
+            mode: 评估模式 "rag" | "agentic"
         """
         self._engine = query_engine
-        self._llm_model = llm_model
-        self._llm_base_url = llm_base_url
-        self._llm_api_key = llm_api_key
         self._answer_top_k = answer_top_k
         self._context = context
         self._config = config
+        self._mode = mode
+
+        if mode == "agentic":
+            # agentic 模式不需要 engine.search()，直接调 LangGraph workflow
+            return
 
         if not hasattr(query_engine, "search"):
             raise TypeError(f"query_engine 必须为 HybridRAGEngine（需有 search 方法），实际: {type(query_engine)}")
 
-    async def aquery(self, query: str, force_english: bool = False) -> Dict[str, Any]:
+    @staticmethod
+    def _node_to_dict(node, score=None) -> dict:
+        """将检索节点统一转为 dict 格式。"""
+        if isinstance(node, dict):
+            return {
+                "text": node.get("text", ""),
+                "metadata": node.get("metadata", {}),
+                "score": score if score is not None else node.get("score", 0.0),
+            }
+        return {
+            "text": getattr(node, "text", ""),
+            "metadata": getattr(node, "metadata", {}),
+            "score": score if score is not None else getattr(node, "score", 0.0),
+        }
+
+    async def aquery(self, query: str) -> Dict[str, Any]:
         """执行异步查询，返回 sources、answer、images 字典"""
+        if self._mode == "agentic":
+            return await self._agentic_query(query)
+
         result = await self._engine.search(query)
 
         nodes = getattr(result, "nodes", [])
         scores = getattr(result, "scores", [1.0] * len(nodes))
-
-        source_nodes = []
-        for i, node in enumerate(nodes):
-            source_nodes.append({
-                "text": getattr(node, "text", ""),
-                "metadata": getattr(node, "metadata", {}),
-                "score": scores[i] if i < len(scores) else 0.0,
-            })
+        source_nodes = [
+            self._node_to_dict(node, scores[i] if i < len(scores) else 0.0)
+            for i, node in enumerate(nodes)
+        ]
 
         answer = ""
         answer_chunks = source_nodes[:self._answer_top_k]
         answer_texts = [n["text"] for n in answer_chunks if n["text"]]
-        if answer_texts and (self._context is not None or self._llm_base_url):
+        if answer_texts and self._context is not None:
             context_block = "\n\n".join(answer_texts)
             prompt = (
                 "You are answering a research question using excerpts from academic papers. "
@@ -189,9 +225,8 @@ class RAGQueryWrapper:
         }
 
     async def _generate_answer(self, prompt: str, fallback: str = "") -> str:
-        """生成 answer（系统 LLM 优先，云端 LLM fallback，带 retry + fallback）"""
+        """通过 call_llm() 调用系统 LLM 生成答案。"""
 
-        # 首选系统 LLM：通过 call_llm() 调用（VLM 或用户配置的 provider）
         if self._context is not None:
             try:
                 answer = await call_llm(
@@ -200,44 +235,43 @@ class RAGQueryWrapper:
                 )
                 if answer and answer.strip():
                     return answer
-                logger.warning("[RAGQueryWrapper] 系统 LLM 返回空答案，回退到云端 LLM")
+                logger.warning("[RAGQueryWrapper] 系统 LLM 返回空答案")
             except Exception as e:
-                logger.warning(f"[RAGQueryWrapper] 系统 LLM 调用失败: {type(e).__name__}: {e}，回退到云端 LLM")
+                logger.error(f"[RAGQueryWrapper] 系统 LLM 调用失败: {type(e).__name__}: {e}")
 
-        # fallback: 云端 LLM 路径
-        async def _try_generate() -> str:
-            llm = OpenAICompatibleLLM(
-                model=self._llm_model or "gpt-4o-mini",
-                api_base=self._llm_base_url,
-                api_key=self._llm_api_key or "sk-placeholder",
-                temperature=0.3,
-                max_tokens=2048,
-            )
-            llm_result = await llm.agenerate_text(StringPromptValue(text=prompt))
-            text = llm_result.generations[0][0].text
-            try:
-                parsed = json.loads(text)
-                if isinstance(parsed, dict) and "text" in parsed:
-                    return parsed["text"]
-            except (json.JSONDecodeError, TypeError):
-                pass
-            return text
-
-        # 外层 retry（底层 agenerate_text 内部已重试 3 次）
-        for attempt in range(2):
-            try:
-                result = await _try_generate()
-                if result.strip():
-                    return result
-                logger.warning(f"[RAGQueryWrapper] LLM 返回空内容 (attempt {attempt+1}/2): model={self._llm_model}")
-            except Exception as e:
-                logger.warning(f"[RAGQueryWrapper] LLM 失败 (attempt {attempt+1}/2): {type(e).__name__}: {e}")
-
-        # fallback: 返回 context 完整文本，避免空答案
+        # call_llm() 失败时返回原始 context 文本，确保评估仍可继续
         if fallback:
             logger.warning(f"[RAGQueryWrapper] 使用 fallback 文本 ({len(fallback)} chars)")
             return fallback
         return ""
+
+    async def _agentic_query(self, query: str) -> Dict[str, Any]:
+        """Agentic RAG 查询：直接调用 LangGraph workflow，提取 final_answer + retrieved_nodes。"""
+        from agentic_rag.workflow import compile_workflow
+
+        app = compile_workflow()
+        initial_state = {
+            "query": query,
+            "_context": self._context,
+            "_config": self._config,
+            "top_k": self._answer_top_k,
+            "steps": [],
+        }
+        result = await app.ainvoke(initial_state)
+
+        final_answer = result.get("final_answer", "")
+        retrieved_nodes = result.get("retrieved_nodes", [])
+        if not isinstance(retrieved_nodes, list):
+            retrieved_nodes = []
+
+        sources = [self._node_to_dict(node) for node in retrieved_nodes]
+
+        return {
+            "response": final_answer,
+            "answer": final_answer,
+            "sources": sources,
+            "images": [],
+        }
 
 
 # ============================================================================
@@ -291,46 +325,61 @@ class RagasEvaluator:
             "mode": embedding_mode,
         }
 
+    @staticmethod
+    def _create_openai_client(base_url: str, api_key: str):
+        from openai import OpenAI
+        import httpx
+        return OpenAI(
+            base_url=base_url.rstrip('/'),
+            api_key=api_key or "sk-placeholder",
+            max_retries=5,
+            timeout=httpx.Timeout(300.0, connect=30.0),
+        )
+
     def _get_llm(self):
-        """获取 LLM 实例（延迟初始化）- 使用 llm_factory 创建 InstructorLLM"""
+        """获取 LLM 实例（延迟初始化）"""
         if self._llm is None:
             if self._llm_config["base_url"]:
-                # 使用 ragas 0.4.3 新接口 llm_factory 创建 InstructorLLM
-                # 这解决了 collection metrics 要求的 InstructorLLM 接口
-                from openai import OpenAI
-                import httpx
-                client = OpenAI(
-                    base_url=self._llm_config["base_url"].rstrip('/'),
-                    api_key=self._llm_config["api_key"] or "sk-placeholder",
-                    max_retries=5,
-                    timeout=httpx.Timeout(300.0, connect=30.0),
-                )
-                self._llm = llm_factory(
-                    model=self._llm_config["model"],
-                    provider="openai",
+                client = self._create_openai_client(
+                    self._llm_config["base_url"], self._llm_config["api_key"])
+                self._llm = _LLMWithN(
                     client=client,
+                    model=self._llm_config["model"],
                     temperature=0,
                     max_tokens=self._llm_config.get("max_tokens", 16384),
                 )
-                print(f"✅ LLM (InstructorLLM) 初始化成功: {self._llm_config['model']} @ {self._llm_config['base_url']}")
+                # 兼容旧 API 指标（_nv_metrics 调用 agenerate_text）
+                self._llm.agenerate_text = self._make_agenerate_text(
+                    client, self._llm_config["model"],
+                    self._llm_config.get("max_tokens", 16384))
+                print(f"✅ LLM (_LLMWithN, supports n>1) 初始化成功: {self._llm_config['model']} @ {self._llm_config['base_url']}")
             else:
                 raise ValueError("base_url is required for LLM")
         return self._llm
 
+    @staticmethod
+    def _make_agenerate_text(client, model: str, max_tokens: int):
+        """给 InstructorLLM 添加 agenerate_text 方法（直接调 OpenAI API）。"""
+        from langchain_core.outputs import LLMResult, Generation
+        async def _agenerate_text(prompt, n=1, temperature=None, stop=None, callbacks=None):
+            text = getattr(prompt, 'text', str(prompt))
+            kwargs: dict = dict(model=model, messages=[dict(role="user", content=text)],
+                                max_tokens=max_tokens, temperature=temperature or 0)
+            if stop:
+                kwargs["stop"] = stop
+            gens = []
+            for _ in range(n):
+                r = client.chat.completions.create(**kwargs)
+                gens.append(Generation(text=r.choices[0].message.content or ""))
+            return LLMResult(generations=[gens])
+        return _agenerate_text
+
     def _get_embed_model(self):
         """获取 Embedding 模型实例（延迟初始化）- 使用 embedding_factory 创建 modern embeddings"""
         if self._embed_model is None:
-            embed_mode = self._embed_config.get("mode", "api")
-
             if self._embed_config["base_url"]:
-                from openai import OpenAI
-                import httpx
-                client = OpenAI(
-                    base_url=self._embed_config["base_url"].rstrip('/'),
-                    api_key=self._embed_config["api_key"] or "sk-placeholder",
-                    max_retries=5,
-                    timeout=httpx.Timeout(300.0, connect=30.0),
-                )
+                client = self._create_openai_client(
+                    self._embed_config["base_url"], self._embed_config["api_key"])
                 self._embed_model = embedding_factory(
                     provider="openai",
                     model=self._embed_config["model"],
@@ -390,12 +439,6 @@ class RagasEvaluator:
                     None, lambda: self._inner.embed_texts(texts)
                 )
 
-            def embed_text(self, text: str):
-                return self._inner.embed_text(text)
-
-            def embed_texts(self, texts):
-                return self._inner.embed_texts(texts)
-
             async def aembed_text(self, text: str):
                 loop = asyncio.get_event_loop()
                 return await loop.run_in_executor(
@@ -435,6 +478,83 @@ class RagasEvaluator:
             AnswerCorrectness(llm=llm, embeddings=embeddings),
         ]
 
+    def _evaluate_and_save(
+        self,
+        questions: list[str],
+        answers: list[str],
+        contexts_list: list[list[str]],
+        ground_truths: list[str],
+        latencies: list,
+        question_types: list[str],
+        has_multimodal_list: list[bool],
+        output_path: str,
+        max_concurrent: int,
+    ) -> pd.DataFrame:
+        """构建 Ragas 数据集、执行评估（含 NaN 重试）、添加元数据、保存结果。
+
+        evaluate() 和 evaluate_from_raw_answers() 共享的核心评估逻辑。
+        """
+        print("构建 Ragas 数据集...")
+        ragas_dataset = Dataset.from_dict({
+            "question": questions,
+            "answer": answers,
+            "contexts": contexts_list,
+            "reference": ground_truths,
+        })
+
+        print("运行 Ragas 评估（计算 6 大指标，串行执行防止 429）...")
+        run_config = RunConfig(max_workers=1, timeout=180)
+        evaluation_result = evaluate(
+            dataset=ragas_dataset,
+            metrics=self._get_ragas_metrics(),
+            llm=cast(BaseRagasLLM, self._get_llm()),
+            embeddings=cast(BaseRagasEmbedding, self._get_embed_model_with_legacy()),
+            run_config=run_config,
+        )
+        scores_df = cast(EvaluationDataset, evaluation_result).to_pandas()
+
+        # 对缺失值（NaN）重试一次
+        nan_mask = scores_df.isna().any(axis=1)
+        if bool(nan_mask.any()):
+            nan_count = int(nan_mask.sum())
+            nan_indices = [i for i in range(len(nan_mask)) if bool(nan_mask.iloc[i])]
+            print(f"\n⚠️ {nan_count} 个样本存在 NaN 指标值，正在重试...")
+            try:
+                full_dict = cast(dict, ragas_dataset.to_dict())
+                retry_dict = {k: [v[i] for i in nan_indices] for k, v in full_dict.items()}
+                retry_dataset = Dataset.from_dict(retry_dict)
+                retry_result = evaluate(
+                    dataset=retry_dataset,
+                    metrics=self._get_ragas_metrics(),
+                    llm=cast(BaseRagasLLM, self._get_llm()),
+                    embeddings=cast(BaseRagasEmbedding, self._get_embed_model_with_legacy()),
+                    run_config=RunConfig(max_workers=1, timeout=180),
+                )
+                retry_df = cast(EvaluationDataset, retry_result).to_pandas()
+                for col in retry_df.columns:
+                    if col not in scores_df.columns:
+                        continue
+                    for local_i, global_i in enumerate(nan_indices):
+                        val = scores_df.at[global_i, col]
+                        if isinstance(val, float) and pd.isna(val):
+                            scores_df.at[global_i, col] = retry_df.at[local_i, col]
+                filled = int(sum(1 for i in nan_indices if not bool(scores_df.iloc[i].isna().any())))
+                print(f"✅ 重试完成: {filled}/{nan_count} 个样本已填充")
+            except Exception as e:
+                logger.warning(f"NaN 重试失败: {e}")
+
+        # 添加元数据列并保存
+        scores_df["latency_ms"] = latencies
+        scores_df["question_type"] = question_types
+        scores_df["has_multimodal"] = has_multimodal_list
+
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        scores_df.to_csv(output_path, index=False, encoding="utf-8-sig")
+        print(f"\n✅ 评估结果已保存到: {output_path}")
+
+        self._print_summary(scores_df)
+        return scores_df
+
     async def evaluate(
         self,
         query_engine: Any,
@@ -443,6 +563,7 @@ class RagasEvaluator:
         max_concurrent: int = 5,
         context=None,
         config: Optional[dict] = None,
+        mode: str = "rag",
     ) -> pd.DataFrame:
         """
         执行评估
@@ -454,41 +575,36 @@ class RagasEvaluator:
             max_concurrent: 最大并发数
             context: AstrBot Context（用于系统 LLM 答案生成）
             config: 插件配置字典
+            mode: 评估模式 "rag" | "agentic"
 
         Returns:
             评估结果 DataFrame
         """
+        mode_label = "Agentic RAG" if mode == "agentic" else "RAG"
         print(f"\n{'='*60}")
-        print("开始 Ragas 评估...")
+        print(f"开始 Ragas 评估 [{mode_label}]...")
         print(f"{'='*60}")
 
-        # 加载测试集
-        generator = RagasTestsetGenerator(
-            llm_model=self._llm_config["model"],
-            llm_base_url=self._llm_config["base_url"],
-            llm_api_key=self._llm_config["api_key"],
-            embedding_model=self._embed_config["model"],
-            embed_base_url=self._embed_config["base_url"],
-            embed_api_key=self._embed_config["api_key"],
-        )
-        samples = generator.load_testset(testset_path)
+        # 加载测试集（直接反序列化，避免无用的 RagasTestsetGenerator 实例化）
+        with open(testset_path, "r", encoding="utf-8") as f:
+            _testset_data = json.load(f)
+        samples = [EvalSample.from_dict(item) for item in _testset_data]
         print(f"加载测试集: {len(samples)} 个样本")
 
-        # 包装查询引擎（传入 LLM 配置用于 hybrid 路径的 answer 生成）
+        # 包装查询引擎（answer 生成通过 call_llm() 使用系统 LLM provider）
         rag_wrapper = RAGQueryWrapper(
             query_engine,
-            llm_model=self._llm_config["model"],
-            llm_base_url=self._llm_config["base_url"],
-            llm_api_key=self._llm_config["api_key"],
             answer_top_k=self._answer_top_k,
             context=context,
             config=config,
+            mode=mode,
         )
 
         # =====================================================================
         # 增量保存：每完成一个样本就写入 raw_answers.json，确保中途崩溃不丢失已计算结果
         # =====================================================================
-        raw_results_path = Path(output_path).parent / "raw_answers.json"
+        _raw_name = f"raw_answers_{mode}.json" if mode != "rag" else "raw_answers.json"
+        raw_results_path = Path(output_path).parent / _raw_name
         Path(raw_results_path).parent.mkdir(parents=True, exist_ok=True)
 
         # 先写入初始状态（含元数据和空结果列表）
@@ -505,6 +621,7 @@ class RagasEvaluator:
                 "git_dirty": git_info["dirty"],
                 "total_samples": len(samples),
                 "success_count": 0,
+                "mode": mode,
                 "llm_model": self._llm_config["model"],
                 "llm_base_url": self._llm_config["base_url"],
                 "embedding_model": self._embed_config["model"],
@@ -521,12 +638,14 @@ class RagasEvaluator:
         print(f"📝 增量保存到: {raw_results_path}  (commit: {commit_label})")
 
         semaphore = asyncio.Semaphore(max_concurrent)
-        results_by_idx: dict[int, dict] = {}
-        write_lock = asyncio.Lock()
         total_samples = len(samples)
+        results_ordered: list[Optional[dict]] = [None] * total_samples
+        results_count = 0
+        write_lock = asyncio.Lock()
 
         async def process_and_save(sample: EvalSample, idx: int) -> None:
             """处理单个样本并立即增量保存到 raw_answers.json"""
+            nonlocal results_count
             try:
                 async with semaphore:
                     result = await self._process_single_sample(rag_wrapper, sample, idx)
@@ -537,24 +656,24 @@ class RagasEvaluator:
                 return
 
             async with write_lock:
-                results_by_idx[idx] = result
-                _n = len(results_by_idx)
+                results_ordered[idx] = result
+                results_count += 1
+                _n = results_count
 
-                # 按原始顺序重建结果列表
-                ordered = []
-                for j in range(total_samples):
-                    if j in results_by_idx:
-                        r = results_by_idx[j]
-                        ordered.append({
-                            "question": r["question"],
-                            "answer": r["answer"],
-                            "contexts": r["contexts"],
-                            "ground_truth": r.get("ground_truth", ""),
-                            "latency_ms": r["latency_ms"],
-                            "question_type": r.get("question_type", "unknown"),
-                            "has_multimodal": r.get("has_multimodal", False),
-                            "used_images": r.get("used_images") or [],
-                        })
+                # 按原始顺序构建显示列表
+                ordered = [
+                    {
+                        "question": r["question"],
+                        "answer": r["answer"],
+                        "contexts": r["contexts"],
+                        "ground_truth": r.get("ground_truth", ""),
+                        "latency_ms": r["latency_ms"],
+                        "question_type": r.get("question_type", "unknown"),
+                        "has_multimodal": r.get("has_multimodal", False),
+                        "used_images": r.get("used_images") or [],
+                    }
+                    for r in results_ordered if r is not None
+                ]
 
                 base_payload["_metadata"]["success_count"] = _n
                 base_payload["results"] = ordered
@@ -571,7 +690,7 @@ class RagasEvaluator:
         await asyncio.gather(*tasks, return_exceptions=True)
 
         # 收集结果用于 Ragas 评估
-        success_count = len(results_by_idx)
+        success_count = results_count
 
         if success_count == 0:
             raise ValueError("没有成功处理任何样本")
@@ -579,7 +698,7 @@ class RagasEvaluator:
         print(f"成功处理 {success_count}/{len(samples)} 个样本")
         print(f"✅ 原始回答已保存到: {raw_results_path}")
 
-        # 从 results_by_idx 按序重建列表，供后续 Ragas 评估使用
+        # 从 results_ordered 按序重建列表，供后续 Ragas 评估使用
         questions = []
         answers = []
         contexts_list = []
@@ -589,10 +708,9 @@ class RagasEvaluator:
         has_multimodal_count = 0
         used_images_all: list = []
 
-        for i in range(total_samples):
-            if i not in results_by_idx:
+        for r in results_ordered:
+            if r is None:
                 continue
-            r = results_by_idx[i]
             questions.append(r["question"])
             answers.append(r["answer"])
             contexts_list.append(r["contexts"])
@@ -607,83 +725,12 @@ class RagasEvaluator:
         if has_multimodal_count > 0:
             print(f"🖼️ 其中 {has_multimodal_count} 个样本涉及图片/表格")
 
-        # 构建 Ragas 数据集
-        print("构建 Ragas 数据集...")
-        ragas_dataset = Dataset.from_dict({
-            "question": questions,
-            "answer": answers,
-            "contexts": contexts_list,
-            "reference": ground_truths,
-        })
-
-        # 执行 Ragas 评估
-        print("运行 Ragas 评估（计算 6 大指标）...")
-        run_config = RunConfig(max_workers=max_concurrent, timeout=180)
-
-        evaluation_result = evaluate(
-            dataset=ragas_dataset,
-            metrics=self._get_ragas_metrics(),
-            llm=cast(BaseRagasLLM, self._get_llm()),
-            embeddings=cast(BaseRagasEmbedding, self._get_embed_model_with_legacy()),
-            run_config=run_config,
+        multimodal_flags = [r.get("has_multimodal", False) for r in results_ordered if r is not None]
+        return self._evaluate_and_save(
+            questions, answers, contexts_list, ground_truths,
+            latencies, question_types, multimodal_flags,
+            output_path, max_concurrent,
         )
-
-        # 转换为 DataFrame
-        scores_df = cast(EvaluationDataset, evaluation_result).to_pandas()
-
-        # 对缺失值（NaN）重试一次
-        nan_mask = scores_df.isna().any(axis=1)
-        if bool(nan_mask.any()):
-            nan_count = int(nan_mask.sum())
-            nan_indices = [i for i in range(len(nan_mask)) if bool(nan_mask.iloc[i])]
-            print(f"\n⚠️ {nan_count} 个样本存在 NaN 指标值，正在重试...")
-            try:
-                from datasets import Dataset as HFDataset
-                full_dict = cast(dict, ragas_dataset.to_dict())
-                retry_dict = {
-                    k: [v[i] for i in nan_indices]
-                    for k, v in full_dict.items()
-                }
-                retry_dataset = HFDataset.from_dict(retry_dict)
-                retry_result = evaluate(
-                    dataset=retry_dataset,
-                    metrics=self._get_ragas_metrics(),
-                    llm=cast(BaseRagasLLM, self._get_llm()),
-                    embeddings=cast(BaseRagasEmbedding, self._get_embed_model_with_legacy()),
-                    run_config=RunConfig(max_workers=max_concurrent, timeout=180),
-                )
-                retry_df = cast(EvaluationDataset, retry_result).to_pandas()
-                for col in retry_df.columns:
-                    if col not in scores_df.columns:
-                        continue
-                    for local_i, global_i in enumerate(nan_indices):
-                        val = scores_df.at[global_i, col]
-                        if isinstance(val, float) and pd.isna(val):
-                            scores_df.at[global_i, col] = retry_df.at[local_i, col]
-                filled = int(sum(1 for i in nan_indices if not bool(scores_df.iloc[i].isna().any())))
-                print(f"✅ 重试完成: {filled}/{nan_count} 个样本已填充")
-            except Exception as e:
-                logger.warning(f"NaN 重试失败: {e}")
-
-        # 添加元数据列
-        scores_df["latency_ms"] = latencies
-        scores_df["question_type"] = question_types
-
-        # 添加多模态信息（从 results_by_idx 按 scores_df 的顺序派生）
-        multimodal_flags = []
-        for i in range(total_samples):
-            if i in results_by_idx:
-                multimodal_flags.append(results_by_idx[i].get("has_multimodal", False))
-        scores_df["has_multimodal"] = multimodal_flags
-
-        # 保存结果
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        scores_df.to_csv(output_path, index=False, encoding="utf-8-sig")
-        print(f"\n✅ 评估结果已保存到: {output_path}")
-
-        self._print_summary(scores_df)
-
-        return scores_df
 
     async def evaluate_from_raw_answers(
         self,
@@ -707,74 +754,31 @@ class RagasEvaluator:
         print(f"{'='*60}")
 
         # 读取 raw_answers.json（兼容新旧格式）
-        with open(raw_answers_path, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-
-        if isinstance(loaded, list):
-            # 旧格式：裸列表，无元数据
-            raw_data = loaded
+        raw_data, meta = load_raw_answers(raw_answers_path)
+        if not meta:
             print("⚠️ 旧格式 raw_answers.json（无元数据），建议重新运行 RAG 推理以生成含溯源信息的版本")
-        elif isinstance(loaded, dict) and "results" in loaded:
-            raw_data = loaded["results"]
-            meta = loaded.get("_metadata", {})
+        else:
             commit_short = meta.get("git_commit", "unknown")[:8]
             print(f"📋 元数据: commit={commit_short}, dirty={meta.get('git_dirty')}, "
                   f"generated_at={meta.get('generated_at', 'unknown')}")
-        else:
-            raise ValueError(f"无法识别的 raw_answers.json 格式: {type(loaded)}")
 
         print(f"加载 {len(raw_data)} 个已有结果")
 
-        questions = [d["question"] for d in raw_data]
-        answers = [d["answer"] for d in raw_data]
-        contexts_list = [d["contexts"] for d in raw_data]
-        ground_truths = [d.get("ground_truth", "") for d in raw_data]
-        latencies = [d.get("latency_ms", 0) for d in raw_data]
-        question_types = [d.get("question_type", "unknown") for d in raw_data]
         has_multimodal_list = [d.get("has_multimodal", False) for d in raw_data]
-
-        # 多模态统计
-        multimodal_count = sum(1 for h in has_multimodal_list if h)
+        multimodal_count = sum(has_multimodal_list)
         if multimodal_count > 0:
             print(f"🖼️ 其中 {multimodal_count} 个样本涉及图片/表格")
 
-        # 构建 Ragas 数据集
-        print("构建 Ragas 数据集...")
-        ragas_dataset = Dataset.from_dict({
-            "question": questions,
-            "answer": answers,
-            "contexts": contexts_list,
-            "reference": ground_truths,
-        })
-
-        # 执行 Ragas 评估
-        print("运行 Ragas 评估（计算 6 大指标）...")
-        run_config = RunConfig(max_workers=max_concurrent, timeout=180)
-
-        evaluation_result = evaluate(
-            dataset=ragas_dataset,
-            metrics=self._get_ragas_metrics(),
-            llm=cast(BaseRagasLLM, self._get_llm()),
-            embeddings=cast(BaseRagasEmbedding, self._get_embed_model_with_legacy()),
-            run_config=run_config,
+        return self._evaluate_and_save(
+            [d["question"] for d in raw_data],
+            [d["answer"] for d in raw_data],
+            [d["contexts"] for d in raw_data],
+            [d.get("ground_truth", "") for d in raw_data],
+            [d.get("latency_ms", 0) for d in raw_data],
+            [d.get("question_type", "unknown") for d in raw_data],
+            has_multimodal_list,
+            output_path, max_concurrent,
         )
-
-        # 转换为 DataFrame
-        scores_df = cast(EvaluationDataset, evaluation_result).to_pandas()
-
-        # 添加元数据列
-        scores_df["latency_ms"] = latencies
-        scores_df["question_type"] = question_types
-        scores_df["has_multimodal"] = has_multimodal_list
-
-        # 保存结果
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        scores_df.to_csv(output_path, index=False, encoding="utf-8-sig")
-        print(f"\n✅ 评估结果已保存到: {output_path}")
-
-        self._print_summary(scores_df)
-
-        return scores_df
 
     async def _process_single_sample(
         self,
@@ -786,7 +790,7 @@ class RagasEvaluator:
         start = time.time()
 
         try:
-            result = await rag_wrapper.aquery(sample.question, force_english=True)
+            result = await rag_wrapper.aquery(sample.question)
             latency = (time.time() - start) * 1000
 
             # 使用测试集原始标记，而不是从检索结果推断
@@ -794,7 +798,7 @@ class RagasEvaluator:
 
             # 提取上下文文本（包含多模态信息）
             contexts = []
-            source_nodes = result.get("sources", result.get("source_nodes", []))
+            source_nodes = result.get("sources", [])
 
             for node in source_nodes:
                 if isinstance(node, dict):
@@ -826,19 +830,17 @@ class RagasEvaluator:
 
                 contexts.append(text)
 
-            # 获取使用的图片列表（从检索结果中提取，与原始问题类型无关）
-            used_images = result.get("images", [])
-            if not used_images:
-                used_images = []
-                for node in source_nodes:
-                    if isinstance(node, dict):
-                        img = node.get("metadata", {}).get("image_path", "")
-                    elif hasattr(node, "metadata"):
-                        img = node.metadata.get("image_path", "")
-                    else:
-                        continue
-                    if img and img not in used_images:
-                        used_images.append(img)
+            # 从检索结果中提取图片路径（RAGQueryWrapper.aquery 始终返回 images:[]）
+            used_images = []
+            for node in source_nodes:
+                if isinstance(node, dict):
+                    img = node.get("metadata", {}).get("image_path", "")
+                elif hasattr(node, "metadata"):
+                    img = node.metadata.get("image_path", "")
+                else:
+                    continue
+                if img and img not in used_images:
+                    used_images.append(img)
 
             return {
                 "question": sample.question,
@@ -855,64 +857,43 @@ class RagasEvaluator:
             logger.error(f"样本 {idx} 处理失败: {e}")
             return None
 
+    _METRIC_NAMES = [
+        "faithfulness", "answer_relevancy", "context_precision",
+        "context_recall", "context_relevancy", "answer_correctness",
+    ]
+
     def _print_summary(self, df: pd.DataFrame) -> None:
         """打印评估摘要"""
-        print("\n" + "=" * 60)
-        print("📊 Ragas 评估摘要")
-        print("=" * 60)
+        print(f"\n{'='*60}\n📊 Ragas 评估摘要\n{'='*60}")
 
-        metrics = [
-            "faithfulness",
-            "answer_relevancy",
-            "context_precision",
-            "context_recall",
-            "context_relevancy",
-            "answer_correctness",
-        ]
-
-        for metric in metrics:
-            if metric in df.columns:
-                avg = df[metric].mean()
-                std = df[metric].std()
-                # 处理 NaN
+        for m in self._METRIC_NAMES:
+            if m in df.columns:
+                avg = df[m].mean()
                 if pd.isna(avg):
-                    print(f"{metric:25s}: N/A (部分样本评估失败)")
+                    print(f"{m:25s}: N/A (部分样本评估失败)")
                 else:
-                    print(f"{metric:25s}: {avg:.3f} ± {std:.3f}")
+                    print(f"{m:25s}: {avg:.3f} ± {df[m].std():.3f}")
 
-        print("=" * 60)
-        print(f"总样本数: {len(df)}")
+        print(f"{'='*60}\n总样本数: {len(df)}")
 
         if "latency_ms" in df.columns:
             avg_latency = df["latency_ms"].mean()
             if not pd.isna(avg_latency):
                 print(f"平均延迟: {avg_latency:.0f}ms")
 
-        # 多模态统计
         if "has_multimodal" in df.columns:
-            multimodal_count = df["has_multimodal"].sum()
-            if multimodal_count > 0:
-                print(f"🖼️ 涉及图片/表格: {multimodal_count} 个样本 ({multimodal_count/len(df)*100:.1f}%)")
-
-                # 按多模态分组显示指标
-                multimodal_df = df[df["has_multimodal"] == True]
-                text_only_df = df[df["has_multimodal"] == False]
-
-                if len(multimodal_df) > 0:
-                    print(f"\n  📊 多模态样本指标:")
-                    for metric in metrics:
-                        if metric in multimodal_df.columns:
-                            avg = multimodal_df[metric].mean()
-                            if not pd.isna(avg):
-                                print(f"     {metric:25s}: {avg:.3f}")
-
-                if len(text_only_df) > 0:
-                    print(f"\n  📊 仅文本样本指标:")
-                    for metric in metrics:
-                        if metric in text_only_df.columns:
-                            avg = text_only_df[metric].mean()
-                            if not pd.isna(avg):
-                                print(f"     {metric:25s}: {avg:.3f}")
+            mm_count = int(df["has_multimodal"].sum())
+            if mm_count > 0:
+                print(f"🖼️ 涉及图片/表格: {mm_count} 个样本 ({mm_count/len(df)*100:.1f}%)")
+                for label, mask in [("多模态", df["has_multimodal"] == True), ("仅文本", df["has_multimodal"] == False)]:
+                    sub = df[mask]
+                    if len(sub) > 0:
+                        print(f"\n  📊 {label}样本指标:")
+                        for m in self._METRIC_NAMES:
+                            if m in sub.columns:
+                                avg = sub[m].mean()
+                                if not pd.isna(avg):
+                                    print(f"     {m:25s}: {avg:.3f}")
 
         print("=" * 60)
 

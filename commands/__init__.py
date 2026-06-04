@@ -4,3 +4,4 @@ from .paper import PaperCommandsMixin
 from .arxiv import ArxivCommandsMixin
 from .graph import GraphCommandsMixin
 from .idea import IdeaCommandsMixin
+from .remote_code import RemoteCodeMixin
