@@ -9,50 +9,21 @@
 - **Academic intent guard for LLM Tools**：新增 `_guard_academic_intent()` 预检查至 `_paper_search_tool`、`_agentic_rag_tool` 和 `_react_rag_tool`。非学术查询（问候、闲聊）现在会被提前拒绝，避免进入昂贵的 RAG 流水线，每次节省 30+ 秒。
 - **强化 `_check_academic_intent`**：扩展负面检测覆盖 "不"/"no"/"非" 变体，添加不可识别 LLM 响应的警告日志。
 - **强化 LLM Tool 描述**：为 `paper_search`、`paper_arag`、`paper_react` 工具描述添加 `【严格限制】` 前缀，阻止主 LLM 为非学术查询调用论文工具。
+- **Cypher code fence 修复**：`TextToCypherRetriever` 有时返回 markdown 包裹的 Cypher，validator 现在自动剥离 ` ```cypher ... ``` ` 后再校验。
+- 完整变更详见 [docs/changelog/2.2.4.md](docs/changelog/2.2.4.md)
 
-### 上版变化 (v2.2.2)
+### 近期更新
 
-- **⚠️ LLM Provider 思考模式处理**：参考文献解析需要 LLM 返回**纯 JSON**。推理模型的思考/推理 tokens 会破坏 JSON 解析。目前**自动关闭**的模型：Gemini（`thinking_budget=0`）、DeepSeek（`"thinking": {"type": "disabled"}`）、GLM（同上）。其他 provider 使用默认配置（大部分模型默认不开启思考模式，但若使用 o-series/reasoner 模型需手动在 AstrBot 配置中关闭）。详见下方 [⚠️ LLM 思考模式说明](#-llm-思考模式说明)。
-- **LLM Provider 多路径**：provider 三重路径（Gemini → stream → sync），HTTP 作为最终回退。
-- **参考文献 4 层解析链路**：Crossref → OpenAlex → arXiv Library → Semantic Scholar → DDG 网络搜索。每层失败后自动退至下一层。
-- **arXiv 限流保护**：`_arxiv_lock` 全局串行化 + `_MIN_ARXIV_INTERVAL=2s` 最小间隔，初始化健康检查用真实查询替代 `"test"` 缓存命中，`num_retries=0` 避免 429 时浪费重试时间。
-- **字符分片回退**：移除 tiktoken 依赖，回归 `15000` 字符阈值（≈4000 tokens），按参考文献序号边界分割 + 二次强制拆分兜底。
-- **并行富化加速**：`asyncio.gather` + `Semaphore(10)`，参考文献富化 5.4x 加速。
-- **OpenAlex 异步化**：`pyalex` → `httpx` 原生异步 REST API。
-- **智能引用修复**：`classify_papers_for_repair()` 自动分类论文为 full_reparse / link_only 两种策略，`/paper repair_refs confirm` 一键修复所有未链接引用。
-- **新命令**：`/paper reparseref <file>`（单篇重解析）、`/paper repair_refs confirm`（智能批量修复）。
-- **enable_fallback_search 默认开启**：正常 ingestion 流程也启用 Semantic Scholar + DDG fallback。
-- **test/ 清理**：移除 8 个 mock-heavy 测试文件（4368 行），保留 10 个有真实代码路径覆盖的测试。
-- 完整变更详见 [docs/changelog/2.2.1.md](docs/changelog/2.2.1.md)
+| 版本 | 日期 | 要点 |
+|------|------|------|
+| [2.2.3](docs/changelog/2.2.3.md) | 2026-06-03 | Remote SSH Claude Code execution (`/cc` 命令)，支持远程编程任务 |
+| [2.2.2](docs/changelog/2.2.2.md) | 2026-05-29 | 云端 LLM 图谱提取 + Pydantic 结构化校验，`strip_code_block` 修复 |
+| [2.2.1](docs/changelog/2.2.1.md) | 2026-05-26 | 参考文献 4 层解析链路、并行富化加速 5.4x、智能引用修复、OpenAlex 异步化 |
+| [2.2.0](docs/changelog/2.2.0.md) | 2026-05-25 | 新 LLM Tool `paper_search` + `code_execute`（远程编程），安全模型白名单 |
+| [2.1.2](docs/changelog/2.1.2.md) | 2026-05-25 | PaperBanana 集成、Docling 逻辑图注编号、Cypher RETURN * 自动修复 |
+| [2.1.1](docs/changelog/2.1.1.md) | 2026-05-15 | Ragas 评估增量保存、代码溯源元数据 |
 
-### 上版变化 (v2.2.0)
-
-- **新 LLM Tool：`paper_search`** — 轻量混合 RAG 检索，比 paper_arag/paper_react 更快速，适合简单的论文内容查询。内部走 `engine.search → 文本清洗 → LLM 生成回答`。
-- **新 LLM Tool：`code_execute`** — Claude Code 远程编程执行器。AstrBot agent 可调用此工具在服务器上执行编程任务（写/改代码、调试、实验、git 操作等）。采用 `claude -p` 子进程模式，无需 cc-connect 即可使用。内置输入校验（危险命令拦截）和超时子进程清理。
-- **安全模型**：code_execute 使用 `--allowedTools` 白名单限制 Claude Code 工具范围，危险命令（rm -rf /、curl|sh、sudo 等）自动拦截，权限不足时返回清晰的授权指引。
-- **版本号修正**：`@register()` 装饰器版本号从遗留的 1.12.6 更新为 2.2.0，与 metadata.yaml 保持一致。
-- 完整变更详见 [docs/changelog/2.2.0.md](docs/changelog/2.2.0.md)
-
-### 上版变化 (v2.1.2)
-
-- **PaperBanana 本地服务集成**：插件可启动和管理本地 PaperBanana 服务，新增 `paperbanana_project_path` 配置项，自动使用项目 `.venv` 中的 Python 启动方法图生成服务。
-- **Feishu 导出修复**：修复 lark-cli vs MCP 网关选择、PaperBanana 临时文件过早清理、`__import__('re')` 惰性导入等多项问题；长引用上下文支持 token 预算分批处理。
-- **Docling 逻辑图注编号**：使用 docling 原生 `caption_text()` API 提取论文真实图注编号（如 "Figure 3"），替代基于每页计数器的简单命名；caption 缺失时回退到全局 `unknown` 计数器（`{page}-unknown_{N}.png`）。
-- **Cypher 自动修复**：Neo4j 查询缺失 RETURN 子句时自动追加 `RETURN *` 并重试。
-- **已验证引用索引**：从 chunk metadata 提取 LLMReferenceParser + arXiv MCP 校验过的引用数据，构建权威引用索引供 LLM 生成使用。
-- **Agentic RAG Tool 修复**：移除 `_FakeEvent` 临时方案，改为传入真实 `AstrMessageEvent`，支持多模态响应文本提取。
-- **正则表达式移除**：`_find_figure_anchor` 和 `_clean_figure_references` 彻底移除正则，改用 `str.find()` + 逐字符扫描，消除正则引擎隐含语义导致的 bug。
-- **规范化章节体系**：8 个 canonical 章节标题，prompt 强制要求 + 运行态空白归一化容错（如 "实验 Benchmark" → "实验Benchmark"）。
-- **双锚点图表定位**：引用图表固定插入相关工作末尾，方法论图表固定插入方法论末尾，`str.find()` 精确定位章节边界。
-- **锚点重新计算**：从 `clean_text`（去图片行后）计算锚点，确保锚点文本在实际上传文档中存在，修复 `--selection-with-ellipsis` 匹配失败。
-- 完整变更详见 [docs/changelog/2.1.2.md](docs/changelog/2.1.2.md)
-
-### 上版变化 (v2.1.1)
-
-- **增量保存机制**：Ragas 评估从批量写入改为逐样本增量保存，中途崩溃不丢失已计算结果。
-- **代码溯源元数据**：`raw_answers.json` 新增 `_metadata` 字段，嵌入 git commit hash 等元数据提升可复现性。
-- **评估 LLM max_tokens 可配置**：新增 `--eval-llm-max-tokens` CLI 参数（默认 16384）。
-- 详细变更见 [docs/changelog/2.1.1.md](docs/changelog/2.1.1.md)
+更早版本见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)。
 
 ---
 
