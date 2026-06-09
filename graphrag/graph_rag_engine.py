@@ -583,6 +583,13 @@ def _make_cypher_validator(graph_store: Any):
     """
     def _validate(cypher_query: str) -> str:
         # --- Sanitize common LLM Cypher mistakes ---
+        # 0. Strip markdown code fences (LLM often wraps Cypher in ```cypher ... ```)
+        cypher_query = re.sub(
+            r"^```(?:cypher|CYPHER)?\s*\n?", "", cypher_query, count=1
+        )
+        cypher_query = re.sub(
+            r"\n?```\s*$", "", cypher_query, count=1
+        )
         # 1. Double braces → single (LLM over-escapes braces)
         cypher_query = cypher_query.replace("{{", "{").replace("}}", "}")
         # 2. | inside node property maps: {prop: 'A'}|{prop: 'B'} → remove property
