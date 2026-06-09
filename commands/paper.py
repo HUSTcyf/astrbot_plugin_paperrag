@@ -395,6 +395,8 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
         query = _extract_text(query, default="")
         if not query:
             return "查询字符串为空"
+        if rejection := await self._guard_academic_intent(query, "paper_arag"):
+            return rejection
         results: list[str] = []
         async for result in self._agentic_rag(event, query=query, top_k=top_k):
             text = result.get_plain_text() if hasattr(result, "get_plain_text") else str(result)
@@ -449,6 +451,8 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
         query = _extract_text(query, default="")
         if not query:
             return "查询字符串为空"
+        if rejection := await self._guard_academic_intent(query, "paper_react"):
+            return rejection
         results: list[str] = []
         async for result in self._react_rag(event, query=query, top_k=top_k):
             text = result.get_plain_text() if hasattr(result, "get_plain_text") else str(result)
@@ -470,6 +474,8 @@ class PaperCommandsMixin(RetrievalHelpersMixin):
         query = _extract_text(query, default="")
         if not query:
             return "查询字符串为空"
+        if rejection := await self._guard_academic_intent(query, "paper_search"):
+            return rejection
         engine = self._get_engine()
         if not engine:
             return "RAG 引擎未就绪"

@@ -1,14 +1,14 @@
-# 📚 Paper RAG Plugin v2.2.3 — 用户指南
+# 📚 Paper RAG Plugin v2.2.4 — 用户指南
 
 本地论文库 RAG 检索插件，为 AstrBot 提供智能论文检索、知识图谱增强问答、研究想法生成和远程 Claude Code 编程执行。支持多模态（图片/表格/公式）提取、Llama.cpp VLM 本地问答和 Agentic RAG（LangGraph 工作流）。
 
-> **版本说明**：当前版本 v2.2.3，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
+> **版本说明**：当前版本 v2.2.4，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
 
-### 本版变化 (v2.2.3)
+### 本版变化 (v2.2.4)
 
-- **远程 SSH Claude Code 执行**：新增 `/cc` 命令组支持通过 SSH 连接远程主机执行 Claude Code 编程任务，支持状态查看、连接管理、命令执行、环境安装和配置管理。
-- **双后端代码执行体系**：重构 `_code_execute_tool` 为调度器，根据配置自动选择远程 SSH 或本地后端执行代码。
-- 全部远程操作指令使用中文用户提示。
+- **Academic intent guard for LLM Tools**：新增 `_guard_academic_intent()` 预检查至 `_paper_search_tool`、`_agentic_rag_tool` 和 `_react_rag_tool`。非学术查询（问候、闲聊）现在会被提前拒绝，避免进入昂贵的 RAG 流水线，每次节省 30+ 秒。
+- **强化 `_check_academic_intent`**：扩展负面检测覆盖 "不"/"no"/"非" 变体，添加不可识别 LLM 响应的警告日志。
+- **强化 LLM Tool 描述**：为 `paper_search`、`paper_arag`、`paper_react` 工具描述添加 `【严格限制】` 前缀，阻止主 LLM 为非学术查询调用论文工具。
 
 ### 上版变化 (v2.2.2)
 

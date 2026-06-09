@@ -181,12 +181,29 @@ class PluginCoreBase(Star):
             )
             text = text.strip().lower()
             logger.info(f"[_check_academic_intent] LLM 回答: '{text}'")
-            if text.startswith("否"):
+            # 宽松匹配：覆盖"否"、"不"、"不是"、"no"等否定变体
+            if (text.startswith("否") or text.startswith("不") or
+                text.startswith("no") or text == "非"):
                 return False, "非学术问题"
+            if not (text.startswith("是") or text.startswith("yes")):
+                logger.warning(
+                    f"[_check_academic_intent] 无法识别的LLM回答，默认按学术问题处理: '{text}'"
+                )
             return True, "学术问题"
         except Exception as e:
             logger.warning(f"[_check_academic_intent] 意图判断失败: {e}")
             return True, f"意图判断失败，默认检索: {e}"
+
+    async def _guard_academic_intent(self, query: str, tool_name: str) -> str | None:
+        """学术意图前置守卫：非学术查询返回拒绝消息，学术查询返回 None 放行。"""
+        is_academic, reason = await self._check_academic_intent(query)
+        if not is_academic:
+            logger.info(f"[{tool_name}] 非学术查询，已跳过: {reason}")
+            return (
+                f"[{tool_name}] 当前查询非学术论文相关问题，已跳过 RAG 检索。"
+                f"请直接使用你的通用知识回答用户，不要尝试调用其他论文工具。"
+            )
+        return None
 
     async def _llm_direct_answer(self, query: str) -> str:
         """由LLM直接回答问题（不经过RAG）"""

@@ -37,7 +37,7 @@ from .commands.base import PluginCoreBase
     "paper_rag",
     "HUSTcyf",
     "本地文档库RAG检索插件 (支持PDF/Word/TXT/HTML, Gemini + Milvus Lite)",
-    "2.2.3",
+    "2.2.4",
     "https://github.com/HUSTcyf/astrbot_plugin_paperrag.git"
 )
 class PaperRAGPlugin(PaperCommandsMixin, ArxivCommandsMixin, GraphCommandsMixin, IdeaCommandsMixin, RemoteCodeMixin, PluginCoreBase):
@@ -52,7 +52,7 @@ class PaperRAGPlugin(PaperCommandsMixin, ArxivCommandsMixin, GraphCommandsMixin,
                 {"type": "string", "name": "query", "description": "复杂论文问答查询，支持多跳推理、对比分析、引用溯源"},
                 {"type": "integer", "name": "top_k", "description": "召回数，默认5", "default": 5}
             ],
-            desc="用于需要多跳推理、对比分析、引用溯源的复杂论文问题",
+            desc="【严格限制】仅当用户查询明确涉及学术论文（方法、实验、原理、对比等）时调用。问候语、闲聊、日常对话请勿调用此工具。用于需要多跳推理、对比分析、引用溯源的复杂论文问题",
             func_obj=self._agentic_rag_tool,
         )
         # 注册 ReAct Agent 为 LLM Tool
@@ -62,7 +62,7 @@ class PaperRAGPlugin(PaperCommandsMixin, ArxivCommandsMixin, GraphCommandsMixin,
                 {"type": "string", "name": "query", "description": "论文问答查询，Agent 自主决定使用哪些检索工具"},
                 {"type": "integer", "name": "top_k", "description": "召回数，默认5", "default": 5}
             ],
-            desc="用于论文问答的智能 Agent，可自主选择向量检索或知识图谱检索",
+            desc="【严格限制】仅当用户查询明确涉及学术论文（方法、实验、原理、对比等）时调用。问候语、闲聊、日常对话请勿调用此工具。用于论文问答的智能 Agent，可自主选择向量检索或知识图谱检索",
             func_obj=self._react_rag_tool,
         )
         # 注册基础 RAG 检索为 LLM Tool
@@ -72,7 +72,7 @@ class PaperRAGPlugin(PaperCommandsMixin, ArxivCommandsMixin, GraphCommandsMixin,
                 {"type": "string", "name": "query", "description": "论文检索查询，从本地论文库中搜索相关内容"},
                 {"type": "integer", "name": "top_k", "description": "召回数，默认5", "default": 5}
             ],
-            desc="基础论文 RAG 检索：直接搜索本地论文库并生成回答。比 paper_arag/paper_react 更轻量快速，适合简单的论文内容查询",
+            desc="【严格限制】仅当用户查询明确涉及学术论文（方法、实验、原理、对比等）时调用。问候语、闲聊、日常对话请勿调用此工具。基础论文 RAG 检索：直接搜索本地论文库并生成回答。比 paper_arag/paper_react 更轻量快速，适合简单的论文内容查询",
             func_obj=self._paper_search_tool,
         )
         # 注册 Claude Code 编程执行为 LLM Tool
