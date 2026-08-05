@@ -25,7 +25,7 @@ os.environ["HF_HUB_OFFLINE"] = "1"
 
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
 from docling_core.types.doc.document import PictureItem, TableItem, FormulaItem
 import fitz  # PyMuPDF
 
@@ -200,6 +200,18 @@ def main():
     figures_dir_arg.mkdir(parents=True, exist_ok=True)
     tables_dir_arg.mkdir(parents=True, exist_ok=True)
 
+    # RapidOCR 显式指定本地 PP-OCRv6 模型（torch 后端）。
+    # 不指定的话 docling 会从 artifacts_path 加载旧版 PP-OCRv4 模型，
+    # 与 rapidocr 3.9.2 的 arch_config.yaml（仅含 PP-OCRv6）不匹配。
+    rapid_ocr_options = RapidOcrOptions(
+        backend="torch",
+        det_model_path=str(MODELS_DIR / "RapidOcr/torch/PP-OCRv6/det/PP-OCRv6_det_small.pth"),
+        cls_model_path=str(MODELS_DIR / "RapidOcr/torch/PP-OCRv6/cls/ch_ptocr_mobile_v2.0_cls_mobile.pth"),
+        rec_model_path=str(MODELS_DIR / "RapidOcr/torch/PP-OCRv6/rec/PP-OCRv6_rec_small.pth"),
+        rec_keys_path=str(MODELS_DIR / "RapidOcr/torch/PP-OCRv6/rec/ppocrv6_dict.txt"),
+        font_path=str(MODELS_DIR / "RapidOcr/fonts/FZYTK.TTF"),
+    )
+
     pipeline_options = PdfPipelineOptions(
         generate_picture_images=True,
         generate_page_images=False,
@@ -208,6 +220,10 @@ def main():
         do_formula_enrichment=False,
         do_code_enrichment=False,  # 禁用代码 enrichment，避免复杂 PDF 触发内部 SyntaxError
         images_scale=2.0,
+        # 从本地 models/ 目录加载 docling 模型（docling 官方离线机制），
+        # 否则每个模型都会走 snapshot_download 且受 HF_HUB_OFFLINE 限制
+        artifacts_path=str(MODELS_DIR),
+        ocr_options=rapid_ocr_options,
     )
 
     converter = DocumentConverter(
