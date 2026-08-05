@@ -19,7 +19,13 @@ import numpy as np
 import torch
 
 from astrbot.api import logger
-from FlagEmbedding import BGEM3FlagModel
+# FlagEmbedding 是可选的：unsloth/astrbot 模式下不依赖该包。
+# 缺包时模块仍可导入，仅在显式选择 flag 模式初始化时才会报错。
+try:
+    from FlagEmbedding import BGEM3FlagModel
+    FLAG_EMBEDDING_AVAILABLE = True
+except ImportError as _flag_import_error:
+    FLAG_EMBEDDING_AVAILABLE = False
 
 
 class FlagEmbeddingModel:
@@ -73,6 +79,12 @@ class FlagEmbeddingModel:
             self._initialized = True
 
     def _load_model(self) -> None:
+        if not FLAG_EMBEDDING_AVAILABLE:
+            raise RuntimeError(
+                "FlagEmbedding 包未安装，无法使用 flag 嵌入模式。"
+                "请执行 pip install FlagEmbedding，或改用 unsloth / astrbot 嵌入模式。"
+                f"原始导入错误: {_flag_import_error}"
+            )
 
         logger.info(f"[FlagEmbedding] 加载模型: {self.model_path}")
         self.model = BGEM3FlagModel(

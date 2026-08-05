@@ -173,4 +173,5 @@ def create_rag_engine(config: RAGConfig, context) -> "HybridRAGEngine":
         logger.info("   - ColBERT 多向量 reranking")
 
     from .hybrid_rag import HybridRAGEngine
-    return HybridRAGEngine(config, context)
+    engine = HybridRAGEngine(config, context)
+    return engine

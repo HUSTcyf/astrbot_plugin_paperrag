@@ -228,10 +228,21 @@ class UnslothEmbeddingModel:
             logger.info(f"[UnslothEmbedding] 加载模型: {actual_model_path}")
             logger.info(f"[UnslothEmbedding] 设备: {self.device}, max_seq_length: {self.max_seq_length}")
 
-            # Apple Silicon: 使用 transformers 直连（Unsloth 不支持 MPS）
-            # NVIDIA/AMD/Intel: 使用 Unsloth（性能更好）
+            # Apple Silicon / 无可用加速器 (CPU-only)：使用 transformers 直连。
+            # Unsloth 不支持 MPS；在无 CUDA/HIP 的机器上 unsloth 导入即报错
+            # (误检 AMD ROCm 后调用 torch.cuda.get_device_capability() 崩溃)。
+            has_accelerator = (
+                (hasattr(torch, "cuda") and torch.cuda.is_available())
+                or getattr(getattr(torch, "version", None), "hip", None)
+                or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+            )
             if self._is_apple_silicon():
                 logger.info("[UnslothEmbedding] Apple Silicon 检测到，使用 transformers + MPS")
+                self._using_transformers_direct = True
+                tokenizer = AutoTokenizer.from_pretrained(actual_model_path, local_files_only=True)
+                model = AutoModel.from_pretrained(actual_model_path, local_files_only=True)
+            elif not has_accelerator:
+                logger.info("[UnslothEmbedding] 无可用加速器 (CUDA/HIP/MPS)，使用 transformers + CPU")
                 self._using_transformers_direct = True
                 tokenizer = AutoTokenizer.from_pretrained(actual_model_path, local_files_only=True)
                 model = AutoModel.from_pretrained(actual_model_path, local_files_only=True)

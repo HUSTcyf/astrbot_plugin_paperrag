@@ -69,24 +69,27 @@ def _clear_accelerator_cache() -> None:
 # 导入混合架构组件
 try:
     from .hybrid_parser import HybridPDFParser, Node
+except ImportError:
+    from hybrid_parser import HybridPDFParser, Node
+try:
     from .hybrid_index import HybridIndexManager
+except ImportError:
+    from hybrid_index import HybridIndexManager
+try:
     from embedding.embedding_providers import (
         create_embedding_provider,
         UnslothEmbeddingProvider,
         AstrBotEmbeddingProvider,
         FlagEmbeddingProvider,
     )
-    from .rag_engine import RAGConfig
 except ImportError:
-    from .hybrid_parser import HybridPDFParser, Node
-    from .hybrid_index import HybridIndexManager
     from ..embedding.embedding_providers import (
         create_embedding_provider,
         UnslothEmbeddingProvider,
         AstrBotEmbeddingProvider,
         FlagEmbeddingProvider,
     )
-    from .rag_engine import RAGConfig
+from .rag_engine import RAGConfig
 
 # 导入 Unsloth embedding 获取稀疏权重和多向量
 try:
