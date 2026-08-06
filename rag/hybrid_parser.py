@@ -10,6 +10,7 @@
 6. 图片存储与关联（通过图片引用关联到文本块）
 """
 
+import asyncio
 import os
 import re
 from datetime import datetime
@@ -289,7 +290,8 @@ class HybridPDFParser:
         self,
         pdf_path: str,
         llm_config: Dict[str, Any] = {},
-        arxiv_client: Any = None
+        arxiv_client: Any = None,
+        skip_ref_resolution: bool = False
     ) -> List[Node]:
         """
         解析PDF并分块为Nodes
@@ -303,8 +305,8 @@ class HybridPDFParser:
             Node列表
         """
         try:
-            # 解析为Documents
-            documents = self.parse_pdf_to_documents(pdf_path)
+            # 解析为Documents（同步解析耗时，含 docling 子进程等待，移出事件循环）
+            documents = await asyncio.to_thread(self.parse_pdf_to_documents, pdf_path)
 
             if not documents:
                 logger.warning(f"⚠️ 无法解析PDF: {pdf_path}")
@@ -372,7 +374,8 @@ class HybridPDFParser:
                     references, all_nodes = await process_references_with_llm(
                         pdf_path, all_nodes, raw_text,
                         llm_config=effective_llm_config,
-                        arxiv_client=effective_arxiv_client
+                        arxiv_client=effective_arxiv_client,
+                        skip_resolution=skip_ref_resolution
                     )
                 except Exception as e:
                     logger.warning(f"⚠️ LLM引用处理失败: {e}")

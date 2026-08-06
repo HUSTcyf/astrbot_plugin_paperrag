@@ -4,6 +4,7 @@
 """
 
 from typing import List, Dict, Any, Optional, Union
+import asyncio
 
 import numpy as np
 
@@ -78,7 +79,7 @@ class UnslothEmbeddingProvider:
             await self.initialize()
 
         assert self._model is not None
-        return self._model.get_dense_embedding(texts)
+        return await asyncio.to_thread(self._model.get_dense_embedding, texts)
 
     async def embed(self, texts: Union[str, List[str]]) -> List[List[float]]:
         """
@@ -146,7 +147,7 @@ class UnslothEmbeddingProvider:
             await self.initialize()
 
         assert self._model is not None
-        return self._model.get_sparse_weight(text, query_embedding)
+        return await asyncio.to_thread(self._model.get_sparse_weight, text, query_embedding)
 
     async def get_multi_vector(self, text: str) -> List[List[float]]:
         """
@@ -243,7 +244,7 @@ class FlagEmbeddingProvider:
         if not self._initialized:
             await self.initialize()
         assert self._model is not None
-        return self._model.get_dense_embedding(texts)
+        return await asyncio.to_thread(self._model.get_dense_embedding, texts)
 
     async def embed(self, texts: Union[str, List[str]]) -> List[List[float]]:
         if isinstance(texts, str):
@@ -266,7 +267,7 @@ class FlagEmbeddingProvider:
         if not self._initialized:
             await self.initialize()
         assert self._model is not None
-        return self._model.get_sparse_weight(text, query_embedding)
+        return await asyncio.to_thread(self._model.get_sparse_weight, text, query_embedding)
 
     async def get_multi_vector(self, text: str) -> List[List[float]]:
         if not self._initialized:

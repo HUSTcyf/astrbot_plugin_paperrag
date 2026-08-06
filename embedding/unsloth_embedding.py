@@ -324,6 +324,7 @@ class UnslothEmbeddingModel:
             logger.info("[UnslothEmbedding] 开始初始化...")
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._load_model)
+            import torch; torch.set_num_threads(1)  # 禁用 MKL 内部并行，避免与 Python 线程池嵌套导致 SIGSEGV
             logger.info(f"[UnslothEmbedding] 初始化完成，维度: {self._embedding_dim}")
 
     def get_dense_embedding(self, texts: Union[str, List[str]]) -> List[List[float]]:

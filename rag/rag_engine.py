@@ -79,6 +79,7 @@ class RAGConfig:
 
     # LLM 参考文献解析配置
     enable_llm_reference_parsing: bool = True
+    skip_reference_resolution: bool = False  # 跳过参考文献链接解析（WebSearch/arXiv MCP），仅保留 LLM 文本解析
 
     # FreeAPI 配置
     freeapi_url: str = ""

@@ -129,6 +129,12 @@ def _find_ref_section_end(
     for i, line in enumerate(lines_text[ref_start:], start=ref_start):
         stripped = line.strip()
 
+        # ICLR 风格附录标题：单独一行的大写字母（"A"、"B"），或 "B.1" 小节标题。
+        # 不会误匹配作者行（"B. Kim" 点号后跟空格+字母而非数字）和编号条目（"[1] ..."）
+        if re.match(r'^[A-Z]\s*$', stripped) or re.match(r'^[A-Z]\.[0-9]+', stripped):
+            ref_end = i
+            break
+
         # 遇到附录/补充材料/Acknowledgment时截断
         # 匹配以这些关键词开头的行（更灵活，支持变体）
         if re.match(r'^(acknowledgment|appendix|supplementary)', stripped, re.IGNORECASE):
@@ -265,6 +271,10 @@ def _find_reference_section(text: str) -> Optional[str]:
             ref_end = i
             break
         if stripped.startswith('$') or stripped.endswith('$'):
+            ref_end = i
+            break
+        # ICLR 风格附录标题：单独一行的大写字母（"A"、"B"），或 "B.1" 小节标题
+        if re.match(r'^[A-Z]\s*$', stripped) or re.match(r'^[A-Z]\.[0-9]+', stripped):
             ref_end = i
             break
         if re.match(r'^(acknowledgment|appendix|supplementary)', stripped, re.IGNORECASE):
@@ -1164,6 +1174,7 @@ class LLMReferenceParser:
         ref_section: str,
         ref_id_prefix: str = "ref",
         enable_fallback_search: bool = False,
+        skip_resolution: bool = False,
     ) -> List[Reference]:
         """
         解析整段参考文献文本（让LLM自动分割+解析）
@@ -1206,14 +1217,15 @@ class LLMReferenceParser:
                 ref.ref_id = f"{ref_id_prefix}_{j + 1}"
 
             # 统一 arXiv 富化
-            await self._enrich_references(all_results, enable_fallback_search=enable_fallback_search)
+            if not skip_resolution:
+                await self._enrich_references(all_results, enable_fallback_search=enable_fallback_search)
 
             logger.info(f"📚 LLM 解析参考文献: 成功 {len(all_results)} 条 ({len(batches)} 批次)")
             return all_results
 
         # 正常单次处理
         results = await self._parse_single_batch(ref_section, ref_id_prefix, 0)
-        if results:
+        if results and not skip_resolution:
             await self._enrich_references(results, enable_fallback_search=enable_fallback_search)
         return results
 
@@ -1304,6 +1316,17 @@ class LLMReferenceParser:
             # 提取 JSON
             json_str = self._extract_json(response)
             if not json_str:
+                # LLM 可能用自然语言拒绝解析（如输入不是参考文献列表）
+                refusal_markers = [
+                    "not a reference", "not a reference list", "not a reference section",
+                    "no complete reference", "no references found", "no reference list",
+                    "appendix",  # 实际观测: 模型会说明输入来自附录部分
+                    "不是参考文献", "不是参考", "无法识别参考文献",
+                ]
+                lower_resp = response.lower()
+                if any(marker in lower_resp for marker in refusal_markers):
+                    logger.info(f"⚠️ 批次 {batch_index+1}: LLM 认为输入不是有效参考文献列表（跳过）: {response[:200]}")
+                    return []
                 logger.warning(f"⚠️ 批次 {batch_index+1}: 无法从 LLM 响应中提取 JSON，响应长度: {len(response)} 字符")
                 logger.warning(f"========== LLM 原始输出 ==========\n{response}\n========== END ==========")
                 return []
@@ -2187,6 +2210,7 @@ async def process_references_with_llm(
     llm_config: Dict[str, Any],
     arxiv_client: Any = None,
     enable_fallback_search: bool = True,
+    skip_resolution: bool = False,
 ) -> Tuple[List[Reference], List[Any]]:
     """
     使用 LLM 解析参考文献并建立引用关联
@@ -2235,7 +2259,7 @@ async def process_references_with_llm(
 
         # 调用 LLM 解析
         refs = await llm_parser.parse_reference_section(
-            ref_section, enable_fallback_search=enable_fallback_search
+            ref_section, enable_fallback_search=enable_fallback_search, skip_resolution=skip_resolution
         )
 
         if not refs:

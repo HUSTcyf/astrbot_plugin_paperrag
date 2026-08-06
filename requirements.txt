@@ -3,6 +3,7 @@ setuptools==81.0.0
 mistune>=3.0.0  # Markdown 解析器（用于将 Markdown 转换为飞书块格式）
 # 核心依赖
 pymilvus[milvus_lite]>=2.5.4,<3.0.0  # Milvus Lite 向量数据库
+milvus-lite==2.5.1  # 固定版本：3.x 在 WSL2 上批量插入会段错误 (milvus-io/milvus-lite#265)，且 3.x 与 2.x 存储格式不兼容
 PyMuPDF>=1.23.0  # PDF解析 (fitz)
 
 # llama-index依赖（新RAG引擎）

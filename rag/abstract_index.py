@@ -308,54 +308,58 @@ class AbstractExtractor:
 
     async def _parse_with_pymupdf(self, pdf_path: str) -> Optional[str]:
         """使用 PyMuPDF 解析 PDF"""
-        try:
-            import pymupdf
+        def _run() -> Optional[str]:
+            try:
+                import pymupdf
 
-            doc = pymupdf.open(pdf_path)
-            full_text = ""
+                doc = pymupdf.open(pdf_path)
+                full_text = ""
 
-            for page_num in range(min(len(doc), 5)):  # 只看前5页
-                page = cast(pymupdf.Page, doc[page_num])
-                text = page.get_text()
-                if text:
-                    full_text += str(text) + "\n"
+                for page_num in range(min(len(doc), 5)):  # 只看前5页
+                    page = cast(pymupdf.Page, doc[page_num])
+                    text = page.get_text()
+                    if text:
+                        full_text += str(text) + "\n"
 
-            doc.close()
-            return full_text if full_text.strip() else None
+                doc.close()
+                return full_text if full_text.strip() else None
 
-        except Exception as e:
-            logger.warning(f"PyMuPDF 解析失败: {e}")
-            return None
+            except Exception as e:
+                logger.warning(f"PyMuPDF 解析失败: {e}")
+                return None
+        return await asyncio.to_thread(_run)
 
     async def _extract_abstract_from_pymupdf_blocks(self, pdf_path: str) -> Optional[str]:
         """使用 PyMuPDF block 布局提取摘要。"""
-        try:
-            import pymupdf
+        def _run() -> Optional[str]:
+            try:
+                import pymupdf
 
-            doc = pymupdf.open(pdf_path)
-            blocks: List[Tuple[int, float, float, float, float, str]] = []
-            for page_num in range(min(len(doc), 5)):
-                page = cast(pymupdf.Page, doc[page_num])
-                for block in page.get_text("blocks"):
-                    if len(block) < 5:
-                        continue
-                    text = self._normalize_abstract_text(str(block[4]))
-                    if text:
-                        blocks.append((
-                            page_num,
-                            float(block[0]),
-                            float(block[1]),
-                            float(block[2]),
-                            float(block[3]),
-                            text,
-                        ))
+                doc = pymupdf.open(pdf_path)
+                blocks: List[Tuple[int, float, float, float, float, str]] = []
+                for page_num in range(min(len(doc), 5)):
+                    page = cast(pymupdf.Page, doc[page_num])
+                    for block in page.get_text("blocks"):
+                        if len(block) < 5:
+                            continue
+                        text = self._normalize_abstract_text(str(block[4]))
+                        if text:
+                            blocks.append((
+                                page_num,
+                                float(block[0]),
+                                float(block[1]),
+                                float(block[2]),
+                                float(block[3]),
+                                text,
+                            ))
 
-            doc.close()
-            return self._extract_abstract_from_blocks(blocks)
+                doc.close()
+                return self._extract_abstract_from_blocks(blocks)
 
-        except Exception as e:
-            logger.warning(f"PyMuPDF block 摘要提取失败: {e}")
-            return None
+            except Exception as e:
+                logger.warning(f"PyMuPDF block 摘要提取失败: {e}")
+                return None
+        return await asyncio.to_thread(_run)
 
     def _extract_abstract_from_blocks(
         self,
@@ -864,25 +868,27 @@ class AbstractIndexManager:
 
     async def _extract_paper_beginning(self, pdf_path: str, max_chars: int = 3000) -> Optional[str]:
         """提取论文开头部分（用于 LLM 提取摘要）"""
-        try:
-            import pymupdf
-            doc = pymupdf.open(pdf_path)
-            full_text = ""
+        def _run() -> Optional[str]:
+            try:
+                import pymupdf
+                doc = pymupdf.open(pdf_path)
+                full_text = ""
 
-            for page_num in range(min(len(doc), 5)):
-                page = doc[page_num]
-                text = page.get_text()
-                if text:
-                    full_text += str(text) + "\n"
-                if len(full_text) >= max_chars:
-                    break
+                for page_num in range(min(len(doc), 5)):
+                    page = doc[page_num]
+                    text = page.get_text()
+                    if text:
+                        full_text += str(text) + "\n"
+                    if len(full_text) >= max_chars:
+                        break
 
-            doc.close()
-            return full_text[:max_chars] if full_text.strip() else None
+                doc.close()
+                return full_text[:max_chars] if full_text.strip() else None
 
-        except Exception as e:
-            logger.warning(f"提取论文开头失败 {pdf_path}: {e}")
-            return None
+            except Exception as e:
+                logger.warning(f"提取论文开头失败 {pdf_path}: {e}")
+                return None
+        return await asyncio.to_thread(_run)
 
     async def _resolve_links_by_title(self, title: str) -> LinkResolution:
         """按标题解析 arXiv / GitHub / DOI 链接。"""

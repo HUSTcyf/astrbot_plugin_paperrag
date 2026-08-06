@@ -341,6 +341,12 @@
         "hint": "启用后将使用 GPT-4o-mini 解析参考文献的标题、作者、年份等信息，比正则表达式更准确。需要配置 text_provider_id。arXiv MCP 可用于查询论文详情。",
         "default": true
     },
+    "skip_reference_resolution": {
+        "description": "跳过参考文献链接解析",
+        "type": "bool",
+        "hint": "跳过 WebSearch/arXiv MCP/DOI 链接补全，仅保留 LLM 文本解析。加速索引构建，适用于测试迭代。",
+        "default": false
+    },
     "core_api_key": {
         "description": "CORE API Key（用于替代arXiv MCP搜索论文）",
         "type": "string",

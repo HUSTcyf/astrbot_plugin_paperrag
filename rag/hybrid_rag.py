@@ -2314,7 +2314,10 @@ class HybridRAGEngine:
         for file_path in file_paths:
             try:
                 # 解析 PDF（传递 LLM config 和 arXiv client 以支持 LLM-based 引用解析）
-                nodes = await parser.parse_and_split(file_path, effective_llm_config, arxiv_client)
+                nodes = await parser.parse_and_split(
+                    file_path, effective_llm_config, arxiv_client,
+                    skip_ref_resolution=self.config.skip_reference_resolution
+                )
 
                 if not nodes:
                     results["failed"] += 1
@@ -2336,26 +2339,29 @@ class HybridRAGEngine:
                 chunks_inserted = await index_manager.insert_nodes(nodes, embeddings)
                 results["chunks_added"] += chunks_inserted
 
-                # 预计算并存储 ColBERT per-token vectors
+                # 预计算并存储 ColBERT per-token vectors（整段进 to_thread，BGE-M3 跨线程不稳定）
                 if colbert_storage is not None:
                     model = get_embedding_model()
-                    chunk_vectors = []
-                    chunk_ids = []
                     if model is None:
                         logger.error(
                             "[ColBERTStorage] 未获取到 ColBERT embedding model，"
                             f"跳过 per-token vectors 预计算: {file_path}"
                         )
                     else:
-                        for i, node in enumerate(nodes):
-                            vec = model.get_multi_vector(node.text)
-                            if vec:
-                                import numpy as np
-                                chunk_vectors.append(np.array(vec, dtype=np.float32))
-                                chunk_id = node.metadata.get("chunk_id", f"{file_path}_{i}")
-                                chunk_ids.append(chunk_id)
-                            else:
-                                logger.warning(f"[ColBERTStorage] get_multi_vector 返回空，跳过 chunk {i}: {file_path}")
+                        def _colbert_encode():
+                            cvs = []
+                            cids = []
+                            for i, node in enumerate(nodes):
+                                vec = model.get_multi_vector(node.text)
+                                if vec:
+                                    import numpy as np
+                                    cvs.append(np.array(vec, dtype=np.float32))
+                                    cid = node.metadata.get("chunk_id", f"{file_path}_{i}")
+                                    cids.append(cid)
+                                else:
+                                    logger.warning(f"[ColBERTStorage] get_multi_vector 返回空，跳过 chunk {i}: {file_path}")
+                            return cvs, cids
+                        chunk_vectors, chunk_ids = await asyncio.to_thread(_colbert_encode)
                         if chunk_vectors:
                             colbert_storage.add_chunks(chunk_vectors, chunk_ids)
                             logger.debug(f"[ColBERTStorage] 为 {len(chunk_vectors)} 个 chunks 存储了 per-token vectors")

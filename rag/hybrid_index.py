@@ -189,7 +189,7 @@ class HybridIndexManager:
                 github_url = metadata.get("github_url")
 
                 if file_name in self._doc_stats:
-                    self._doc_stats[file_name]["chunk_count"] += 1
+                    self._doc_stats[file_name]["chunk_count"] = self._doc_stats[file_name].get("chunk_count", 0) + 1
                     if github_url and not self._doc_stats[file_name].get("github_url"):
                         self._doc_stats[file_name]["github_url"] = github_url
                 else:
@@ -209,8 +209,10 @@ class HybridIndexManager:
         deleted_count = 0
 
         if file_name in self._doc_stats:
-            deleted_count = self._doc_stats[file_name]["chunk_count"]
-            del self._doc_stats[file_name]
+            deleted_count = self._doc_stats[file_name].get("chunk_count", 0)
+            # 不 del 条目——_save_doc_stats 的 merge 逻辑会从磁盘恢复。
+            # 改为清零 chunk_count，磁盘 merge 回来时用内存的 0 覆盖旧值。
+            self._doc_stats[file_name]["chunk_count"] = 0
             self._save_doc_stats()
             logger.info(f"📊 已从统计中删除文件: {file_name} ({deleted_count} chunks)")
 
