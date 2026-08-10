@@ -49,6 +49,7 @@ import io
 from collections import defaultdict
 from llama_index.core import Document as LIDocument
 from .ragas_generator import RagasTestsetGenerator
+from .minimax_compat import resolve_embedding_model
 import tempfile
 import uuid
 import re
@@ -92,7 +93,7 @@ class _EvalLLMConfig:
     embed_api_key: str = ""
     embedding_mode: str = "api"
     eval_embedding_mode: str = "api"
-    max_rpm: int = 96
+    max_rpm: int = 30
 
 
 def _resolve_eval_config(args) -> tuple[_EvalLLMConfig, dict]:
@@ -137,6 +138,86 @@ def _resolve_eval_config(args) -> tuple[_EvalLLMConfig, dict]:
         llm.llm_base_url = args.llm_base_url
     if args.embed_base_url:
         llm.embed_base_url = args.embed_base_url
+
+    # Step 2.6: 从主 AstrBot cmd_config.json 自动填充 LLM 凭据（OpenAI 兼容端点）
+    # 触发条件：CLI/环境变量/freeapi 均未提供 key。此时连带覆盖 base_url，
+    # 避免"真实 key + 无 key 免费端点"的组合错误。
+    # Step 2.55: --eval-provider 显式选择评测端点（覆盖插件 text_provider_id）
+    _eval_provider = getattr(args, "eval_provider", "auto")
+    if _eval_provider != "auto":
+        main_config_path = Path(__file__).parent.parent.parent.parent / "cmd_config.json"
+        if main_config_path.exists():
+            try:
+                with open(main_config_path, "r", encoding="utf-8-sig") as f:
+                    _main_cfg = json.load(f)
+                # 按 --eval-provider 关键字匹配 cmd_config 里的 provider id
+                _match = next(
+                    (p["id"] for p in _main_cfg.get("provider", [])
+                     if _eval_provider in p.get("id", "").lower()),
+                    None,
+                )
+                if _match:
+                    plugin_config = dict(plugin_config)
+                    plugin_config["text_provider_id"] = _match
+                    print(f"✅ --eval-provider={_eval_provider}：使用 provider {_match}")
+            except Exception as e:
+                print(f"⚠️ --eval-provider 解析失败: {e}")
+    if not llm.llm_api_key:
+        main_config_path = Path(__file__).parent.parent.parent.parent / "cmd_config.json"
+        if main_config_path.exists():
+            try:
+                with open(main_config_path, "r", encoding="utf-8-sig") as f:
+                    main_cfg = json.load(f)
+                provider_config = None
+                text_provider_id = plugin_config.get("text_provider_id", "")
+                for p in main_cfg.get("provider", []):
+                    if p.get("id") == text_provider_id:
+                        provider_config = dict(p)
+                        break
+                if provider_config:
+                    src_id = provider_config.get("provider_source_id", "")
+                    if src_id:
+                        for ps in main_cfg.get("provider_sources", []):
+                            if ps.get("id") == src_id:
+                                provider_config = {**ps, **provider_config}
+                                break
+                    raw_key = provider_config.get("key") or provider_config.get("api_key") or ""
+                    if isinstance(raw_key, list):  # AstrBot provider_sources 的 key 可能是 list
+                        raw_key = raw_key[0] if raw_key else ""
+                    key = str(raw_key)
+                    api_base = str(provider_config.get("api_base", "") or "")
+                    # 转换为 OpenAI 兼容 base_url（最终拼接 /chat/completions 调用）
+                    if api_base.endswith("/anthropic"):
+                        # MiniMax 等 Anthropic 协议端点 → OpenAI 兼容
+                        oai_base = api_base.replace("/anthropic", "/v1")
+                    elif "/v4" in api_base or "/v1" in api_base:
+                        # 智谱（/paas/v4/）等已是完整 OpenAI 兼容 base，不再追加 /v1
+                        oai_base = api_base.rstrip("/")
+                    else:
+                        oai_base = api_base.rstrip("/") + "/v1"
+                    if key and oai_base:
+                        model = provider_config.get("model", "")
+                        print(f"✅ 已从 AstrBot cmd_config.json 自动填充 LLM 凭据: "
+                              f"{text_provider_id} ({model}) @ {oai_base}")
+                        llm.llm_api_key = key
+                        if not llm.embed_api_key:
+                            llm.embed_api_key = key
+                        cli_url_explicit = bool(args.llm_base_url) and args.llm_base_url != _DEFAULT_LLM_URL
+                        if not cli_url_explicit:
+                            llm.llm_base_url = oai_base
+                        if not args.embed_base_url:
+                            llm.embed_base_url = oai_base
+                        # MiniMax 端点的 embedding 模型为 embo-01（非 OpenAI 命名）
+                        resolved = resolve_embedding_model(oai_base, llm.embedding_model)
+                        if resolved != llm.embedding_model:
+                            llm.embedding_model = resolved
+                            print(f"✅ MiniMax 端点，embedding 模型切换为 {llm.embedding_model}")
+                        if args.llm_model == "gpt-4o-mini":
+                            llm.llm_model = model or llm.llm_model
+                        if args.eval_llm_model == "gpt-5.4-nano":
+                            llm.eval_llm_model = model or llm.eval_llm_model
+            except Exception as e:
+                print(f"⚠️ 从 cmd_config.json 填充 LLM 凭据失败: {e}")
 
     # Step 3: 从 free.json 读取 vapi（用于评估指标计算）
     free_json_path = Path(__file__).parent.parent.parent.parent / "free.json"
@@ -185,6 +266,7 @@ _PROVIDER_MODULES = {
     "zhipu_chat_completion": "astrbot.core.provider.sources.zhipu_source",
     "openrouter_chat_completion": "astrbot.core.provider.sources.openrouter_source",
     "googlegenai_chat_completion": "astrbot.core.provider.sources.gemini_source",
+    "minimax_token_plan": "astrbot.core.provider.sources.minimax_token_plan_source",
 }
 
 
@@ -1390,6 +1472,14 @@ def main():
     parser.add_argument("--multimodal-context-before", type=int, default=1, help="多模态 chunk 前面的上下文 chunks 数量")
     parser.add_argument("--multimodal-context-after", type=int, default=1, help="多模态 chunk 后面的上下文 chunks 数量")
 
+    # 评测端点选择：MiniMax Token Plan（余额多）vs 智谱 GLM（标准兼容、无补丁开销）
+    parser.add_argument(
+        "--eval-provider",
+        choices=["auto", "minimax", "zhipu"],
+        default="auto",
+        help="评测用 LLM 端点：auto=按插件 text_provider_id，minimax=MiniMax-M3 Token Plan，zhipu=智谱 GLM-5.2（标准 OpenAI 兼容，无思考模式补丁开销）",
+    )
+
     # LLM 配置（用于生成测试集）
     parser.add_argument("--llm-model", default="gpt-4o-mini", help="LLM 模型名称")
     parser.add_argument("--llm-base-url", default=_DEFAULT_LLM_URL, help="LLM API 基础 URL")
@@ -1426,7 +1516,7 @@ def main():
                         help="评估模式: rag=普通RAG检索+LLM生成, agentic=Agentic RAG (LangGraph workflow)")
     parser.add_argument("--max-concurrent", type=int, default=5, help="最大并发数")
     parser.add_argument("--answer-top-k", type=int, default=5, help="用 top-K 个检索 chunk 生成答案（默认5）")
-    parser.add_argument("--max-rpm", type=int, default=96, help="RPM 限制（默认96）")
+    parser.add_argument("--max-rpm", type=int, default=30, help="RPM 限制（默认30：MiniMax Token Plan 限流敏感，过高会触发大量 429）")
 
     # 报告配置
     parser.add_argument("--plugin-version", default="1.0.0", help="插件版本")

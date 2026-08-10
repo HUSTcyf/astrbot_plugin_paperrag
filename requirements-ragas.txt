@@ -2,8 +2,13 @@
 # 安装方式: pip install -r requirements-ragas.txt
 
 # 核心评估框架
-ragas>=0.1.0
+# 锁定 0.4.3：evaluation/ 使用 ragas 0.4 私有 API
+# (ragas.metrics._faithfulness, _nv_metrics, TestsetGenerator.generate_with_llamaindex_docs)
+ragas==0.4.3
 datasets>=2.14.0
+
+# ragas 0.4.3 硬 import langchain_community.chat_models.vertexai，该模块在 community 0.4.2 被移除
+langchain-community<0.4.2
 
 # llama-index（用于测试集生成和查询引擎）
 llama-index-core>=0.10.0

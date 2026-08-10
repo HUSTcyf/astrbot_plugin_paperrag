@@ -38,6 +38,13 @@ class RAGConfig:
     llama_vlm_n_ctx: int = 16384
     llama_vlm_n_gpu_layers: int = 99
 
+    # 微调 LoRA 模型配置（transformers+peft 直连，详见 provider/finetune_llm_provider.py）
+    finetune_llm_enabled: bool = False  # 是否启用微调模型 provider（默认关，仅评测对比用）
+    finetune_base_model_dir: str = "finetune/models/Qwen3.5-0.8B"  # HF 格式基座目录
+    finetune_adapter_dir: str = ""  # PEFT LoRA adapter 目录（空=只加载基座）
+    finetune_llm_max_new_tokens: int = 512
+    finetune_llm_num_threads: int = 16
+
     # Unsloth Embedding配置
     unsloth_config: dict = field(default_factory=dict)
 

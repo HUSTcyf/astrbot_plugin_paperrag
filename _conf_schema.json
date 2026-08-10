@@ -99,6 +99,43 @@
         "minimum": 64,
         "maximum": 4096
     },
+    "finetune_llm_enabled": {
+        "description": "启用微调 LoRA 模型 provider（transformers+peft 直连）",
+        "type": "bool",
+        "hint": "开启后可经 _get_finetune_llm() 加载本地微调模型（Qwen3.5-0.8B + PEFT adapter），用于评测对比。不影响生产 VLM（9B）。",
+        "obvious_hint": true,
+        "default": false
+    },
+    "finetune_base_model_dir": {
+        "description": "微调基座模型目录（HF 格式）",
+        "type": "string",
+        "hint": "HF 格式基座目录（相对路径解析到插件根），如 finetune/models/Qwen3.5-0.8B",
+        "obvious_hint": true,
+        "default": "finetune/models/Qwen3.5-0.8B"
+    },
+    "finetune_adapter_dir": {
+        "description": "微调 PEFT LoRA adapter 目录",
+        "type": "string",
+        "hint": "PEFT adapter 目录（含 adapter_config.json + adapter_model.safetensors）。空=只加载基座。如 finetune/checkpoints/lora-qwen3.5-0.8b-ragtruth-gpt4-dpo",
+        "obvious_hint": true,
+        "default": ""
+    },
+    "finetune_llm_max_new_tokens": {
+        "description": "微调模型单次生成最大新 token 数",
+        "type": "int",
+        "hint": "微调模型 generate 的 max_new_tokens",
+        "default": 512,
+        "minimum": 64,
+        "maximum": 8192
+    },
+    "finetune_llm_num_threads": {
+        "description": "微调模型 CPU 推理线程数",
+        "type": "int",
+        "hint": "CPU 推理线程数（GPU 时忽略）",
+        "default": 16,
+        "minimum": 1,
+        "maximum": 64
+    },
     "text_llm_temperature": {
         "description": "文本 LLM 生成温度",
         "type": "float",

@@ -247,14 +247,23 @@ class UnslothEmbeddingModel:
                 tokenizer = AutoTokenizer.from_pretrained(actual_model_path, local_files_only=True)
                 model = AutoModel.from_pretrained(actual_model_path, local_files_only=True)
             else:
-                from unsloth import FastSentenceTransformer
-
-                self._using_transformers_direct = False
-                model = FastSentenceTransformer.from_pretrained(
-                    model_name=actual_model_path,
-                    max_seq_length=self.max_seq_length,
-                )
-                tokenizer = model.tokenizer
+                try:
+                    from unsloth import FastSentenceTransformer
+                except ImportError:
+                    # unsloth 未安装（如 AMD ROCm 环境：官方仅支持 CUDA，装错版本
+                    # 还会拖垮 torch 依赖）→ 回退 transformers 直连，设备由下方
+                    # self.device 决定（cuda=HIP / cpu）
+                    logger.warning("[UnslothEmbedding] unsloth 未安装，使用 transformers 直连")
+                    self._using_transformers_direct = True
+                    tokenizer = AutoTokenizer.from_pretrained(actual_model_path, local_files_only=True)
+                    model = AutoModel.from_pretrained(actual_model_path, local_files_only=True)
+                else:
+                    self._using_transformers_direct = False
+                    model = FastSentenceTransformer.from_pretrained(
+                        model_name=actual_model_path,
+                        max_seq_length=self.max_seq_length,
+                    )
+                    tokenizer = model.tokenizer
 
             # 设置设备
             if self.device == "mps" and torch.backends.mps.is_available():

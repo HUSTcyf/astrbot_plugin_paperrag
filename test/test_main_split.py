@@ -58,6 +58,7 @@ def test_split_main_keeps_command_shell_and_paper_commands_callable():
     assert command_groups == [
         "filter.command_group('paper')",
         "filter.command_group('idea')",
+        "filter.command_group('cc')",
     ]
     for command in [
         "paper_commands.command('search')",

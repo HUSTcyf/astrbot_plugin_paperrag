@@ -51,6 +51,26 @@ try:
 except ImportError:
     StringPromptValue = None
 
+# MiniMax 端点专属兼容（思考模式禁用 + 非标准 embedding 格式 + embo-01）
+try:
+    from .minimax_compat import (
+        build_embedding_request_data,
+        build_llm_request_fields,
+        extract_embedding_vectors,
+        is_minimax_endpoint,
+        needs_thinking_disabled,
+        resolve_embedding_model,
+    )
+except ImportError:
+    from minimax_compat import (
+        build_embedding_request_data,
+        build_llm_request_fields,
+        extract_embedding_vectors,
+        is_minimax_endpoint,
+        needs_thinking_disabled,
+        resolve_embedding_model,
+    )
+
 RAGAS_AVAILABLE = True
 
 
@@ -65,6 +85,52 @@ class InvalidLLMResponseError(ValueError):
     def __init__(self, message: str, text: str = ""):
         super().__init__(message)
         self.text = text  # ragas raise_first_exception 会访问此属性
+
+
+class RateLimitError(RuntimeError):
+    """HTTP 429 限流专用异常，携带 Retry-After（秒）。
+
+    MiniMax Token Plan 的限流是动态的（5 小时/周窗口 + 高峰期限流），
+    超限后通常约 1 分钟恢复。常规 1/2/4s 重试会连续命中 429，必须长退避。
+    """
+
+    def __init__(self, message: str, retry_after: float = 0.0):
+        super().__init__(message)
+        self.retry_after = retry_after  # 服务端建议的等待秒数（0=未提供）
+
+
+def _compute_backoff(attempt: int, exc: BaseException, base: float = 2.0,
+                     cap: float = 60.0) -> float:
+    """计算重试等待秒数。
+
+    429 限流：优先用 Retry-After，否则用长指数退避（attempt 从 0 起，
+    序列为 base^attempt * 系数，封顶 cap）。Token Plan 恢复约 1 分钟，
+    所以默认 cap=60s。
+    其他错误：短指数退避（1/2/4s 风格）。
+    """
+    if isinstance(exc, RateLimitError) and exc.retry_after > 0:
+        return min(exc.retry_after, cap)
+    if isinstance(exc, RateLimitError):
+        # 限流：5/10/20/40/60…（比 1/2/4 更克制，避免连续撞 429）
+        return min(base ** attempt * 5.0, cap)
+    # 普通网络/解析错误：1/2/4/8…
+    return min(base ** attempt, cap)
+
+
+def _parse_retry_after(resp) -> float:
+    """从 HTTP 响应解析 Retry-After 头（秒）。不支持或缺失返回 0。"""
+    try:
+        val = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+    except Exception:
+        return 0.0
+    if not val:
+        return 0.0
+    try:
+        return max(0.0, float(val))
+    except (TypeError, ValueError):
+        # HTTP-date 格式极少用于 API 限流，这里忽略
+        return 0.0
+
 
 
 class OpenAICompatibleLLM(BaseRagasLLM):
@@ -82,12 +148,12 @@ class OpenAICompatibleLLM(BaseRagasLLM):
     # 全局并发限制信号量（类变量，所有实例共享）
     _semaphore: Optional[Any] = None
     _async_lock: Optional[Any] = None  # 异步信号量初始化的锁
-    _max_concurrent: int = 4  # 全局最大并发数（默认4，最大8）
+    _max_concurrent: int = 2  # 全局最大并发数（默认2：MiniMax Token Plan 限流敏感）
 
     # RPM 限制：时间窗口内的请求时间戳列表（类变量，所有实例共享）
     _rpm_timestamps: List[float] = []
     _rpm_lock: Optional[Any] = None
-    _max_rpm: int = 96  # 默认 RPM 限制
+    _max_rpm: int = 30  # 默认 RPM 限制（MiniMax Token Plan 限流敏感，96 会触发大量 429）
 
     @classmethod
     def set_max_concurrent(cls, n: int):
@@ -167,16 +233,21 @@ class OpenAICompatibleLLM(BaseRagasLLM):
         api_key: str,
         temperature: float = 0.3,
         max_tokens: int = 2048,
-        max_concurrent: int = 4,
+        max_concurrent: int = 2,
         **kwargs
     ):
         super().__init__()
         self.model = model
         self.api_base = api_base.rstrip('/')
         self.api_key = api_key
+        # MiniMax-M3 思考模式需禁用（详见 evaluation/minimax_compat.py）；标准端点无需。
+        self._disable_thinking = bool(kwargs.get(
+            "disable_thinking", needs_thinking_disabled(self.api_base)
+        ))
         self.temperature = temperature
         self.max_tokens = max_tokens
-        self._max_concurrent = min(max_concurrent, 8)  # 最多8
+        # MiniMax Token Plan 限流敏感：并发过高会触发大量 429
+        self._max_concurrent = min(max_concurrent, 8)
 
     def get_temperature(self, n: Optional[int] = None) -> float:
         return self.temperature
@@ -192,9 +263,28 @@ class OpenAICompatibleLLM(BaseRagasLLM):
             pass
         return False
 
+    def _build_llm_request_body(self, prompt_text: str, temperature: float,
+                                max_tokens: int, stop: Optional[list] = None) -> dict:
+        """构造 chat/completions 请求体（同步/异步共用）。
+
+        MiniMax 专属字段（thinking/response_format）由 minimax_compat.build_llm_request_fields
+        提供；智谱 GLM 等标准端点得到空 dict → 纯净请求体。
+        """
+        data = {
+            'model': self.model,
+            'messages': [{'role': 'user', 'content': prompt_text}],
+            'temperature': temperature,
+            'max_tokens': max_tokens,
+        }
+        if self._disable_thinking:
+            data.update(build_llm_request_fields(self.api_base))
+        if stop:
+            data['stop'] = stop
+        return data
+
     @staticmethod
     def _repair_json_string(text: str) -> str:
-        """修复 LLM 输出中的常见 JSON 问题。
+        r"""修复 LLM 输出中的常见 JSON 问题。
 
         已知问题:
         - 无效转义序列: \` → `  \\(非 JSON 转义字符) → 去掉反斜杠
@@ -208,22 +298,65 @@ class OpenAICompatibleLLM(BaseRagasLLM):
         repaired = re.sub(r',\s*([}\]])', r'\1', repaired)
         return repaired
 
-    def _call_api(self, prompt_text: str, temperature: float, max_tokens: int, stop: Optional[list], max_retries: int = 3):
-        """同步调用 API（受全局 Semaphore 限制并发），超时/网络错误自动重试"""
+    def _normalize_json_response(self, raw_text: str) -> str:
+        """规范化 LLM 的 JSON 响应。
+
+        - 剥离 <think>...</think> 块（模型思考模式输出）
+        - 去 markdown code block 包装
+        - 解 {"text": "<json字符串>"} 双重包装（JSON mode 下模型可能多包一层）
+        - 检测 schema 回显（模型直接回显 prompt 中的 JSON schema）并触发重试
+        """
+        stripped = raw_text.strip()
+        stripped = re.sub(r'<think>.*?</think>', '', stripped, flags=re.DOTALL).strip()
+        if stripped.startswith("```"):
+            stripped = re.sub(r'^```(?:json)?\s*', '', stripped, flags=re.MULTILINE)
+            stripped = re.sub(r'\s*```$', '', stripped)
+            stripped = stripped.strip()
+        if not stripped:
+            raise RuntimeError("LLM 返回空内容，可能是模型服务暂时不可用或被限流")
+
+        repaired = self._repair_json_string(stripped)
+        try:
+            parsed = json.loads(repaired)
+        except json.JSONDecodeError:
+            return json.dumps({"text": stripped})
+        # 字面量 null / 空对象：对任何 prompt 都不是合法完成（null 会导致 ragas
+        # StringIO/Pydantic 解析失败），触发重试而不是放行
+        if parsed is None or parsed == {}:
+            raise RuntimeError("LLM 返回空 JSON（null/空对象），可能是模型服务暂时不可用")
+
+        # 解 {"text": "<json字符串>"} 双重包装
+        while (isinstance(parsed, dict) and set(parsed.keys()) <= {"text"}
+               and isinstance(parsed.get("text"), str)):
+            try:
+                parsed = json.loads(parsed["text"].strip())
+            except json.JSONDecodeError:
+                break
+            if parsed is None or parsed == {}:
+                raise RuntimeError("LLM 返回空 JSON（null/空对象），可能是模型服务暂时不可用")
+
+        # 裸空数组 []：对任何 prompt 都不是合法完成
+        if isinstance(parsed, list) and not parsed:
+            raise RuntimeError("LLM 返回空数组，可能是模型服务暂时不可用")
+
+        # schema 回显检测：顶层出现 schema 专有键且无业务字段
+        if isinstance(parsed, dict) and {"properties", "title", "type"} <= set(parsed.keys()):
+            raise RuntimeError(f"LLM 回显了 JSON schema 而非实际内容: {str(parsed)[:120]}")
+
+        return json.dumps(parsed, ensure_ascii=False)
+
+    def _call_api(self, prompt_text: str, temperature: float, max_tokens: int, stop: Optional[list], max_retries: int = 5):
+        """同步调用 API（受全局 Semaphore 限制并发），超时/网络错误自动重试
+
+        max_retries=5：MiniMax Token Plan 限流恢复约 1 分钟，需更多重试 + 长退避。
+        """
 
         url = f"{self.api_base}/chat/completions"
         headers = {
             'Authorization': f'Bearer {self.api_key}',
             'Content-Type': 'application/json'
         }
-        data = {
-            'model': self.model,
-            'messages': [{'role': 'user', 'content': prompt_text}],
-            'temperature': temperature,
-            'max_tokens': max_tokens,
-        }
-        if stop:
-            data['stop'] = stop
+        data = self._build_llm_request_body(prompt_text, temperature, max_tokens, stop)
 
         # RPM 限制
         self._wait_for_rpm_slot()
@@ -240,35 +373,23 @@ class OpenAICompatibleLLM(BaseRagasLLM):
             sync_sem.acquire()
             try:
                 response = requests.post(url, headers=headers, json=data, timeout=300)
+                # 429 限流：单独捕获，解析 Retry-After 做长退避（raise_for_status 抛 HTTPError 会丢失 header）
+                if response.status_code == 429:
+                    retry_after = _parse_retry_after(response)
+                    raise RateLimitError(
+                        f"HTTP 429 限流（Token Plan 速率限制），{retry_after or '~60'}s 后重试: {response.text[:200]}",
+                        retry_after=retry_after,
+                    )
                 response.raise_for_status()
                 result = response.json()
                 raw_text = result.get('choices', [{}])[0].get('message', {}).get('content') or ""
-
-                stripped = raw_text.strip()
-                if stripped.startswith("```"):
-                    stripped = re.sub(r'^```(?:json)?\s*', '', stripped, flags=re.MULTILINE)
-                    stripped = re.sub(r'\s*```$', '', stripped)
-                    stripped = stripped.strip()
-
-                if not stripped:
-                    final_text = '{"text": "模型未返回有效响应"}'
-                else:
-                    repaired = self._repair_json_string(stripped)
-                    try:
-                        parsed = json.loads(repaired)
-                        if parsed == {}:
-                            final_text = '{"text": "模型未返回有效响应"}'
-                        else:
-                            final_text = repaired
-                    except json.JSONDecodeError:
-                        final_text = json.dumps({"text": stripped})
-
-                return final_text
-            except (requests.Timeout, requests.ConnectionError, requests.RequestException) as e:
+                return self._normalize_json_response(raw_text)
+            except (requests.Timeout, requests.ConnectionError, requests.RequestException,
+                    RateLimitError, RuntimeError) as e:
                 last_error = e
                 if attempt < max_retries - 1:
-                    wait = 2 ** attempt
-                    logger.warning(f"[OpenAICompatibleLLM] 同步请求失败({e})，{wait}s 后重试 ({attempt + 1}/{max_retries})")
+                    wait = _compute_backoff(attempt, e)
+                    logger.warning(f"[OpenAICompatibleLLM] 同步请求失败({e})，{wait:.0f}s 后重试 ({attempt + 1}/{max_retries})")
                     time.sleep(wait)
                 else:
                     logger.error(f"[OpenAICompatibleLLM] 同步请求失败，已重试{max_retries}次: {e}")
@@ -298,6 +419,14 @@ class OpenAICompatibleLLM(BaseRagasLLM):
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
                 logger.info(f"[OpenAICompatibleLLM] 请求 LLM: model={self.model}, api_base={self.api_base}")
                 async with session.post(url, headers=headers, json=data) as resp:
+                    if resp.status == 429:
+                        # MiniMax Token Plan 限流：解析 Retry-After，交给重试循环长退避
+                        retry_after = _parse_retry_after(resp)
+                        text = await resp.text()
+                        raise RateLimitError(
+                            f"HTTP 429 限流（Token Plan 速率限制），{retry_after or '~60'}s 后重试: {text[:200]}",
+                            retry_after=retry_after,
+                        )
                     if resp.status != 200:
                         text = await resp.text()
                         raise RuntimeError(f"API 请求失败: HTTP {resp.status}, 响应: {text[:500]}")
@@ -310,9 +439,12 @@ class OpenAICompatibleLLM(BaseRagasLLM):
         temperature: Optional[float] = 0.01,
         stop: Optional[list] = None,
         callbacks: Any = None,
-        max_retries: int = 3,
+        max_retries: int = 5,
     ) -> LLMResult:
-        """异步生成文本（实现 BaseRagasLLM 接口），超时/网络错误自动重试"""
+        """异步生成文本（实现 BaseRagasLLM 接口），超时/网络错误自动重试
+
+        max_retries=5：MiniMax Token Plan 限流恢复约 1 分钟，需更多重试 + 长退避。
+        """
 
         # RPM 限制
         await self._await_for_rpm_slot_async()
@@ -331,14 +463,12 @@ class OpenAICompatibleLLM(BaseRagasLLM):
             'Authorization': f'Bearer {self.api_key}',
             'Content-Type': 'application/json'
         }
-        data = {
-            'model': self.model,
-            'messages': [{'role': 'user', 'content': prompt_text}],
-            'temperature': temperature if temperature is not None else self.temperature,
-            'max_tokens': self.max_tokens,
-        }
-        if stop:
-            data['stop'] = stop
+        data = self._build_llm_request_body(
+            prompt_text,
+            temperature if temperature is not None else self.temperature,
+            self.max_tokens,
+            stop,
+        )
 
         last_error = None
         for attempt in range(max_retries):
@@ -363,33 +493,17 @@ class OpenAICompatibleLLM(BaseRagasLLM):
                     raise RuntimeError(f"API message 格式错误: {type(message)}")
 
                 raw_text = message.get('content') or ""
-
-                stripped = raw_text.strip()
-                if stripped.startswith("```"):
-                    stripped = re.sub(r'^```(?:json)?\s*', '', stripped, flags=re.MULTILINE)
-                    stripped = re.sub(r'\s*```$', '', stripped)
-                    stripped = stripped.strip()
-
-                if not stripped:
-                    raise RuntimeError("LLM 返回空内容，可能是模型服务暂时不可用或被限流")
-
-                repaired = self._repair_json_string(stripped)
-                try:
-                    parsed = json.loads(repaired)
-                    if parsed == {}:
-                        raise RuntimeError("LLM 返回空 JSON 对象，可能是模型服务暂时不可用")
-                    final_text = repaired
-                except json.JSONDecodeError:
-                    final_text = json.dumps({"text": stripped})
+                final_text = self._normalize_json_response(raw_text)
 
                 gen = Generation(text=final_text)
                 return LLMResult(generations=[[gen]])
 
-            except (asyncio.TimeoutError, RuntimeError) as e:
+            except (asyncio.TimeoutError, aiohttp.ClientError, json.JSONDecodeError,
+                    RateLimitError, RuntimeError) as e:
                 last_error = e
                 if attempt < max_retries - 1:
-                    wait = 2 ** attempt
-                    logger.warning(f"[OpenAICompatibleLLM] 请求失败({type(e).__name__}: {e})，{wait}s 后重试 ({attempt + 1}/{max_retries})")
+                    wait = _compute_backoff(attempt, e)
+                    logger.warning(f"[OpenAICompatibleLLM] 请求失败({type(e).__name__}: {e})，{wait:.0f}s 后重试 ({attempt + 1}/{max_retries})")
                     await asyncio.sleep(wait)
                 else:
                     logger.error(f"[OpenAICompatibleLLM] 请求失败，已重试{max_retries}次: {type(e).__name__}: {e}")
@@ -473,6 +587,7 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings):
 
     # 全局并发限制信号量（类变量，所有实例共享）
     _semaphore: Optional[Any] = None
+    _sync_semaphore: Optional[Any] = None  # 同步信号量（惰性初始化）
     _async_lock: Optional[Any] = None  # 异步信号量初始化的锁
     _sync_semaphore_lock: Optional[Any] = None  # 同步信号量初始化的锁
     _max_concurrent: int = 4  # 全局最大并发数（默认4，最大8）
@@ -506,6 +621,14 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings):
         # 初始化 run_config（父类需要这个属性）
         self.run_config = RunConfig()
 
+    def _build_request_data(self, texts: List[str]) -> dict:
+        # MiniMax/标准格式差异由 minimax_compat 处理
+        return build_embedding_request_data(self.api_base, self.model, texts)
+
+    def _extract_vectors(self, result: dict) -> List[List[float]]:
+        # MiniMax/标准响应格式差异由 minimax_compat 处理
+        return extract_embedding_vectors(self.api_base, result)
+
     def set_run_config(self, run_config):
         """设置 run_config（Ragas 接口）"""
         self.run_config = run_config
@@ -528,10 +651,7 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings):
             'Authorization': f'Bearer {self.api_key}',
             'Content-Type': 'application/json'
         }
-        data = {
-            'model': self.model,
-            'input': texts,
-        }
+        data = self._build_request_data(texts if isinstance(texts, list) else [texts])
 
         sync_sem = self._get_sync_semaphore()
         sync_sem.acquire()
@@ -543,9 +663,7 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings):
             sync_sem.release()
 
         # 按 input 顺序返回 embeddings
-        embeddings = result['data']
-        embeddings.sort(key=lambda x: x['index'])
-        return [e['embedding'] for e in embeddings]
+        return self._extract_vectors(result)
 
     def embed_query(self, text: str) -> List[float]:
         """同步获取单条文本 embedding"""
@@ -585,18 +703,28 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings):
 
         async with OpenAICompatibleEmbeddings._semaphore:
             session = await self._get_session()
-            data = {
-                'model': self.model,
-                'input': texts,
-            }
-            async with session.post(url, headers=headers, json=data) as resp:
-                resp.raise_for_status()
-                result = await resp.json()
-
-        # 按 index 排序确保顺序
-        embeddings = result['data']
-        embeddings.sort(key=lambda x: x['index'])
-        return [e['embedding'] for e in embeddings]
+            data = self._build_request_data(texts)
+            last_error = None
+            for attempt in range(5):
+                try:
+                    async with session.post(url, headers=headers, json=data) as resp:
+                        if resp.status == 429:
+                            retry_after = _parse_retry_after(resp)
+                            body = await resp.text()
+                            raise RateLimitError(
+                                f"embedding HTTP 429 限流，{retry_after or '~60'}s 后重试: {body[:200]}",
+                                retry_after=retry_after,
+                            )
+                        resp.raise_for_status()
+                        result = await resp.json()
+                    # 按 input 顺序返回 embeddings
+                    return self._extract_vectors(result)
+                except (aiohttp.ClientError, json.JSONDecodeError, RateLimitError, RuntimeError) as e:
+                    last_error = e
+                    if attempt < 4:
+                        wait = _compute_backoff(attempt, e)
+                        await asyncio.sleep(wait)
+        raise RuntimeError(f"embedding 请求失败，已重试5次: {last_error}")
 
     async def close(self):
         """关闭 aiohttp session"""
@@ -606,6 +734,63 @@ class OpenAICompatibleEmbeddings(BaseRagasEmbeddings):
 
     def __repr__(self):
         return f"OpenAICompatibleEmbeddings(model={self.model})"
+
+
+class UnslothEmbeddingsWrapper(BaseRagasEmbeddings):
+    """
+    本地 BGE-M3（插件 embedding/unsloth_embedding.py 单例）的 Ragas Embeddings 适配器。
+
+    复用插件模型的 transformers 直连回退（unsloth 未安装 / MPS / CPU 场景），
+    设备自动选择：CUDA/HIP 可用时用 cuda（AMD ROCm 上即 HIP），否则 cpu。
+    同步 embed_* 在普通线程中执行（无运行中事件循环），初始化用 asyncio.run 包装；
+    异步 aembed_* 通过 asyncio.to_thread 复用同步路径，避免 loop 冲突。
+    """
+
+    def __init__(self, model_path: Optional[str] = None,
+                 max_seq_length: int = 512, device: str = ""):
+        super().__init__()
+        self.run_config = RunConfig()
+        self._model = None
+        self._model_path = model_path
+        self._max_seq_length = max_seq_length
+        self._device = device
+
+    def _ensure(self):
+        if self._model is None:
+            import torch
+            device = self._device or ("cuda" if torch.cuda.is_available() else "cpu")
+            from embedding.unsloth_embedding import get_embedding_model
+            self._model = get_embedding_model(
+                model_path=self._model_path,
+                device=device,
+                max_seq_length=self._max_seq_length,
+            )
+        if not self._model._initialized:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(self._model.initialize())
+            else:
+                raise RuntimeError("UnslothEmbeddingsWrapper 同步 embed 调用必须在事件循环外执行")
+        return self._model
+
+    def embed_query(self, text: str) -> List[float]:
+        return self._ensure().get_dense_embedding(text)[0]
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return self._ensure().get_dense_embedding(texts)
+
+    async def aembed_query(self, text: str) -> List[float]:
+        return (await self.aembed_documents([text]))[0]
+
+    async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
+        return await asyncio.to_thread(self.embed_documents, texts)
+
+    async def close(self):
+        pass
+
+    def __repr__(self):
+        return f"UnslothEmbeddingsWrapper(model={self._model_path or 'bge-m3'})"
 
 
 # ============================================================================
@@ -1073,8 +1258,13 @@ class RagasTestsetGenerator:
             embed_mode = self._embed_config.get("mode", "api")
 
             if embed_mode == "unsloth":
-                # Unsloth 模式需要在外部处理，此处抛出错误提示
-                raise ValueError("Unsloth embedding 模式需要在外部系统初始化，请在 embedding_mode='api' 时使用 API 兼容接口")
+                # 本地 BGE-M3：复用插件 UnslothEmbeddingModel（含 transformers 直连回退）
+                print("🔧 正在初始化本地 BGE-M3 embedding (UnslothEmbeddingsWrapper)...")
+                self._embed_model = UnslothEmbeddingsWrapper(
+                    model_path=self._embed_config.get("model_path"),
+                    device=self._embed_config.get("device", ""),
+                )
+                print("✅ 本地 BGE-M3 embedding 初始化成功")
             elif self._embed_config["base_url"]:
                 print(f"🔧 正在使用 OpenAI 兼容 embedding: {self._embed_config['base_url']}/{self._embed_config['model']}")
                 self._embed_model = OpenAICompatibleEmbeddings(
@@ -1173,10 +1363,14 @@ class RagasTestsetGenerator:
         # 生成测试集
         print("正在调用 LLM 生成问答对（可能需要几分钟）...")
 
-        # 容错：LLM 返回无效/结构不匹配 JSON 时，RAGAS extractor 会抛 OutputParserException
-        # 导致整个 generate_with_llamaindex_docs 挂掉。此处 patch extractor，失败时返回空值。
+        # ========== 容错补丁（本函数作用域内生效，finally 恢复）==========
+        # 背景：transforms 阶段（Summary/Headlines/Themes/NER/Filter/Embedding）跑在
+        # ragas.async_utils.run_async_tasks 里，该函数在所有任务完成后【无条件】raise
+        # 第一个异常（与 raise_exceptions 参数无关），单个 chunk 失败即中止整个管线。
+        # 因此对每个 transform 的方法做 try/except 包装，失败只跳过该节点不中止管线。
+
         from ragas.testset.transforms.extractors.llm_based import (
-            HeadlinesExtractor, ThemesExtractor,
+            HeadlinesExtractor, ThemesExtractor, SummaryExtractor, NERExtractor,
         )
 
         _orig_headlines_extract = HeadlinesExtractor.extract
@@ -1195,8 +1389,27 @@ class RagasTestsetGenerator:
                 logger.warning(f"[PaperRAG] ThemesExtractor 失败: {e}")
                 return self.property_name, []
 
+        _orig_summary_extract = SummaryExtractor.extract
+        async def _safe_summary_extract(self, node):
+            try:
+                return await _orig_summary_extract(self, node)
+            except Exception as e:
+                # summary 置空：CustomNodeFilter 对空 summary 的节点会跳过过滤
+                logger.warning(f"[PaperRAG] SummaryExtractor 失败: {e}")
+                return self.property_name, ""
+
+        _orig_ner_extract = NERExtractor.extract
+        async def _safe_ner_extract(self, node):
+            try:
+                return await _orig_ner_extract(self, node)
+            except Exception as e:
+                logger.warning(f"[PaperRAG] NERExtractor 失败: {e}")
+                return self.property_name, []
+
         HeadlinesExtractor.extract = _safe_headlines_extract
         ThemesExtractor.extract = _safe_themes_extract
+        SummaryExtractor.extract = _safe_summary_extract
+        NERExtractor.extract = _safe_ner_extract
 
         # 容错：HeadlineSplitter 遇到 None headlines 时抛 ValueError
         _orig_split = HeadlineSplitter.split
@@ -1206,6 +1419,39 @@ class RagasTestsetGenerator:
                 return [node], []
             return await _orig_split(self, node)
         HeadlineSplitter.split = _safe_split
+
+        # 容错：CustomNodeFilter 单块打分失败（question_potential/fix_output_format 解析失败）
+        # → 保留该块（返回 False = 不过滤），不中止管线
+        from ragas.testset.transforms.filters import CustomNodeFilter
+        _orig_custom_filter = CustomNodeFilter.custom_filter
+        async def _safe_custom_filter(self, node, kg):
+            try:
+                return await _orig_custom_filter(self, node, kg)
+            except Exception as e:
+                logger.warning(f"[PaperRAG] CustomNodeFilter 失败，保留节点: {e}")
+                return False
+        CustomNodeFilter.custom_filter = _safe_custom_filter
+
+        # 容错：EmbeddingExtractor 失败（网络/限流）→ 该节点无 embedding，跳过
+        from ragas.testset.transforms.extractors.embeddings import EmbeddingExtractor
+        _orig_embed_extract = EmbeddingExtractor.extract
+        async def _safe_embed_extract(self, node):
+            try:
+                return await _orig_embed_extract(self, node)
+            except Exception as e:
+                logger.warning(f"[PaperRAG] EmbeddingExtractor 失败: {e}")
+                return self.property_name, []
+        EmbeddingExtractor.extract = _safe_embed_extract
+
+        # 容错：generate 阶段（personas/scenarios/distill）单个样本失败时，
+        # ragas Executor(raise_exceptions=False) 会把 Exception 混入结果列表，
+        # 导致后续 TestsetSample 构造校验失败 → 全量 0 样本。过滤掉异常结果即可。
+        from ragas.executor import Executor
+        _orig_executor_results = Executor.results
+        def _safe_executor_results(self):
+            results = _orig_executor_results(self)
+            return [r for r in results if not isinstance(r, Exception)]
+        Executor.results = _safe_executor_results
 
         try:
             testset = generator.generate_with_llamaindex_docs(
@@ -1222,7 +1468,12 @@ class RagasTestsetGenerator:
         finally:
             HeadlinesExtractor.extract = _orig_headlines_extract
             ThemesExtractor.extract = _orig_themes_extract
+            SummaryExtractor.extract = _orig_summary_extract
+            NERExtractor.extract = _orig_ner_extract
             HeadlineSplitter.split = _orig_split
+            CustomNodeFilter.custom_filter = _orig_custom_filter
+            EmbeddingExtractor.extract = _orig_embed_extract
+            Executor.results = _orig_executor_results
 
         # 转换为标准格式
         samples = []

@@ -224,7 +224,14 @@ evaluation/freeapi.json
 
 # Safe Refactor drafts
 .cc-connect/
+.zcode/
 .vscode/
 .claude/
 .refactor/
 .env*
+
+# 微调实验产物（legacy 归档里的原始数据集与 checkpoint 不入库）
+legacy/finetune_ragtruth_truthfulqa/RAGTruth/
+legacy/finetune_ragtruth_truthfulqa/TruthfulQA/
+legacy/finetune_ragtruth_truthfulqa/lora-*/
+finetune/checkpoints/

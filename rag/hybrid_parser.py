@@ -26,13 +26,9 @@ import fitz  # PyMuPDF
 
 from astrbot.api import logger
 
-# 导入自定义PDF解析器（兼容直接运行和包运行）
-try:
-    from .multimodal_extractor import PDFParserAdvanced
-except ImportError:
-    from multimodal_extractor import PDFParserAdvanced
-
-# 导入引用处理器（兼容直接运行和包运行）
+# PDFParserAdvanced（multimodal_extractor → docling）改为惰性导入：
+# docling 只在真实解析 PDF 时需要，检索/评测路径不依赖它，避免强制安装
+# 引用处理器（兼容直接运行和包运行）
 try:
     from .reference_processor import (
         CitationLinker,
@@ -110,7 +106,11 @@ class HybridPDFParser:
         self.llm_config = llm_config
         self.arxiv_client = arxiv_client
 
-        # 初始化自定义PDF解析器
+        # 初始化自定义PDF解析器（惰性导入，docling 仅在解析时加载）
+        try:
+            from .multimodal_extractor import PDFParserAdvanced
+        except ImportError:
+            from multimodal_extractor import PDFParserAdvanced
         self.pdf_parser = PDFParserAdvanced(
             enable_multimodal=enable_multimodal
         )

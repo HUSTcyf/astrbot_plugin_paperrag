@@ -34,6 +34,12 @@ def extract_text_from_response(response) -> str:
     if content is not None and isinstance(content, str) and content.strip():
         return content
 
+    # AstrBot LLMResponse：纯文本在 .completion_text property（非 .content）
+    # 当 result_chain=None 时，文本存在 _completion_text 字段
+    completion_text = getattr(response, 'completion_text', None)
+    if completion_text is not None and isinstance(completion_text, str) and completion_text.strip():
+        return completion_text
+
     if isinstance(response, dict):
         return response.get("content", "") or response.get("text", "")
     return str(response)

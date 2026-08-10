@@ -256,18 +256,39 @@ class LlamaCppVLMProvider:
 
         raise RuntimeError("9B 和 4B 模型都无法加载")
 
+    def _build_llama_kwargs(self, model_path: str, mmproj_path: Optional[str] = None) -> dict:
+        """构造 Llama() 参数。
+
+        llama-cpp-python 0.3.34 起 mmproj 参数被移除且被静默忽略（视觉模型
+        依赖 chat_handler 注入）；旧版本仍接受 mmproj 直接传参。
+        """
+        kwargs = dict(
+            model_path=model_path,
+            n_ctx=self.n_ctx,
+            n_gpu_layers=self.n_gpu_layers,
+            n_batch=self.n_parallel * 32,
+            verbose=False,
+        )
+        mmproj = mmproj_path or self.mmproj_path
+        if mmproj and Path(mmproj).exists():
+            try:
+                from llama_cpp.llama_chat_format import MTMDChatHandler
+                kwargs["chat_handler"] = MTMDChatHandler(
+                    clip_model_path=mmproj,
+                    verbose=False,
+                    # CPU-only 构建（n_gpu_layers 生效时才会走 GPU）
+                    use_gpu=self.n_gpu_layers > 0,
+                )
+            except (ImportError, AttributeError):
+                # 旧版 llama-cpp-python：mmproj 作为直接构造参数
+                kwargs["mmproj"] = mmproj
+        return kwargs
+
     async def _try_load_model(self, model_path: str, mmproj_path: str) -> None:
         """在独立线程中加载 Llama 模型"""
 
         def _load() -> Any:
-            return Llama(
-                model_path=model_path,
-                mmproj=mmproj_path,
-                n_ctx=self.n_ctx,
-                n_gpu_layers=self.n_gpu_layers,
-                n_batch=self.n_parallel * 32,
-                verbose=False,
-            )
+            return Llama(**self._build_llama_kwargs(model_path, mmproj_path))
 
         loop = asyncio.get_event_loop()
         with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -276,14 +297,7 @@ class LlamaCppVLMProvider:
     def _load_llama(self) -> Any:
         """在线程中加载 Llama 模型（同步版本，保留兼容性）"""
 
-        llama = Llama(
-            model_path=self.model_path,
-            mmproj=self.mmproj_path,
-            n_ctx=self.n_ctx,
-            n_gpu_layers=self.n_gpu_layers,
-            n_batch=self.n_parallel * 32,
-            verbose=False,
-        )
+        llama = Llama(**self._build_llama_kwargs(self.model_path))
         return llama
 
     async def text_chat(

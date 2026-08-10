@@ -74,11 +74,15 @@ class PluginCoreBase(Star):
         # Graph RAG 引擎（懒加载，缓存复用）
         self._graph_engine = None
 
+        # 微调 LoRA 模型 provider（懒加载，仅 finetune_llm_enabled=true 时实例化）
+        self._finetune_llm = None
+
         # 后台服务线程追踪
         self._neo4j_thread = None
 
         # 并发安全锁
         self._engine_lock = threading.Lock()  # 保护 _get_engine 初始化
+        self._finetune_llm_lock = threading.Lock()  # 保护 _get_finetune_llm 初始化
         self._auto_build_lock = asyncio.Lock()  # 保护 _papers_since_graph_build 计数
         self._response_cache_lock = threading.Lock()  # 保护 _response_cache（sync 方法访问）
 
@@ -225,6 +229,35 @@ class PluginCoreBase(Star):
                 if self._engine is None:
                     return self._create_engine_inner()
         return self._engine
+
+    def _get_finetune_llm(self):
+        """获取微调 LoRA 模型 provider（单例，惰性加载）。
+
+        仅当配置 finetune_llm_enabled=true 时返回 provider 实例；否则返回 None。
+        provider 的模型加载也是惰性的（首次 chat() 时在线程池完成）。
+        """
+        if not self.config.get("finetune_llm_enabled", False):
+            return None
+        if self._finetune_llm is None:
+            with self._finetune_llm_lock:
+                if self._finetune_llm is None:
+                    try:
+                        from ..provider.finetune_llm_provider import FinetuneLLMProvider
+                    except ImportError:
+                        from provider.finetune_llm_provider import FinetuneLLMProvider
+                    self._finetune_llm = FinetuneLLMProvider(
+                        base_model_dir=self.config.get(
+                            "finetune_base_model_dir", "finetune/models/Qwen3.5-0.8B"
+                        ),
+                        adapter_dir=self.config.get("finetune_adapter_dir", ""),
+                        max_new_tokens=self.config.get("finetune_llm_max_new_tokens", 512),
+                        num_threads=self.config.get("finetune_llm_num_threads", 16),
+                    )
+                    logger.info(
+                        f"[FinetuneLLM] provider 已创建（未加载）: "
+                        f"{self._finetune_llm.model_info}"
+                    )
+        return self._finetune_llm
 
     def _create_engine_inner(self) -> Optional["HybridRAGEngine"]:
         """创建 RAG 引擎（仅在持有 _engine_lock 时调用）"""

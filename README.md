@@ -1,22 +1,23 @@
-# 📚 Paper RAG Plugin v2.2.4 — 用户指南
+# 📚 Paper RAG Plugin v2.2.5 — 用户指南
 
 本地论文库 RAG 检索插件，为 AstrBot 提供智能论文检索、知识图谱增强问答、研究想法生成和远程 Claude Code 编程执行。支持多模态（图片/表格/公式）提取、Llama.cpp VLM 本地问答和 Agentic RAG（LangGraph 工作流）。
 
-> **版本说明**：当前版本 v2.2.4，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
+> **版本说明**：当前版本 v2.2.5，完整更新历史见 [CHANGELOG.md](docs/CHANGELOG.md)，按版本拆分索引见 [docs/changelog/INDEX.md](docs/changelog/INDEX.md)
 
-### 本版变化 (v2.2.4)
+### 本版变化 (v2.2.5)
 
-- **Academic intent guard for LLM Tools**：新增 `_guard_academic_intent()` 预检查至 `_paper_search_tool`、`_agentic_rag_tool` 和 `_react_rag_tool`。非学术查询（问候、闲聊）现在会被提前拒绝，避免进入昂贵的 RAG 流水线，每次节省 30+ 秒。
-- **强化 `_check_academic_intent`**：扩展负面检测覆盖 "不"/"no"/"非" 变体，添加不可识别 LLM 响应的警告日志。
-- **强化 LLM Tool 描述**：为 `paper_search`、`paper_arag`、`paper_react` 工具描述添加 `【严格限制】` 前缀，阻止主 LLM 为非学术查询调用论文工具。
-- **Cypher code fence 修复**：`TextToCypherRetriever` 有时返回 markdown 包裹的 Cypher，validator 现在自动剥离 ` ```cypher ... ``` ` 后再校验。
-- 完整变更详见 [docs/changelog/2.2.4.md](docs/changelog/2.2.4.md)
+- **微调 LoRA 模型接入（FinetuneLLMProvider）**：新增 `provider/finetune_llm_provider.py`，transformers+peft 直连加载本地微调模型（Qwen3.5-0.8B ± LoRA），惰性加载、异步不阻塞事件循环；`_conf_schema.json` + `RAGConfig` 新增 `finetune_llm_enabled` / `finetune_base_model_dir` / `finetune_adapter_dir` / `finetune_llm_max_new_tokens` / `finetune_llm_num_threads`。
+- **RAGAS 评测 MiniMax 兼容层**：新增 `evaluation/minimax_compat.py` 集中处理 MiniMax-M3 三处差异（思考模式 `<think>` 块、非标准 `/v1/embeddings`、`embo-01` 模型名），智谱等标准端点保持纯净；429 限流长退避。
+- **测试集生成容错**：transforms 阶段单节点失败不再中止整个管线，修复"单样本失败 → 全量 0 样本"。
+- **本地 embedding 回退**：unsloth 未安装（如 AMD ROCm）时自动回退 transformers 直连 BGE-M3。
+- 完整变更详见 [docs/changelog/2.2.5.md](docs/changelog/2.2.5.md)
 
 ### 近期更新
 
 | 版本 | 日期 | 要点 |
 |------|------|------|
-| [2.2.3](docs/changelog/2.2.3.md) | 2026-06-03 | Remote SSH Claude Code execution (`/cc` 命令)，支持远程编程任务 |
+| [2.2.5](docs/changelog/2.2.5.md) | 2026-08-10 | 微调 LoRA 接入、RAGAS MiniMax 兼容层、测试集生成容错 |
+| [2.2.4](docs/changelog/2.2.4.md) | 2026-06-09 | Academic intent guard for LLM Tools、Cypher code fence 修复 |
 | [2.2.2](docs/changelog/2.2.2.md) | 2026-05-29 | 云端 LLM 图谱提取 + Pydantic 结构化校验，`strip_code_block` 修复 |
 | [2.2.1](docs/changelog/2.2.1.md) | 2026-05-26 | 参考文献 4 层解析链路、并行富化加速 5.4x、智能引用修复、OpenAlex 异步化 |
 | [2.2.0](docs/changelog/2.2.0.md) | 2026-05-25 | 新 LLM Tool `paper_search` + `code_execute`（远程编程），安全模型白名单 |

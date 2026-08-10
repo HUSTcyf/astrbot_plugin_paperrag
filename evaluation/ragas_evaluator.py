@@ -17,7 +17,7 @@ import pandas as pd
 from datasets import Dataset
 from ragas import evaluate, RunConfig, EvaluationDataset
 from ragas.llms.base import BaseRagasLLM
-from ragas.embeddings.base import BaseRagasEmbedding, embedding_factory
+from ragas.embeddings.base import BaseRagasEmbedding
 from ragas.metrics._faithfulness import Faithfulness
 from ragas.metrics._answer_relevance import AnswerRelevancy
 from ragas.metrics._context_precision import ContextPrecision
@@ -28,6 +28,12 @@ from ragas.metrics._answer_correctness import AnswerCorrectness
 os.environ["RAGAS_DO_NOT_TRACK"] = "True"
 
 from astrbot.api import logger
+
+# MiniMax 专属请求字段合并（openai SDK 兼容）。双重 import 模式（CLAUDE.md 约定）。
+try:
+    from .minimax_compat import apply_llm_request_fields
+except ImportError:
+    from minimax_compat import apply_llm_request_fields  # type: ignore
 
 
 class _LLMWithN:
@@ -50,6 +56,8 @@ class _LLMWithN:
         self._temperature = temperature
         self._max_tokens = max_tokens
         self.agenerate_text: Any = None  # 由 _make_agenerate_text 在 _get_llm() 中设置
+        # MiniMax 思考模式需禁用；标准端点（智谱等）发纯净请求。详见 minimax_compat.py。
+        self._endpoint_base_url = str(getattr(client, "base_url", ""))
 
     async def generate(self, prompt_value, n=1, temperature=None, stop=None, callbacks=None):
         """被 RAGAS generate_multiple() 的 BaseRagasLLM 分支调用。"""
@@ -61,12 +69,25 @@ class _LLMWithN:
             max_tokens=self._max_tokens,
             temperature=temperature if temperature is not None else self._temperature,
             n=n,
-            response_format={"type": "json_object"},
         )
+        # MiniMax 专属字段（thinking 走 extra_body / response_format 顶层）；标准端点为空 dict
+        apply_llm_request_fields(kwargs, self._endpoint_base_url)
         if stop:
             kwargs["stop"] = stop
 
-        r = self._client.chat.completions.create(**kwargs)
+        try:
+            r = self._client.chat.completions.create(**kwargs)
+        except Exception:
+            # 兜底：部分端点（MiniMax-M3 等）连 n>1 的请求本身都 400 拒绝
+            # （"model does not support n > 1"），降级为 n 次独立的 n=1 请求，
+            # 保持 generate_multiple 需要的 n 条 generation 语义不变。
+            single_kwargs = {k: v for k, v in kwargs.items() if k != "n"}
+            gens = []
+            for _ in range(n):
+                r = self._client.chat.completions.create(**single_kwargs)
+                gens.append(Generation(text=r.choices[0].message.content or ""))
+            return LLMResult(generations=[gens])
+
         gens = [Generation(text=choice.message.content or "") for choice in r.choices]
         # 兜底：部分 API 代理不支持 n 参数，仅返回 1 个 choice
         while len(gens) < n:
@@ -124,7 +145,7 @@ def load_raw_answers(path: str) -> tuple[list[dict], dict]:
 
 
 sys.path.insert(0, str(Path(__file__).parent))
-from ragas_generator import EvalSample
+from ragas_generator import EvalSample, UnslothEmbeddingsWrapper, OpenAICompatibleEmbeddings
 
 # call_llm import（确保 plugin root 在 sys.path 中）
 _plugin_root = str(Path(__file__).parent.parent)
@@ -365,6 +386,8 @@ class RagasEvaluator:
             text = getattr(prompt, 'text', str(prompt))
             kwargs: dict = dict(model=model, messages=[dict(role="user", content=text)],
                                 max_tokens=max_tokens, temperature=temperature or 0)
+            # MiniMax 专属字段（thinking 走 extra_body / response_format 顶层）；标准端点为空 dict
+            apply_llm_request_fields(kwargs, str(getattr(client, "base_url", "")))
             if stop:
                 kwargs["stop"] = stop
             gens = []
@@ -375,18 +398,28 @@ class RagasEvaluator:
         return _agenerate_text
 
     def _get_embed_model(self):
-        """获取 Embedding 模型实例（延迟初始化）- 使用 embedding_factory 创建 modern embeddings"""
+        """获取 Embedding 模型实例（延迟初始化）
+
+        使用自定义 OpenAICompatibleEmbeddings（复用 ragas_generator 的实现）：
+        - MiniMax /v1/embeddings 为非标准格式（texts/type=query/embo-01/vectors），
+          embedding_factory 的 OpenAI 客户端（input/data 格式）在该端点不可用
+        - 自带并发限制和 3 次指数退避重试
+        """
         if self._embed_model is None:
-            if self._embed_config["base_url"]:
-                client = self._create_openai_client(
-                    self._embed_config["base_url"], self._embed_config["api_key"])
-                self._embed_model = embedding_factory(
-                    provider="openai",
-                    model=self._embed_config["model"],
-                    client=client,
-                    interface="modern",
+            if self._embed_config.get("mode") == "unsloth":
+                print("🔧 正在初始化本地 BGE-M3 embedding (UnslothEmbeddingsWrapper)...")
+                self._embed_model = UnslothEmbeddingsWrapper(
+                    model_path=self._embed_config.get("model_path"),
+                    device=self._embed_config.get("device", ""),
                 )
-                print(f"✅ Embedding (modern) 初始化成功: {self._embed_config['model']} @ {self._embed_config['base_url']}")
+                print("✅ 本地 BGE-M3 embedding 初始化成功")
+            elif self._embed_config["base_url"]:
+                self._embed_model = OpenAICompatibleEmbeddings(
+                    model=self._embed_config["model"],
+                    api_base=self._embed_config["base_url"],
+                    api_key=self._embed_config["api_key"] or "sk-placeholder",
+                )
+                print(f"✅ Embedding 初始化成功: {self._embed_config['model']} @ {self._embed_config['base_url']}")
             else:
                 raise ValueError("embed_base_url is required for embedding")
         return self._embed_model
